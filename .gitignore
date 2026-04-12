@@ -1,0 +1,20 @@
+# BIOS ROM (copyrighted, not distributable)
+bios/
+
+# DuckStation (2.1GB modified build, tracked separately)
+duckstation/
+
+# Ghidra project files (large, regenerable)
+ghidra/
+
+# Build artifacts
+recompiler/build/
+generated/*.o
+generated/*.obj
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
