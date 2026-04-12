@@ -38,6 +38,7 @@
 #include "fmt/format.h"
 
 #include "bios_slice_walker.h"
+#include "full_function_emitter.h"
 #include "function_discovery.h"
 #include "mips_decoder.h"
 
@@ -703,6 +704,53 @@ int run_boot_slice(const fs::path& bios_path, const fs::path& out_dir,
     return 0;
 }
 
+// ----- Phase 2: full BIOS emission ------------------------------------------
+
+int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
+                  const fs::path& seed_path) {
+    // 1. Load + validate BIOS file.
+    const auto rom = load_file_strict(bios_path, kBiosSize);
+    const std::string sha = sha256_hex(rom);
+
+    // 2. Load seeds.
+    const auto seeds = load_seeds(seed_path);
+    std::fprintf(stdout, "psxrecomp-bios: loaded %zu seeds from %s\n",
+                 seeds.size(), seed_path.string().c_str());
+
+    // 3. Run discovery.
+    const auto dr = PSXRecompV4::FunctionDiscovery::discover(
+        rom, kBiosBase, kBiosBase + static_cast<uint32_t>(kBiosSize) - 1, seeds);
+
+    if (!dr.ok) {
+        // Write unsupported_ops.json for diagnosis, but continue — some
+        // functions may be skippable (e.g. FPU).
+        std::fprintf(stderr,
+            "psxrecomp-bios: WARNING: discovery had %zu unsupported instructions; "
+            "they will be skipped during emission\n",
+            dr.unsupported.size());
+    }
+
+    // 4. Emit full C.
+    const auto stats = PSXRecompV4::FullFunctionEmitter::emit(
+        rom, kBiosBase, kBiosBase + static_cast<uint32_t>(kBiosSize) - 1,
+        dr, sha, out_dir.string());
+
+    std::fprintf(stdout,
+        "psxrecomp-bios: EMIT OK  emitted=%u  skipped=%u  instructions=%u  "
+        "dispatch_entries=%u\n",
+        stats.functions_emitted, stats.functions_skipped,
+        stats.total_instructions, stats.dispatch_entries);
+
+    if (stats.functions_skipped > 0) {
+        std::fprintf(stdout, "psxrecomp-bios: skipped functions:\n");
+        for (const auto& [addr, reason] : stats.skipped) {
+            std::fprintf(stdout, "  0x%08X: %s\n", addr, reason.c_str());
+        }
+    }
+
+    return 0;
+}
+
 // ----- Phase 1c discovery mode ---------------------------------------------
 
 int run_discover(const fs::path& bios_path, const fs::path& out_dir,
@@ -767,13 +815,15 @@ int main(int argc, char** argv) {
         if (argc < 3) {
             std::fprintf(stderr,
                 "usage: psxrecomp-bios <bios.bin> <out_dir> [--cc <c-compiler>]\n"
-                "       psxrecomp-bios <bios.bin> <out_dir> --discover <seeds.json>\n");
+                "       psxrecomp-bios <bios.bin> <out_dir> --discover <seeds.json>\n"
+                "       psxrecomp-bios <bios.bin> <out_dir> --emit-full <seeds.json>\n");
             return 2;
         }
         const fs::path bios_path = argv[1];
         const fs::path out_dir   = argv[2];
         std::optional<std::string> cc_override;
         std::optional<fs::path> seed_path;
+        std::optional<fs::path> emit_full_seed_path;
 
         for (int i = 3; i < argc; ++i) {
             const std::string a = argv[i];
@@ -781,13 +831,17 @@ int main(int argc, char** argv) {
                 cc_override = argv[++i];
             } else if (a == "--discover" && i + 1 < argc) {
                 seed_path = argv[++i];
+            } else if (a == "--emit-full" && i + 1 < argc) {
+                emit_full_seed_path = argv[++i];
             } else {
                 std::fprintf(stderr, "psxrecomp-bios: unknown argument: %s\n", a.c_str());
                 return 2;
             }
         }
 
-        if (seed_path) {
+        if (emit_full_seed_path) {
+            return run_emit_full(bios_path, out_dir, *emit_full_seed_path);
+        } else if (seed_path) {
             return run_discover(bios_path, out_dir, *seed_path);
         } else {
             return run_boot_slice(bios_path, out_dir, cc_override);

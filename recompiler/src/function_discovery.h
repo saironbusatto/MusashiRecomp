@@ -121,9 +121,9 @@ public:
         uint32_t                    rom_end,
         const std::vector<Seed>&    seeds);
 
-private:
     // Walk a single function via BFS. Returns the set of visited
     // (addr, raw) pairs, basic block info, edges, and indirect jump sites.
+    // Made public for Phase 2 full function emitter.
     struct SingleFunctionResult {
         std::vector<std::pair<uint32_t, uint32_t>> instructions; // (addr, raw) sorted
         std::vector<BasicBlockInfo>                blocks;
@@ -142,6 +142,7 @@ private:
         uint32_t                    hard_cap,
         const std::string&          lineage);
 
+private:
     static uint32_t read_u32_le(const std::vector<uint8_t>& rom, uint32_t offset);
 
     // Control flow classification for a raw instruction at a given address.

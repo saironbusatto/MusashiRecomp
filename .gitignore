@@ -9,8 +9,16 @@ ghidra/
 
 # Build artifacts
 recompiler/build/
+runtime/build/
 generated/*.o
 generated/*.obj
+
+# Runtime diagnostic/crash files
+psx_crash.txt
+psx_diag.txt
+psx_dispatch_misses.txt
+psx_err.txt
+psx_out.txt
 
 # OS / editor junk
 .DS_Store

@@ -37,8 +37,8 @@ uint32_t FunctionDiscovery::read_u32_le(const std::vector<uint8_t>& rom, uint32_
 // See generated/normalization_rule.md for the full derivation.
 static uint32_t normalize_address(uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
-    // ROM-to-RAM copy: 0x1FC10000..0x1FC18BEF → 0x00000500..0x000090EF
-    if (phys >= 0x1FC10000u && phys <= 0x1FC18BEFu) {
+    // Kernel Part 2: ROM 0x1FC10000..0x1FC17FFF → RAM 0x00000500..0x00008500
+    if (phys >= 0x1FC10000u && phys <= 0x1FC17FFFu) {
         phys = phys - 0x1FC10000u + 0x00000500u;
     }
     return phys;

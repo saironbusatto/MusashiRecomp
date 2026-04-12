@@ -202,7 +202,9 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
 
             case 0x0C: { // SYSCALL
                 r.supported = true;
-                r.c_code = "psx_syscall(cpu, cpu->gpr[2]); return;";
+                r.c_code = fmt::format(
+                    "cpu->pc = 0x{:08X}u; psx_syscall(cpu, cpu->gpr[2]); return;",
+                    d.address);
                 r.comment = "syscall";
                 return r;
             }
@@ -224,10 +226,26 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
                 return r;
             }
 
+            case 0x11: { // MTHI rs
+                r.supported = true;
+                r.c_code = fmt::format("cpu->hi = cpu->gpr[{}];",
+                                       static_cast<int>(rs));
+                r.comment = fmt::format("mthi {}", gpr_name(rs));
+                return r;
+            }
+
             case 0x12: { // MFLO rd
                 r.supported = true;
                 r.c_code = emit_gpr_write(rd, "cpu->lo");
                 r.comment = fmt::format("mflo {}", gpr_name(rd));
+                return r;
+            }
+
+            case 0x13: { // MTLO rs
+                r.supported = true;
+                r.c_code = fmt::format("cpu->lo = cpu->gpr[{}];",
+                                       static_cast<int>(rs));
+                r.comment = fmt::format("mtlo {}", gpr_name(rs));
                 return r;
             }
 

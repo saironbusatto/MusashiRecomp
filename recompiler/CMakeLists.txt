@@ -89,6 +89,7 @@ add_executable(psxrecomp-bios
     src/strict_translator.cpp
     src/bios_slice_walker.cpp
     src/function_discovery.cpp
+    src/full_function_emitter.cpp
     src/main_bios.cpp
 )
 target_include_directories(psxrecomp-bios PRIVATE
