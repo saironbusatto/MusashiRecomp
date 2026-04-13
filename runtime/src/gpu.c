@@ -11,6 +11,7 @@
  */
 
 #include "gpu.h"
+#include "gpu_sw_renderer.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -126,6 +127,7 @@ static uint32_t gpustat_poll_count;
 
 void gpu_init(void) {
     memset(vram, 0, sizeof(vram));
+    sw_renderer_init(vram);
 
     /* Reset GP0 state machine */
     gp0_state = GP0_IDLE;
@@ -461,96 +463,195 @@ static void gp0_exec_mono_quad(void) {
     raster_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
 }
 
-/* Execute shaded triangle (GP0 0x30-0x33) — flat shaded with first vertex color */
+/* Execute shaded triangle (GP0 0x30-0x33) — Gouraud shaded */
 static void gp0_exec_shaded_tri(void) {
-    /* For now, use first vertex color (true Gouraud shading deferred) */
-    uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int32_t vx[3], vy[3];
-    /* Shaded tri: color0+v0, color1+v1, color2+v2 → words: C0, V0, C1, V1, C2, V2 */
+    uint16_t c[3];
+    /* Layout: C0, V0, C1, V1, C2, V2 */
     for (int i = 0; i < 3; i++) {
+        c[i] = rgb888_to_rgb555(gp0_cmd_buf[i * 2] & 0xFFFFFFu);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    raster_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
+    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+    sw_draw_gouraud_triangle(vx[0], vy[0], c[0],
+                             vx[1], vy[1], c[1],
+                             vx[2], vy[2], c[2]);
 }
 
 /* Execute shaded quad (GP0 0x38-0x3B) */
 static void gp0_exec_shaded_quad(void) {
-    uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int32_t vx[4], vy[4];
-    /* Shaded quad: C0, V0, C1, V1, C2, V2, C3, V3 */
+    uint16_t c[4];
+    /* Layout: C0, V0, C1, V1, C2, V2, C3, V3 */
     for (int i = 0; i < 4; i++) {
+        c[i] = rgb888_to_rgb555(gp0_cmd_buf[i * 2] & 0xFFFFFFu);
         parse_vertex(gp0_cmd_buf[1 + i * 2], &vx[i], &vy[i]);
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    raster_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
-    raster_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
+    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+    sw_draw_gouraud_triangle(vx[0], vy[0], c[0],
+                             vx[1], vy[1], c[1],
+                             vx[2], vy[2], c[2]);
+    sw_draw_gouraud_triangle(vx[2], vy[2], c[2],
+                             vx[1], vy[1], c[1],
+                             vx[3], vy[3], c[3]);
 }
 
-/* Execute textured triangle (GP0 0x24-0x27) — rasterize with flat color, ignore textures for now */
+/* Helper: build texpage word from GPU state for SW renderer.
+ * Format: bits 0-3 = X base, bit 4 = Y base, bits 5-6 = semi-trans, bits 7-8 = color depth */
+static uint16_t current_texpage(void) {
+    return (uint16_t)(texpage_x | (texpage_y << 4) |
+                      (semi_transparency << 5) | (texpage_colors << 7));
+}
+
+/* Helper: set up SW renderer state before a textured draw.
+ * semi_trans: whether the primitive has semi-transparency enabled (from opcode bit) */
+static void setup_textured_draw(uint32_t color24, int semi_trans) {
+    uint32_t r = (color24 >> 0) & 0xFF;
+    uint32_t g = (color24 >> 8) & 0xFF;
+    uint32_t b = (color24 >> 16) & 0xFF;
+    int raw = (r == 0x80 && g == 0x80 && b == 0x80) ? 0 : 0;
+    sw_set_color_modulation((int)r, (int)g, (int)b, raw);
+    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+}
+
+/* Execute textured triangle (GP0 0x24-0x27) */
 static void gp0_exec_textured_tri(void) {
-    uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
+    uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int32_t vx[3], vy[3];
-    /* Textured tri: color+v0, texcoord0+clut, v1, texcoord1+tpage, v2, texcoord2 */
+    int u[3], v[3];
+    /* Layout: color+v0, texcoord0+clut, v1, texcoord1+tpage, v2, texcoord2 */
     parse_vertex(gp0_cmd_buf[1], &vx[0], &vy[0]);
     parse_vertex(gp0_cmd_buf[3], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[5], &vx[2], &vy[2]);
+    u[0] = gp0_cmd_buf[2] & 0xFF;        v[0] = (gp0_cmd_buf[2] >> 8) & 0xFF;
+    u[1] = gp0_cmd_buf[4] & 0xFF;        v[1] = (gp0_cmd_buf[4] >> 8) & 0xFF;
+    u[2] = gp0_cmd_buf[6] & 0xFF;        v[2] = (gp0_cmd_buf[6] >> 8) & 0xFF;
+    uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
+    uint16_t clut_x = (clut & 0x3F) * 16;
+    uint16_t clut_y = (clut >> 6) & 0x1FF;
+    /* Texpage from word 4 bits 16-31, or use current state */
+    uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[4] >> 16);
+    uint16_t tpage = tpage_word & 0x1FF;
+
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    raster_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
+
+    setup_textured_draw(color24, semi_trans);
+    sw_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
+                              vx[1], vy[1], u[1], v[1],
+                              vx[2], vy[2], u[2], v[2],
+                              clut_x, clut_y, tpage);
 }
 
 /* Execute textured quad (GP0 0x2C-0x2F) */
 static void gp0_exec_textured_quad(void) {
-    uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
+    uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int32_t vx[4], vy[4];
-    /* Textured quad: color+v0, texcoord0+clut, v1, texcoord1+tpage, v2, texcoord2, v3, texcoord3 */
+    int u[4], v[4];
+    /* Layout: color+v0, tc0+clut, v1, tc1+tpage, v2, tc2, v3, tc3 */
     parse_vertex(gp0_cmd_buf[1], &vx[0], &vy[0]);
     parse_vertex(gp0_cmd_buf[3], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[5], &vx[2], &vy[2]);
     parse_vertex(gp0_cmd_buf[7], &vx[3], &vy[3]);
+    u[0] = gp0_cmd_buf[2] & 0xFF;  v[0] = (gp0_cmd_buf[2] >> 8) & 0xFF;
+    u[1] = gp0_cmd_buf[4] & 0xFF;  v[1] = (gp0_cmd_buf[4] >> 8) & 0xFF;
+    u[2] = gp0_cmd_buf[6] & 0xFF;  v[2] = (gp0_cmd_buf[6] >> 8) & 0xFF;
+    u[3] = gp0_cmd_buf[8] & 0xFF;  v[3] = (gp0_cmd_buf[8] >> 8) & 0xFF;
+    uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
+    uint16_t clut_x = (clut & 0x3F) * 16;
+    uint16_t clut_y = (clut >> 6) & 0x1FF;
+    uint16_t tpage = (uint16_t)(gp0_cmd_buf[4] >> 16) & 0x1FF;
+
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    raster_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
-    raster_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
+
+    setup_textured_draw(color24, semi_trans);
+    sw_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
+                              vx[1], vy[1], u[1], v[1],
+                              vx[2], vy[2], u[2], v[2],
+                              clut_x, clut_y, tpage);
+    sw_draw_textured_triangle(vx[2], vy[2], u[2], v[2],
+                              vx[1], vy[1], u[1], v[1],
+                              vx[3], vy[3], u[3], v[3],
+                              clut_x, clut_y, tpage);
 }
 
 /* Execute shaded textured triangle (GP0 0x34-0x37) */
 static void gp0_exec_shaded_textured_tri(void) {
-    uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
+    uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int32_t vx[3], vy[3];
-    /* C0, V0, TC0+clut, C1, V1, TC1+tpage, C2, V2, TC2 */
+    int u[3], v[3];
+    /* Layout: C0, V0, TC0+clut, C1, V1, TC1+tpage, C2, V2, TC2 */
     parse_vertex(gp0_cmd_buf[1], &vx[0], &vy[0]);
     parse_vertex(gp0_cmd_buf[4], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[7], &vx[2], &vy[2]);
+    u[0] = gp0_cmd_buf[2] & 0xFF;  v[0] = (gp0_cmd_buf[2] >> 8) & 0xFF;
+    u[1] = gp0_cmd_buf[5] & 0xFF;  v[1] = (gp0_cmd_buf[5] >> 8) & 0xFF;
+    u[2] = gp0_cmd_buf[8] & 0xFF;  v[2] = (gp0_cmd_buf[8] >> 8) & 0xFF;
+    uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
+    uint16_t clut_x = (clut & 0x3F) * 16;
+    uint16_t clut_y = (clut >> 6) & 0x1FF;
+    uint16_t tpage = (uint16_t)(gp0_cmd_buf[5] >> 16) & 0x1FF;
+
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    raster_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
+
+    setup_textured_draw(color24, semi_trans);
+    sw_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
+                              vx[1], vy[1], u[1], v[1],
+                              vx[2], vy[2], u[2], v[2],
+                              clut_x, clut_y, tpage);
 }
 
 /* Execute shaded textured quad (GP0 0x3C-0x3F) */
 static void gp0_exec_shaded_textured_quad(void) {
-    uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
+    uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int32_t vx[4], vy[4];
-    /* C0, V0, TC0+clut, C1, V1, TC1+tpage, C2, V2, TC2, C3, V3, TC3 */
+    int u[4], v[4];
+    /* Layout: C0, V0, TC0+clut, C1, V1, TC1+tpage, C2, V2, TC2, C3, V3, TC3 */
     parse_vertex(gp0_cmd_buf[1], &vx[0], &vy[0]);
     parse_vertex(gp0_cmd_buf[4], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[7], &vx[2], &vy[2]);
     parse_vertex(gp0_cmd_buf[10], &vx[3], &vy[3]);
+    u[0] = gp0_cmd_buf[2] & 0xFF;   v[0] = (gp0_cmd_buf[2] >> 8) & 0xFF;
+    u[1] = gp0_cmd_buf[5] & 0xFF;   v[1] = (gp0_cmd_buf[5] >> 8) & 0xFF;
+    u[2] = gp0_cmd_buf[8] & 0xFF;   v[2] = (gp0_cmd_buf[8] >> 8) & 0xFF;
+    u[3] = gp0_cmd_buf[11] & 0xFF;  v[3] = (gp0_cmd_buf[11] >> 8) & 0xFF;
+    uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
+    uint16_t clut_x = (clut & 0x3F) * 16;
+    uint16_t clut_y = (clut >> 6) & 0x1FF;
+    uint16_t tpage = (uint16_t)(gp0_cmd_buf[5] >> 16) & 0x1FF;
+
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    raster_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
-    raster_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
+
+    setup_textured_draw(color24, semi_trans);
+    sw_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
+                              vx[1], vy[1], u[1], v[1],
+                              vx[2], vy[2], u[2], v[2],
+                              clut_x, clut_y, tpage);
+    sw_draw_textured_triangle(vx[2], vy[2], u[2], v[2],
+                              vx[1], vy[1], u[1], v[1],
+                              vx[3], vy[3], u[3], v[3],
+                              clut_x, clut_y, tpage);
 }
 
 /* Execute mono line (GP0 0x40-0x47) — Bresenham */
@@ -617,18 +718,23 @@ static void gp0_exec_mono_rect(void) {
 
 /* Execute textured rectangle (GP0 0x64-0x67) */
 static void gp0_exec_textured_rect(void) {
-    /* Flat color for now — textures deferred */
-    uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
+    uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     x0 += draw_offset_x; y0 += draw_offset_y;
-    uint32_t w = gp0_cmd_buf[3] & 0xFFFFu;
-    uint32_t h = (gp0_cmd_buf[3] >> 16) & 0xFFFFu;
+    int u0 = gp0_cmd_buf[2] & 0xFF;
+    int v0 = (gp0_cmd_buf[2] >> 8) & 0xFF;
+    uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
+    uint16_t clut_x = (clut & 0x3F) * 16;
+    uint16_t clut_y = (clut >> 6) & 0x1FF;
+    int w = gp0_cmd_buf[3] & 0x3FF;
+    int h = (gp0_cmd_buf[3] >> 16) & 0x1FF;
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
-    for (uint32_t dy = 0; dy < h; dy++)
-        for (uint32_t dx = 0; dx < w; dx++)
-            raster_pixel(x0 + (int32_t)dx, y0 + (int32_t)dy, color);
+
+    setup_textured_draw(color24, semi_trans);
+    sw_draw_textured_rect(x0, y0, w, h, u0, v0, clut_x, clut_y, current_texpage());
 }
 
 /* Execute 1x1 dot (GP0 0x68-0x6B) */
@@ -640,13 +746,21 @@ static void gp0_exec_mono_dot(void) {
     raster_pixel(x, y, color);
 }
 
-/* Execute textured dot (GP0 0x74-0x77) */
-static void gp0_exec_textured_dot(void) {
-    uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
-    int32_t x, y;
-    parse_vertex(gp0_cmd_buf[1], &x, &y);
-    x += draw_offset_x; y += draw_offset_y;
-    raster_pixel(x, y, color);
+/* Execute 8x8 textured sprite (GP0 0x74-0x77) */
+static void gp0_exec_textured_8x8(void) {
+    uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+    int32_t x0, y0;
+    parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+    x0 += draw_offset_x; y0 += draw_offset_y;
+    int u0 = gp0_cmd_buf[2] & 0xFF;
+    int v0 = (gp0_cmd_buf[2] >> 8) & 0xFF;
+    uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
+    uint16_t clut_x = (clut & 0x3F) * 16;
+    uint16_t clut_y = (clut >> 6) & 0x1FF;
+
+    setup_textured_draw(color24, semi_trans);
+    sw_draw_textured_rect(x0, y0, 8, 8, u0, v0, clut_x, clut_y, current_texpage());
 }
 
 /* Execute 8x8 sprite (GP0 0x70-0x73) */
@@ -660,15 +774,21 @@ static void gp0_exec_mono_8x8(void) {
             raster_pixel(x0 + dx, y0 + dy, color);
 }
 
-/* Execute 16x16 sprite (GP0 0x7C-0x7F) */
+/* Execute 16x16 textured sprite (GP0 0x7C-0x7F) */
 static void gp0_exec_textured_16x16(void) {
-    uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
+    uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
+    int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     x0 += draw_offset_x; y0 += draw_offset_y;
-    for (int32_t dy = 0; dy < 16; dy++)
-        for (int32_t dx = 0; dx < 16; dx++)
-            raster_pixel(x0 + dx, y0 + dy, color);
+    int u0 = gp0_cmd_buf[2] & 0xFF;
+    int v0 = (gp0_cmd_buf[2] >> 8) & 0xFF;
+    uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
+    uint16_t clut_x = (clut & 0x3F) * 16;
+    uint16_t clut_y = (clut >> 6) & 0x1FF;
+
+    setup_textured_draw(color24, semi_trans);
+    sw_draw_textured_rect(x0, y0, 16, 16, u0, v0, clut_x, clut_y, current_texpage());
 }
 
 /* ---- GP0 command execution ---- */
@@ -717,6 +837,7 @@ static void gp0_exec_draw_mode(void) {
     dither_enabled    = (param >> 9) & 1;
     draw_to_display   = (param >> 10) & 1;
     texture_disable   = (param >> 11) & 1;
+    /* Sync semi-transparency to SW renderer — actual blending is per-primitive */
 }
 
 static void gp0_exec_texture_window(void) {
@@ -726,6 +847,7 @@ static void gp0_exec_texture_window(void) {
      * Bits 10-14: offset X
      * Bits 15-19: offset Y */
     texture_window_value = gp0_cmd_buf[0] & 0x000FFFFFu;
+    sw_set_texture_window(texture_window_value);
 }
 
 static void gp0_exec_draw_area_tl(void) {
@@ -735,6 +857,8 @@ static void gp0_exec_draw_area_tl(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     draw_area_left = param & 0x3FF;
     draw_area_top  = (param >> 10) & 0x3FF;
+    sw_set_draw_area((int)draw_area_left, (int)draw_area_top,
+                     (int)draw_area_right, (int)draw_area_bottom);
 }
 
 static void gp0_exec_draw_area_br(void) {
@@ -744,6 +868,8 @@ static void gp0_exec_draw_area_br(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     draw_area_right  = param & 0x3FF;
     draw_area_bottom = (param >> 10) & 0x3FF;
+    sw_set_draw_area((int)draw_area_left, (int)draw_area_top,
+                     (int)draw_area_right, (int)draw_area_bottom);
 }
 
 static void gp0_exec_draw_offset(void) {
@@ -753,6 +879,7 @@ static void gp0_exec_draw_offset(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     draw_offset_x = sign_extend(param & 0x7FFu, 11);
     draw_offset_y = sign_extend((param >> 11) & 0x7FFu, 11);
+    sw_set_draw_offset(draw_offset_x, draw_offset_y);
 }
 
 static void gp0_exec_mask_bit(void) {
@@ -762,6 +889,7 @@ static void gp0_exec_mask_bit(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     set_mask_bit   = param & 1;
     check_mask_bit = (param >> 1) & 1;
+    sw_set_mask_bits((int)set_mask_bit, (int)check_mask_bit);
 }
 
 static void gp0_exec_cpu_to_vram(void) {
@@ -994,11 +1122,33 @@ static void gp0_execute_command(void) {
             gp0_exec_mono_8x8();
             break;
         case 0x74: case 0x75: case 0x76: case 0x77:
-            gp0_exec_textured_dot();
+            gp0_exec_textured_8x8();
             break;
         case 0x7C: case 0x7D: case 0x7E: case 0x7F:
             gp0_exec_textured_16x16();
             break;
+
+        /* VRAM→VRAM copy */
+        case 0x80: case 0x81: case 0x82: case 0x83:
+        case 0x84: case 0x85: case 0x86: case 0x87:
+        case 0x88: case 0x89: case 0x8A: case 0x8B:
+        case 0x8C: case 0x8D: case 0x8E: case 0x8F:
+        case 0x90: case 0x91: case 0x92: case 0x93:
+        case 0x94: case 0x95: case 0x96: case 0x97:
+        case 0x98: case 0x99: case 0x9A: case 0x9B:
+        case 0x9C: case 0x9D: case 0x9E: case 0x9F: {
+            /* Word 1: source coords, Word 2: dest coords, Word 3: dimensions */
+            int src_x = gp0_cmd_buf[1] & 0x3FF;
+            int src_y = (gp0_cmd_buf[1] >> 16) & 0x1FF;
+            int dst_x = gp0_cmd_buf[2] & 0x3FF;
+            int dst_y = (gp0_cmd_buf[2] >> 16) & 0x1FF;
+            int w = gp0_cmd_buf[3] & 0x3FF;
+            int h = (gp0_cmd_buf[3] >> 16) & 0x1FF;
+            if (w == 0) w = 0x400;
+            if (h == 0) h = 0x200;
+            sw_copy_rect(src_x, src_y, dst_x, dst_y, w, h);
+            break;
+        }
 
         case 0xA0: case 0xA1: case 0xA2: case 0xA3:
         case 0xA4: case 0xA5: case 0xA6: case 0xA7:
