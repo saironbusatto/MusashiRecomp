@@ -6,8 +6,10 @@
  */
 
 #include "cpu_state.h"
+#include "cdrom.h"
 #include "gpu.h"
 #include "sio.h"
+#include "spu.h"
 #include "memcard.h"
 #include "debug_server.h"
 #include <SDL.h>
@@ -161,6 +163,8 @@ int main(int argc, char** argv) {
     interrupts_init();
     sio_init();
     sio_connect_pad(0);  /* Controller on port 1 */
+    spu_init();
+    cdrom_init(NULL);    /* No disc for BIOS-only boot */
     memcard_init(".");   /* Look for card1.mcd / card2.mcd in working directory */
     debug_server_init(4370);
 

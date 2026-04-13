@@ -18,6 +18,8 @@ add_executable(psx-runtime
     src/traps.c
     src/gte.cpp
     src/crc32.c
+    src/cdrom.c
+    src/spu.c
     src/iso_reader.cpp
     src/iso_reader_c.cpp
     ../generated/SCPH1001_full.c

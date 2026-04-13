@@ -9,9 +9,11 @@
  */
 
 #include "cpu_state.h"
+#include "cdrom.h"
 #include "dma.h"
 #include "gpu.h"
 #include "sio.h"
+#include "spu.h"
 #include "timers.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -43,8 +45,7 @@ static const uint32_t *sr_ptr;
 uint32_t i_stat;  /* 0x1F801070 — interrupt status (AND-acknowledge semantics) */
 uint32_t i_mask;  /* 0x1F801074 — interrupt enable mask */
 
-/* SPU registers: 0x1F801C00..0x1F801FFF — store only, no semantic behavior. */
-static uint16_t spu_regs[512];  /* 0x200 halfwords covers 0x400 bytes */
+/* SPU registers are now handled by spu.c */
 
 void memory_set_sr_ptr(const uint32_t *p) { sr_ptr = p; }
 
@@ -122,7 +123,7 @@ static uint32_t mmio_read32(uint32_t addr) {
     }
     /* CDROM: 0x1F801800..0x1F801803 */
     if (addr >= 0x1F801800u && addr <= 0x1F801803u) {
-        return 0;
+        return cdrom_read(addr);
     }
     /* GPU: 0x1F801810 (GPUREAD), 0x1F801814 (GPUSTAT) */
     if (addr == 0x1F801810u) return gpu_read_gpuread();
@@ -131,8 +132,7 @@ static uint32_t mmio_read32(uint32_t addr) {
     if (addr == 0x1F801820u || addr == 0x1F801824u) return 0;
     /* SPU: 0x1F801C00..0x1F801FFF */
     if (addr >= 0x1F801C00u && addr <= 0x1F801FFFu) {
-        uint32_t off = (addr - 0x1F801C00u) >> 1;
-        return spu_regs[off] | ((uint32_t)spu_regs[off + 1] << 16);
+        return spu_read(addr);
     }
     /* Expansion 2 / POST: 0x1F802000..0x1F802FFF */
     if (addr >= 0x1F802000u && addr <= 0x1F802FFFu) {
@@ -173,6 +173,7 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
     }
     /* CDROM: 0x1F801800..0x1F801803 */
     if (addr >= 0x1F801800u && addr <= 0x1F801803u) {
+        cdrom_write(addr, val);
         return;
     }
     /* GPU GP0: 0x1F801810, GP1: 0x1F801814 */
@@ -182,9 +183,7 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
     if (addr == 0x1F801820u || addr == 0x1F801824u) return;
     /* SPU: 0x1F801C00..0x1F801FFF */
     if (addr >= 0x1F801C00u && addr <= 0x1F801FFFu) {
-        uint32_t off = (addr - 0x1F801C00u) >> 1;
-        spu_regs[off]     = (uint16_t)(val);
-        spu_regs[off + 1] = (uint16_t)(val >> 16);
+        spu_write(addr, val);
         return;
     }
     /* Expansion 2 / POST: 0x1F802000..0x1F802FFF */
@@ -208,7 +207,7 @@ static uint16_t mmio_read16(uint32_t addr) {
     }
     /* SPU: 0x1F801C00..0x1F801FFF */
     if (addr >= 0x1F801C00u && addr <= 0x1F801FFFu) {
-        return spu_regs[(addr - 0x1F801C00u) >> 1];
+        return (uint16_t)spu_read(addr);
     }
     mmio_fatal(addr, addr, "READ16");
     return 0;
@@ -230,7 +229,7 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
     }
     /* SPU: 0x1F801C00..0x1F801FFF */
     if (addr >= 0x1F801C00u && addr <= 0x1F801FFFu) {
-        spu_regs[(addr - 0x1F801C00u) >> 1] = val;
+        spu_write(addr, val);
         return;
     }
     mmio_fatal(addr, addr, "WRITE16");
@@ -239,7 +238,7 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
 static uint8_t mmio_read8(uint32_t addr) {
     /* CDROM: 0x1F801800..0x1F801803 */
     if (addr >= 0x1F801800u && addr <= 0x1F801803u) {
-        return 0;
+        return (uint8_t)cdrom_read(addr);
     }
     /* Expansion 2 / POST: 0x1F802000..0x1F802FFF */
     if (addr >= 0x1F802000u && addr <= 0x1F802FFFu) {
@@ -252,6 +251,7 @@ static uint8_t mmio_read8(uint32_t addr) {
 static void mmio_write8(uint32_t addr, uint8_t val) {
     /* CDROM: 0x1F801800..0x1F801803 */
     if (addr >= 0x1F801800u && addr <= 0x1F801803u) {
+        cdrom_write(addr, val);
         return;
     }
     /* Expansion 2 / POST: 0x1F802000..0x1F802FFF */
