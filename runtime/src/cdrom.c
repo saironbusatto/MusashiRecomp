@@ -286,6 +286,10 @@ static void exec_command(uint8_t cmd) {
     }
 
     param_count = 0;
+
+    /* Fire the CDROM IRQ for the immediate response.
+     * Delayed responses (pending) fire from process_pending(). */
+    fire_cdrom_irq();
 }
 
 static void process_pending(void) {

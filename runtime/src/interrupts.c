@@ -29,6 +29,7 @@
 #include "sio.h"
 #include "timers.h"
 #include "gpu.h"
+#include "cdrom.h"
 #include "cpu_state.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -102,6 +103,7 @@ void psx_check_interrupts(CPUState* cpu) {
             i_stat |= (1 << IRQ_VBLANK);
             gpu_vblank_tick();  /* Toggle LCF (GPUSTAT bit 31) */
             timers_tick(33868); /* ~1 NTSC frame worth of cycles */
+            cdrom_tick();      /* Process pending CDROM responses */
         }
     }
 
