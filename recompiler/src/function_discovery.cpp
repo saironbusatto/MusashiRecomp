@@ -364,6 +364,94 @@ FunctionDiscovery::SingleFunctionResult FunctionDiscovery::walk_function(
                 site.kind = "jr_non_ra";
                 result.indirect_jumps.push_back(std::move(site));
                 result.exit_types.insert("indirect_jump_recorded_for_1d");
+
+                // --- Jump table resolution ---
+                // Scan backward from jr to detect the pattern:
+                //   SLTIU (count), SLL, LUI, ADDU, LW, jr
+                // If found, read the table entries from ROM and push each
+                // case target onto the work queue so the case body code
+                // is included in this function's instruction set.
+                {
+                    uint32_t jr_rs = cf.reg;
+                    uint32_t lw_base = 0xFF; int32_t lw_off = 0;
+                    uint32_t ac[2] = {0xFF, 0xFF}; uint32_t lui_v = 0;
+                    int16_t  av[2] = {0, 0}; bool fa[2] = {false, false};
+                    bool fl = false; uint32_t tc = 0;
+
+                    for (int b = 1; b <= 40; b++) {
+                        uint32_t sa = addr - (uint32_t)(b * 4);
+                        if (sa < entry) break;
+                        if (!in_bounds(sa)) break;
+                        uint32_t si = fetch(sa);
+                        uint32_t s_op = (si >> 26) & 0x3F;
+                        uint32_t s_rs = (si >> 21) & 0x1F;
+                        uint32_t s_rt = (si >> 16) & 0x1F;
+                        uint32_t s_rd = (si >> 11) & 0x1F;
+                        uint32_t s_fn = si & 0x3F;
+
+                        if (s_op == 0x23 && s_rt == jr_rs && lw_base == 0xFF) {
+                            lw_base = s_rs; lw_off = (int32_t)(int16_t)(si & 0xFFFF); continue;
+                        }
+                        if (s_op == 0x00 && s_fn == 0x21 && s_rd == lw_base &&
+                            lw_base != 0xFF && ac[0] == 0xFF) {
+                            ac[0] = s_rs; ac[1] = s_rt; continue;
+                        }
+                        if (s_op == 0x09 && ac[0] != 0xFF) {
+                            for (int c = 0; c < 2; c++) {
+                                if (!fa[c] && ac[c] != 0xFF && s_rs == ac[c] && s_rt == ac[c]) {
+                                    av[c] = (int16_t)(si & 0xFFFF); fa[c] = true; break;
+                                }
+                            }
+                            continue;
+                        }
+                        if (s_op == 0x0F && ac[0] != 0xFF && !fl) {
+                            for (int c = 0; c < 2; c++) {
+                                if (ac[c] != 0xFF && s_rt == ac[c]) {
+                                    lui_v = ((uint32_t)(si & 0xFFFF)) << 16;
+                                    if (!fa[c]) av[c] = 0;
+                                    av[0] = av[c]; fa[0] = fa[c]; fl = true; break;
+                                }
+                            }
+                            continue;
+                        }
+                        if (s_op == 0x0B && tc == 0) { tc = si & 0xFFFF; continue; }
+                        if (fl && tc != 0) break;
+                    }
+
+                    if (fl && tc > 0 && tc < 512) {
+                        uint32_t tb = (lui_v + (fa[0] ? (uint32_t)(int32_t)av[0] : 0u))
+                                    + (uint32_t)lw_off;
+                        // tb is a RAM address; map to ROM for reading.
+                        uint32_t tb_phys = tb & 0x1FFFFFFFu;
+                        uint32_t rom_tb = tb;
+                        if (tb_phys >= 0x00030000u && tb_phys <= 0x0005AFFFu)
+                            rom_tb = 0xBFC18000u + (tb_phys - 0x00030000u);
+
+                        for (uint32_t i = 0; i < tc; i++) {
+                            uint32_t taddr = rom_tb + i * 4;
+                            if (!in_bounds(taddr)) continue;
+                            uint32_t tval = fetch(taddr);
+                            // tval is a RAM address; map to ROM.
+                            uint32_t tv_phys = tval & 0x1FFFFFFFu;
+                            uint32_t rom_target = tval;
+                            if (tv_phys >= 0x00030000u && tv_phys <= 0x0005AFFFu)
+                                rom_target = 0xBFC18000u + (tv_phys - 0x00030000u);
+
+                            if (in_bounds(rom_target)) {
+                                work.push(rom_target);
+                                block_leader_set.insert(rom_target);
+                            }
+                        }
+                        // Also push fall-through after delay slot (code between
+                        // jr and the first case target may be dead, but including
+                        // it ensures no gaps in the generated function).
+                        uint32_t after_delay = addr + 8;
+                        if (in_bounds(after_delay)) {
+                            work.push(after_delay);
+                            block_leader_set.insert(after_delay);
+                        }
+                    }
+                }
                 break;
             }
 

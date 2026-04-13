@@ -307,9 +307,98 @@ bool FullFunctionEmitter::emit_function(
                 if (rs == 31) {
                     out += "    return;\n";
                 } else {
-                    // Tail call: set cpu->pc and return; dispatch loop re-dispatches.
-                    out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
-                                       static_cast<int>(rs));
+                    // Attempt jump table resolution: scan backward from the
+                    // jr instruction to find SLTIU/SLL/LUI/ADDU/LW pattern.
+                    // If found, read the table from ROM, map entries from RAM
+                    // to ROM addresses, and emit a switch with goto labels
+                    // for targets that exist within this function.
+                    bool emitted_switch = false;
+                    {
+                        uint32_t jr_addr = pb.terminator_addr;
+                        uint32_t jr_rs = rs;
+                        uint32_t lw_base = 0xFF; int32_t lw_off = 0;
+                        uint32_t ac[2] = {0xFF, 0xFF}; uint32_t lui_v = 0;
+                        int16_t  av[2] = {0, 0}; bool fa[2] = {false, false};
+                        bool fl = false; uint32_t tc = 0;
+
+                        for (int b = 1; b <= 40; b++) {
+                            uint32_t sa = jr_addr - (uint32_t)(b * 4);
+                            if (sa < func.entry_addr) break;
+                            auto sa_it = addr_to_raw.find(sa);
+                            if (sa_it == addr_to_raw.end()) break;
+                            uint32_t si = sa_it->second;
+                            uint32_t s_op=(si>>26)&0x3F, s_rs=(si>>21)&0x1F,
+                                     s_rt=(si>>16)&0x1F, s_rd=(si>>11)&0x1F, s_fn=si&0x3F;
+
+                            if (s_op==0x23 && s_rt==jr_rs && lw_base==0xFF) {
+                                lw_base=s_rs; lw_off=(int32_t)(int16_t)(si&0xFFFF); continue; }
+                            if (s_op==0x00 && s_fn==0x21 && s_rd==lw_base &&
+                                lw_base!=0xFF && ac[0]==0xFF) {
+                                ac[0]=s_rs; ac[1]=s_rt; continue; }
+                            if (s_op==0x09 && ac[0]!=0xFF) {
+                                for(int c=0;c<2;c++){
+                                    if(!fa[c]&&ac[c]!=0xFF&&s_rs==ac[c]&&s_rt==ac[c]){
+                                        av[c]=(int16_t)(si&0xFFFF);fa[c]=true;break;}}
+                                continue; }
+                            if (s_op==0x0F && ac[0]!=0xFF && !fl) {
+                                for(int c=0;c<2;c++){
+                                    if(ac[c]!=0xFF&&s_rt==ac[c]){
+                                        lui_v=((uint32_t)(si&0xFFFF))<<16;
+                                        if(!fa[c])av[c]=0; av[0]=av[c]; fa[0]=fa[c];
+                                        fl=true; break;}}
+                                continue; }
+                            if (s_op==0x0B && tc==0) { tc=si&0xFFFF; continue; }
+                            if (fl && tc!=0) break;
+                        }
+
+                        if (fl && tc > 0 && tc < 512) {
+                            uint32_t tb = (lui_v + (fa[0] ? (uint32_t)(int32_t)av[0] : 0u))
+                                        + (uint32_t)lw_off;
+                            // Map RAM table address to ROM for reading.
+                            uint32_t tb_phys = tb & 0x1FFFFFFFu;
+                            uint32_t rom_tb = tb;
+                            if (tb_phys >= 0x00030000u && tb_phys <= 0x0005AFFFu)
+                                rom_tb = 0xBFC18000u + (tb_phys - 0x00030000u);
+
+                            // Read table entries and map to ROM labels.
+                            // Deduplicate by runtime address to avoid duplicate
+                            // case values in the switch.  Only include targets
+                            // that exist as code in this function.
+                            std::vector<std::pair<uint32_t,uint32_t>> targets; // {runtime, rom}
+                            std::set<uint32_t> seen_runtime;
+                            uint32_t rom_off = rom_tb - base_addr;
+                            for (uint32_t i = 0; i < tc; i++) {
+                                if (rom_off + i*4 + 3 >= rom.size()) break;
+                                uint32_t rv = read_u32_le(rom, rom_off + i * 4);
+                                if (!seen_runtime.insert(rv).second) continue;
+                                uint32_t rv_phys = rv & 0x1FFFFFFFu;
+                                uint32_t rom_target = rv;
+                                if (rv_phys >= 0x00030000u && rv_phys <= 0x0005AFFFu)
+                                    rom_target = 0xBFC18000u + (rv_phys - 0x00030000u);
+                                if (addr_to_raw.count(rom_target) && block_leaders.count(rom_target))
+                                    targets.push_back({rv, rom_target});
+                            }
+                            if (!targets.empty()) {
+                                out += fmt::format("    /* jump table at 0x{:08X}, {} entries */\n",
+                                                   tb, tc);
+                                out += fmt::format("    switch (cpu->gpr[{}]) {{\n",
+                                                   static_cast<int>(jr_rs));
+                                for (auto& [rt, rom_t] : targets) {
+                                    out += fmt::format("        case 0x{:08X}u: goto label_{:08X};\n",
+                                                       rt, rom_t);
+                                }
+                                out += fmt::format("        default: cpu->pc = cpu->gpr[{}]; return;\n",
+                                                   static_cast<int>(jr_rs));
+                                out += "    }\n";
+                                emitted_switch = true;
+                            }
+                        }
+                    }
+                    if (!emitted_switch) {
+                        // Tail call: set cpu->pc and return; dispatch loop re-dispatches.
+                        out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
+                                           static_cast<int>(rs));
+                    }
                 }
             }
             // RFE: already emitted at terminator address, no delay slot.

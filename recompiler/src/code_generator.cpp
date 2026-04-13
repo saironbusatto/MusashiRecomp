@@ -7,6 +7,27 @@
 
 namespace PSXRecomp {
 
+/*
+ * Translate a runtime RAM address to the ROM kseg1 address that
+ * exe_.read_word() can resolve.
+ *
+ * The BIOS shell code lives at ROM 0xBFC18000-0xBFC427FF and gets copied
+ * to RAM at 0x80030000-0x8005A7FF during BIOS init.  Jump tables within
+ * shell functions store RAM-space target addresses (0x80058xxx), but at
+ * recompile time we can only read the ROM.  This helper maps:
+ *
+ *   RAM phys 0x00030000-0x0005AFFF  →  ROM kseg1 0xBFC18000+
+ *
+ * Non-shell addresses pass through unchanged.
+ */
+static uint32_t ram_to_rom(uint32_t addr) {
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys >= 0x00030000u && phys <= 0x0005AFFFu) {
+        return 0xBFC18000u + (phys - 0x00030000u);
+    }
+    return addr;
+}
+
 CodeGenerator::CodeGenerator(const PS1Executable& exe, const CodeGenConfig& config)
     : exe_(exe), config_(config) {}
 
@@ -1074,23 +1095,32 @@ std::string CodeGenerator::translate_basic_block(
                         }
                     }
 
-                    // If we found a valid table, read entries and emit switch
+                    // If we found a valid table, read entries and emit switch.
+                    // table_base may be a RAM address (BIOS shell code copies
+                    // ROM 0xBFC18000+ to RAM 0x80030000+).  Translate to ROM
+                    // so exe_.read_word() can read the data, and translate each
+                    // entry so it matches cfg.blocks / extra_labels_ (ROM space).
                     bool emitted_switch = false;
                     if (table_base != 0 && table_count > 0) {
+                        uint32_t rom_table_base = ram_to_rom(table_base);
                         std::set<uint32_t>    seen;
-                        std::vector<uint32_t> targets;
+                        std::vector<std::pair<uint32_t,uint32_t>> targets; // {runtime_addr, rom_addr}
                         for (uint32_t i = 0; i < table_count; i++) {
-                            auto eopt = exe_.read_word(table_base + i * 4);
-                            if (eopt && seen.insert(*eopt).second &&
-                                (cfg.blocks.count(*eopt) || extra_labels_.count(*eopt))) {
-                                targets.push_back(*eopt);
+                            auto eopt = exe_.read_word(rom_table_base + i * 4);
+                            if (!eopt) continue;
+                            uint32_t runtime_addr = *eopt;
+                            uint32_t rom_addr = ram_to_rom(runtime_addr);
+                            if (seen.insert(rom_addr).second &&
+                                (cfg.blocks.count(rom_addr) || extra_labels_.count(rom_addr))) {
+                                targets.push_back({runtime_addr, rom_addr});
                             }
                         }
                         if (!targets.empty()) {
-                            ss << config_.indent << fmt::format("/* jump table 0x{:08X}, {} entries */\n", table_base, table_count);
+                            ss << config_.indent << fmt::format("/* jump table 0x{:08X} (rom 0x{:08X}), {} entries */\n",
+                                                                table_base, rom_table_base, table_count);
                             ss << config_.indent << fmt::format("switch ({}) {{\n", reg_name(jr_rs));
-                            for (uint32_t t : targets) {
-                                ss << config_.indent << fmt::format("    case 0x{:08X}u: goto block_{:08X};\n", t, t);
+                            for (auto& [rt, rom] : targets) {
+                                ss << config_.indent << fmt::format("    case 0x{:08X}u: goto block_{:08X};\n", rt, rom);
                             }
                             ss << config_.indent << "    default: call_by_address(cpu, " << reg_name(jr_rs) << "); return;\n";
                             ss << config_.indent << "}\n";
@@ -1225,10 +1255,11 @@ GeneratedFunction CodeGenerator::generate_function(
             if (fl && tc>0 && tc<512) tb = (lui_v+(fa[0]?(uint32_t)(int32_t)av[0]:0u)) + (uint32_t)lw_off;
         }
         if (tb==0 || tc==0) continue;
+        uint32_t rom_tb = ram_to_rom(tb);
         for (uint32_t i = 0; i < tc; i++) {
-            auto eopt = exe_.read_word(tb + i*4);
+            auto eopt = exe_.read_word(rom_tb + i*4);
             if (!eopt) continue;
-            uint32_t t = *eopt;
+            uint32_t t = ram_to_rom(*eopt);
             if (t >= cfg.function_start && t < cfg.function_end && !cfg.blocks.count(t))
                 extra_labels_.insert(t);
         }
