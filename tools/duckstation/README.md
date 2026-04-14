@@ -48,61 +48,41 @@ The pinned base SHA lives in one place only: `UPSTREAM_BASE` at the top of `tool
 
 Both servers implement the same JSON-over-newline command set where possible so that `tools/debug_client.py compare <cmd>` diffs state between them. See `TCP_COMMANDS.md` at the v4 root for the full command table with "native-only / duckstation-only / both" annotations.
 
-## Known issue: rebuilt binary doesn't start emulation (2026-04-14)
+## First-time setup: the `duckstation-qt.rcc` resource file
 
-The binary from this session's rebuild does not start BIOS emulation regardless
-of launch flags (`-bios -nogui -fastboot`, `-bios -nogui -slowboot`, `-bios`
-alone, `-bios -batch`, etc.). The process runs (stable ~34 MB, no growth), but
-`PSXRecompDebug::Initialize(4371)` is never reached because it's called *after*
-`System::Initialize()` completes, and `System::Initialize()` never completes —
-likely `BIOS::GetBIOSImage` or a downstream step fails silently (the error path
-in `QtCore::CoreThread::bootSystem` emits a signal that's lost in `-nogui`).
+The MSBuild `duckstation-qt` target does NOT include the Qt resource compile
+step. You must also build the `duckstation-qt-rcc` target, which produces
+`build/bin/resources/duckstation-qt.rcc` (~740 KB). Without it the binary
+opens a dialog `"duckstation-qt.rcc could not be loaded. Your installation is
+not complete."` and exits. `tools/duckstation/build.sh` builds both targets;
+do not short-cut to `-t:duckstation-qt` alone.
 
-What's been verified working:
-- Binary has all patch strings (`PSXRecompDebug`, `pc_break`, `read_ram`,
-  `psxrecomp_debug_server`) — confirmed via `tools/check_ds_patch.py`.
-- BIOS file present + valid: `duckstation/build/bin/bios/SCPH1001.BIN`
-  has MD5 `924e392ed05558ffdb115408c263dccf` which matches DuckStation's known
-  SCPH-1001 hash in `src/core/bios.cpp:36`.
-- Prebuilt deps extracted + path-normalised (`tools/fix_duckstation_deps_paths.py`
-  handles the 27-file `_IMPORT_PREFIX` rewrite).
-- `settings.ini` has `[BIOS]PathNTSCU = SCPH1001.BIN`, `SearchDirectory = bios`,
-  `[Main]SetupWizardIncomplete = false`, `SettingsVersion = 3`,
-  `[AutoUpdater]CheckAtStartup = false`, `LogToFile = true`.
-- `portable.txt` placed, `resources/` + `translations/` directories next to exe.
-- Pinned at upstream commit `ffb33c281` (release-20260328 era).
+After the rcc is in place, a **first-time GUI launch** is also required so
+DuckStation's setup wizard can write out a working `settings.ini`. Launch
+without any command-line flags:
 
-What hasn't been ruled out:
-- An environmental factor (GPU/Vulkan/D3D init failing silently for the user's
-  particular GPU + Qt 6.11 combination on this specific machine).
-- A subtle difference in the prebuilt deps between the archive's extraction time
-  and now — the archive was extracted originally into `psxrecomp-projects/` and
-  has absolute paths baked into CMake metadata; our path-rewriter fixes the
-  CMake paths but there may be other baked paths (e.g., pdb references) we miss.
-- Silent `InitializeAudio` / `GPU` / `Achievements` error paths in
-  `System::Initialize` that would be visible only in a DuckStation log file —
-  which itself is never written because log init happens after the failing step.
+```bash
+python3 tools/launch_ds_detached.py   # spawns GUI, no flags
+```
 
-The pre-rebuild binary (the one I destroyed with `rm -rf`) worked flawlessly
-for the same invocation. The same source, with only my uncommitted `pc_break`
-additions on top, doesn't. Something in the environment changed between the
-original build and the rebuild; without the original binary to diff against we
-can't narrow it further from inside a session.
+Click through the wizard (BIOS directory → pick `duckstation/build/bin/bios/`,
+then continue, then quit). After that, headless launches work forever:
 
-**Workaround / recovery path for a next session:**
+```bash
+python3 tools/launch_ds_detached.py -bios -nogui -fastboot
+```
 
-1. Reproduce the failure: `bash tools/duckstation/build.sh` then launch.
-2. Enable DuckStation's console logging via the Qt debugger or by editing
-   `src/core/system.cpp` to add a `DEV_LOG(...)` around each gate in
-   `BootSystem`, rebuild, identify which gate fails, push the log output into a
-   TCP-visible place (per `CLAUDE.md` §3: no `fprintf` to stderr).
-3. Or: run the prebuilt-released DuckStation binary from GitHub against the
-   same BIOS to confirm the environment setup is fine, then narrow to the
-   patch-vs-upstream delta.
+Verify with a quick ping:
 
-The restructure itself is complete and correct; only the "post-rebuild binary
-works end-to-end" box is un-ticked. The oracle can still be driven interactively
-through the GUI debugger window — that's how DuckStation is designed to be used.
+```bash
+NC='/c/Program Files (x86)/Nmap/ncat'
+(printf '{"cmd":"ping"}\n'; sleep 1) | "$NC" localhost 4371
+# expect: {"id":0,"ok":true,"frame":N}  with N > 0
+```
+
+The settings.ini that the wizard writes is needed but not tracked (it's under
+the gitignored `duckstation/build/`). If you rebuild from scratch (clobbering
+`build/`), repeat the GUI-first-launch once.
 
 ## Troubleshooting
 

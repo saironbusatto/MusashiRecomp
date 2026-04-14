@@ -28,11 +28,14 @@ if [ ! -f build/duckstation.sln ]; then
     "$CMAKE" -S . -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
 fi
 
-echo "[duckstation-build] compiling duckstation-qt (Release|x64)..."
+echo "[duckstation-build] compiling duckstation-qt + duckstation-qt-rcc (Release|x64)..."
+# Build both targets — duckstation-qt-rcc compiles data/resources into
+# build/bin/resources/duckstation-qt.rcc which the binary loads at startup.
+# Without it the binary shows "duckstation-qt.rcc could not be loaded" and exits.
 "$MSBUILD" build/duckstation.sln \
     -p:Configuration=Release \
     -p:Platform=x64 \
-    -t:duckstation-qt \
+    -t:duckstation-qt\;duckstation-qt-rcc \
     -m \
     -verbosity:minimal \
     -nologo
