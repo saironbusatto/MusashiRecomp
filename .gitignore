@@ -1,8 +1,12 @@
 # BIOS ROM (copyrighted, not distributable)
 bios/
 
-# DuckStation (2.1GB modified build, tracked separately)
-duckstation/
+# DuckStation — upstream source is a git submodule pointing at stenzek/duckstation.
+# Our custom changes live in tools/duckstation/psxrecomp_oracle.patch (committed).
+# Only the build artefacts and prebuilt binary deps are untracked at the parent level;
+# the submodule's own .gitignore handles in-tree ignores.
+duckstation/build/
+duckstation/dep/prebuilt/
 
 # Ghidra project files (large, regenerable)
 ghidra/

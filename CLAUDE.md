@@ -58,8 +58,14 @@ Truth comes from two sources:
 
 - **Ghidra** for what the BIOS code is supposed to do (static analysis
   of `SCPH1001.BIN` loaded at `0xBFC00000`)
-- **DuckStation** at `F:/Projects/psxrecomp-v4/duckstation/build/bin/`
-  for what real PS1 hardware does at runtime (dynamic oracle)
+- **DuckStation** at `F:/Projects/psxrecomp-v4/duckstation/build/bin/duckstation-qt.exe`
+  for what real PS1 hardware does at runtime (dynamic oracle). The `duckstation/`
+  directory is a **git submodule** pinned at upstream `stenzek/duckstation`
+  commit `ffb33c281` (release-20260328 era). Our PSXRecomp TCP debug server
+  patch lives at `tools/duckstation/psxrecomp_oracle.patch` and auto-applies
+  via `tools/duckstation/setup.sh`. Never commit changes into the submodule —
+  edit files freely for local experimentation, then regenerate the patch with
+  `git -C duckstation diff <base> > tools/duckstation/psxrecomp_oracle.patch`
 
 Use both, never just one. Don't guess. Don't say "probably". If you
 cannot answer a question from Ghidra or DuckStation, the answer is
@@ -245,3 +251,26 @@ If something is unknown:
 → produce artifact showing unknown  
 
 Do NOT guess behavior.
+
+---
+
+## 15. DuckStation oracle setup (from fresh checkout)
+
+On a fresh clone of this repo, the DuckStation oracle is not yet ready. Run:
+
+```bash
+git submodule update --init --recursive duckstation
+bash tools/duckstation/setup.sh     # clones deps, applies psxrecomp_oracle.patch
+bash tools/duckstation/build.sh     # builds Release x64 via MSBuild
+```
+
+The result is `duckstation/build/bin/duckstation-qt.exe` — the oracle binary.
+For headless launch it needs `settings.ini` in `duckstation/build/bin/` with
+`PathNTSCU = SCPH1001.BIN` under `[BIOS]` and `SearchDirectory = bios`, plus
+`bios/SCPH1001.BIN` copied next to the exe. `tools/duckstation/setup.sh` handles
+these post-build config steps. See `tools/duckstation/README.md` for the full
+layout and how to regenerate the patch.
+
+**Never edit the submodule source to work around upstream bugs.** If a change
+is needed in DuckStation's side, edit in the working tree, then regenerate the
+patch against the pinned base — so the change is reviewable in a single diff.
