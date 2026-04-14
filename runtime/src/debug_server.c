@@ -92,6 +92,28 @@ typedef struct {
 } Watchpoint;
 static Watchpoint s_watchpoints[MAX_WATCHPOINTS];
 
+/* ---- Write trace (ring buffer) ----
+ * Records every RAM write whose physical address is in [trace_lo, trace_hi).
+ * Filter variables are non-static so memory.c can inline the bounds check.
+ * Disabled when trace_lo == trace_hi. */
+#define WRITE_TRACE_CAP 1024
+typedef struct {
+    uint64_t seq;
+    uint32_t addr;
+    uint32_t old_val;
+    uint32_t new_val;
+    uint32_t ra;
+    uint8_t  width;
+} WriteTraceEntry;
+static WriteTraceEntry s_wtrace[WRITE_TRACE_CAP];
+static uint64_t s_wtrace_seq  = 0;  /* total writes ever recorded */
+static uint32_t s_wtrace_head = 0;
+/* Default: trace the EvCB region from program start so we catch OpenEvent
+ * writes that happen during early BIOS boot, before TCP clients can connect.
+ * Can be overridden at runtime via the wtrace_range command. */
+uint32_t debug_server_wtrace_lo = 0x0000E000;  /* physical */
+uint32_t debug_server_wtrace_hi = 0x0000E1F0;  /* physical, exclusive — EvCB slots (stops before PCB@0xE1EC/TCB@0xE1F4) */
+
 /* ---- Platform helpers ---- */
 static void set_nonblocking(sock_t s)
 {
@@ -783,6 +805,71 @@ static void handle_vram_peek(int id, const char *json)
              id, x, y, w, h, hex);
 }
 
+/* ---- Write trace: hook + handlers ---- */
+extern CPUState *debug_cpu_ptr;
+
+/* Called from memory.c write paths after the bounds check. */
+void debug_server_trace_write(uint32_t phys, uint32_t old_val, uint32_t new_val, uint8_t width)
+{
+    uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
+    WriteTraceEntry *e = &s_wtrace[s_wtrace_head];
+    e->seq     = s_wtrace_seq++;
+    e->addr    = phys;
+    e->old_val = old_val;
+    e->new_val = new_val;
+    e->ra      = ra;
+    e->width   = width;
+    s_wtrace_head = (s_wtrace_head + 1) % WRITE_TRACE_CAP;
+}
+
+static void handle_wtrace_range(int id, const char *json)
+{
+    char lo_str[32], hi_str[32];
+    if (!json_get_str(json, "lo", lo_str, sizeof(lo_str))) { send_err(id, "missing lo"); return; }
+    if (!json_get_str(json, "hi", hi_str, sizeof(hi_str))) { send_err(id, "missing hi"); return; }
+    debug_server_wtrace_lo = hex_to_u32(lo_str) & 0x1FFFFFFFu;
+    debug_server_wtrace_hi = hex_to_u32(hi_str) & 0x1FFFFFFFu;
+    send_fmt("{\"id\":%d,\"ok\":true,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}",
+             id, debug_server_wtrace_lo, debug_server_wtrace_hi);
+}
+
+static void handle_wtrace_clear(int id, const char *json)
+{
+    (void)json;
+    s_wtrace_seq = 0;
+    s_wtrace_head = 0;
+    memset(s_wtrace, 0, sizeof(s_wtrace));
+    send_ok(id);
+}
+
+static void handle_wtrace_dump(int id, const char *json)
+{
+    (void)json;
+    uint64_t total = s_wtrace_seq;
+    uint32_t count = (total < WRITE_TRACE_CAP) ? (uint32_t)total : WRITE_TRACE_CAP;
+    uint32_t start = (total < WRITE_TRACE_CAP) ? 0 : s_wtrace_head;
+
+    const size_t BUF_SZ = 256 * 1024;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"entries\":[",
+                    id, (unsigned long long)total, count);
+    for (uint32_t i = 0; i < count && pos < BUF_SZ - 256; i++) {
+        uint32_t idx = (start + i) % WRITE_TRACE_CAP;
+        WriteTraceEntry *e = &s_wtrace[idx];
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"old\":\"0x%08X\",\"new\":\"0x%08X\",\"ra\":\"0x%08X\",\"w\":%u}",
+                        (i == 0) ? "" : ",",
+                        (unsigned long long)e->seq,
+                        e->addr, e->old_val, e->new_val, e->ra, (unsigned)e->width);
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
 static void handle_quit(int id, const char *json)
 {
     (void)json;
@@ -809,6 +896,9 @@ static const CmdEntry s_commands[] = {
     { "sio_state",         handle_sio_state },
     { "watch",             handle_watch },
     { "unwatch",           handle_unwatch },
+    { "wtrace_range",      handle_wtrace_range },
+    { "wtrace_dump",       handle_wtrace_dump },
+    { "wtrace_clear",      handle_wtrace_clear },
     { "set_input",         handle_set_input },
     { "press",             handle_press },
     { "clear_input",       handle_clear_input },
@@ -856,10 +946,12 @@ static void process_command(const char *line)
 
 /* Extended init that accepts a CPU state pointer for register queries. */
 static CPUState *s_init_cpu = NULL;
+CPUState *debug_cpu_ptr = NULL; /* Global, used by memory.c watchpoints */
 
 void debug_server_set_cpu(CPUState *cpu)
 {
     s_cpu = cpu;
+    debug_cpu_ptr = cpu;
 }
 
 void debug_server_init(int port)

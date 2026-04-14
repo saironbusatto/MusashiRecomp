@@ -45,6 +45,21 @@ static const uint32_t *sr_ptr;
 uint32_t i_stat;  /* 0x1F801070 — interrupt status (AND-acknowledge semantics) */
 uint32_t i_mask;  /* 0x1F801074 — interrupt enable mask */
 
+/* Write-trace hook (implemented in debug_server.c). Disabled when lo == hi. */
+extern uint32_t debug_server_wtrace_lo;
+extern uint32_t debug_server_wtrace_hi;
+extern void debug_server_trace_write(uint32_t phys, uint32_t old_val, uint32_t new_val, uint8_t width);
+
+static inline uint32_t read_ram_word(uint32_t phys) {
+    return  (uint32_t)ram[phys]
+         | ((uint32_t)ram[phys + 1] << 8)
+         | ((uint32_t)ram[phys + 2] << 16)
+         | ((uint32_t)ram[phys + 3] << 24);
+}
+static inline uint16_t read_ram_half(uint32_t phys) {
+    return (uint16_t)ram[phys] | ((uint16_t)ram[phys + 1] << 8);
+}
+
 /* SPU registers are now handled by spu.c */
 
 void memory_set_sr_ptr(const uint32_t *p) { sr_ptr = p; }
@@ -311,6 +326,9 @@ void psx_write_word(uint32_t addr, uint32_t val) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
+        if (phys >= debug_server_wtrace_lo && phys < debug_server_wtrace_hi) {
+            debug_server_trace_write(phys, read_ram_word(phys), val, 4);
+        }
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         ram[phys + 2] = (uint8_t)(val >> 16);
@@ -366,6 +384,9 @@ void psx_write_half(uint32_t addr, uint16_t val) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
+        if (phys >= debug_server_wtrace_lo && phys < debug_server_wtrace_hi) {
+            debug_server_trace_write(phys, read_ram_half(phys), val, 2);
+        }
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         return;
@@ -413,6 +434,9 @@ void psx_write_byte(uint32_t addr, uint8_t val) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
+        if (phys >= debug_server_wtrace_lo && phys < debug_server_wtrace_hi) {
+            debug_server_trace_write(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
+        }
         ram[phys] = val;
         return;
     }

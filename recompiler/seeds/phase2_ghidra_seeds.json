@@ -1,7 +1,7 @@
 {
   "schema": "psxrecomp-v4 phase2 seeds",
   "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
-  "seed_count": 823,
+  "seed_count": 824,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -4117,6 +4117,16 @@
       "address": "0xBFC33CC0",
       "label": "jal_BFC33CC0",
       "rationale": "JAL target from code region"
+    },
+    {
+      "address": "0xBFC41FC0",
+      "label": "shell_InitRCnt_setup",
+      "rationale": "Undiscovered function: calls B0:0x15 (InitRCnt) with arg 0x20000001. Only reachable via indirect jalr from shell init table. Missing seed causes VSync counter to never increment."
+    },
+    {
+      "address": "0xBFC425BC",
+      "label": "vblank_chain_handler",
+      "rationale": "VBlank chain handler: the ONLY instruction in the entire BIOS ROM that stores to 0x80079D9C (VSync counter) is at 0xBFC425E0, inside this 15-instruction function at 0xBFC425BC. Function reads counter, increments it, optionally calls user callback at *0x800DFF40. Not reachable via any JAL/literal/lui in ROM — installed at runtime by kernel chain-registration code. Missing seed means counter-increment code is never recompiled, so even if kernel installs the handler pointer it cannot dispatch to recompiled code."
     }
   ],
   "excluded": [
