@@ -131,26 +131,37 @@ void psx_arith_overflow(CPUState* cpu) {
 }
 
 void psx_unaligned_access(CPUState* cpu, uint32_t addr, uint32_t pc) {
-    char buf[512];
-    snprintf(buf, sizeof(buf),
-        "UNALIGNED @ addr=0x%08X, PC=0x%08X\n"
-        "  $s3=0x%08X $s6=0x%08X $s4=0x%08X\n"
-        "  $k0=0x%08X $sp=0x%08X $ra=0x%08X\n"
-        "  RAM[0x100]=0x%08X RAM[0x108]=0x%08X\n"
-        "  SR=0x%08X Cause=0x%08X EPC=0x%08X\n"
-        "  in_exception=%d",
-        addr, pc,
-        cpu->gpr[19], cpu->gpr[22], cpu->gpr[20],
-        cpu->gpr[26], cpu->gpr[29], cpu->gpr[31],
-        cpu->read_word(0x100), cpu->read_word(0x108),
-        cpu->cop0[12], cpu->cop0[13], cpu->cop0[14],
-        psx_get_in_exception());
-    trap_crash(buf);
-    fprintf(stderr, "%s\n", buf); fflush(stderr);
-    exit(1);
+    /* Survivable fault: log diagnostics and let the generated code's
+     * `return;` skip the rest of the current function. */
+    static int count = 0;
+    if (count < 3) {
+        char buf[1024];
+        int n = snprintf(buf, sizeof(buf),
+            "ADEL: addr=0x%08X PC=0x%08X ra=0x%08X v0=0x%08X a0=0x%08X t9=0x%08X (hit #%d)\n"
+            "  Callback table at 0x800DFEE0:",
+            addr, pc, cpu->gpr[31], cpu->gpr[2], cpu->gpr[4], cpu->gpr[25], count + 1);
+        for (int i = 0; i < 11; i++) {
+            uint32_t cb = cpu->read_word(0x800DFEE0u + (uint32_t)(i * 4));
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n, " [%d]=0x%08X", i, cb);
+        }
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+            "\n  Mask=0x%08X s0=0x%08X s1=0x%08X s2=0x%08X",
+            cpu->read_word(0x800DFF0Cu),
+            cpu->gpr[16], cpu->gpr[17], cpu->gpr[18]);
+        trap_crash(buf);
+        count++;
+    }
 }
 
 void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
+    /* NULL dispatch: address 0 is never a valid function target.
+     * Silently absorb — this can happen when a corrupt function pointer
+     * or uninitialized callback slot is dispatched. */
+    if (addr == 0) {
+        cpu->pc = 0;
+        return;
+    }
+
     /* Detect ReturnFromException: when the recompiled B0:0x17 function
      * (or handler epilogue) has already restored all registers from the
      * TCB and done RFE, it sets cpu->pc = saved_epc = our sentinel

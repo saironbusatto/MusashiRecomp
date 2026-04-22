@@ -84,6 +84,19 @@ bool FullFunctionEmitter::emit_function(
         addr_to_raw[p.first] = p.second;
     }
 
+    // BIOS RestoreState (A0:0x14, at 0xBFC0227C) is a longjmp: it restores
+    // all callee-saved registers from a save buffer and returns to the
+    // saved $ra.  In the native build, `jr $ra` must set cpu->pc so the
+    // dispatch loop tail-calls to the restored address instead of returning
+    // to the C caller.  Detected by: first instruction is `lw $ra, 0($a0)`.
+    bool ra_loaded_from_non_sp = false;
+    if (!addr_to_raw.empty()) {
+        uint32_t first_insn = addr_to_raw.begin()->second;
+        // lw $ra, 0($a0) = opcode 0x23, rs=$a0(4), rt=$ra(31), imm=0
+        if (first_insn == 0x8C9F0000u)
+            ra_loaded_from_non_sp = true;
+    }
+
     // Build the set of basic block leaders from the function metadata.
     std::set<uint32_t> block_leaders(func.block_leaders.begin(), func.block_leaders.end());
     // The function entry is always a leader.
@@ -225,7 +238,10 @@ bool FullFunctionEmitter::emit_function(
                         // Emit JR resolution.
                         uint8_t rs = (pb.raw >> 21) & 0x1F;
                         if (rs == 31) {
-                            out += "    return;\n";
+                            if (ra_loaded_from_non_sp)
+                                out += "    cpu->pc = cpu->gpr[31]; return;  /* longjmp-return */\n";
+                            else
+                                out += "    return;\n";
                         } else {
                             out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
                                                static_cast<int>(rs));
@@ -247,7 +263,10 @@ bool FullFunctionEmitter::emit_function(
             if (orphaned_delay_slots.count(addr) && kind == "jr") {
                 uint8_t rs = (raw >> 21) & 0x1F;
                 if (rs == 31) {
-                    out += "    return;\n";
+                    if (ra_loaded_from_non_sp)
+                        out += "    cpu->pc = cpu->gpr[31]; return;  /* longjmp-return */\n";
+                    else
+                        out += "    return;\n";
                 } else {
                     out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
                                        static_cast<int>(rs));
@@ -313,7 +332,10 @@ bool FullFunctionEmitter::emit_function(
             } else if (kind == "jr") {
                 uint8_t rs = (pb.raw >> 21) & 0x1F;
                 if (rs == 31) {
-                    out += "    return;\n";
+                    if (ra_loaded_from_non_sp)
+                        out += "    cpu->pc = cpu->gpr[31]; return;  /* longjmp-return */\n";
+                    else
+                        out += "    return;\n";
                 } else {
                     // Attempt jump table resolution: scan backward from the
                     // jr instruction to find SLTIU/SLL/LUI/ADDU/LW pattern.

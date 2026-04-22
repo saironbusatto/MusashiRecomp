@@ -130,9 +130,9 @@ static void execute_ch2_gpu(void) {
 
         for (;;) {
             if (safety++ > MAX_NODES) {
-                fprintf(stderr, "DMA ch2 linked-list: exceeded %u nodes — possible corruption\n", MAX_NODES);
-                fflush(stderr);
-                exit(1);
+                /* Abort this transfer — linked list has a cycle or is corrupt.
+                 * Don't crash; the shell may recover on the next frame. */
+                break;
             }
 
             uint32_t header = psx_read_word(addr);

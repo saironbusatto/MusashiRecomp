@@ -172,6 +172,15 @@ static void raise_exception(CPUState* cpu, uint32_t exccode, int in_delay) {
 
 static void exec_one(CPUState* cpu) {
     uint32_t pc = cpu->pc;
+
+    /* Trap: halt if we jumped to address 0 (NULL function pointer). */
+    if (pc == 0) {
+        fprintf(stderr, "INTERP: NULL jump (PC=0x00000000), ra=0x%08X, t0=0x%08X, t1=0x%08X\n",
+                cpu->gpr[31], cpu->gpr[8], cpu->gpr[9]);
+        s_halted = 1;
+        return;
+    }
+
     uint32_t insn = cpu->read_word(pc);
 
     /* Trace before execution. */
@@ -199,8 +208,19 @@ static void exec_one(CPUState* cpu) {
         case 0x04: set_reg(cpu, rd, rt_val << (rs_val & 31)); break; /* SLLV */
         case 0x06: set_reg(cpu, rd, rt_val >> (rs_val & 31)); break; /* SRLV */
         case 0x07: set_reg(cpu, rd, (uint32_t)((int32_t)rt_val >> (rs_val & 31))); break; /* SRAV */
-        case 0x08: cpu->pc = rs_val; break;                         /* JR */
-        case 0x09: set_reg(cpu, rd, pc + 8); cpu->pc = rs_val; break; /* JALR */
+        case 0x08: { /* JR */
+            uint32_t target = rs_val;
+            exec_one(cpu); /* delay slot */
+            cpu->pc = target;
+            return;
+        }
+        case 0x09: { /* JALR */
+            uint32_t target = rs_val;
+            set_reg(cpu, rd, pc + 8);
+            exec_one(cpu); /* delay slot */
+            cpu->pc = target;
+            return;
+        }
         case 0x0C: raise_exception(cpu, 8, 0); return;              /* SYSCALL */
         case 0x0D: raise_exception(cpu, 9, 0); return;              /* BREAK */
         case 0x10: set_reg(cpu, rd, cpu->hi); break;                /* MFHI */

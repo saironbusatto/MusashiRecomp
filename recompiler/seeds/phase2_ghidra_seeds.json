@@ -1,7 +1,7 @@
 {
   "schema": "psxrecomp-v4 phase2 seeds",
   "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
-  "seed_count": 832,
+  "seed_count": 836,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -3309,6 +3309,21 @@
       "rationale": "Ghidra function start"
     },
     {
+      "address": "0xBFC421D8",
+      "label": "shell_vblank_restore_entry",
+      "rationale": "Mid-function entry: SaveState/RestoreState (A0:0x13/0x14) longjmp target inside func_1FC42160; after RestoreState returns v0!=0 the callback loop runs"
+    },
+    {
+      "address": "0xBFC4231C",
+      "label": "shell_vblank_init_body",
+      "rationale": "Mid-function entry: SaveState returns v0=0 → BEQ at 0xBFC421D8 taken → callback table setup at 0xBFC4231C. Split from func_1FC42160"
+    },
+    {
+      "address": "0xBFC42370",
+      "label": "shell_vblank_epilogue",
+      "rationale": "Mid-function entry: func_1FC42160 epilogue (restore ra/sp, return). Branch target from BNE at 0xBFC4216C when init flag is set"
+    },
+    {
       "address": "0xBFC42424",
       "label": "ghidra_BFC42424",
       "rationale": "Ghidra function start"
@@ -3357,6 +3372,11 @@
       "address": "0xBFC38AD4",
       "label": "dmiss_BFC38AD4",
       "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC42910",
+      "label": "shell_post_callback_cleanup",
+      "rationale": "Called from func_1FC42160 after 256-iteration callback countdown expires; was dispatch miss"
     },
     {
       "address": "0xBFC42A90",
@@ -4152,6 +4172,11 @@
       "address": "0xBFC137D0",
       "label": "kernel_ram_function",
       "rationale": "Dispatch miss at 0xBFC137D0 (phys 0x00003CD0) — 3 misses. Kernel RAM function."
+    },
+    {
+      "address": "0xBFC42BF0",
+      "label": "shell_register_callback",
+      "rationale": "Called from func_1FC42160 init path at 0xBFC42330 to register VBlank callbacks; missing seed caused callback table corruption"
     },
     {
       "address": "0xBFC42BE0",

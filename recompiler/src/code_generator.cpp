@@ -1000,8 +1000,39 @@ std::string CodeGenerator::translate_basic_block(
                                           block.exit_instr.target);
                     }
                 } else if (block.exit_instr.type == ControlFlowType::Return) {
-                    // Return instruction
-                    ss << config_.indent << "return;  /* jr $ra */\n";
+                    /* Return instruction.
+                     *
+                     * Detect "longjmp-return" pattern: if $ra was loaded from a
+                     * non-$sp source anywhere in this function (e.g. RestoreState
+                     * loads $ra from a save buffer via $a0), the jr $ra must set
+                     * cpu->pc so the dispatch loop tail-calls to the restored
+                     * address — the C `return` alone would go back to the wrong
+                     * caller.  Normal functions that save/restore $ra on the $sp
+                     * stack get the plain `return;`. */
+                    bool ra_loaded_from_non_sp = false;
+                    for (const auto& [baddr, blk] : cfg.blocks) {
+                        for (uint32_t ia = blk.start_addr; ia < blk.end_addr; ia += 4) {
+                            auto wopt = exe_.read_word(ia);
+                            if (!wopt) continue;
+                            uint32_t w = *wopt;
+                            uint32_t i_op = (w >> 26) & 0x3F;
+                            uint32_t i_rt = (w >> 16) & 0x1F;
+                            uint32_t i_rs = (w >> 21) & 0x1F;
+                            if (i_op == 0x23 && i_rt == 31 && i_rs == 4) {
+                                /* lw $ra, offset($a0) — RestoreState/longjmp pattern */
+                                ra_loaded_from_non_sp = true;
+                                break;
+                            }
+                        }
+                        if (ra_loaded_from_non_sp) break;
+                    }
+                    if (ra_loaded_from_non_sp) {
+                        ss << config_.indent
+                           << "cpu->pc = cpu->gpr[31]; return;"
+                           << "  /* jr $ra — longjmp-return (ra loaded from non-sp) */\n";
+                    } else {
+                        ss << config_.indent << "return;  /* jr $ra */\n";
+                    }
                 } else if (block.exit_instr.type == ControlFlowType::JumpRegister) {
                     // jr $rs — may be: BIOS call (jr $t2, t2=0xA0/0xB0/0xC0)
                     //                  or: jump table (jr $v0, v0 loaded from LW+ADDU+LUI)

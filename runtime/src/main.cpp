@@ -244,51 +244,76 @@ int main(int argc, char** argv) {
     interp_init(&cpu);
     interp_trace_enable(1);
 
-    /* Check boot progress: break at shell entry, VBlank loop, and VSync write. */
-    interp_break_add(0x8005A160u);  /* func_1FC42160 shell init — KSEG0 */
-    interp_break_add(0xBFC42160u);  /* func_1FC42160 shell init — ROM */
-    interp_break_add(0x8005A26Cu);  /* callback loop entry — KSEG0 */
-    interp_break_add(0x8005A5BCu);  /* VSync incrementer — KSEG0 */
-    interp_break_add(0x80058628u);  /* chain-E004 handler — KSEG0 */
-    std::fprintf(stderr, "ORACLE: running with 5 breakpoints (shell, callback, vsync, chain-E004)...\n");
-    std::fflush(stderr);
-    uint32_t ran = interp_run(&cpu, 200000000);
-    if (interp_hit_breakpoint()) {
-        std::fprintf(stderr, "ORACLE: breakpoint at PC=0x%08X after %u instructions\n",
-                     cpu.pc, ran);
-        /* Dump last 30 trace entries. */
-        uint64_t total = interp_trace_count();
-        uint32_t avail = (total < UINT32_MAX) ? (uint32_t)total : UINT32_MAX;
-        uint32_t start = (avail > 30) ? avail - 30 : 0;
-        for (uint32_t i = start; i < avail; i++) {
-            const InterpTraceEntry* e = interp_trace_get(i);
-            if (e) std::fprintf(stderr, "  trace[%llu] PC=0x%08X insn=0x%08X ra=0x%08X sp=0x%08X\n",
-                               (unsigned long long)e->seq, e->pc, e->insn, e->gpr[31], e->gpr[29]);
-        }
-        std::fflush(stderr);
-    } else {
-        std::fprintf(stderr, "ORACLE: ran %u instructions, no breakpoint hit. Final PC=0x%08X\n", ran, cpu.pc);
-        /* Dump last 10 trace entries to see where we ended up. */
-        uint64_t total2 = interp_trace_count();
-        uint32_t avail2 = (total2 < UINT32_MAX) ? (uint32_t)total2 : UINT32_MAX;
-        uint32_t start2 = (avail2 > 10) ? avail2 - 10 : 0;
-        for (uint32_t i = start2; i < avail2; i++) {
-            const InterpTraceEntry* e = interp_trace_get(i);
-            if (e) std::fprintf(stderr, "  tail[%llu] PC=0x%08X insn=0x%08X ra=0x%08X\n",
-                               (unsigned long long)e->seq, e->pc, e->insn, e->gpr[31]);
-        }
-        std::fflush(stderr);
-    }
+    /* Breakpoints focused on VSync diagnostics.
+     * Only break on the VSync incrementer — count how many times it's hit. */
+    interp_break_add(0x8005A5BCu);  /* VSync counter incrementer — KSEG0 */
 
-    /* Run interpreter in chunks, polling debug server between chunks. */
+    std::fprintf(stderr, "ORACLE: running with BP at 0x8005A5BC (VSync incrementer)...\n");
+    std::fflush(stderr);
+
+    uint64_t total_executed = 0;
+    const uint64_t max_total = 100000000ULL; /* 100M instructions */
+    uint32_t vsync_hits = 0;
     for (;;) {
-        uint32_t ran = interp_step(&cpu, 100000);
+        uint32_t ran = interp_step(&cpu, 1000000);
+        total_executed += ran;
         if (interp_hit_breakpoint()) {
-            std::fprintf(stdout, "ORACLE: breakpoint hit at PC=0x%08X\n", cpu.pc);
-            debug_server_wait_if_paused();
+            vsync_hits++;
+            if (vsync_hits <= 3 || (vsync_hits % 100 == 0)) {
+                std::fprintf(stderr, "ORACLE: VSync hit #%u at %llu instructions, ra=0x%08X\n",
+                             vsync_hits, (unsigned long long)total_executed, cpu.gpr[31]);
+                /* Dump last 20 trace entries for first 3 hits. */
+                if (vsync_hits <= 3) {
+                    uint64_t tseq = interp_trace_count();
+                    uint32_t tavail = (tseq < 1048576ULL) ? (uint32_t)tseq : 1048576u;
+                    uint32_t tstart = (tavail > 20) ? tavail - 20 : 0;
+                    for (uint32_t ti = tstart; ti < tavail; ti++) {
+                        const InterpTraceEntry* e = interp_trace_get(ti);
+                        if (e) std::fprintf(stderr, "  [%llu] PC=0x%08X insn=0x%08X ra=0x%08X v0=0x%08X\n",
+                                           (unsigned long long)e->seq, e->pc, e->insn,
+                                           e->gpr[31], e->gpr[2]);
+                    }
+                }
+                std::fflush(stderr);
+            }
+            /* Step past the breakpoint: temporarily remove, step 1, re-add. */
+            uint32_t bp_pc = cpu.pc;
+            interp_break_remove(bp_pc);
+            interp_step(&cpu, 1);
+            total_executed++;
+            interp_break_add(bp_pc);
         }
-        if (ran == 0) break;
+        if (ran == 0) {
+            std::fprintf(stderr, "ORACLE: halted at PC=0x%08X after %llu total instructions\n",
+                         cpu.pc, (unsigned long long)total_executed);
+            break;
+        }
+        if (total_executed >= max_total) {
+            std::fprintf(stderr, "ORACLE: reached %llu instructions, stopping. PC=0x%08X\n",
+                         (unsigned long long)total_executed, cpu.pc);
+            /* Dump last 30 trace entries (ring-relative). */
+            uint64_t tseq2 = interp_trace_count();
+            uint32_t tavail2 = (tseq2 < 1048576ULL) ? (uint32_t)tseq2 : 1048576u;
+            uint32_t tstart2 = (tavail2 > 30) ? tavail2 - 30 : 0;
+            for (uint32_t ti = tstart2; ti < tavail2; ti++) {
+                const InterpTraceEntry* e = interp_trace_get(ti);
+                if (e) std::fprintf(stderr, "  [%llu] PC=0x%08X insn=0x%08X ra=0x%08X\n",
+                                   (unsigned long long)e->seq, e->pc, e->insn, e->gpr[31]);
+            }
+            std::fflush(stderr);
+            break;
+        }
+        /* Poll debug server. */
+        debug_server_poll();
     }
+    /* Read VSync counter from RAM. */
+    uint32_t vsync_counter = cpu.read_word(0x80079D9Cu);
+    uint32_t init_flag_48 = cpu.read_word(0x80079D48u);
+    uint32_t init_flag_4C = cpu.read_word(0x80079D4Cu);
+    std::fprintf(stderr, "ORACLE: VSync counter = 0x%08X (%u), init_flag@48 = 0x%08X, init_flag@4C = 0x%08X\n",
+                 vsync_counter, vsync_counter, init_flag_48, init_flag_4C);
+    std::fprintf(stderr, "ORACLE: VSync incrementer hit count = %u\n", vsync_hits);
+    std::fflush(stderr);
 #else
     psx_dispatch(&cpu, cpu.pc);
 #endif
