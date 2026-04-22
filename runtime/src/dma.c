@@ -56,15 +56,12 @@ static void update_master_irq(void) {
 
     dicr = (dicr & 0x7FFFFFFFu) | (master_flag << 31);
 
-    /* Edge-triggered: only set I_STAT bit 3 on 0→1 transition of
-     * master_flag.  On real PS1, the DMA controller asserts the IRQ
-     * line once per transition, not continuously while the flag is
-     * high.  Without this, an unacknowledged DMA IRQ causes an
-     * interrupt storm (i_stat bit 3 re-set on every DMA register
-     * access or DICR read). */
-    if (master_flag && !prev_master_flag) {
-        i_stat |= (1u << 3);
-    }
+    /* I_STAT bit 3 is set by direct assertion in transfer completion
+     * code (not through edge detection here).  The BIOS shell handler
+     * only acknowledges ch3 in DICR, leaving ch2/ch6 flags high — so
+     * edge detection on master_flag would fire once and then be stuck.
+     * Direct assertion + handler AND-acknowledge gives exactly one IRQ
+     * per DMA completion, matching real hardware behavior. */
     prev_master_flag = master_flag;
 }
 
@@ -99,9 +96,11 @@ static void execute_ch2_gpu(void) {
                 addr = (addr + addr_step) & 0x1FFFFCu;
             }
         }
-        /* Transfer complete: clear start/busy bits.
-         * DMA IRQ suppressed — same rationale as RAM→GPU path. */
+        /* Transfer complete: clear start/busy bits, post IRQ directly. */
         channels[2].chcr &= ~((1u << 24) | (1u << 28));
+        dicr |= (1u << (24 + 2));
+        update_master_irq();
+        i_stat |= (1u << 3);
         return;
     }
 
@@ -166,15 +165,11 @@ static void execute_ch2_gpu(void) {
         channels[2].madr = addr;
     }
 
-    /* Transfer complete: clear start/busy/trigger bits */
+    /* Transfer complete: clear start/busy/trigger bits, post IRQ directly. */
     channels[2].chcr &= ~((1u << 24) | (1u << 28));
-
-    /* DMA completion IRQ: suppressed.  In our model, DMA transfers
-     * complete synchronously when CHCR is written.  The BIOS polls
-     * CHCR start bit (which we clear above) to detect completion.
-     * Posting DICR IRQ flags causes an interrupt storm because the
-     * BIOS kernel's exception handler has no registered EvCB callback
-     * to acknowledge DMA in i_stat, leaving it permanently pending. */
+    dicr |= (1u << (24 + 2));
+    update_master_irq();
+    i_stat |= (1u << 3);
 }
 
 static void execute_ch6_otc(void) {
@@ -199,10 +194,11 @@ static void execute_ch6_otc(void) {
         addr = (addr - 4) & 0x1FFFFCu;
     }
 
-    /* Transfer complete */
+    /* Transfer complete, post IRQ directly. */
     channels[6].chcr &= ~((1u << 24) | (1u << 28));
-
-    /* DMA completion IRQ for ch6: suppressed (same rationale as ch2). */
+    dicr |= (1u << (24 + 6));
+    update_master_irq();
+    i_stat |= (1u << 3);
 }
 
 static void try_execute(int ch) {
@@ -228,6 +224,9 @@ static void try_execute(int ch) {
 }
 
 /* ---- Public interface ---- */
+
+uint32_t dma_get_dicr(void) { update_master_irq(); return dicr; }
+uint32_t dma_get_dpcr(void) { return dpcr; }
 
 void dma_init(void) {
     memset(channels, 0, sizeof(channels));

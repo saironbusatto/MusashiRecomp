@@ -9,6 +9,7 @@
  */
 #include "debug_server.h"
 #include "cpu_state.h"
+#include "dma.h"
 #include "gpu.h"
 #include "sio.h"
 
@@ -433,12 +434,14 @@ static void handle_irq_state(int id, const char *json)
              "\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
              "\"pending\":\"0x%08X\","
              "\"cop0_sr\":\"0x%08X\","
-             "\"IEc\":%d,\"IM2\":%d,\"BEV\":%d}",
+             "\"IEc\":%d,\"IM2\":%d,\"BEV\":%d,"
+             "\"dpcr\":\"0x%08X\",\"dicr\":\"0x%08X\"}",
              id, i_stat, i_mask, i_stat & i_mask,
              s_cpu ? s_cpu->cop0[12] : 0,
              s_cpu ? (s_cpu->cop0[12] & 1) : 0,
              s_cpu ? ((s_cpu->cop0[12] >> 10) & 1) : 0,
-             s_cpu ? ((s_cpu->cop0[12] >> 22) & 1) : 0);
+             s_cpu ? ((s_cpu->cop0[12] >> 22) & 1) : 0,
+             dma_get_dpcr(), dma_get_dicr());
 }
 
 static void handle_sio_state(int id, const char *json)

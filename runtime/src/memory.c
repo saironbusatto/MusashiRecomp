@@ -221,6 +221,11 @@ static uint16_t mmio_read16(uint32_t addr) {
     if (addr >= 0x1F801100u && addr <= 0x1F80112Fu) {
         return (uint16_t)timers_read(addr);
     }
+    /* DMA: 0x1F801080..0x1F8010FF */
+    if (addr >= 0x1F801080u && addr <= 0x1F8010FFu) {
+        uint32_t val = dma_read(addr & ~3u);
+        return (addr & 2) ? (uint16_t)(val >> 16) : (uint16_t)val;
+    }
     /* SPU: 0x1F801C00..0x1F801FFF */
     if (addr >= 0x1F801C00u && addr <= 0x1F801FFFu) {
         return (uint16_t)spu_read(addr);
@@ -244,6 +249,17 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
         timers_write(addr, val);
         return;
     }
+    /* DMA: 0x1F801080..0x1F8010FF */
+    if (addr >= 0x1F801080u && addr <= 0x1F8010FFu) {
+        uint32_t aligned = addr & ~3u;
+        uint32_t cur = dma_read(aligned);
+        if (addr & 2)
+            cur = (cur & 0x0000FFFFu) | ((uint32_t)val << 16);
+        else
+            cur = (cur & 0xFFFF0000u) | (uint32_t)val;
+        dma_write(aligned, cur);
+        return;
+    }
     /* SPU: 0x1F801C00..0x1F801FFF */
     if (addr >= 0x1F801C00u && addr <= 0x1F801FFFu) {
         spu_write(addr, val);
@@ -262,6 +278,14 @@ static uint8_t mmio_read8(uint32_t addr) {
     if (addr >= 0x1F801040u && addr <= 0x1F80104Fu) {
         return (uint8_t)sio_read(addr & ~3u);
     }
+    /* DMA: 0x1F801080..0x1F8010FF — byte reads return the corresponding
+     * byte of the 32-bit register.  The BIOS shell reads DICR (0x1F8010F4)
+     * as individual bytes during interrupt handling. */
+    if (addr >= 0x1F801080u && addr <= 0x1F8010FFu) {
+        uint32_t aligned = addr & ~3u;
+        uint32_t val = dma_read(aligned);
+        return (uint8_t)(val >> (8 * (addr & 3)));
+    }
     /* CDROM: 0x1F801800..0x1F801803 */
     if (addr >= 0x1F801800u && addr <= 0x1F801803u) {
         return (uint8_t)cdrom_read(addr);
@@ -279,6 +303,16 @@ static void mmio_write8(uint32_t addr, uint8_t val) {
     /* SIO: 0x1F801040..0x1F80105F */
     if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
         sio_write(addr & ~3u, (uint32_t)val);
+        return;
+    }
+    /* DMA: 0x1F801080..0x1F8010FF — byte writes update the corresponding
+     * byte of the 32-bit register.  Needed for DICR byte-level access. */
+    if (addr >= 0x1F801080u && addr <= 0x1F8010FFu) {
+        uint32_t aligned = addr & ~3u;
+        uint32_t cur = dma_read(aligned);
+        uint32_t shift = 8 * (addr & 3);
+        cur = (cur & ~(0xFFu << shift)) | ((uint32_t)val << shift);
+        dma_write(aligned, cur);
         return;
     }
     /* CDROM: 0x1F801800..0x1F801803 */

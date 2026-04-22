@@ -26,6 +26,8 @@ extern "C" {
 void     dma_init(void);
 uint32_t dma_read(uint32_t addr);
 void     dma_write(uint32_t addr, uint32_t val);
+uint32_t dma_get_dicr(void);
+uint32_t dma_get_dpcr(void);
 
 #ifdef __cplusplus
 }
