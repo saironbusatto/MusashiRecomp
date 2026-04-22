@@ -28,8 +28,9 @@ static uint8_t ram[RAM_SIZE];
 static uint8_t scratchpad[SCRATCHPAD_SIZE];
 static uint8_t bios_rom[BIOS_ROM_SIZE];
 
-/* Memory control registers: 0x1F801000..0x1F801020 (9 words) + 0x1F801060 (RAM size). */
-static uint32_t mem_ctrl[9];    /* indices 0..8 → addresses 0x1F801000..0x1F801020 */
+/* Memory control registers: 0x1F801000..0x1F80103F (16 words) + 0x1F801060 (RAM size).
+ * Includes expansion base/size, COM_DELAY, SPU_DELAY, CDROM_DELAY etc. */
+static uint32_t mem_ctrl[16];   /* indices 0..15 → addresses 0x1F801000..0x1F80103C */
 static uint32_t ram_size_reg;   /* 0x1F801060 */
 
 /* Cache control register (KSEG2: 0xFFFE0130). */
@@ -114,7 +115,7 @@ static void unmapped_fatal(uint32_t vaddr, uint32_t phys, const char* op) {
 
 static uint32_t mmio_read32(uint32_t addr) {
     /* Memory control: 0x1F801000..0x1F801020 */
-    if (addr >= 0x1F801000u && addr <= 0x1F801020u) {
+    if (addr >= 0x1F801000u && addr <= 0x1F80103Cu) {
         return mem_ctrl[(addr - 0x1F801000u) >> 2];
     }
     /* SIO: 0x1F801040..0x1F80105F */
@@ -160,7 +161,7 @@ static uint32_t mmio_read32(uint32_t addr) {
 static void mmio_write32(uint32_t addr, uint32_t val) {
     debug_server_trace_mmio_write(addr, val, 4);
     /* Memory control: 0x1F801000..0x1F801020 */
-    if (addr >= 0x1F801000u && addr <= 0x1F801020u) {
+    if (addr >= 0x1F801000u && addr <= 0x1F80103Cu) {
         mem_ctrl[(addr - 0x1F801000u) >> 2] = val;
         return;
     }
