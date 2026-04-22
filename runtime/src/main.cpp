@@ -6,6 +6,7 @@
  */
 
 #include "cpu_state.h"
+#include "psx_interpreter.h"
 #include "cdrom.h"
 #include "gpu.h"
 #include "sio.h"
@@ -166,7 +167,11 @@ int main(int argc, char** argv) {
     spu_init();
     cdrom_init(NULL);    /* No disc for BIOS-only boot */
     memcard_init(".");   /* Look for card1.mcd / card2.mcd in working directory */
+#ifdef DEFAULT_DEBUG_PORT
+    debug_server_init(DEFAULT_DEBUG_PORT);
+#else
     debug_server_init(4370);
+#endif
 
     /* ---- SDL init ---- */
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -233,7 +238,34 @@ int main(int argc, char** argv) {
 
     /* Execute. */
     std::fprintf(stdout, "psxrecomp-v4 runtime: executing from PC=0x%08X\n", cpu.pc);
+
+#if defined(PSX_ORACLE_BUILD)
+    std::fprintf(stdout, "psxrecomp-v4 ORACLE: interpreter mode (port %d)\n", DEFAULT_DEBUG_PORT);
+    interp_init(&cpu);
+    interp_trace_enable(1);
+
+    /* Trace first 20 instructions to verify boot. */
+    for (int i = 0; i < 20; i++) {
+        std::fprintf(stderr, "  [%d] PC=0x%08X insn=0x%08X\n",
+                     i, cpu.pc, cpu.read_word(cpu.pc));
+        std::fflush(stderr);
+        interp_step(&cpu, 1);
+    }
+    std::fprintf(stderr, "ORACLE: boot trace done, entering main loop\n");
+    std::fflush(stderr);
+
+    /* Run interpreter in chunks, polling debug server between chunks. */
+    for (;;) {
+        uint32_t ran = interp_step(&cpu, 100000);
+        if (interp_hit_breakpoint()) {
+            std::fprintf(stdout, "ORACLE: breakpoint hit at PC=0x%08X\n", cpu.pc);
+            debug_server_wait_if_paused();
+        }
+        if (ran == 0) break;
+    }
+#else
     psx_dispatch(&cpu, cpu.pc);
+#endif
 
     /* If we reach here, all execution completed without MMIO abort. */
     std::fprintf(stdout, "psxrecomp-v4 runtime: execution completed, PC=0x%08X\n", cpu.pc);
