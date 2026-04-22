@@ -244,15 +244,41 @@ int main(int argc, char** argv) {
     interp_init(&cpu);
     interp_trace_enable(1);
 
-    /* Trace first 20 instructions to verify boot. */
-    for (int i = 0; i < 20; i++) {
-        std::fprintf(stderr, "  [%d] PC=0x%08X insn=0x%08X\n",
-                     i, cpu.pc, cpu.read_word(cpu.pc));
-        std::fflush(stderr);
-        interp_step(&cpu, 1);
-    }
-    std::fprintf(stderr, "ORACLE: boot trace done, entering main loop\n");
+    /* Check boot progress: break at shell entry, VBlank loop, and VSync write. */
+    interp_break_add(0x8005A160u);  /* func_1FC42160 shell init — KSEG0 */
+    interp_break_add(0xBFC42160u);  /* func_1FC42160 shell init — ROM */
+    interp_break_add(0x8005A26Cu);  /* callback loop entry — KSEG0 */
+    interp_break_add(0x8005A5BCu);  /* VSync incrementer — KSEG0 */
+    interp_break_add(0x80058628u);  /* chain-E004 handler — KSEG0 */
+    std::fprintf(stderr, "ORACLE: running with 5 breakpoints (shell, callback, vsync, chain-E004)...\n");
     std::fflush(stderr);
+    uint32_t ran = interp_run(&cpu, 200000000);
+    if (interp_hit_breakpoint()) {
+        std::fprintf(stderr, "ORACLE: breakpoint at PC=0x%08X after %u instructions\n",
+                     cpu.pc, ran);
+        /* Dump last 30 trace entries. */
+        uint64_t total = interp_trace_count();
+        uint32_t avail = (total < UINT32_MAX) ? (uint32_t)total : UINT32_MAX;
+        uint32_t start = (avail > 30) ? avail - 30 : 0;
+        for (uint32_t i = start; i < avail; i++) {
+            const InterpTraceEntry* e = interp_trace_get(i);
+            if (e) std::fprintf(stderr, "  trace[%llu] PC=0x%08X insn=0x%08X ra=0x%08X sp=0x%08X\n",
+                               (unsigned long long)e->seq, e->pc, e->insn, e->gpr[31], e->gpr[29]);
+        }
+        std::fflush(stderr);
+    } else {
+        std::fprintf(stderr, "ORACLE: ran %u instructions, no breakpoint hit. Final PC=0x%08X\n", ran, cpu.pc);
+        /* Dump last 10 trace entries to see where we ended up. */
+        uint64_t total2 = interp_trace_count();
+        uint32_t avail2 = (total2 < UINT32_MAX) ? (uint32_t)total2 : UINT32_MAX;
+        uint32_t start2 = (avail2 > 10) ? avail2 - 10 : 0;
+        for (uint32_t i = start2; i < avail2; i++) {
+            const InterpTraceEntry* e = interp_trace_get(i);
+            if (e) std::fprintf(stderr, "  tail[%llu] PC=0x%08X insn=0x%08X ra=0x%08X\n",
+                               (unsigned long long)e->seq, e->pc, e->insn, e->gpr[31]);
+        }
+        std::fflush(stderr);
+    }
 
     /* Run interpreter in chunks, polling debug server between chunks. */
     for (;;) {

@@ -13,9 +13,26 @@
 
 #include "psx_interpreter.h"
 #include "cpu_state.h"
+#include "gpu.h"
+#include "sio.h"
+#include "timers.h"
+#include "cdrom.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+/* I_STAT and I_MASK are owned by memory.c */
+extern uint32_t i_stat;
+extern uint32_t i_mask;
+
+#define COP0_SR    12
+#define COP0_CAUSE 13
+#define COP0_EPC   14
+#define IRQ_VBLANK 0
+
+/* VBlank scheduling — matches interrupts.c */
+#define VBLANK_INTERVAL 50000
+static uint32_t s_vblank_count;
 
 /* ---- Decode helpers ---- */
 #define OP(i)    (((i) >> 26) & 0x3F)
@@ -60,6 +77,7 @@ void interp_init(CPUState* cpu) {
     s_trace_write_idx = 0;
     s_load_reg = 0;
     s_load_val = 0;
+    s_vblank_count = 0;
     memset(s_trace_ring, 0, sizeof(s_trace_ring));
 }
 
@@ -225,8 +243,8 @@ static void exec_one(CPUState* cpu) {
         case 0x2A: set_reg(cpu, rd, (int32_t)rs_val < (int32_t)rt_val ? 1 : 0); break; /* SLT */
         case 0x2B: set_reg(cpu, rd, rs_val < rt_val ? 1 : 0); break; /* SLTU */
         default:
-            fprintf(stderr, "INTERP: unknown SPECIAL func 0x%02X at PC=0x%08X\n", func, pc);
-            s_halted = 1; return;
+            /* R3000A ignores undefined SPECIAL encodings (no trap). */
+            break;
         }
         break;
     }
@@ -464,14 +482,49 @@ static void exec_one(CPUState* cpu) {
     }
 
     default:
-        fprintf(stderr, "INTERP: unknown opcode 0x%02X at PC=0x%08X insn=0x%08X\n",
-                op, pc, insn);
-        s_halted = 1;
-        return;
+        /* R3000A ignores undefined opcodes (no trap). */
+        break;
     }
 
     /* Enforce $0 = 0 after every instruction. */
     cpu->gpr[0] = 0;
+}
+
+/* ---- Interrupt injection ---- */
+
+static void interp_check_interrupts(CPUState* cpu) {
+    /* SIO tick. */
+    sio_tick();
+
+    /* VBlank / timer scheduling. */
+    s_vblank_count++;
+    if (s_vblank_count >= VBLANK_INTERVAL) {
+        s_vblank_count = 0;
+        i_stat |= (1u << IRQ_VBLANK);
+        gpu_vblank_tick();
+        timers_tick(33868);
+        cdrom_tick();
+    }
+
+    /* Check if interrupt should fire. */
+    if ((i_stat & i_mask) == 0) return;
+
+    uint32_t sr = cpu->cop0[COP0_SR];
+    if (!(sr & 0x01u)) return;       /* IEc disabled */
+    if (!(sr & (1u << 10))) return;   /* IM2 not set */
+
+    /* Fire interrupt exception.
+     * Push SR stack, set Cause, set EPC, jump to vector. */
+    cpu->cop0[COP0_CAUSE] = (cpu->cop0[COP0_CAUSE] & ~0x7Cu) | (0u << 2); /* ExcCode=0 (interrupt) */
+    cpu->cop0[COP0_CAUSE] |= (1u << 10); /* IP2 */
+    cpu->cop0[COP0_SR] = (sr & ~0x3Fu) | ((sr & 0x0Fu) << 2);
+    cpu->cop0[COP0_EPC] = cpu->pc;
+
+    /* Vector: BEV selects between RAM and ROM exception vectors. */
+    if (sr & 0x00400000u)
+        cpu->pc = 0xBFC00180u;
+    else
+        cpu->pc = 0x80000080u;
 }
 
 /* ---- Public step/run ---- */
@@ -490,6 +543,11 @@ uint32_t interp_step(CPUState* cpu, uint32_t count) {
         exec_one(cpu);
         executed++;
         if (s_halted) break;
+
+        /* Check interrupts periodically (every 16 instructions). */
+        if ((executed & 0xF) == 0) {
+            interp_check_interrupts(cpu);
+        }
     }
     return executed;
 }
