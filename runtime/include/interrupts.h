@@ -37,6 +37,19 @@ int psx_get_in_exception(void);
  * the exception handler to model real hardware's RFE+JR $k0 unwind. */
 void psx_exception_longjmp(void);
 
+/* longjmp back to psx_check_interrupts for RestoreState redirection.
+ *
+ * On real hardware, RestoreState (A0:0x14) restores all GPRs from a
+ * save buffer and does `jr $ra`, which jumps to the restored $ra —
+ * abandoning the current call stack.  In our model, a plain `return;`
+ * would go back to the C caller (the chain walker), not to $ra.
+ *
+ * This function longjmps with code 2 (vs. 1 for ReturnFromException),
+ * so psx_check_interrupts can re-dispatch to cpu->pc while still in
+ * exception context.  The redirected code (e.g., VSync callback loop)
+ * will eventually call ReturnFromException (longjmp code 1) to exit. */
+void psx_restore_state_escape(void);
+
 #ifdef __cplusplus
 }
 #endif

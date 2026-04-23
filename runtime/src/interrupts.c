@@ -90,6 +90,12 @@ void psx_exception_longjmp(void) {
     longjmp(exception_jmpbuf, 1);
 }
 
+void psx_restore_state_escape(void) {
+    if (in_exception)
+        longjmp(exception_jmpbuf, 2);
+    /* Not in exception context — return normally, let caller's `return;` handle it. */
+}
+
 void psx_check_interrupts(CPUState* cpu) {
     total_checks++;
 
@@ -175,22 +181,42 @@ void psx_check_interrupts(CPUState* cpu) {
     /* Dispatch the BIOS exception handler.
      * BEV (SR bit 22) selects between 0x80000080 and 0xBFC00180.
      *
-     * setjmp is placed here so that ReturnFromException (B0:0x17 or
-     * SYSCALL(3)) can longjmp back, unwinding the entire handler
-     * call tree — matching real hardware behaviour where RFE+JR $k0
-     * abandons the handler and returns to the interrupted code. */
-    if (setjmp(exception_jmpbuf) == 0) {
-        /* Normal path: dispatch the handler. */
-        if (sr & 0x00400000u) {
-            psx_dispatch(cpu, 0xBFC00180u);
-        } else {
-            uint32_t w0 = cpu->read_word(0x80000080u);
-            uint32_t w1 = cpu->read_word(0x80000084u);
-            uint32_t hi_val = (w0 & 0xFFFF) << 16;
-            int16_t lo_val = (int16_t)(w1 & 0xFFFF);
-            uint32_t handler = hi_val + (uint32_t)(int32_t)lo_val;
-            psx_dispatch(cpu, handler);
+     * setjmp is placed here so ReturnFromException (longjmp code 1)
+     * and RestoreState (longjmp code 2) can escape the handler call
+     * tree.
+     *
+     * The loop handles the PSX VSync mechanism (SaveState/RestoreState):
+     *   - Code 0: normal entry — dispatch the handler.
+     *   - Code 2: RestoreState redirect — re-dispatch to cpu->pc
+     *     (e.g. VSync callback loop at 0xBFC421D8), still in exception
+     *     context.  The redirected code eventually calls ReturnFromException.
+     *   - Code 1: ReturnFromException — exit the loop entirely. */
+    uint32_t target_pc;
+    if (sr & 0x00400000u) {
+        target_pc = 0xBFC00180u;
+    } else {
+        uint32_t w0 = cpu->read_word(0x80000080u);
+        uint32_t w1 = cpu->read_word(0x80000084u);
+        uint32_t hi_val = (w0 & 0xFFFF) << 16;
+        int16_t lo_val = (int16_t)(w1 & 0xFFFF);
+        target_pc = hi_val + (uint32_t)(int32_t)lo_val;
+    }
+
+    for (;;) {
+        int jmp_val = setjmp(exception_jmpbuf);
+        if (jmp_val == 2) {
+            /* RestoreState redirect: re-dispatch to cpu->pc.
+             * GPRs were already set by RestoreState — do NOT restore.
+             * Stay in exception context so ReturnFromException works. */
+            target_pc = cpu->pc;
+            continue;
         }
+        if (jmp_val == 0) {
+            /* Normal entry (or after RestoreState redirect): dispatch. */
+            psx_dispatch(cpu, target_pc);
+        }
+        /* jmp_val 0 (normal return) or 1 (ReturnFromException): done. */
+        break;
     }
 
     /* Restore the interrupted code's registers.

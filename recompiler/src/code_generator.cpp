@@ -1028,7 +1028,7 @@ std::string CodeGenerator::translate_basic_block(
                     }
                     if (ra_loaded_from_non_sp) {
                         ss << config_.indent
-                           << "cpu->pc = cpu->gpr[31]; return;"
+                           << "cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;"
                            << "  /* jr $ra — longjmp-return (ra loaded from non-sp) */\n";
                     } else {
                         ss << config_.indent << "return;  /* jr $ra */\n";

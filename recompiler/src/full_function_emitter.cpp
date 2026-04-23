@@ -84,17 +84,29 @@ bool FullFunctionEmitter::emit_function(
         addr_to_raw[p.first] = p.second;
     }
 
-    // BIOS RestoreState (A0:0x14, at 0xBFC0227C) is a longjmp: it restores
-    // all callee-saved registers from a save buffer and returns to the
-    // saved $ra.  In the native build, `jr $ra` must set cpu->pc so the
-    // dispatch loop tail-calls to the restored address instead of returning
-    // to the C caller.  Detected by: first instruction is `lw $ra, 0($a0)`.
+    // BIOS RestoreState (A0:0x14) restores all callee-saved registers from
+    // a save buffer and returns to the saved $ra.  In the native build,
+    // `jr $ra` must set cpu->pc and call psx_restore_state_escape() so the
+    // dispatch loop routes to the restored address instead of returning to
+    // the C caller.
+    //
+    // Detected by: any instruction in the function is exactly `lw $ra, 0($a0)`
+    // (encoding 0x8C9F0000).  This covers both:
+    //   - Standalone RestoreState (func_1FC0227C): first insn is lw $ra,0($a0)
+    //   - Kernel inline RestoreState in the exception handler (func_00000C80):
+    //     lw $ra, 0($a0) appears at BFC10964 deep inside the chain walker.
+    //
+    // We match the exact encoding (offset 0 only) to avoid false positives
+    // from functions that load $ra from $a0 at other offsets (e.g. GPU code
+    // at BFC2A180 loads $ra from offset 16 of a structure, but restores the
+    // real $ra from $sp before returning).
     bool ra_loaded_from_non_sp = false;
-    if (!addr_to_raw.empty()) {
-        uint32_t first_insn = addr_to_raw.begin()->second;
-        // lw $ra, 0($a0) = opcode 0x23, rs=$a0(4), rt=$ra(31), imm=0
-        if (first_insn == 0x8C9F0000u)
+    for (const auto& [addr, raw] : addr_to_raw) {
+        if (raw == 0x8C9F0000u) {
+            // lw $ra, 0($a0) — RestoreState pattern
             ra_loaded_from_non_sp = true;
+            break;
+        }
     }
 
     // Build the set of basic block leaders from the function metadata.
@@ -239,7 +251,7 @@ bool FullFunctionEmitter::emit_function(
                         uint8_t rs = (pb.raw >> 21) & 0x1F;
                         if (rs == 31) {
                             if (ra_loaded_from_non_sp)
-                                out += "    cpu->pc = cpu->gpr[31]; return;  /* longjmp-return */\n";
+                                out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
                             else
                                 out += "    return;\n";
                         } else {
@@ -264,7 +276,7 @@ bool FullFunctionEmitter::emit_function(
                 uint8_t rs = (raw >> 21) & 0x1F;
                 if (rs == 31) {
                     if (ra_loaded_from_non_sp)
-                        out += "    cpu->pc = cpu->gpr[31]; return;  /* longjmp-return */\n";
+                        out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
                     else
                         out += "    return;\n";
                 } else {
@@ -333,7 +345,7 @@ bool FullFunctionEmitter::emit_function(
                 uint8_t rs = (pb.raw >> 21) & 0x1F;
                 if (rs == 31) {
                     if (ra_loaded_from_non_sp)
-                        out += "    cpu->pc = cpu->gpr[31]; return;  /* longjmp-return */\n";
+                        out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
                     else
                         out += "    return;\n";
                 } else {
@@ -493,6 +505,7 @@ void FullFunctionEmitter::emit_dispatch(
     // Extern declarations for runtime-provided functions.
     out += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
     out += "extern void psx_check_interrupts(CPUState* cpu);\n";
+    out += "extern void psx_restore_state_escape(void);\n";
     out += "extern uint32_t g_debug_current_func_addr;\n";
     out += "extern void debug_server_trace_dispatch(uint32_t func_addr);\n\n";
 
@@ -614,7 +627,8 @@ EmitStats FullFunctionEmitter::emit(
     // Forward declare psx_dispatch, psx_unknown_dispatch, and interrupt check.
     full_c += "extern void psx_dispatch(CPUState* cpu, uint32_t addr);\n";
     full_c += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
-    full_c += "extern void psx_check_interrupts(CPUState* cpu);\n\n";
+    full_c += "extern void psx_check_interrupts(CPUState* cpu);\n";
+    full_c += "extern void psx_restore_state_escape(void);\n\n";
 
     // Forward declare ALL functions so intra-file calls resolve.
     for (const auto& fn : dr.functions) {
