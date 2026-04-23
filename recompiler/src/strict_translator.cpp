@@ -367,6 +367,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
                 return r;
             }
 
+            case 0x22: // SUB rd, rs, rt -- same as SUBU on PSX (no overflow trap in recomp)
             case 0x23: { // SUBU rd, rs, rt -- unsigned wrap, no trap
                 r.supported = true;
                 r.c_code = emit_gpr_write(rd,
