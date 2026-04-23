@@ -1078,6 +1078,34 @@ shell. Memory card screen displays. Cards present/absent correctly.
 Format card works (writes 128 KB image, structure verified by
 DuckStation comparison).
 
+**Status (2026-04-23):** Phase 4 functionally complete. Shell renders,
+pad input works, Memory Card screen navigable (CARD 1/2, EXIT/COPY/
+COPY ALL/DELETE). Card present/absent and format card untested but
+infrastructure is in place (SIO memcard protocol + memcard.c). COP2/GTE
+support added (was planned for Phase 5). 1173 emitted functions, zero
+dispatch misses.
+
+### Phase 4.5 — Visual polish (deferred)
+
+**Goal:** cosmetic improvements to the BIOS shell rendering. Not
+blocking Phase 5 entry.
+
+**Known gaps:**
+- Colored background panels behind menu text items (204 shaded quads
+  drawn with GTE-computed coordinates — likely zero-area due to
+  rotation matrix not persisting between frames)
+- 3D memory card slot graphics (GTE RTPS/RTPT coordinate transforms)
+- Particle/sparkle animation effects
+- Semi-transparent overlays on UI elements
+
+**Root cause hypothesis:** GTE rotation matrix (ctrl regs 0-4) reads
+as zero at debug poll time. The matrix may be set and cleared within
+a single frame. The 204 shaded quads (GP0 0x38) produce degenerate
+vertices because RTPS with zero RT matrix maps all inputs to
+(OFX, OFY) = (320, 240). Needs: trace vertex coordinates during
+actual frame rendering to confirm, then fix matrix persistence or
+GTE command accuracy.
+
 ### Phase 5 — Game EXE recompilation layer
 
 **Goal:** the recompiler can ingest a PS1-EXE (re-using the v3-era
