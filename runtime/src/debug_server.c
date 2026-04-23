@@ -816,6 +816,71 @@ static void handle_get_snapshots(int id, const char *json)
              s_snapshot_addrs[3], s_snapshot_active[3]);
 }
 
+static void handle_screenshot_file(int id, const char *json)
+{
+    (void)json;
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    if (di.disabled || di.width == 0 || di.height == 0) {
+        send_err(id, "display disabled"); return;
+    }
+
+    const uint16_t *vram = gpu_get_vram();
+    uint32_t w = di.width;  if (w > 640) w = 640;
+    uint32_t h = di.height; if (h > 512) h = 512;
+
+    const char *path = "psx_screenshot.bmp";
+    FILE *f = fopen(path, "wb");
+    if (!f) { send_err(id, "cannot open file"); return; }
+
+    /* BMP row stride: 3 bytes/pixel, padded to 4-byte boundary */
+    uint32_t row_stride = (w * 3 + 3) & ~3u;
+    uint32_t pixel_size = row_stride * h;
+    uint32_t file_size = 14 + 40 + pixel_size;
+
+    /* BITMAPFILEHEADER (14 bytes) */
+    uint8_t bfh[14] = {0};
+    bfh[0] = 'B'; bfh[1] = 'M';
+    bfh[2] = file_size & 0xFF; bfh[3] = (file_size >> 8) & 0xFF;
+    bfh[4] = (file_size >> 16) & 0xFF; bfh[5] = (file_size >> 24) & 0xFF;
+    bfh[10] = 54; /* offset to pixel data */
+    fwrite(bfh, 1, 14, f);
+
+    /* BITMAPINFOHEADER (40 bytes) */
+    uint8_t bih[40] = {0};
+    bih[0] = 40; /* header size */
+    bih[4] = w & 0xFF; bih[5] = (w >> 8) & 0xFF;
+    /* Height negative = top-down */
+    int32_t neg_h = -(int32_t)h;
+    memcpy(bih + 8, &neg_h, 4);
+    bih[12] = 1;  /* planes */
+    bih[14] = 24; /* bits per pixel */
+    fwrite(bih, 1, 40, f);
+
+    /* Pixel data: top-down, BGR */
+    uint8_t *row = (uint8_t *)malloc(row_stride);
+    for (uint32_t y = 0; y < h; y++) {
+        memset(row, 0, row_stride);
+        uint32_t vy = (di.display_y + y) & 511;
+        for (uint32_t x = 0; x < w; x++) {
+            uint32_t vx = (di.display_x + x) & 1023;
+            uint16_t c = vram[vy * 1024 + vx];
+            uint8_t r = (c & 0x1F) << 3;
+            uint8_t g = ((c >> 5) & 0x1F) << 3;
+            uint8_t b = ((c >> 10) & 0x1F) << 3;
+            row[x * 3 + 0] = b;
+            row[x * 3 + 1] = g;
+            row[x * 3 + 2] = r;
+        }
+        fwrite(row, 1, row_stride, f);
+    }
+    free(row);
+    fclose(f);
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,\"height\":%u}",
+             id, path, w, h);
+}
+
 static void handle_screenshot(int id, const char *json)
 {
     (void)json;
@@ -1188,6 +1253,7 @@ static const CmdEntry s_commands[] = {
     { "set_snapshot",      handle_set_snapshot },
     { "get_snapshots",     handle_get_snapshots },
     { "screenshot",        handle_screenshot },
+    { "screenshot_file",   handle_screenshot_file },
     { "quit",              handle_quit },
     { "dispatch_check",    handle_dispatch_check },
     { "dispatch_tail",     handle_dispatch_tail },

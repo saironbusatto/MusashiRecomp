@@ -1210,8 +1210,15 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
 
         if (cop_op == 0x00) { // MFC2 — move from COP2 data register
             r.supported = true;
-            r.c_code = emit_gpr_write(rt,
-                fmt::format("cpu->gte_data[{}]", static_cast<int>(rd)));
+            // Regs 28/29 (IRGB/ORGB) compute packed values from IR1/IR2/IR3;
+            // must route through gte_read_data() for correct behavior.
+            if (rd == 28 || rd == 29) {
+                r.c_code = emit_gpr_write(rt,
+                    fmt::format("gte_read_data(cpu, {})", static_cast<int>(rd)));
+            } else {
+                r.c_code = emit_gpr_write(rt,
+                    fmt::format("cpu->gte_data[{}]", static_cast<int>(rd)));
+            }
             r.comment = fmt::format("mfc2 {}, gte_data[{}]", gpr_name(rt), rd);
             return r;
         }
@@ -1224,9 +1231,18 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         }
         if (cop_op == 0x04) { // MTC2 — move to COP2 data register
             r.supported = true;
-            r.c_code = fmt::format(
-                "cpu->gte_data[{}] = cpu->gpr[{}];",
-                static_cast<int>(rd), static_cast<int>(rt));
+            // Reg 15 (SXYP) pushes SXY FIFO; reg 28 (IRGB) decomposes
+            // into IR1/IR2/IR3; reg 30 (LZCS) triggers leading-zero count.
+            // Route these through gte_write_data() for correct side effects.
+            if (rd == 15 || rd == 28 || rd == 30) {
+                r.c_code = fmt::format(
+                    "gte_write_data(cpu, {}, cpu->gpr[{}]);",
+                    static_cast<int>(rd), static_cast<int>(rt));
+            } else {
+                r.c_code = fmt::format(
+                    "cpu->gte_data[{}] = cpu->gpr[{}];",
+                    static_cast<int>(rd), static_cast<int>(rt));
+            }
             r.comment = fmt::format("mtc2 {}, gte_data[{}]", gpr_name(rt), rd);
             return r;
         }
