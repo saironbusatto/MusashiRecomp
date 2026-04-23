@@ -13,6 +13,8 @@ extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);
 extern void psx_check_interrupts(CPUState* cpu);
 extern void psx_restore_state_escape(void);
 extern void gte_execute(CPUState* cpu, uint32_t cmd);
+extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);
+extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);
 extern uint32_t g_debug_current_func_addr;
 extern void debug_server_trace_dispatch(uint32_t func_addr);
 
