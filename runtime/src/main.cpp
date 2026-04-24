@@ -18,6 +18,8 @@
 #include <cstring>
 #include <cstdlib>
 
+extern "C" uint64_t gte_get_exec_count(void);
+
 /* memory.c */
 extern "C" void memory_init(const char* bios_path);
 extern "C" void memory_set_sr_ptr(const uint32_t *p);
@@ -260,8 +262,9 @@ int main(int argc, char** argv) {
         if (interp_hit_breakpoint()) {
             vsync_hits++;
             if (vsync_hits <= 3 || (vsync_hits % 100 == 0)) {
-                std::fprintf(stderr, "ORACLE: VSync hit #%u at %llu instructions, ra=0x%08X\n",
-                             vsync_hits, (unsigned long long)total_executed, cpu.gpr[31]);
+                std::fprintf(stderr, "ORACLE: VSync hit #%u at %llu instructions, ra=0x%08X, gte_exec=%llu\n",
+                             vsync_hits, (unsigned long long)total_executed, cpu.gpr[31],
+                             (unsigned long long)gte_get_exec_count());
                 /* Dump last 20 trace entries for first 3 hits. */
                 if (vsync_hits <= 3) {
                     uint64_t tseq = interp_trace_count();

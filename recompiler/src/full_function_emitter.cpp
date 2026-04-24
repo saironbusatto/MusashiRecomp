@@ -159,6 +159,22 @@ bool FullFunctionEmitter::emit_function(
         return target;
     };
 
+    /* Relocate a return address ($ra) from ROM PC to the runtime address.
+     * On real hardware, $ra is set by the CPU using the runtime PC.
+     * Shell code runs at RAM 0x80030000+, kernel Part 2 at 0x500+.
+     * Without this, handler/callback tables get ROM addresses instead of
+     * RAM addresses, breaking pointer comparisons in the BIOS. */
+    auto relocate_ra = [](uint32_t rom_ra) -> uint32_t {
+        uint32_t phys = rom_ra & 0x1FFFFFFFu;
+        if (phys >= 0x1FC18000u && phys <= 0x1FC427FFu) {
+            return 0x80030000u + (phys - 0x1FC18000u);
+        }
+        if (phys >= 0x1FC10000u && phys <= 0x1FC17FFFu) {
+            return phys - 0x1FC10000u + 0x00000500u;
+        }
+        return rom_ra;
+    };
+
     // First pass: identify terminators and their delay slots.
     for (const auto& [addr, raw] : addr_to_raw) {
         PSXRecomp::DecodedInstruction d = PSXRecomp::MipsDecoder::decode(raw, addr);
@@ -319,18 +335,18 @@ bool FullFunctionEmitter::emit_function(
                 }
             } else if (kind == "jal") {
                 uint32_t target = pb.target;
-                uint32_t return_addr = pb.terminator_addr + 8;
+                uint32_t return_addr = relocate_ra(pb.terminator_addr + 8);
                 out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
                 // Regular call: always go through psx_dispatch (handles tail-call loop).
                 out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
                 // Safety net: if continuation falls outside this function, tail-call to it.
-                if (!addr_to_raw.count(return_addr)) {
+                if (!addr_to_raw.count(pb.terminator_addr + 8)) {
                     out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jal cont: outside func */\n", return_addr);
                 }
             } else if (kind == "jalr") {
                 uint8_t rs = (pb.raw >> 21) & 0x1F;
                 uint8_t rd = (pb.raw >> 11) & 0x1F;
-                uint32_t return_addr = pb.terminator_addr + 8;
+                uint32_t return_addr = relocate_ra(pb.terminator_addr + 8);
                 if (rd != 0) {
                     out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
                                        static_cast<int>(rd), return_addr);
@@ -338,7 +354,7 @@ bool FullFunctionEmitter::emit_function(
                 out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
                                    static_cast<int>(rs));
                 // Safety net: if continuation falls outside this function, tail-call to it.
-                if (!addr_to_raw.count(return_addr)) {
+                if (!addr_to_raw.count(pb.terminator_addr + 8)) {
                     out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jalr cont: outside func */\n", return_addr);
                 }
             } else if (kind == "jr") {
