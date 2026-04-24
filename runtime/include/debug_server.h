@@ -133,6 +133,11 @@ int debug_server_get_input_override(void);
 /* Set the CPU state pointer for register queries. Call after CPU init. */
 void debug_server_set_cpu(CPUState *cpu);
 
+/* Global CPU pointer — set by debug_server_set_cpu(). Available for
+ * hardware simulation modules that need to read CPU state (e.g. GPU
+ * capturing stack values during A0 uploads). */
+extern CPUState *debug_cpu_ptr;
+
 void debug_server_send_line(const char *json);
 void debug_server_send_fmt(const char *fmt, ...);
 

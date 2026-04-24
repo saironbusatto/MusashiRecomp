@@ -12,6 +12,8 @@
 
 #include "gpu.h"
 #include "gpu_sw_renderer.h"
+#include "debug_server.h"
+#include "cpu_state.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,6 +108,17 @@ static uint32_t v_display_y2;
 
 /* GPUREAD latch (GP1(10h) get-info result, or VRAM read data) */
 static uint32_t gpuread_latch;
+
+/* C0 (VRAM→CPU) capture slot — forward declaration for gpu_read_gpuread */
+#define C0_HISTORY_CAP_FWD 32
+static struct C0HistEntry {
+    uint16_t x, y, w, h;
+    uint32_t func_addr, sp_val, s1_val;
+    uint32_t first_words[4];
+    int read_count;
+} c0_history_fwd[C0_HISTORY_CAP_FWD];
+static int c0_history_count_fwd = 0;
+static int c0_capture_slot_fwd = -1;
 
 /* Vblank presentation callback */
 static gpu_vblank_cb vblank_callback;
@@ -273,6 +286,15 @@ uint32_t gpu_read_gpuread(void) {
                 break;
             }
         }
+    }
+
+    /* Capture first words for C0 debug */
+    if (c0_capture_slot_fwd >= 0 && c0_capture_slot_fwd < C0_HISTORY_CAP_FWD) {
+        int rc = c0_history_fwd[c0_capture_slot_fwd].read_count++;
+        if (rc < 4)
+            c0_history_fwd[c0_capture_slot_fwd].first_words[rc] = value;
+        if (!vram_read_active)
+            c0_capture_slot_fwd = -1;  /* transfer complete */
     }
 
     gpuread_latch = value;
@@ -536,13 +558,13 @@ static uint16_t current_texpage(void) {
 }
 
 /* Helper: set up SW renderer state before a textured draw.
- * semi_trans: whether the primitive has semi-transparency enabled (from opcode bit) */
-static void setup_textured_draw(uint32_t color24, int semi_trans) {
+ * semi_trans: whether the primitive has semi-transparency enabled (from opcode bit)
+ * raw_texture: 1 if this is a raw-texture opcode (bit 0 of GP0 opcode set) */
+static void setup_textured_draw(uint32_t color24, int semi_trans, int raw_texture) {
     uint32_t r = (color24 >> 0) & 0xFF;
     uint32_t g = (color24 >> 8) & 0xFF;
     uint32_t b = (color24 >> 16) & 0xFF;
-    int raw = (r == 0x80 && g == 0x80 && b == 0x80) ? 1 : 0;
-    sw_set_color_modulation((int)r, (int)g, (int)b, raw);
+    sw_set_color_modulation((int)r, (int)g, (int)b, raw_texture);
     sw_set_semi_transparency(semi_trans, (int)semi_transparency);
 }
 
@@ -550,6 +572,7 @@ static void setup_textured_draw(uint32_t color24, int semi_trans) {
 static void gp0_exec_textured_tri(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+    int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t vx[3], vy[3];
     int u[3], v[3];
     /* Layout: color+v0, texcoord0+clut, v1, texcoord1+tpage, v2, texcoord2 */
@@ -571,7 +594,7 @@ static void gp0_exec_textured_tri(void) {
         vy[i] += draw_offset_y;
     }
 
-    setup_textured_draw(color24, semi_trans);
+    setup_textured_draw(color24, semi_trans, raw_texture);
     sw_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
                               vx[1], vy[1], u[1], v[1],
                               vx[2], vy[2], u[2], v[2],
@@ -582,6 +605,7 @@ static void gp0_exec_textured_tri(void) {
 static void gp0_exec_textured_quad(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+    int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t vx[4], vy[4];
     int u[4], v[4];
     /* Layout: color+v0, tc0+clut, v1, tc1+tpage, v2, tc2, v3, tc3 */
@@ -603,7 +627,7 @@ static void gp0_exec_textured_quad(void) {
         vy[i] += draw_offset_y;
     }
 
-    setup_textured_draw(color24, semi_trans);
+    setup_textured_draw(color24, semi_trans, raw_texture);
     sw_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
                               vx[1], vy[1], u[1], v[1],
                               vx[2], vy[2], u[2], v[2],
@@ -618,6 +642,7 @@ static void gp0_exec_textured_quad(void) {
 static void gp0_exec_shaded_textured_tri(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+    int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t vx[3], vy[3];
     int u[3], v[3];
     /* Layout: C0, V0, TC0+clut, C1, V1, TC1+tpage, C2, V2, TC2 */
@@ -637,7 +662,7 @@ static void gp0_exec_shaded_textured_tri(void) {
         vy[i] += draw_offset_y;
     }
 
-    setup_textured_draw(color24, semi_trans);
+    setup_textured_draw(color24, semi_trans, raw_texture);
     sw_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
                               vx[1], vy[1], u[1], v[1],
                               vx[2], vy[2], u[2], v[2],
@@ -648,6 +673,7 @@ static void gp0_exec_shaded_textured_tri(void) {
 static void gp0_exec_shaded_textured_quad(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+    int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t vx[4], vy[4];
     int u[4], v[4];
     /* Layout: C0, V0, TC0+clut, C1, V1, TC1+tpage, C2, V2, TC2, C3, V3, TC3 */
@@ -669,7 +695,7 @@ static void gp0_exec_shaded_textured_quad(void) {
         vy[i] += draw_offset_y;
     }
 
-    setup_textured_draw(color24, semi_trans);
+    setup_textured_draw(color24, semi_trans, raw_texture);
     sw_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
                               vx[1], vy[1], u[1], v[1],
                               vx[2], vy[2], u[2], v[2],
@@ -726,6 +752,7 @@ static void gp0_exec_mono_rect(void) {
 static void gp0_exec_textured_rect(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+    int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     x0 += draw_offset_x; y0 += draw_offset_y;
@@ -739,7 +766,7 @@ static void gp0_exec_textured_rect(void) {
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
 
-    setup_textured_draw(color24, semi_trans);
+    setup_textured_draw(color24, semi_trans, raw_texture);
     sw_draw_textured_rect(x0, y0, w, h, u0, v0, clut_x, clut_y, current_texpage());
 }
 
@@ -758,6 +785,7 @@ static void gp0_exec_mono_dot(void) {
 static void gp0_exec_textured_8x8(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+    int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     x0 += draw_offset_x; y0 += draw_offset_y;
@@ -767,7 +795,7 @@ static void gp0_exec_textured_8x8(void) {
     uint16_t clut_x = (clut & 0x3F) * 16;
     uint16_t clut_y = (clut >> 6) & 0x1FF;
 
-    setup_textured_draw(color24, semi_trans);
+    setup_textured_draw(color24, semi_trans, raw_texture);
     sw_draw_textured_rect(x0, y0, 8, 8, u0, v0, clut_x, clut_y, current_texpage());
 }
 
@@ -786,6 +814,7 @@ static void gp0_exec_mono_8x8(void) {
 static void gp0_exec_textured_16x16(void) {
     uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+    int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     x0 += draw_offset_x; y0 += draw_offset_y;
@@ -795,7 +824,7 @@ static void gp0_exec_textured_16x16(void) {
     uint16_t clut_x = (clut & 0x3F) * 16;
     uint16_t clut_y = (clut >> 6) & 0x1FF;
 
-    setup_textured_draw(color24, semi_trans);
+    setup_textured_draw(color24, semi_trans, raw_texture);
     sw_draw_textured_rect(x0, y0, 16, 16, u0, v0, clut_x, clut_y, current_texpage());
 }
 
@@ -900,6 +929,46 @@ static void gp0_exec_mask_bit(void) {
     sw_set_mask_bits((int)set_mask_bit, (int)check_mask_bit);
 }
 
+/* A0 upload history for debug inspection */
+#define A0_HISTORY_CAP 128
+typedef struct {
+    uint16_t x, y, w, h;
+    uint32_t first_words[4];
+    int word_count;
+    uint32_t func_addr;
+    uint32_t sp_val;       /* CPU $sp at time of A0 header */
+    uint32_t ra_val;       /* CPU $ra register at time of A0 header */
+    uint32_t s1_val;       /* CPU $s1 = source data pointer in func_1FC38524 */
+    uint32_t stack[10];    /* first 10 words from sp (sp+32=saved $s1, sp+36=saved $ra) */
+} A0HistEntry;
+static A0HistEntry a0_history[A0_HISTORY_CAP];
+static int a0_history_count = 0;
+static int a0_capture_slot = -1;  /* currently capturing data words for this slot */
+
+extern uint32_t psx_read_word(uint32_t addr);
+
+int gpu_get_a0_history(int index, int *x, int *y, int *w, int *h,
+                       uint32_t *fw0, uint32_t *fw1, int *wcount) {
+    if (index < 0 || index >= a0_history_count) return 0;
+    *x = a0_history[index].x; *y = a0_history[index].y;
+    *w = a0_history[index].w; *h = a0_history[index].h;
+    *fw0 = a0_history[index].first_words[0];
+    *fw1 = a0_history[index].first_words[1];
+    *wcount = a0_history[index].word_count;
+    return 1;
+}
+int gpu_get_a0_count(void) { return a0_history_count; }
+int gpu_get_a0_extra(int index, uint32_t *func, uint32_t *sp, uint32_t *ra,
+                     uint32_t *s1, uint32_t *stack10) {
+    if (index < 0 || index >= a0_history_count) return 0;
+    *func = a0_history[index].func_addr;
+    *sp = a0_history[index].sp_val;
+    *ra = a0_history[index].ra_val;
+    *s1 = a0_history[index].s1_val;
+    memcpy(stack10, a0_history[index].stack, 10 * sizeof(uint32_t));
+    return 1;
+}
+
 static void gp0_exec_cpu_to_vram(void) {
     /* 0xA0 — CPU→VRAM Copy (header: 3 words)
      * Word 0: command
@@ -915,6 +984,34 @@ static void gp0_exec_cpu_to_vram(void) {
     vram_write_w = (w == 0) ? 0x400 : (uint16_t)w;
     vram_write_h = (h == 0) ? 0x200 : (uint16_t)h;
 
+    /* Record for debug */
+    if (a0_history_count < A0_HISTORY_CAP) {
+        int slot = a0_history_count++;
+        a0_history[slot].x = vram_write_x;
+        a0_history[slot].y = vram_write_y;
+        a0_history[slot].w = vram_write_w;
+        a0_history[slot].h = vram_write_h;
+        a0_history[slot].word_count = 0;
+        a0_history[slot].func_addr = g_debug_current_func_addr;
+        memset(a0_history[slot].first_words, 0, sizeof(a0_history[slot].first_words));
+        /* Capture CPU context for caller tracing.
+         * func_1FC38524 (shell LoadImage) uses $s1 as source data pointer. */
+        a0_history[slot].sp_val = 0;
+        a0_history[slot].ra_val = 0;
+        a0_history[slot].s1_val = 0;
+        memset(a0_history[slot].stack, 0, sizeof(a0_history[slot].stack));
+        if (debug_cpu_ptr) {
+            uint32_t sp = debug_cpu_ptr->gpr[29];
+            a0_history[slot].sp_val = sp;
+            a0_history[slot].ra_val = debug_cpu_ptr->gpr[31];
+            a0_history[slot].s1_val = debug_cpu_ptr->gpr[17]; /* $s1 */
+            uint32_t sp_phys = sp & 0x1FFFFFu;
+            for (int si = 0; si < 10 && sp_phys + (si + 1) * 4 <= 0x200000u; si++)
+                a0_history[slot].stack[si] = psx_read_word(sp + si * 4);
+        }
+        a0_capture_slot = slot;
+    }
+
     vram_write_col = 0;
     vram_write_row = 0;
 
@@ -923,6 +1020,28 @@ static void gp0_exec_cpu_to_vram(void) {
 
     if (vram_write_remaining > 0)
         gp0_state = GP0_VRAM_WRITE;
+}
+
+/* C0 (VRAM→CPU) history — uses c0_history_fwd declared at top of file */
+#define C0_HISTORY_CAP C0_HISTORY_CAP_FWD
+#define c0_history c0_history_fwd
+#define c0_history_count c0_history_count_fwd
+#define c0_capture_slot c0_capture_slot_fwd
+
+int gpu_get_c0_count(void) { return c0_history_count; }
+int gpu_get_c0_history(int index, int *x, int *y, int *w, int *h,
+                       uint32_t *func, uint32_t *sp, uint32_t *s1,
+                       uint32_t *fw0, uint32_t *fw1, int *rcount) {
+    if (index < 0 || index >= c0_history_count) return 0;
+    *x = c0_history[index].x; *y = c0_history[index].y;
+    *w = c0_history[index].w; *h = c0_history[index].h;
+    *func = c0_history[index].func_addr;
+    *sp = c0_history[index].sp_val;
+    *s1 = c0_history[index].s1_val;
+    *fw0 = c0_history[index].first_words[0];
+    *fw1 = c0_history[index].first_words[1];
+    *rcount = c0_history[index].read_count;
+    return 1;
 }
 
 static void gp0_exec_vram_to_cpu(void) {
@@ -938,8 +1057,20 @@ static void gp0_exec_vram_to_cpu(void) {
     vram_read_w = (w == 0) ? 0x400 : (uint16_t)w;
     vram_read_h = (h == 0) ? 0x200 : (uint16_t)h;
 
-    /* DuckStation uses (val-1)&mask+1 for VRAM→CPU, but the effect
-     * is identical: 0→max. We use ReplaceZero like CPU→VRAM. */
+    /* Record for debug */
+    if (c0_history_count < C0_HISTORY_CAP) {
+        int slot = c0_history_count++;
+        c0_history[slot].x = vram_read_x;
+        c0_history[slot].y = vram_read_y;
+        c0_history[slot].w = vram_read_w;
+        c0_history[slot].h = vram_read_h;
+        c0_history[slot].func_addr = g_debug_current_func_addr;
+        c0_history[slot].sp_val = debug_cpu_ptr ? debug_cpu_ptr->gpr[29] : 0;
+        c0_history[slot].s1_val = debug_cpu_ptr ? debug_cpu_ptr->gpr[17] : 0;
+        memset(c0_history[slot].first_words, 0, sizeof(c0_history[slot].first_words));
+        c0_history[slot].read_count = 0;
+        c0_capture_slot = slot;
+    }
 
     vram_read_col = 0;
     vram_read_row = 0;
@@ -1136,6 +1267,7 @@ static void gp0_execute_command(void) {
             /* 1x1 textured dot: cmd, vertex, texcoord+clut (no size word) */
             uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
             int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
+            int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
             int32_t x0, y0;
             parse_vertex(gp0_cmd_buf[1], &x0, &y0);
             x0 += draw_offset_x; y0 += draw_offset_y;
@@ -1144,7 +1276,7 @@ static void gp0_execute_command(void) {
             uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
             uint16_t clut_x = (clut & 0x3F) * 16;
             uint16_t clut_y = (clut >> 6) & 0x1FF;
-            setup_textured_draw(color24, semi_trans);
+            setup_textured_draw(color24, semi_trans, raw_texture);
             sw_draw_textured_rect(x0, y0, 1, 1, u0, v0, clut_x, clut_y, current_texpage());
             break;
         }
@@ -1264,6 +1396,12 @@ void gpu_write_gp0(uint32_t val) {
 
     /* State: consuming pixel data for CPU→VRAM transfer */
     if (gp0_state == GP0_VRAM_WRITE) {
+        /* Capture first few data words for debug */
+        if (a0_capture_slot >= 0 && a0_capture_slot < A0_HISTORY_CAP) {
+            int wc = a0_history[a0_capture_slot].word_count++;
+            if (wc < 4)
+                a0_history[a0_capture_slot].first_words[wc] = val;
+        }
         /* Each word contains two 16-bit pixels (low halfword first) */
         for (int i = 0; i < 2; i++) {
             uint16_t pixel = (uint16_t)(val >> (i * 16));

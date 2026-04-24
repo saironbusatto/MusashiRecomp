@@ -449,6 +449,69 @@ static void handle_irq_state(int id, const char *json)
 /* GPU opcode counter — defined in gpu.c */
 extern uint32_t gpu_get_opcode_count(uint8_t op);
 
+extern int gpu_get_a0_count(void);
+extern int gpu_get_a0_history(int index, int *x, int *y, int *w, int *h,
+                              uint32_t *fw0, uint32_t *fw1, int *wcount);
+extern int gpu_get_a0_extra(int index, uint32_t *func, uint32_t *sp, uint32_t *ra,
+                            uint32_t *s1, uint32_t *stack10);
+
+static void handle_a0_history(int id, const char *json)
+{
+    (void)json;
+    int count = gpu_get_a0_count();
+    /* Use dynamic allocation for large output */
+    int bufsz = 65536;
+    char *buf = (char*)malloc(bufsz);
+    if (!buf) { send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"OOM\"}", id); return; }
+    int pos = snprintf(buf, bufsz, "{\"id\":%d,\"ok\":true,\"count\":%d,\"uploads\":[", id, count);
+    for (int i = 0; i < count && pos < bufsz - 500; i++) {
+        int x, y, w, h, wcount;
+        uint32_t fw0, fw1, func, sp, ra, s1, stk[10];
+        gpu_get_a0_history(i, &x, &y, &w, &h, &fw0, &fw1, &wcount);
+        gpu_get_a0_extra(i, &func, &sp, &ra, &s1, stk);
+        pos += snprintf(buf + pos, bufsz - pos,
+            "%s{\"i\":%d,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,"
+            "\"fw0\":\"0x%08X\",\"fw1\":\"0x%08X\",\"words\":%d,"
+            "\"func\":\"0x%08X\",\"sp\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"s1\":\"0x%08X\","
+            "\"stk\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\","
+            "\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\","
+            "\"0x%08X\",\"0x%08X\"]}",
+            i ? "," : "", i, x, y, w, h, fw0, fw1, wcount,
+            func, sp, ra, s1,
+            stk[0], stk[1], stk[2], stk[3], stk[4], stk[5], stk[6], stk[7],
+            stk[8], stk[9]);
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "]}");
+    send_fmt("%s", buf);
+    free(buf);
+}
+
+extern int gpu_get_c0_count(void);
+extern int gpu_get_c0_history(int index, int *x, int *y, int *w, int *h,
+                              uint32_t *func, uint32_t *sp, uint32_t *s1,
+                              uint32_t *fw0, uint32_t *fw1, int *rcount);
+
+static void handle_c0_history(int id, const char *json)
+{
+    (void)json;
+    int count = gpu_get_c0_count();
+    char buf[8192];
+    int pos = snprintf(buf, sizeof(buf), "{\"id\":%d,\"ok\":true,\"count\":%d,\"reads\":[", id, count);
+    for (int i = 0; i < count && pos < (int)sizeof(buf) - 300; i++) {
+        int x, y, w, h, rcount;
+        uint32_t func, sp, s1, fw0, fw1;
+        gpu_get_c0_history(i, &x, &y, &w, &h, &func, &sp, &s1, &fw0, &fw1, &rcount);
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"i\":%d,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,"
+            "\"func\":\"0x%08X\",\"sp\":\"0x%08X\",\"s1\":\"0x%08X\","
+            "\"fw0\":\"0x%08X\",\"fw1\":\"0x%08X\",\"reads\":%d}",
+            i ? "," : "", i, x, y, w, h, func, sp, s1, fw0, fw1, rcount);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    send_fmt("%s", buf);
+}
+
 static void handle_gpu_opcodes(int id, const char *json)
 {
     (void)json;
@@ -1328,6 +1391,8 @@ static const CmdEntry s_commands[] = {
     { "screenshot",        handle_screenshot },
     { "screenshot_file",   handle_screenshot_file },
     { "gpu_opcodes",       handle_gpu_opcodes },
+    { "a0_history",        handle_a0_history },
+    { "c0_history",        handle_c0_history },
     { "capture_quads",     handle_capture_quads },
     { "get_quads",         handle_get_quads },
     { "gte_state",         handle_gte_state },
@@ -1414,12 +1479,19 @@ void debug_server_init(int port)
     s_wtrace_seq = 0;
     s_wtrace_head = 0;
 
-    /* Phase 4.5: watch EB4 area + DF8/DFC area. */
+    /* Phase 4.5: watch EB4 area + DF8/DFC area + EvCB slot 1 status + state machine
+     * + spiral texture buffer. */
     s_wtrace_ranges[0].lo = 0x00079EB0u;
     s_wtrace_ranges[0].hi = 0x00079EC0u;
     s_wtrace_ranges[1].lo = 0x00079DF0u;
     s_wtrace_ranges[1].hi = 0x00079E04u;
-    s_wtrace_range_count = 2;
+    s_wtrace_ranges[2].lo = 0x0000E044u;  /* EvCB slot 1 (class+status+spec) */
+    s_wtrace_ranges[2].hi = 0x0000E054u;
+    s_wtrace_ranges[3].lo = 0x00066940u;  /* shell state machine 0x80066940 */
+    s_wtrace_ranges[3].hi = 0x00066954u;
+    s_wtrace_ranges[4].lo = 0x001B6810u;  /* spiral texture buffer (heap @ 0x801B6814) */
+    s_wtrace_ranges[4].hi = 0x001B6830u;
+    s_wtrace_range_count = 5;
 
     /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */
     if (!s_mmio_trace) {

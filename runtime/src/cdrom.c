@@ -223,19 +223,15 @@ static void exec_command(uint8_t cmd) {
         break;
 
     case 0x1A: /* GetID */
-        if (!has_disc()) {
-            response_push(stat_reg | CDSTAT_IDERROR);
-            response_push(0x80); /* NOT_READY */
-            set_irq(CDIRQ_ERROR);
-            fire_cdrom_irq();
-        } else {
-            response_push(stat_reg);
-            set_irq(CDIRQ_ACK);
-            pending.cmd = 0x1A;
-            pending.pending = 1;
-            pending.delay = 30000;
-            pending.phase = 1;
-        }
+        /* GetID always sends INT3 (ACK) first, then a pending
+         * second response: INT2 (COMPLETE) with disc ID if present,
+         * or INT5 (ERROR) if no disc / lid open. */
+        response_push(stat_reg);
+        set_irq(CDIRQ_ACK);
+        pending.cmd = 0x1A;
+        pending.pending = 1;
+        pending.delay = 30000;
+        pending.phase = 1;
         break;
 
     case 0x1B: /* ReadS */
@@ -356,6 +352,7 @@ static void process_pending(void) {
     case 0x1E: /* ReadTOC complete */
         response_push(stat_reg);
         set_irq(CDIRQ_COMPLETE);
+        fire_cdrom_irq();
         break;
 
     default:
