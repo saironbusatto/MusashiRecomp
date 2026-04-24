@@ -27,7 +27,9 @@ static uint16_t vram[1024 * 512];
 typedef enum {
     GP0_IDLE,
     GP0_COLLECTING,
-    GP0_VRAM_WRITE
+    GP0_VRAM_WRITE,
+    GP0_POLYLINE_MONO,    /* collecting mono polyline vertices */
+    GP0_POLYLINE_SHADED   /* collecting shaded polyline color+vertex pairs */
 } Gp0State;
 
 static Gp0State gp0_state;
@@ -36,6 +38,13 @@ static uint64_t gp0_nop_count, gp0_fill_count, gp0_draw_count, gp0_env_count, gp
 static uint32_t gp0_cmd_buf[16];   /* max fixed-length command is 12 words */
 static int      gp0_words_collected;
 static int      gp0_words_needed;
+
+/* Polyline state */
+static uint16_t polyline_color;       /* mono polyline: current color */
+static int32_t  polyline_prev_x, polyline_prev_y;  /* previous vertex */
+static uint16_t polyline_prev_c;      /* shaded polyline: previous color */
+static int      polyline_semi_trans;  /* semi-transparency flag from command word */
+static int      polyline_has_prev;    /* have we seen at least one vertex? */
 
 /* VRAM write transfer state (CPU→VRAM, command 0xA0) */
 static uint16_t vram_write_x, vram_write_y;   /* start coords */
@@ -719,18 +728,18 @@ static void gp0_exec_mono_line(void) {
     sw_draw_line(x0, y0, x1, y1, color);
 }
 
-/* Execute shaded line (GP0 0x50-0x57) — flat shaded for now */
+/* Execute shaded line (GP0 0x50-0x57) */
 static void gp0_exec_shaded_line(void) {
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
-    uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
+    uint16_t c0 = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
+    uint16_t c1 = rgb888_to_rgb555(gp0_cmd_buf[2] & 0xFFFFFFu);
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
-    /* Shaded line: C0, V0, C1, V1 */
     parse_vertex(gp0_cmd_buf[3], &x1, &y1);
     x0 += draw_offset_x; y0 += draw_offset_y;
     x1 += draw_offset_x; y1 += draw_offset_y;
     sw_set_semi_transparency(semi_trans, (int)semi_transparency);
-    sw_draw_line(x0, y0, x1, y1, color);
+    sw_draw_shaded_line(x0, y0, c0, x1, y1, c1);
 }
 
 /* Execute mono rectangle (GP0 0x60-0x63) */
@@ -1435,6 +1444,63 @@ void gpu_write_gp0(uint32_t val) {
         return;
     }
 
+    /* State: mono polyline — each word is a vertex (or terminator) */
+    if (gp0_state == GP0_POLYLINE_MONO) {
+        if (val & 0xF000F000u) {
+            /* Terminator: bit pattern has high bits set in both halfwords */
+            gp0_state = GP0_IDLE;
+            return;
+        }
+        int32_t x, y;
+        parse_vertex(val, &x, &y);
+        x += draw_offset_x; y += draw_offset_y;
+        if (polyline_has_prev) {
+            sw_draw_line(polyline_prev_x, polyline_prev_y, x, y, polyline_color);
+        }
+        polyline_prev_x = x; polyline_prev_y = y;
+        polyline_has_prev = 1;
+        return;
+    }
+
+    /* State: shaded polyline — alternating color, vertex words */
+    if (gp0_state == GP0_POLYLINE_SHADED) {
+        /* Even words (after cmd) are colors, odd words are vertices.
+         * Sequence: [cmd+C0] [V0] [C1] [V1] [C2] [V2] ...
+         * polyline_has_prev tracks: 0=need V0, 1=need C_next, 2=need V_next */
+        if (!polyline_has_prev) {
+            /* First vertex */
+            int32_t x, y;
+            parse_vertex(val, &x, &y);
+            x += draw_offset_x; y += draw_offset_y;
+            polyline_prev_x = x; polyline_prev_y = y;
+            polyline_prev_c = polyline_color;
+            polyline_has_prev = 1;
+            return;
+        }
+        if (polyline_has_prev == 1) {
+            /* Expecting color word (or terminator) */
+            if (val & 0xF000F000u) {
+                gp0_state = GP0_IDLE;
+                return;
+            }
+            polyline_color = rgb888_to_rgb555(val & 0xFFFFFFu);
+            polyline_has_prev = 2;
+            return;
+        }
+        /* polyline_has_prev == 2: vertex word */
+        {
+            int32_t x, y;
+            parse_vertex(val, &x, &y);
+            x += draw_offset_x; y += draw_offset_y;
+            sw_draw_shaded_line(polyline_prev_x, polyline_prev_y, polyline_prev_c,
+                                x, y, polyline_color);
+            polyline_prev_x = x; polyline_prev_y = y;
+            polyline_prev_c = polyline_color;
+            polyline_has_prev = 1;
+        }
+        return;
+    }
+
     /* State: collecting words for a multi-word command */
     if (gp0_state == GP0_COLLECTING) {
         gp0_cmd_buf[gp0_words_collected++] = val;
@@ -1460,13 +1526,19 @@ void gpu_write_gp0(uint32_t val) {
     }
 
     if (word_count < 0) {
-        /* Polyline — not yet implemented */
-        FILE* cf = fopen("psx_crash.txt", "w");
-        if (cf) {
-            fprintf(cf, "GPU GP0 polyline command 0x%02X not implemented\n", opcode);
-            fclose(cf);
-        }
-        exit(1);
+        /* Variable-length polyline command.
+         * Mono  (0x48-0x4F): [cmd+color] [v0] [v1] ... [terminator]
+         * Shaded(0x58-0x5F): [cmd+C0] [v0] [C1] [v1] ... [terminator]
+         * Terminator: word with bit 31 set (0x5xxx or 0xFFFF). */
+        int shaded = (opcode & 0x10) != 0;  /* 0x58+ = shaded, 0x48+ = mono */
+        polyline_semi_trans = (val >> 25) & 1;
+        polyline_color = rgb888_to_rgb555(val & 0xFFFFFFu);
+        polyline_prev_c = polyline_color;
+        polyline_has_prev = 0;
+        sw_set_semi_transparency(polyline_semi_trans, (int)semi_transparency);
+        gp0_state = shaded ? GP0_POLYLINE_SHADED : GP0_POLYLINE_MONO;
+        gp0_draw_count++;
+        return;
     }
 
     gp0_cmd_buf[0] = val;
