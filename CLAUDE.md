@@ -295,3 +295,20 @@ layout and how to regenerate the patch.
 **Never edit the submodule source to work around upstream bugs.** If a change
 is needed in DuckStation's side, edit in the working tree, then regenerate the
 patch against the pinned base — so the change is reviewable in a single diff.
+
+---
+
+## 17. Phase 5 gate — fix hardware stubs before loading a game
+
+`STUBS_TO_FIX.md` lists every known stub in the runtime. Before any
+Phase 5 work (loading Tomba or any game EXE), every stub marked
+"Phase 5+" in that file **must be implemented and oracle-verified**:
+
+- **S3 — MDEC decoder** (FMV playback)
+- **S4 — SPU audio synthesis** (sound output)
+- **S5 — DMA channels 0/1/3/4** (MDEC, CDROM, SPU data pipes)
+
+These cannot be tested until disc data flows, but they cannot be
+skipped either. The first task of Phase 5 is to implement them, not
+to load the game and see what breaks. Loading the game with known
+stubs is how v3 ended up with 1808 lines of shims.
