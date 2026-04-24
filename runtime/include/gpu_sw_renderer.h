@@ -35,6 +35,8 @@ void sw_draw_textured_rect(int x, int y, int w, int h,
                            uint16_t clut_x, uint16_t clut_y,
                            uint16_t texpage);
 void sw_draw_line(int x0, int y0, int x1, int y1, uint16_t color);
+void sw_draw_shaded_line(int x0, int y0, uint16_t c0,
+                         int x1, int y1, uint16_t c1);
 
 /* Copy display region to a 32-bit RGBA buffer for SDL presentation.
    Returns number of pixels written. */

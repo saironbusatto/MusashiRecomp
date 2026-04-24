@@ -646,6 +646,39 @@ void sw_draw_line(int x0, int y0, int x1, int y1, uint16_t color) {
     }
 }
 
+void sw_draw_shaded_line(int x0, int y0, uint16_t c0,
+                         int x1, int y1, uint16_t c1) {
+    int dx = abs(x1 - x0);
+    int dy = -abs(y1 - y0);
+    int sx = (x0 < x1) ? 1 : -1;
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx + dy;
+
+    /* Total steps for interpolation */
+    int total = max_i(abs(x1 - x0), abs(y1 - y0));
+    if (total == 0) total = 1;
+
+    /* Extract 5-bit color channels */
+    int r0 = c0 & 0x1F, g0 = (c0 >> 5) & 0x1F, b0 = (c0 >> 10) & 0x1F;
+    int r1 = c1 & 0x1F, g1 = (c1 >> 5) & 0x1F, b1 = (c1 >> 10) & 0x1F;
+
+    int step = 0;
+    for (;;) {
+        int r = r0 + (r1 - r0) * step / total;
+        int g = g0 + (g1 - g0) * step / total;
+        int b = b0 + (b1 - b0) * step / total;
+        uint16_t color = (uint16_t)(r | (g << 5) | (b << 10));
+        draw_pixel_opaque(x0, y0, color);
+
+        if (x0 == x1 && y0 == y1) break;
+
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+        step++;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* VRAM pixel access                                                  */
 /* ------------------------------------------------------------------ */
