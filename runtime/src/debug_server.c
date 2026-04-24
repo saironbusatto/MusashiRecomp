@@ -268,7 +268,7 @@ void debug_server_send_line(const char *json)
 
 void debug_server_send_fmt(const char *fmt, ...)
 {
-    char buf[16384];
+    char buf[65536];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
@@ -346,14 +346,16 @@ static void handle_read_ram(int id, const char *json)
     uint32_t addr = hex_to_u32(addr_str);
     int len = json_get_int(json, "len", 1);
     if (len < 1) len = 1;
-    if (len > 256) len = 256;
+    if (len > 16384) len = 16384;  /* 16KB max */
 
-    char hex[513];
+    char *hex = (char *)malloc(len * 2 + 1);
+    if (!hex) { send_err(id, "alloc failed"); return; }
     for (int i = 0; i < len; i++)
         snprintf(hex + i * 2, 3, "%02x", psx_read_byte(addr + i));
 
     send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"len\":%d,\"hex\":\"%s\"}",
              id, addr, len, hex);
+    free(hex);
 }
 
 static void handle_dump_ram(int id, const char *json)
