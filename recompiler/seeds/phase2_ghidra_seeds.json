@@ -1,7 +1,7 @@
 {
   "schema": "psxrecomp-v4 phase2 seeds",
   "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
-  "seed_count": 955,
+  "seed_count": 960,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -4777,6 +4777,31 @@
       "address": "0xBFC34A64",
       "label": "gte_lib_BFC34A64",
       "rationale": "GTE library sub-entry. Cascade."
+    },
+    {
+      "address": "0xBFC41D18",
+      "label": "shell_3d_callback_BFC41D18",
+      "rationale": "DuckStation oracle TCB saved PC - shell 3D rendering callback"
+    },
+    {
+      "address": "0xBFC41DFC",
+      "label": "shell_3d_callback_BFC41DFC",
+      "rationale": "DuckStation oracle TCB saved EPC - shell 3D rendering"
+    },
+    {
+      "address": "0xBFC210F0",
+      "label": "shell_handler_BFC210F0",
+      "rationale": "Recomp TCB saved PC - handler function"
+    },
+    {
+      "address": "0xBFC41DC8",
+      "label": "dispatch_miss_0xBFC41DC8",
+      "rationale": "Phase 4.5 dispatch miss from 3D rendering seeds"
+    },
+    {
+      "address": "0xBFC41E14",
+      "label": "dispatch_miss_0xBFC41E14",
+      "rationale": "Phase 4.5 dispatch miss from 3D rendering seeds"
     }
   ],
   "excluded": [
