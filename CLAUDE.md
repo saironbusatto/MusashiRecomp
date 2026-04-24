@@ -254,7 +254,28 @@ Do NOT guess behavior.
 
 ---
 
-## 15. DuckStation oracle setup (from fresh checkout)
+## 15. Broken tooling is never acceptable. Fix it.
+
+If a tool, command, or verification mechanism fails or returns
+unexpected results:
+
+→ **Fix the tool.** Diagnose why it failed and repair it.  
+→ Do NOT route around it with indirect evidence.  
+→ Do NOT infer correctness from two broken implementations agreeing.  
+
+"The screenshot command returns black" is not a reason to skip visual
+verification. It is a reason to fix the screenshot command.
+
+"Both the native runtime and interpreter show the same wrong value"
+does not make the value correct. It means both have the same bug.
+
+If you cannot fix the tool, **ask the user** what they observe.
+Never declare a result "correct" without direct verification against
+the oracle.
+
+---
+
+## 16. DuckStation oracle setup (from fresh checkout)
 
 On a fresh clone of this repo, the DuckStation oracle is not yet ready. Run:
 
