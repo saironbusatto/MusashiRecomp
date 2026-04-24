@@ -68,20 +68,25 @@ class DebugClient:
                 time.sleep(0.1)
 
     def read_ram(self, addr, length):
-        """Read up to 256 bytes."""
+        """Read up to 16KB."""
         resp = self.send({"cmd": "read_ram", "addr": hex(addr), "len": length})
         if not resp.get('ok'):
             raise RuntimeError(f"read_ram failed at 0x{addr:08X}: {resp}")
-        return bytes.fromhex(resp['hex'])
+        data = bytes.fromhex(resp['hex'])
+        if len(data) != length:
+            raise RuntimeError(f"read_ram at 0x{addr:08X}: requested {length}, got {len(data)}")
+        return data
 
+
+CHUNK_SIZE = 4096  # 4KB per request — fits in both servers' buffers
 
 def read_ram_range(client, lo, hi, label=""):
-    """Read a full RAM range in 256-byte chunks using a persistent connection."""
+    """Read a full RAM range in CHUNK_SIZE-byte chunks using a persistent connection."""
     result = bytearray()
     total = hi - lo
     done = 0
-    for addr in range(lo, hi, 256):
-        chunk_len = min(256, hi - addr)
+    for addr in range(lo, hi, CHUNK_SIZE):
+        chunk_len = min(CHUNK_SIZE, hi - addr)
         chunk = client.read_ram(addr, chunk_len)
         result.extend(chunk)
         done += chunk_len
@@ -93,8 +98,13 @@ def read_ram_range(client, lo, hi, label=""):
 
 
 def find_divergences(recomp_data, oracle_data, base_addr, excludes, max_results=20):
-    """Compare two RAM buffers and return list of divergences."""
+    """Compare two RAM buffers and return (divergences_list, total_diff_bytes, total_compared).
+
+    Never silently truncates: always returns full counts even when
+    max_results limits the detailed list."""
     divergences = []
+    total_diff_bytes = 0
+    total_compared = 0
     i = 0
     while i < len(recomp_data) and i < len(oracle_data):
         addr = base_addr + i
@@ -102,33 +112,36 @@ def find_divergences(recomp_data, oracle_data, base_addr, excludes, max_results=
         excluded = False
         for ex_addr, ex_len in excludes:
             if ex_addr <= addr < ex_addr + ex_len:
-                i = ex_addr + ex_len - base_addr  # skip past exclusion
+                i = ex_addr + ex_len - base_addr
                 excluded = True
                 break
         if excluded:
             continue
 
+        total_compared += 1
         if recomp_data[i] != oracle_data[i]:
-            # Found a divergence — collect the full divergent run
+            total_diff_bytes += 1
+            # Collect the full divergent run (no length cap)
             run_start = i
             while (i < len(recomp_data) and i < len(oracle_data) and
-                   recomp_data[i] != oracle_data[i] and
-                   i - run_start < 64):
+                   recomp_data[i] != oracle_data[i]):
+                if i > run_start:
+                    total_compared += 1
+                    total_diff_bytes += 1
                 i += 1
             run_end = i
 
-            divergences.append({
-                'addr': base_addr + run_start,
-                'len': run_end - run_start,
-                'recomp': recomp_data[run_start:run_end],
-                'oracle': oracle_data[run_start:run_end],
-            })
-            if len(divergences) >= max_results:
-                break
+            if len(divergences) < max_results:
+                divergences.append({
+                    'addr': base_addr + run_start,
+                    'len': run_end - run_start,
+                    'recomp': recomp_data[run_start:run_end],
+                    'oracle': oracle_data[run_start:run_end],
+                })
         else:
             i += 1
 
-    return divergences
+    return divergences, total_diff_bytes, total_compared
 
 
 def format_divergence(d):
@@ -169,10 +182,9 @@ def main():
                         help='Skip pause/continue (read live)')
     args = parser.parse_args()
 
-    # Parse exclusions
+    # Parse exclusions — nothing excluded by default.
+    # Use --exclude 0x80079D9C:4 to exclude VSync counter if needed.
     excludes = []
-    # Always exclude VSync counter (timing-dependent)
-    excludes.append((0x80079D9C, 4))
     for ex in args.exclude:
         parts = ex.split(':')
         ex_addr = int(parts[0], 0)
@@ -244,14 +256,18 @@ def main():
     oracle.close()
 
     # Find divergences
-    divs = find_divergences(recomp_ram, oracle_ram, args.lo, excludes, args.max)
+    divs, total_diff, total_compared = find_divergences(
+        recomp_ram, oracle_ram, args.lo, excludes, args.max)
+
+    print(f"SUMMARY: {total_diff} bytes differ out of {total_compared} compared "
+          f"({total_diff*100/max(total_compared,1):.2f}%)")
+    print(f"  Showing {len(divs)} divergent region(s)" +
+          (f" (capped at --max {args.max}; there may be more)" if len(divs) >= args.max else ""))
+    print()
 
     if not divs:
         print("NO DIVERGENCES FOUND in scanned range.")
-        print("(This may mean both sides match, or the relevant state is outside this range.)")
     else:
-        print(f"FOUND {len(divs)} DIVERGENCE(S):")
-        print()
         for i, d in enumerate(divs):
             print(f"#{i+1}: {format_divergence(d)}")
             print()
