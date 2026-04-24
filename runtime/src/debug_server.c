@@ -1414,10 +1414,12 @@ void debug_server_init(int port)
     s_wtrace_seq = 0;
     s_wtrace_head = 0;
 
-    /* Default trace range: EvCB + kernel data region. */
-    s_wtrace_ranges[0].lo = 0x0000E000u;
-    s_wtrace_ranges[0].hi = 0x0000E300u;
-    s_wtrace_range_count = 1;
+    /* Phase 4.5: watch EB4 area + DF8/DFC area. */
+    s_wtrace_ranges[0].lo = 0x00079EB0u;
+    s_wtrace_ranges[0].hi = 0x00079EC0u;
+    s_wtrace_ranges[1].lo = 0x00079DF0u;
+    s_wtrace_ranges[1].hi = 0x00079E04u;
+    s_wtrace_range_count = 2;
 
     /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */
     if (!s_mmio_trace) {
