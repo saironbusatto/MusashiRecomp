@@ -1,7 +1,7 @@
 {
   "schema": "psxrecomp-v4 phase2 seeds",
-  "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
-  "seed_count": 960,
+  "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual + gte_lib_seeds",
+  "seed_count": 1006,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -4802,6 +4802,190 @@
       "address": "0xBFC41E14",
       "label": "dispatch_miss_0xBFC41E14",
       "rationale": "Phase 4.5 dispatch miss from 3D rendering seeds"
+    },
+    {
+      "address": "0xBFC34E00",
+      "name": "gte_lib_BFC34E00"
+    },
+    {
+      "address": "0xBFC3586C",
+      "name": "gte_lib_BFC3586C"
+    },
+    {
+      "address": "0xBFC359B4",
+      "name": "gte_lib_BFC359B4"
+    },
+    {
+      "address": "0xBFC35AD8",
+      "name": "gte_lib_BFC35AD8"
+    },
+    {
+      "address": "0xBFC35B08",
+      "name": "gte_lib_BFC35B08"
+    },
+    {
+      "address": "0xBFC35B38",
+      "name": "gte_lib_BFC35B38"
+    },
+    {
+      "address": "0xBFC35B68",
+      "name": "gte_lib_BFC35B68"
+    },
+    {
+      "address": "0xBFC36000",
+      "name": "gte_lib_BFC36000"
+    },
+    {
+      "address": "0xBFC36024",
+      "name": "gte_lib_BFC36024"
+    },
+    {
+      "address": "0xBFC36068",
+      "name": "gte_lib_BFC36068"
+    },
+    {
+      "address": "0xBFC36094",
+      "name": "gte_lib_BFC36094"
+    },
+    {
+      "address": "0xBFC360E0",
+      "name": "gte_lib_BFC360E0"
+    },
+    {
+      "address": "0xBFC36104",
+      "name": "gte_lib_BFC36104"
+    },
+    {
+      "address": "0xBFC3614C",
+      "name": "gte_lib_BFC3614C"
+    },
+    {
+      "address": "0xBFC36178",
+      "name": "gte_lib_BFC36178"
+    },
+    {
+      "address": "0xBFC361A0",
+      "name": "gte_lib_BFC361A0"
+    },
+    {
+      "address": "0xBFC361CC",
+      "name": "gte_lib_BFC361CC"
+    },
+    {
+      "address": "0xBFC361F4",
+      "name": "gte_lib_BFC361F4"
+    },
+    {
+      "address": "0xBFC3621C",
+      "name": "gte_lib_BFC3621C"
+    },
+    {
+      "address": "0xBFC36244",
+      "name": "gte_lib_BFC36244"
+    },
+    {
+      "address": "0xBFC3625C",
+      "name": "gte_lib_BFC3625C"
+    },
+    {
+      "address": "0xBFC36280",
+      "name": "gte_lib_BFC36280"
+    },
+    {
+      "address": "0xBFC36294",
+      "name": "gte_lib_BFC36294"
+    },
+    {
+      "address": "0xBFC362BC",
+      "name": "gte_lib_BFC362BC"
+    },
+    {
+      "address": "0xBFC362D0",
+      "name": "gte_lib_BFC362D0"
+    },
+    {
+      "address": "0xBFC3632C",
+      "name": "gte_lib_BFC3632C"
+    },
+    {
+      "address": "0xBFC36388",
+      "name": "gte_lib_BFC36388"
+    },
+    {
+      "address": "0xBFC363A0",
+      "name": "gte_lib_BFC363A0"
+    },
+    {
+      "address": "0xBFC363F0",
+      "name": "gte_lib_BFC363F0"
+    },
+    {
+      "address": "0xBFC36458",
+      "name": "gte_lib_BFC36458"
+    },
+    {
+      "address": "0xBFC364DC",
+      "name": "gte_lib_BFC364DC"
+    },
+    {
+      "address": "0xBFC3653C",
+      "name": "gte_lib_BFC3653C"
+    },
+    {
+      "address": "0xBFC365C4",
+      "name": "gte_lib_BFC365C4"
+    },
+    {
+      "address": "0xBFC365F8",
+      "name": "gte_lib_BFC365F8"
+    },
+    {
+      "address": "0xBFC36684",
+      "name": "gte_lib_BFC36684"
+    },
+    {
+      "address": "0xBFC36740",
+      "name": "gte_lib_BFC36740"
+    },
+    {
+      "address": "0xBFC367D4",
+      "name": "gte_lib_BFC367D4"
+    },
+    {
+      "address": "0xBFC36880",
+      "name": "gte_lib_BFC36880"
+    },
+    {
+      "address": "0xBFC36940",
+      "name": "gte_lib_BFC36940"
+    },
+    {
+      "address": "0xBFC36998",
+      "name": "gte_lib_BFC36998"
+    },
+    {
+      "address": "0xBFC36A3C",
+      "name": "gte_lib_BFC36A3C"
+    },
+    {
+      "address": "0xBFC36B14",
+      "name": "gte_lib_BFC36B14"
+    },
+    {
+      "address": "0xBFC36BEC",
+      "name": "gte_lib_BFC36BEC"
+    },
+    {
+      "address": "0xBFC36C60",
+      "name": "gte_lib_BFC36C60"
+    },
+    {
+      "address": "0xBFC36CA4",
+      "name": "gte_lib_BFC36CA4"
+    },
+    {
+      "address": "0xBFC36FF0",
+      "name": "gte_lib_BFC36FF0"
     }
   ],
   "excluded": [
