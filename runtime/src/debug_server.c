@@ -586,6 +586,13 @@ static void handle_sio_state(int id, const char *json)
     extern int sio_get_mc_probe_count(void);
     extern int sio_get_mc_ack_count(void);
     extern int sio_get_mc_cmd_count(void);
+    extern int sio_get_mc_read_count(void);
+    extern int sio_get_mc_read_done(void);
+    extern uint32_t sio_get_mc_last_caller(void);
+    extern int sio_get_mc_abort_count(void);
+    extern int sio_get_mc_abort_state(void);
+    extern uint16_t sio_get_mc_abort_ctrl(void);
+    extern int sio_get_mc_max_state(void);
     extern int sio_get_tx_writes(void);
     extern int sio_get_tx_gated(void);
     extern uint16_t sio_get_last_ctrl_on_tx(void);
@@ -597,6 +604,13 @@ static void handle_sio_state(int id, const char *json)
              "\"mc_probes\":%d,"
              "\"mc_acks\":%d,"
              "\"mc_cmds\":%d,"
+             "\"mc_reads\":%d,"
+             "\"mc_read_done\":%d,"
+             "\"mc_last_caller\":\"0x%08X\","
+             "\"mc_aborts\":%d,"
+             "\"mc_abort_state\":%d,"
+             "\"mc_abort_ctrl\":\"0x%04X\","
+             "\"mc_max_state\":%d,"
              "\"tx_writes\":%d,"
              "\"tx_gated\":%d,"
              "\"last_ctrl_on_tx\":\"0x%04X\"}",
@@ -608,9 +622,101 @@ static void handle_sio_state(int id, const char *json)
              sio_get_mc_probe_count(),
              sio_get_mc_ack_count(),
              sio_get_mc_cmd_count(),
+             sio_get_mc_read_count(),
+             sio_get_mc_read_done(),
+             sio_get_mc_last_caller(),
+             sio_get_mc_abort_count(),
+             sio_get_mc_abort_state(),
+             sio_get_mc_abort_ctrl(),
+             sio_get_mc_max_state(),
              sio_get_tx_writes(),
              sio_get_tx_gated(),
              sio_get_last_ctrl_on_tx());
+}
+
+/* ---- I_MASK bit 7 trace (card protocol flow) ---- */
+typedef struct {
+    uint32_t old_mask;
+    uint32_t new_mask;
+    uint32_t caller;
+    uint8_t  width;
+    uint8_t  bit7_set;
+    uint8_t  bit7_clear;
+    uint8_t  in_exc;
+} ImaskTraceEntry;
+extern int memory_get_imask_bit7_set_count(void);
+extern int memory_get_imask_bit7_clear_count(void);
+extern const ImaskTraceEntry *memory_get_imask_trace(int *idx_out, int *count_out);
+
+static void handle_imask_trace(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 32);
+    int idx, total;
+    const ImaskTraceEntry *buf = memory_get_imask_trace(&idx, &total);
+    int cap = 256; /* IMASK_TRACE_CAP */
+    int avail = total < cap ? total : cap;
+    if (count > avail) count = avail;
+    if (count < 1) count = 1;
+
+    int start = (idx - count + cap) % cap;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"bit7_sets\":%d,\"bit7_clears\":%d,"
+             "\"total\":%d,\"count\":%d,\"entries\":[",
+             id, memory_get_imask_bit7_set_count(),
+             memory_get_imask_bit7_clear_count(), total, count);
+
+    for (int i = 0; i < count; i++) {
+        int ii = (start + i) % cap;
+        const ImaskTraceEntry *e = &buf[ii];
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"old\":\"0x%03X\",\"new\":\"0x%03X\","
+                 "\"func\":\"0x%08X\",\"w\":%d,"
+                 "\"b7s\":%d,\"b7c\":%d,\"exc\":%d}",
+                 e->old_mask, e->new_mask,
+                 (unsigned)e->caller, e->width,
+                 e->bit7_set, e->bit7_clear, e->in_exc);
+    }
+    send_fmt("]}\n");
+}
+
+static void handle_sio_trace(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 64);
+    if (count < 1) count = 1;
+    if (count > SIO_TRACE_CAP) count = SIO_TRACE_CAP;
+
+    const SioTraceEntry *buf;
+    int write_idx;
+    uint32_t total_seq = sio_get_trace(&buf, &write_idx);
+
+    /* How many entries are actually available? */
+    int avail = (int)(total_seq < (uint32_t)SIO_TRACE_CAP ? total_seq : SIO_TRACE_CAP);
+    if (count > avail) count = avail;
+
+    /* Start reading from (write_idx - count) wrapped */
+    int start = (write_idx - count + SIO_TRACE_CAP) % SIO_TRACE_CAP;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"count\":%d,\"entries\":[",
+             id, (unsigned)total_seq, count);
+
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % SIO_TRACE_CAP;
+        const SioTraceEntry *e = &buf[idx];
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"seq\":%u,\"tx\":\"0x%02X\",\"rx\":\"0x%02X\","
+                 "\"mc_pre\":%d,\"mc_post\":%d,"
+                 "\"dev_pre\":%d,\"dev_post\":%d,"
+                 "\"ctrl\":\"0x%04X\",\"func\":\"0x%08X\","
+                 "\"abort\":%d,\"irq_cd\":%d,\"in_exc\":%d,\"ctr\":%d}",
+                 (unsigned)e->seq, e->tx, e->rx,
+                 e->mc_state_pre, e->mc_state_post,
+                 e->dev_pre, e->dev_post,
+                 e->ctrl, (unsigned)e->func_addr,
+                 e->was_abort, e->irq_countdown, e->in_exception,
+                 e->counter_7514);
+    }
+
+    send_fmt("]}\n");
 }
 
 static void handle_watch(int id, const char *json)
@@ -1380,6 +1486,8 @@ static const CmdEntry s_commands[] = {
     { "vram_peek",         handle_vram_peek },
     { "irq_state",         handle_irq_state },
     { "sio_state",         handle_sio_state },
+    { "sio_trace",         handle_sio_trace },
+    { "imask_trace",       handle_imask_trace },
     { "watch",             handle_watch },
     { "unwatch",           handle_unwatch },
     { "wtrace_range",      handle_wtrace_range },
@@ -1624,7 +1732,7 @@ void debug_server_record_frame(void)
     }
 
     /* SIO state */
-    r->pad_buttons = 0; /* TODO: expose from sio.c */
+    r->pad_buttons = sio_get_pad_buttons();
     r->sio_stat = (uint16_t)sio_read(0x1F801044);
     r->sio_ctrl = (uint16_t)sio_read(0x1F80104A);
 

@@ -32,6 +32,29 @@ void sio_connect_pad(int slot);
 /* Return current pad button state (for debug server). */
 uint16_t sio_get_pad_buttons(void);
 
+/* ---- SIO byte-level trace ring buffer ---- */
+#define SIO_TRACE_CAP 4096
+
+typedef struct {
+    uint32_t seq;           /* monotonic sequence number */
+    uint8_t  tx;            /* byte written to TX */
+    uint8_t  rx;            /* byte produced in RX */
+    uint8_t  mc_state_pre;  /* mc_state BEFORE processing */
+    uint8_t  mc_state_post; /* mc_state AFTER processing */
+    uint8_t  dev_pre;       /* active_device BEFORE (0=NONE,1=PAD,2=MC) */
+    uint8_t  dev_post;      /* active_device AFTER */
+    uint16_t ctrl;          /* CTRL register value */
+    uint32_t func_addr;     /* g_debug_current_func_addr */
+    uint8_t  was_abort;     /* 1 if this byte caused mc_state abort */
+    uint8_t  irq_countdown; /* sio_irq_countdown at entry */
+    uint8_t  in_exception;  /* psx_get_in_exception() at time of byte */
+    uint8_t  counter_7514; /* RAM[0x7514] at time of byte */
+} SioTraceEntry;
+
+/* Get pointer to ring buffer and current write index.
+ * Returns number of entries ever written (seq of next write). */
+uint32_t sio_get_trace(const SioTraceEntry **buf_out, int *write_idx_out);
+
 #ifdef __cplusplus
 }
 #endif

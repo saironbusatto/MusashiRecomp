@@ -49,6 +49,49 @@ static const uint32_t *sr_ptr;
 uint32_t i_stat;  /* 0x1F801070 — interrupt status (AND-acknowledge semantics) */
 uint32_t i_mask;  /* 0x1F801074 — interrupt enable mask */
 
+/* ---- Card protocol trace: tracks I_MASK bit 7 transitions ---- */
+#define IMASK_TRACE_CAP 256
+typedef struct {
+    uint32_t old_mask;
+    uint32_t new_mask;
+    uint32_t caller;     /* g_debug_current_func_addr */
+    uint8_t  width;      /* 16 or 32 */
+    uint8_t  bit7_set;   /* 1 if this write SET bit 7 */
+    uint8_t  bit7_clear; /* 1 if this write CLEARED bit 7 */
+    uint8_t  in_exc;
+} ImaskTraceEntry;
+static ImaskTraceEntry imask_trace[IMASK_TRACE_CAP];
+static int imask_trace_idx = 0;
+static int imask_trace_count = 0;
+static int imask_bit7_set_count = 0;
+static int imask_bit7_clear_count = 0;
+
+static void imask_trace_record(uint32_t old_val, uint32_t new_val, uint8_t width) {
+    extern uint32_t g_debug_current_func_addr;
+    extern int psx_get_in_exception(void);
+    ImaskTraceEntry *e = &imask_trace[imask_trace_idx];
+    e->old_mask   = old_val;
+    e->new_mask   = new_val;
+    e->caller     = g_debug_current_func_addr;
+    e->width      = width;
+    e->bit7_set   = (!(old_val & 0x80) && (new_val & 0x80)) ? 1 : 0;
+    e->bit7_clear = ((old_val & 0x80) && !(new_val & 0x80)) ? 1 : 0;
+    e->in_exc     = (uint8_t)psx_get_in_exception();
+    if (e->bit7_set) imask_bit7_set_count++;
+    if (e->bit7_clear) imask_bit7_clear_count++;
+    imask_trace_idx = (imask_trace_idx + 1) % IMASK_TRACE_CAP;
+    imask_trace_count++;
+}
+
+/* Getters for debug server */
+int memory_get_imask_bit7_set_count(void) { return imask_bit7_set_count; }
+int memory_get_imask_bit7_clear_count(void) { return imask_bit7_clear_count; }
+const ImaskTraceEntry *memory_get_imask_trace(int *idx_out, int *count_out) {
+    if (idx_out) *idx_out = imask_trace_idx;
+    if (count_out) *count_out = imask_trace_count;
+    return imask_trace;
+}
+
 /* Tier 1 write-trace hooks (implemented in debug_server.c). */
 extern void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                            uint32_t new_val, uint8_t width);
@@ -180,7 +223,7 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
     }
     /* Interrupts: 0x1F801070, 0x1F801074 */
     if (addr == 0x1F801070u) { i_stat &= val; return; } /* AND-acknowledge */
-    if (addr == 0x1F801074u) { i_mask = val & 0x7FFu; return; }
+    if (addr == 0x1F801074u) { uint32_t old = i_mask; i_mask = val & 0x7FFu; imask_trace_record(old, i_mask, 32); return; }
     /* DMA: 0x1F801080..0x1F8010FF */
     if (addr >= 0x1F801080u && addr <= 0x1F8010FFu) {
         dma_write(addr, val);
@@ -247,7 +290,7 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
     }
     /* Interrupts */
     if (addr == 0x1F801070u) { i_stat &= val; return; }
-    if (addr == 0x1F801074u) { i_mask = val & 0x7FFu; return; }
+    if (addr == 0x1F801074u) { uint32_t old = i_mask; i_mask = val & 0x7FFu; imask_trace_record(old, i_mask, 16); return; }
     /* Timers: 0x1F801100..0x1F80112F */
     if (addr >= 0x1F801100u && addr <= 0x1F80112Fu) {
         timers_write(addr, val);

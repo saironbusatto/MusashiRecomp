@@ -76,6 +76,31 @@ typedef enum {
     MC_GETID_4,
 } McState;
 
+/* Per-slot card state.  On real hardware each card controller is a
+ * separate physical device that retains its protocol state independently.
+ * When the BIOS alternates between slot 0 and slot 1 (by changing the
+ * SLOT bit in SIO_CTRL), the in-flight card on one slot must not lose
+ * its state because the other slot is being probed. */
+typedef struct {
+    McState  state;
+    uint8_t  cmd;
+    uint16_t sector;
+    uint8_t  sector_msb;
+    uint8_t  sector_lsb;
+    uint8_t  data[128];
+    int      data_idx;
+    uint8_t  checksum;
+    uint8_t  flag;  /* 0x08=new data, 0x00=normal */
+} McSlotState;
+
+static McSlotState mc_slots[2] = {
+    { MC_IDLE, 0, 0, 0, 0, {0}, 0, 0, 0x08 },
+    { MC_IDLE, 0, 0, 0, 0, {0}, 0, 0, 0x08 },
+};
+
+/* Active slot's state — copied from mc_slots[selected_slot] before each
+ * byte exchange and copied back after.  The mc_process_byte function
+ * operates on these "working" variables for simplicity. */
 static McState mc_state = MC_IDLE;
 static int mc_slot = 0;
 static uint8_t mc_cmd = 0;
@@ -95,17 +120,72 @@ typedef enum {
 
 static ActiveDevice active_device = DEV_NONE;
 
+/* Save working mc_ vars back to the slot state for the given slot. */
+static void mc_save_slot(int slot) {
+    if (slot < 0 || slot > 1) return;
+    McSlotState *s = &mc_slots[slot];
+    s->state      = mc_state;
+    s->cmd        = mc_cmd;
+    s->sector     = mc_sector;
+    s->sector_msb = mc_sector_msb;
+    s->sector_lsb = mc_sector_lsb;
+    memcpy(s->data, mc_data, sizeof(mc_data));
+    s->data_idx   = mc_data_idx;
+    s->checksum   = mc_checksum;
+    s->flag       = mc_flag;
+}
+
+/* Load slot state into working mc_ vars. */
+static void mc_load_slot(int slot) {
+    if (slot < 0 || slot > 1) return;
+    const McSlotState *s = &mc_slots[slot];
+    mc_state      = s->state;
+    mc_cmd        = s->cmd;
+    mc_sector     = s->sector;
+    mc_sector_msb = s->sector_msb;
+    mc_sector_lsb = s->sector_lsb;
+    memcpy(mc_data, s->data, sizeof(mc_data));
+    mc_data_idx   = s->data_idx;
+    mc_checksum   = s->checksum;
+    mc_flag       = s->flag;
+}
+
 /* Card probe diagnostic counters */
 static int sio_mc_probe_count = 0;  /* times 0x81 written to TX */
 static int sio_mc_ack_count = 0;    /* times card sent ACK */
 static int sio_mc_cmd_count = 0;    /* times card reached CMD state */
+static int sio_mc_read_count = 0;   /* times 0x52 (read) cmd received */
+static int sio_mc_read_done = 0;    /* times read protocol completed */
+static uint32_t sio_mc_last_caller = 0; /* func that last sent 0x81 */
+static int sio_mc_abort_count = 0;  /* times mc_state reset from non-IDLE */
+static int sio_mc_abort_state = 0;  /* mc_state at last abort */
+static uint16_t sio_mc_abort_ctrl = 0; /* CTRL value that caused last abort */
+static int sio_mc_max_state = 0;    /* highest mc_state reached */
 static int sio_tx_writes = 0;       /* ANY write to SIO_TX_DATA */
 static int sio_tx_gated = 0;        /* writes gated by missing TX_EN */
 static uint16_t sio_last_ctrl_on_tx = 0; /* CTRL at last TX write */
 
+/* ---- SIO byte-level trace ring buffer ---- */
+static SioTraceEntry sio_trace_buf[SIO_TRACE_CAP];
+static int sio_trace_idx = 0;       /* next write position */
+static uint32_t sio_trace_seq = 0;  /* monotonic sequence number */
+
+uint32_t sio_get_trace(const SioTraceEntry **buf_out, int *write_idx_out) {
+    if (buf_out) *buf_out = sio_trace_buf;
+    if (write_idx_out) *write_idx_out = sio_trace_idx;
+    return sio_trace_seq;
+}
+
 int sio_get_mc_probe_count(void) { return sio_mc_probe_count; }
 int sio_get_mc_ack_count(void) { return sio_mc_ack_count; }
 int sio_get_mc_cmd_count(void) { return sio_mc_cmd_count; }
+int sio_get_mc_read_count(void) { return sio_mc_read_count; }
+int sio_get_mc_read_done(void) { return sio_mc_read_done; }
+uint32_t sio_get_mc_last_caller(void) { return sio_mc_last_caller; }
+int sio_get_mc_abort_count(void) { return sio_mc_abort_count; }
+int sio_get_mc_abort_state(void) { return sio_mc_abort_state; }
+uint16_t sio_get_mc_abort_ctrl(void) { return sio_mc_abort_ctrl; }
+int sio_get_mc_max_state(void) { return sio_mc_max_state; }
 int sio_get_tx_writes(void) { return sio_tx_writes; }
 int sio_get_tx_gated(void) { return sio_tx_gated; }
 uint16_t sio_get_last_ctrl_on_tx(void) { return sio_last_ctrl_on_tx; }
@@ -129,7 +209,18 @@ uint16_t sio_get_last_ctrl_on_tx(void) { return sio_last_ctrl_on_tx; }
  * The BIOS card detection does: TX write, STAT read, RX read, CTRL
  * write (clear IRQ), then checks I_STAT. We need the IRQ to fire
  * AFTER the CTRL clear. 4 accesses covers the typical sequence. */
-#define SIO_IRQ_DELAY 4
+/* IRQ delay for pad detection — short, just enough for the BIOS
+ * "write-clear-check" card detection sequence. */
+#define SIO_IRQ_DELAY_PAD 4
+
+/* IRQ delay for active card transfers — moderate value to keep TX_RDY
+ * cleared briefly during a byte transfer.  Per-slot state already
+ * prevents pad bytes from corrupting card state, so we don't need a
+ * long delay — we just need the IRQ to fire SOON so the SIO chain
+ * walker can dispatch the next card byte before the next timer tick
+ * clears the protocol counter. */
+#define SIO_IRQ_DELAY_CARD 8
+
 static int sio_irq_pending = 0;
 static int sio_irq_countdown = 0;
 
@@ -161,6 +252,17 @@ void sio_init(void) {
     pad_buttons = 0xFFFF;
     pad_connected = 0;
     mc_state = MC_IDLE;
+    for (int i = 0; i < 2; i++) {
+        mc_slots[i].state = MC_IDLE;
+        mc_slots[i].cmd = 0;
+        mc_slots[i].sector = 0;
+        mc_slots[i].sector_msb = 0;
+        mc_slots[i].sector_lsb = 0;
+        memset(mc_slots[i].data, 0, sizeof(mc_slots[i].data));
+        mc_slots[i].data_idx = 0;
+        mc_slots[i].checksum = 0;
+        mc_slots[i].flag = 0x08;
+    }
     active_device = DEV_NONE;
     sio_irq_pending = 0;
     sio_irq_countdown = 0;
@@ -231,6 +333,7 @@ static void pad_process_byte(uint8_t tx_byte) {
 }
 
 static void mc_process_byte(uint8_t tx_byte) {
+    if ((int)mc_state > sio_mc_max_state) sio_mc_max_state = (int)mc_state;
     switch (mc_state) {
     case MC_IDLE:
         mc_slot = selected_slot;
@@ -248,6 +351,7 @@ static void mc_process_byte(uint8_t tx_byte) {
         mc_cmd = tx_byte;
         sio_mc_cmd_count++;
         if (tx_byte == 0x52 || tx_byte == 0x57 || tx_byte == 0x53) {
+            if (tx_byte == 0x52) sio_mc_read_count++;
             mc_state = MC_ID1;
             sio_rx_data = mc_flag;
             sio_stat |= SIO_STAT_ACK;
@@ -358,6 +462,7 @@ static void mc_process_byte(uint8_t tx_byte) {
 
     case MC_READ_END:
         mc_state = MC_IDLE;
+        sio_mc_read_done++;
         if (mc_sector < MEMCARD_SECTORS) {
             sio_rx_data = 0x47; /* 'G' = Good */
         } else {
@@ -425,23 +530,105 @@ static void mc_process_byte(uint8_t tx_byte) {
 }
 
 static void sio_process_byte(uint8_t tx_byte) {
+    /* ---- Trace: capture pre-state ---- */
+    extern uint32_t g_debug_current_func_addr;
+    uint8_t trace_mc_pre = (uint8_t)mc_state;
+    uint8_t trace_dev_pre = (uint8_t)active_device;
+    uint8_t trace_irq_cd = (uint8_t)(sio_irq_countdown > 255 ? 255 : sio_irq_countdown);
+    int trace_abort_before = sio_mc_abort_count;
+
     if (active_device == DEV_NONE) {
         selected_slot = (sio_ctrl & SIO_CTRL_SLOT) ? 1 : 0;
+
         if (tx_byte == 0x01) {
+            /* Pad select.  Save any in-flight card state back to its slot
+             * so it survives pad polling.  Don't touch mc_state — we need
+             * it per-slot, and mc_load_slot will restore it when the card
+             * slot is selected again. */
+            if (mc_state != MC_IDLE) {
+                mc_save_slot(mc_slot);
+                mc_state = MC_IDLE; /* working vars idle while pad talks */
+            }
             active_device = DEV_PAD;
             pad_process_byte(tx_byte);
         } else if (tx_byte == 0x81) {
+            /* Card select.  Load this slot's state.  If the slot already
+             * has an in-flight protocol, the 0x81 restarts it (abort). */
+            mc_load_slot(selected_slot);
+            if (mc_state != MC_IDLE) {
+                sio_mc_abort_count++;
+                sio_mc_abort_state = (int)mc_state;
+                sio_mc_abort_ctrl = sio_ctrl;
+                mc_state = MC_IDLE;
+            }
             active_device = DEV_MEMCARD;
+            mc_slot = selected_slot;
             sio_mc_probe_count++;
+            { extern uint32_t g_debug_current_func_addr;
+              sio_mc_last_caller = g_debug_current_func_addr; }
             mc_process_byte(tx_byte);
         } else {
-            sio_rx_data = 0xFF;
-            sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
+            /* Non-select byte with DEV_NONE — only resume a card protocol
+             * if the CTRL slot matches the slot that started the card
+             * transaction.  Otherwise this is stray data (e.g. pad bytes
+             * that leaked through). */
+            mc_load_slot(selected_slot);
+            if (mc_state != MC_IDLE && selected_slot == mc_slot) {
+                active_device = DEV_MEMCARD;
+                mc_process_byte(tx_byte);
+            } else {
+                mc_state = MC_IDLE;
+                sio_rx_data = 0xFF;
+                sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
+            }
         }
     } else if (active_device == DEV_PAD) {
         pad_process_byte(tx_byte);
     } else if (active_device == DEV_MEMCARD) {
-        mc_process_byte(tx_byte);
+        if (mc_state == MC_IDLE) {
+            /* Card protocol finished or was aborted.  Only start a new
+             * card transaction if this is actually 0x81 (card select).
+             * Any other byte means the BIOS moved on to a different
+             * device (pad polling sends 0x01 here). */
+            if (tx_byte == 0x81) {
+                mc_process_byte(tx_byte);
+            } else {
+                active_device = DEV_NONE;
+                selected_slot = (sio_ctrl & SIO_CTRL_SLOT) ? 1 : 0;
+                if (tx_byte == 0x01) {
+                    active_device = DEV_PAD;
+                    pad_process_byte(tx_byte);
+                } else {
+                    sio_rx_data = 0xFF;
+                    sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
+                }
+            }
+        } else {
+            mc_process_byte(tx_byte);
+        }
+    }
+
+    /* ---- Trace: capture post-state and record entry ---- */
+    {
+        SioTraceEntry *e = &sio_trace_buf[sio_trace_idx];
+        e->seq           = sio_trace_seq;
+        e->tx            = tx_byte;
+        e->rx            = sio_rx_data;
+        e->mc_state_pre  = trace_mc_pre;
+        e->mc_state_post = (uint8_t)mc_state;
+        e->dev_pre       = trace_dev_pre;
+        e->dev_post      = (uint8_t)active_device;
+        e->ctrl          = sio_ctrl;
+        e->func_addr     = g_debug_current_func_addr;
+        e->was_abort     = (sio_mc_abort_count > trace_abort_before) ? 1 : 0;
+        e->irq_countdown = trace_irq_cd;
+        { extern int psx_get_in_exception(void);
+          e->in_exception = (uint8_t)psx_get_in_exception(); }
+        { extern uint8_t psx_read_byte(uint32_t addr);
+          /* Read card counter 0x7514 — low byte only for trace */
+          e->counter_7514 = psx_read_byte(0x7514); }
+        sio_trace_idx = (sio_trace_idx + 1) % SIO_TRACE_CAP;
+        sio_trace_seq++;
     }
 }
 
@@ -489,10 +676,20 @@ void sio_write(uint32_t addr, uint32_t value) {
         if (!(sio_ctrl & SIO_CTRL_TX_EN)) sio_tx_gated++;
         if (sio_ctrl & SIO_CTRL_TX_EN) {
             sio_process_byte(sio_tx_data);
+            /* Model SIO busy: on real hardware TX_RDY clears during the
+             * byte transfer (~BAUD*8 cycles) and re-sets when complete.
+             * The BIOS pad polling tight-loops on TX_RDY before sending
+             * each byte.  Without this, pad polling proceeds instantly
+             * over a card byte that's still "in flight", interleaving
+             * pad and card protocols within the same interrupt. */
+            sio_stat &= ~(SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY);
             if ((sio_stat & SIO_STAT_ACK) && (sio_ctrl & SIO_CTRL_ACK_IRQ_EN)) {
                 sio_stat &= ~SIO_STAT_ACK;
                 sio_irq_pending = 1;
-                sio_irq_countdown = SIO_IRQ_DELAY;
+                /* Use a longer delay for card transfers to keep TX_RDY
+                 * cleared through pad polling within the same ISR. */
+                sio_irq_countdown = (active_device == DEV_MEMCARD)
+                    ? SIO_IRQ_DELAY_CARD : SIO_IRQ_DELAY_PAD;
             }
         }
         break;
@@ -501,29 +698,51 @@ void sio_write(uint32_t addr, uint32_t value) {
         sio_mode = (uint16_t)value;
         break;
 
-    case 0x1F80104A: /* SIO_CTRL */
+    case 0x1F80104A: /* SIO_CTRL */ {
+        uint16_t old_ctrl = sio_ctrl;
         sio_ctrl = (uint16_t)value;
         if (value & SIO_CTRL_ACK) {
             sio_stat &= ~SIO_STAT_IRQ;
             sio_stat &= ~SIO_STAT_ACK;
         }
         if (value & SIO_CTRL_RESET) {
+            if (mc_state != MC_IDLE) {
+                sio_mc_abort_count++;
+                sio_mc_abort_state = (int)mc_state;
+                sio_mc_abort_ctrl = (uint16_t)value;
+            }
             sio_stat = SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
             sio_mode = 0;
             sio_ctrl = 0;
             sio_baud = 0;
             pad_state = PAD_IDLE;
             mc_state = MC_IDLE;
+            mc_slots[0].state = MC_IDLE;
+            mc_slots[1].state = MC_IDLE;
             active_device = DEV_NONE;
             sio_irq_pending = 0;
             sio_irq_countdown = 0;
         }
-        if (!(value & SIO_CTRL_SELECT)) {
+        /* On SELECT deassert, reset pad_state and active_device so the
+         * next byte exchange correctly identifies the device type.
+         * However, do NOT reset mc_state — the card protocol must
+         * survive brief SELECT drops between bytes.  The BIOS writes
+         * CTRL=0x0000 between SIO byte exchanges to acknowledge IRQs,
+         * which briefly deasserts SELECT.  On real hardware the card
+         * stays selected because DSR timing prevents instant deselect.
+         * sio_process_byte resumes the card protocol via mc_state when
+         * active_device has been cleared but mc_state is still active. */
+        if ((old_ctrl & SIO_CTRL_SELECT) && !(value & SIO_CTRL_SELECT)) {
+            /* Save card state back to slot before deselecting.  The
+             * card retains its state across brief SELECT drops. */
+            if (active_device == DEV_MEMCARD && mc_state != MC_IDLE) {
+                mc_save_slot(mc_slot);
+            }
             pad_state = PAD_IDLE;
-            mc_state = MC_IDLE;
             active_device = DEV_NONE;
         }
         break;
+    }
 
     case 0x1F80104E: /* SIO_BAUD */
         sio_baud = (uint16_t)value;
@@ -546,6 +765,10 @@ void sio_tick(void) {
             sio_irq_pending = 0;
             sio_stat |= SIO_STAT_ACK;
             sio_stat |= SIO_STAT_IRQ;
+            /* Restore TX_RDY — the byte transfer is complete.
+             * This unblocks the BIOS pad polling loop that spins
+             * on TX_RDY before writing the next byte. */
+            sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
             i_stat |= (1 << IRQ_SIO0);
         }
     }
