@@ -203,7 +203,7 @@ static uint32_t s_chain_state_active = 0;  /* 0 if not in a state, else state ad
  *
  * Memory: 1M entries × 32B = 32 MB per ring × 2 = 64 MB. Heap-allocated. */
 #define FN_TRACE_CAP   (1 << 20)
-#define FN_STACK_DEPTH 256
+#define FN_STACK_DEPTH 4096
 
 typedef struct {
     uint64_t seq;
