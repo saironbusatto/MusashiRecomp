@@ -182,6 +182,177 @@ static uint32_t s_prev_dispatch_target = 0;
  * dispatch is the state's final return value. */
 static uint32_t s_chain_state_active = 0;  /* 0 if not in a state, else state addr */
 
+/* ---- Function ENTRY / EXIT trace rings (Tier 1 reverse-debugger) ----
+ *
+ * Two parallel always-on rings, hooked off psx_dispatch via
+ * debug_server_trace_dispatch. Together they provide:
+ *
+ *   Entry ring  — every dispatch in CALL ORDER, with $a0..$a3, $ra, $t1
+ *                 (the B0 function index when target is a B0 vector).
+ *   Exit  ring  — every function in FINISH ORDER, with $v0, $v1 and a
+ *                 link back to the entry seq.
+ *
+ * Exit detection uses a shadow call stack: each entry pushes (target, ra);
+ * when a later dispatch's TARGET == a stack frame's RA, we pop intermediate
+ * frames as "exited" and record their exit values. This is heuristic
+ * (longjmp / setjmp / chain-handler tail-jumps via jr $t8 will skip), but
+ * covers ~95% of normal call/return.
+ *
+ * Optional address filter so the ring isn't drowned by hot kernel funcs.
+ * Default: trace everything; user sets [lo, hi) range to focus.
+ *
+ * Memory: 1M entries × 32B = 32 MB per ring × 2 = 64 MB. Heap-allocated. */
+#define FN_TRACE_CAP   (1 << 20)
+#define FN_STACK_DEPTH 256
+
+typedef struct {
+    uint64_t seq;
+    uint64_t paired_exit_seq; /* set later when matching exit recorded; 0 = open */
+    uint32_t func_addr;
+    uint32_t ra;
+    uint32_t a0, a1, a2, a3;
+    uint32_t t1;              /* B0/A0/C0 function index when target is BIOS vector */
+    uint32_t depth;           /* shadow stack depth at entry */
+    uint32_t frame;
+} FnEntryEntry;
+
+typedef struct {
+    uint64_t seq;
+    uint64_t entry_seq;       /* link back to entry */
+    uint32_t func_addr;
+    uint32_t v0, v1;
+    uint32_t depth;           /* shadow stack depth at exit */
+    uint32_t frame;
+    uint32_t pad;
+} FnExitEntry;
+
+static FnEntryEntry *s_fn_entry      = NULL;
+static FnExitEntry  *s_fn_exit       = NULL;
+static uint64_t      s_fn_entry_seq  = 0;
+static uint64_t      s_fn_exit_seq   = 0;
+
+/* Shadow call stack: tracks open call frames. */
+typedef struct {
+    uint32_t func_addr;
+    uint32_t ra;
+    uint64_t entry_seq;       /* index in s_fn_entry */
+} FnStackFrame;
+static FnStackFrame s_fn_stack[FN_STACK_DEPTH];
+static int          s_fn_stack_top = 0;
+static uint32_t     s_fn_prev_ra   = 0;   /* last seen $ra; new JAL changes this */
+/* Stats: how many shadow-stack pops we couldn't match (interference signal). */
+static uint64_t     s_fn_unmatched_returns = 0;
+static uint64_t     s_fn_stack_overflows   = 0;
+static uint64_t     s_fn_tail_calls        = 0;
+
+/* Optional [lo, hi) physical-address filter; default = trace all. */
+static uint32_t s_fn_trace_filter_lo = 0u;
+static uint32_t s_fn_trace_filter_hi = 0xFFFFFFFFu;
+
+static int fn_trace_in_filter(uint32_t phys) {
+    return phys >= s_fn_trace_filter_lo && phys < s_fn_trace_filter_hi;
+}
+
+/* Helper: record an exit event for a popped frame. */
+static void fn_record_exit(FnStackFrame *f) {
+    if (!fn_trace_in_filter(f->func_addr)) return;
+    FnExitEntry *e = &s_fn_exit[s_fn_exit_seq % FN_TRACE_CAP];
+    e->seq        = s_fn_exit_seq;
+    e->entry_seq  = f->entry_seq;
+    e->func_addr  = f->func_addr;
+    e->v0         = debug_cpu_ptr->gpr[2];
+    e->v1         = debug_cpu_ptr->gpr[3];
+    e->depth      = (uint32_t)s_fn_stack_top;
+    e->frame      = (uint32_t)s_frame_count;
+    /* Back-fill entry's paired_exit_seq if still in ring. */
+    if (f->entry_seq != (uint64_t)-1
+        && s_fn_entry_seq > f->entry_seq
+        && s_fn_entry_seq - f->entry_seq <= FN_TRACE_CAP) {
+        s_fn_entry[f->entry_seq % FN_TRACE_CAP].paired_exit_seq = e->seq;
+    }
+    s_fn_exit_seq++;
+}
+
+/* Called from debug_server_trace_dispatch on every dispatch.
+ *
+ * Classify the dispatch into one of:
+ *   RETURN     — target == some frame's saved RA → pop frames as exited
+ *   TAIL CALL  — $ra unchanged from previous dispatch → replace top frame
+ *   NEW CALL   — $ra changed (fresh JAL) → push new frame
+ *
+ * Distinguishing TAIL CALL from NEW CALL via $ra-change is what keeps the
+ * shadow stack bounded under heavy code that uses fall-through dispatch. */
+static void function_trace_record(uint32_t target) {
+    if (!s_fn_entry || !s_fn_exit || !debug_cpu_ptr) return;
+
+    uint32_t cur_ra = debug_cpu_ptr->gpr[31];
+
+    /* RETURN check first: walk stack from top down. Match deepest first, since
+     * deeper frames may have stale RAs that coincidentally match. */
+    int return_idx = -1;
+    for (int i = s_fn_stack_top - 1; i >= 0; i--) {
+        if (s_fn_stack[i].ra == target) { return_idx = i; break; }
+    }
+    if (return_idx >= 0) {
+        while (s_fn_stack_top > return_idx) {
+            s_fn_stack_top--;
+            fn_record_exit(&s_fn_stack[s_fn_stack_top]);
+        }
+        s_fn_prev_ra = cur_ra;
+        return;
+    }
+
+    /* TAIL CALL: $ra unchanged from the previous dispatch and we have an open
+     * frame. Treat as replacing the top frame's func_addr. Also record an
+     * exit for the previous func + an entry for the new func, so the user
+     * sees the chain of tail calls. */
+    if (s_fn_stack_top > 0 && cur_ra == s_fn_prev_ra && cur_ra != 0) {
+        s_fn_tail_calls++;
+        fn_record_exit(&s_fn_stack[s_fn_stack_top - 1]);
+        /* Replace top frame in place (don't push). */
+        s_fn_stack[s_fn_stack_top - 1].func_addr = target;
+        s_fn_stack[s_fn_stack_top - 1].entry_seq = s_fn_entry_seq;
+    }
+    /* NEW CALL or first-ever dispatch: push new frame. */
+    else {
+        if (s_fn_stack_top < FN_STACK_DEPTH) {
+            s_fn_stack[s_fn_stack_top].func_addr = target;
+            s_fn_stack[s_fn_stack_top].ra        = cur_ra;
+            s_fn_stack[s_fn_stack_top].entry_seq = s_fn_entry_seq;
+            s_fn_stack_top++;
+        } else {
+            /* Stack full — drop OLDEST frame (rotate) so we keep tracking
+             * recent activity instead of stalling forever. The dropped frame
+             * never gets an exit recorded; that's acceptable for unbounded
+             * recursion / longjmp pathology. */
+            for (int i = 0; i < FN_STACK_DEPTH - 1; i++) s_fn_stack[i] = s_fn_stack[i + 1];
+            s_fn_stack[FN_STACK_DEPTH - 1].func_addr = target;
+            s_fn_stack[FN_STACK_DEPTH - 1].ra        = cur_ra;
+            s_fn_stack[FN_STACK_DEPTH - 1].entry_seq = s_fn_entry_seq;
+            s_fn_stack_overflows++;
+        }
+    }
+
+    /* Record entry (always, when target passes filter). */
+    if (fn_trace_in_filter(target)) {
+        FnEntryEntry *e = &s_fn_entry[s_fn_entry_seq % FN_TRACE_CAP];
+        e->seq        = s_fn_entry_seq;
+        e->paired_exit_seq = 0;
+        e->func_addr  = target;
+        e->ra         = cur_ra;
+        e->a0         = debug_cpu_ptr->gpr[4];
+        e->a1         = debug_cpu_ptr->gpr[5];
+        e->a2         = debug_cpu_ptr->gpr[6];
+        e->a3         = debug_cpu_ptr->gpr[7];
+        e->t1         = debug_cpu_ptr->gpr[9];
+        e->depth      = (uint32_t)s_fn_stack_top;
+        e->frame      = (uint32_t)s_frame_count;
+        s_fn_entry_seq++;
+    }
+
+    s_fn_prev_ra = cur_ra;
+}
+
 static int is_chain_state_entry(uint32_t phys) {
     static const uint32_t entries[] = {
         /* Read chain (table at 0x6c98) */
@@ -203,6 +374,10 @@ static int is_chain_epilogue(uint32_t phys) {
 }
 
 void debug_server_trace_dispatch(uint32_t func_addr) {
+    /* Function entry/exit rings (always-on, hooked here so every dispatch
+     * is recorded with args and a return value when the call unwinds). */
+    function_trace_record(func_addr);
+
     /* Track when we ENTER a chain state subtree. */
     if (is_chain_state_entry(func_addr)) {
         s_chain_state_active = func_addr;
@@ -1628,6 +1803,157 @@ static void handle_dispatch_tail(int id, const char *json) {
     debug_server_send_fmt("]}\n");
 }
 
+/* ---- Function entry/exit trace handlers ---- */
+
+static void handle_fn_filter(int id, const char *json) {
+    char buf[32];
+    if (json_get_str(json, "lo", buf, sizeof(buf))) s_fn_trace_filter_lo = hex_to_u32(buf);
+    if (json_get_str(json, "hi", buf, sizeof(buf))) s_fn_trace_filter_hi = hex_to_u32(buf);
+    send_fmt("{\"id\":%d,\"ok\":true,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}\n",
+             id, s_fn_trace_filter_lo, s_fn_trace_filter_hi);
+}
+
+static void handle_fn_clear(int id, const char *json) {
+    (void)json;
+    s_fn_entry_seq = 0;
+    s_fn_exit_seq  = 0;
+    s_fn_stack_top = 0;
+    s_fn_prev_ra   = 0;
+    s_fn_unmatched_returns = 0;
+    s_fn_stack_overflows   = 0;
+    s_fn_tail_calls        = 0;
+    if (s_fn_entry) memset(s_fn_entry, 0, (size_t)FN_TRACE_CAP * sizeof(FnEntryEntry));
+    if (s_fn_exit)  memset(s_fn_exit,  0, (size_t)FN_TRACE_CAP * sizeof(FnExitEntry));
+    send_ok(id);
+}
+
+static void handle_fn_stats(int id, const char *json) {
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"entry_total\":%llu,\"exit_total\":%llu,"
+             "\"stack_top\":%d,\"unmatched_returns\":%llu,"
+             "\"stack_overflows\":%llu,\"tail_calls\":%llu,"
+             "\"capacity\":%d,"
+             "\"filter_lo\":\"0x%08X\",\"filter_hi\":\"0x%08X\"}\n",
+             id,
+             (unsigned long long)s_fn_entry_seq,
+             (unsigned long long)s_fn_exit_seq,
+             s_fn_stack_top,
+             (unsigned long long)s_fn_unmatched_returns,
+             (unsigned long long)s_fn_stack_overflows,
+             (unsigned long long)s_fn_tail_calls,
+             FN_TRACE_CAP,
+             s_fn_trace_filter_lo, s_fn_trace_filter_hi);
+}
+
+/* Helper: parse filter / range / count for fn_*_dump. */
+static void fn_dump_parse(const char *json, uint64_t total,
+                         uint64_t *out_seq_lo, uint64_t *out_seq_hi,
+                         uint32_t *out_addr_lo, uint32_t *out_addr_hi,
+                         int *out_max) {
+    char buf[32];
+    *out_seq_lo  = 0;
+    *out_seq_hi  = total;
+    *out_addr_lo = 0;
+    *out_addr_hi = 0xFFFFFFFFu;
+    *out_max     = 256;
+    if (json_get_str(json, "seq_lo", buf, sizeof(buf))) *out_seq_lo = strtoull(buf, NULL, 0);
+    if (json_get_str(json, "seq_hi", buf, sizeof(buf))) *out_seq_hi = strtoull(buf, NULL, 0);
+    if (json_get_str(json, "addr_lo", buf, sizeof(buf))) *out_addr_lo = hex_to_u32(buf) & 0x1FFFFFFFu;
+    if (json_get_str(json, "addr_hi", buf, sizeof(buf))) *out_addr_hi = hex_to_u32(buf) & 0x1FFFFFFFu;
+    *out_max = json_get_int(json, "count", 256);
+    if (*out_max < 1) *out_max = 1;
+    if (*out_max > 4096) *out_max = 4096;
+    /* If seq_lo not specified, default to "tail N entries". */
+    if (*out_seq_lo == 0 && total > (uint64_t)*out_max) {
+        *out_seq_lo = total - (uint64_t)*out_max;
+    }
+}
+
+static void handle_fn_entry_dump(int id, const char *json) {
+    if (!s_fn_entry) { send_err(id, "not initialized"); return; }
+    uint64_t seq_lo, seq_hi;
+    uint32_t addr_lo, addr_hi;
+    int max_count;
+    fn_dump_parse(json, s_fn_entry_seq, &seq_lo, &seq_hi, &addr_lo, &addr_hi, &max_count);
+
+    /* Earliest available seq in ring. */
+    uint64_t oldest = (s_fn_entry_seq > FN_TRACE_CAP) ? s_fn_entry_seq - FN_TRACE_CAP : 0;
+    if (seq_lo < oldest) seq_lo = oldest;
+    if (seq_hi > s_fn_entry_seq) seq_hi = s_fn_entry_seq;
+
+    const size_t BUF_SZ = 2 * 1024 * 1024;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"oldest\":%llu,"
+                    "\"seq_lo\":%llu,\"seq_hi\":%llu,\"entries\":[",
+                    id, (unsigned long long)s_fn_entry_seq,
+                    (unsigned long long)oldest,
+                    (unsigned long long)seq_lo, (unsigned long long)seq_hi);
+    int emitted = 0;
+    int first = 1;
+    for (uint64_t s = seq_lo; s < seq_hi && emitted < max_count && pos < BUF_SZ - 512; s++) {
+        FnEntryEntry *e = &s_fn_entry[s % FN_TRACE_CAP];
+        if (e->func_addr < addr_lo || e->func_addr >= addr_hi) continue;
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+            "%s{\"seq\":%llu,\"func\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+            "\"t1\":\"0x%08X\",\"depth\":%u,\"frame\":%u,\"exit_seq\":%llu}",
+            first ? "" : ",",
+            (unsigned long long)e->seq,
+            e->func_addr, e->ra, e->a0, e->a1, e->a2, e->a3, e->t1,
+            e->depth, e->frame,
+            (unsigned long long)e->paired_exit_seq);
+        first = 0;
+        emitted++;
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_fn_exit_dump(int id, const char *json) {
+    if (!s_fn_exit) { send_err(id, "not initialized"); return; }
+    uint64_t seq_lo, seq_hi;
+    uint32_t addr_lo, addr_hi;
+    int max_count;
+    fn_dump_parse(json, s_fn_exit_seq, &seq_lo, &seq_hi, &addr_lo, &addr_hi, &max_count);
+
+    uint64_t oldest = (s_fn_exit_seq > FN_TRACE_CAP) ? s_fn_exit_seq - FN_TRACE_CAP : 0;
+    if (seq_lo < oldest) seq_lo = oldest;
+    if (seq_hi > s_fn_exit_seq) seq_hi = s_fn_exit_seq;
+
+    const size_t BUF_SZ = 2 * 1024 * 1024;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"oldest\":%llu,"
+                    "\"seq_lo\":%llu,\"seq_hi\":%llu,\"entries\":[",
+                    id, (unsigned long long)s_fn_exit_seq,
+                    (unsigned long long)oldest,
+                    (unsigned long long)seq_lo, (unsigned long long)seq_hi);
+    int emitted = 0;
+    int first = 1;
+    for (uint64_t s = seq_lo; s < seq_hi && emitted < max_count && pos < BUF_SZ - 512; s++) {
+        FnExitEntry *e = &s_fn_exit[s % FN_TRACE_CAP];
+        if (e->func_addr < addr_lo || e->func_addr >= addr_hi) continue;
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+            "%s{\"seq\":%llu,\"entry_seq\":%llu,\"func\":\"0x%08X\","
+            "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\",\"depth\":%u,\"frame\":%u}",
+            first ? "" : ",",
+            (unsigned long long)e->seq, (unsigned long long)e->entry_seq,
+            e->func_addr, e->v0, e->v1, e->depth, e->frame);
+        first = 0;
+        emitted++;
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
+}
+
 typedef void (*CmdHandler)(int id, const char *json);
 typedef struct { const char *name; CmdHandler handler; } CmdEntry;
 
@@ -1684,6 +2010,11 @@ static const CmdEntry s_commands[] = {
     { "quit",              handle_quit },
     { "dispatch_check",    handle_dispatch_check },
     { "dispatch_tail",     handle_dispatch_tail },
+    { "fn_filter",         handle_fn_filter },
+    { "fn_clear",          handle_fn_clear },
+    { "fn_stats",          handle_fn_stats },
+    { "fn_entry_dump",     handle_fn_entry_dump },
+    { "fn_exit_dump",      handle_fn_exit_dump },
     { NULL, NULL }
 };
 
@@ -1771,6 +2102,15 @@ void debug_server_init(int port)
     }
     s_wtrace_seq = 0;
     s_wtrace_head = 0;
+
+    /* Function entry/exit ring buffers (32 MB each, 64 MB total). */
+    if (!s_fn_entry) s_fn_entry = (FnEntryEntry *)calloc(FN_TRACE_CAP, sizeof(FnEntryEntry));
+    if (!s_fn_exit)  s_fn_exit  = (FnExitEntry *)calloc(FN_TRACE_CAP, sizeof(FnExitEntry));
+    s_fn_entry_seq = 0;
+    s_fn_exit_seq  = 0;
+    s_fn_stack_top = 0;
+    s_fn_unmatched_returns = 0;
+    s_fn_stack_overflows   = 0;
 
     /* Phase 4.5: watch EB4 area + DF8/DFC area + EvCB slot 1 status + state machine
      * + spiral texture buffer. */
