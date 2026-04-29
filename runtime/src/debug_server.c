@@ -1254,6 +1254,91 @@ static void handle_mc_status(int id, const char *json)
              m1[0], m1[1]);
 }
 
+/* ---- SIO IRQ-arm audit -----------------------------------------------
+ * Reports counts of TX writes that reached the IRQ-arm decision in
+ * sio_write SIO_TX_DATA, partitioned by active_device. Tells us at the
+ * arm-time gate whether ACK + ACK_IRQ_EN were set, or which side blocked
+ * the arm. Steps 3-4 of the IRQ-chain audit. */
+extern void sio_get_card_arm_audit(uint32_t out[3][7]);
+extern int  sio_get_card_arm_countdown_after(void);
+extern void sio_get_burst_stats(uint64_t out[10]);
+
+static void handle_sio_burst_stats(int id, const char *json)
+{
+    (void)json;
+    uint64_t s[10];
+    sio_get_burst_stats(s);
+    const char *reason_str =
+        s[8] == 1 ? "idle" :
+        s[8] == 2 ? "mode_clear" :
+        s[8] == 3 ? "capped" : "n/a";
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"calls\":%llu,\"iters_total\":%llu,\"iter_max\":%llu,"
+             "\"break_idle\":%llu,\"break_mode_clear\":%llu,\"break_capped\":%llu,"
+             "\"fires_in_burst\":%llu,\"last_iters\":%llu,"
+             "\"last_break_reason\":\"%s\"}\n",
+             id,
+             (unsigned long long)s[0], (unsigned long long)s[1], (unsigned long long)s[2],
+             (unsigned long long)s[3], (unsigned long long)s[4], (unsigned long long)s[5],
+             (unsigned long long)s[6], (unsigned long long)s[7],
+             reason_str);
+}
+
+static void handle_sio_arm_audit(int id, const char *json)
+{
+    (void)json;
+    uint32_t a[3][7];
+    sio_get_card_arm_audit(a);
+    int cd_after = sio_get_card_arm_countdown_after();
+    const char *names[3] = { "card", "pad", "none" };
+    send_fmt("{\"id\":%d,\"ok\":true,\"countdown_after_last_card\":%d,\"by_device\":{",
+             id, cd_after);
+    for (int i = 0; i < 3; i++) {
+        if (i > 0) send_fmt(",");
+        send_fmt("\"%s\":{\"tx_total\":%u,\"armed\":%u,\"no_ack\":%u,\"no_ackirqen\":%u,"
+                 "\"ctrl_last\":\"0x%04X\",\"stat_pre_last\":\"0x%04X\",\"stat_post_last\":\"0x%04X\"}",
+                 names[i], a[i][0], a[i][1], a[i][2], a[i][3], a[i][4], a[i][5], a[i][6]);
+    }
+    send_fmt("}}\n");
+}
+
+/* ---- Memory card raw buffer dump (in-memory cards[].data) ----
+ * Used by the audit harness to verify that what the runtime loaded matches
+ * the on-disk file byte-for-byte. Returns hex string, chunked. */
+static void handle_card_buffer_dump(int id, const char *json)
+{
+    int slot   = json_get_int(json, "slot",   0);
+    int offset = json_get_int(json, "offset", 0);
+    int len    = json_get_int(json, "len",    256);
+    if (slot < 0 || slot > 1)            { send_err(id, "bad slot"); return; }
+    if (offset < 0 || offset > 0x20000)  { send_err(id, "bad offset"); return; }
+    if (len < 1)                         { send_err(id, "bad len"); return; }
+    if (len > 0x20000)                   len = 0x20000;
+    if (offset + len > 0x20000)          len = 0x20000 - offset;
+
+    uint8_t *buf = (uint8_t *)malloc((size_t)len);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    int got = memcard_debug_read_buffer(slot, (uint32_t)offset, (uint32_t)len, buf);
+    if (got <= 0) { free(buf); send_err(id, "slot empty or read failed"); return; }
+
+    /* hex envelope: 2 chars/byte + ~256 envelope */
+    size_t env = 256;
+    size_t total = (size_t)got * 2 + env;
+    char *out = (char *)malloc(total);
+    if (!out) { free(buf); send_err(id, "alloc failed"); return; }
+    int hdr = snprintf(out, env,
+                       "{\"id\":%d,\"ok\":true,\"slot\":%d,\"offset\":%d,\"len\":%d,\"hex\":\"",
+                       id, slot, offset, got);
+    char *hex = out + hdr;
+    for (int i = 0; i < got; i++)
+        snprintf(hex + (size_t)i * 2, 3, "%02x", buf[i]);
+    char *tail = hex + (size_t)got * 2;
+    memcpy(tail, "\"}", 3);
+    debug_server_send_line(out);
+    free(out);
+    free(buf);
+}
+
 /* ---- I_MASK bit 7 trace (card protocol flow) ---- */
 typedef struct {
     uint32_t old_mask;
@@ -1333,13 +1418,15 @@ static void handle_sio_trace(int id, const char *json)
                  "\"dev_pre\":%d,\"dev_post\":%d,"
                  "\"ctrl\":\"0x%04X\",\"func\":\"0x%08X\","
                  "\"abort\":%d,\"irq_cd\":%d,\"in_exc\":%d,\"ctr\":%d,"
-                 "\"sr\":\"0x%08X\"}",
+                 "\"sr\":\"0x%08X\","
+                 "\"slot0\":%d,\"slot1\":%d}",
                  (unsigned)e->seq, e->tx, e->rx,
                  e->mc_state_pre, e->mc_state_post,
                  e->dev_pre, e->dev_post,
                  e->ctrl, (unsigned)e->func_addr,
                  e->was_abort, e->irq_countdown, e->in_exception,
-                 e->counter_7514, (unsigned)e->cop0_sr);
+                 e->counter_7514, (unsigned)e->cop0_sr,
+                 e->slot0_state, e->slot1_state);
     }
 
     send_fmt("]}\n");
@@ -2743,6 +2830,9 @@ static const CmdEntry s_commands[] = {
     { "irq_state",         handle_irq_state },
     { "sio_state",         handle_sio_state },
     { "mc_status",         handle_mc_status },
+    { "card_buffer_dump",  handle_card_buffer_dump },
+    { "sio_arm_audit",     handle_sio_arm_audit },
+    { "sio_burst_stats",   handle_sio_burst_stats },
     { "chain_trace",       handle_chain_trace },
     { "sio_trace",         handle_sio_trace },
     { "sio_pc_trace",      handle_sio_pc_trace },

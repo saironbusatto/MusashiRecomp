@@ -35,6 +35,15 @@ uint64_t g_dirty_ram_blocks_run = 0;
 uint64_t g_dirty_ram_insns_run  = 0;
 uint64_t g_dirty_ram_aborts     = 0;
 
+/* Mid-block unsupported-opcode counters. Bumped instead of fprintf-spamming
+ * stderr (CLAUDE.md §3). Read via dirty_ram_get_unsupported(). The "last_*"
+ * fields capture the most recent occurrence so a TCP query can see what
+ * opcode is missing without needing log scraping. */
+uint64_t g_dirty_ram_unsupported_midblock = 0;
+uint32_t g_dirty_ram_last_unsupported_pc  = 0;
+uint32_t g_dirty_ram_last_unsupported_insn = 0;
+const char *g_dirty_ram_last_unsupported_reason = NULL;
+
 DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE] = {0};
 
 /* Linear-probed insert/lookup keyed on entry PC.  Table is small (64) and
@@ -410,15 +419,15 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
              * targets — set cpu->pc=0 so the trampoline exits cleanly.
              * If this turns out to be load-bearing, measurement will
              * surface it as a card-protocol stall and we can add the
-             * missing opcode. */
-            fprintf(stderr,
-                    "[dirty_ram_interp] WARN: unsupported opcode mid-block "
-                    "at PC=0x%08X insn=0x%08X (%s) after %d insns; treating "
-                    "block as no-op return.\n",
-                    g_unsupported_pc, g_unsupported_insn,
-                    g_unsupported_reason ? g_unsupported_reason : "?",
-                    insns_executed);
-            fflush(stderr);
+             * missing opcode.
+             *
+             * No fprintf — read the last-* globals via TCP if needed
+             * (CLAUDE.md §3). Synchronous stderr at the rate this fires
+             * starves the dispatch loop and the debug-server poll. */
+            g_dirty_ram_unsupported_midblock++;
+            g_dirty_ram_last_unsupported_pc     = g_unsupported_pc;
+            g_dirty_ram_last_unsupported_insn   = g_unsupported_insn;
+            g_dirty_ram_last_unsupported_reason = g_unsupported_reason;
             cpu->pc = 0;
             return 1;
         }

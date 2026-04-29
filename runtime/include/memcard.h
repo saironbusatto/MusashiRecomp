@@ -30,6 +30,12 @@ int memcard_debug_info(int card, const char **path_out,
                        uint8_t magic_out[2], int *present_out,
                        int *dirty_out);
 
+/* Copy raw bytes out of the in-memory card image. Used by the debug server
+ * to verify that what the runtime loaded matches the on-disk file.
+ * Returns the number of bytes copied (0 if slot empty / range invalid). */
+int memcard_debug_read_buffer(int card, uint32_t offset, uint32_t len,
+                              uint8_t *dst);
+
 #ifdef __cplusplus
 }
 #endif

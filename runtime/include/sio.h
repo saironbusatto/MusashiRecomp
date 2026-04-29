@@ -49,8 +49,13 @@ typedef struct {
     uint8_t  was_abort;     /* 1 if this byte caused mc_state abort */
     uint8_t  irq_countdown; /* sio_irq_countdown at entry */
     uint8_t  in_exception;  /* psx_get_in_exception() at time of byte */
-    uint8_t  counter_7514; /* RAM[0x7514] at time of byte */
+    uint8_t  counter_7514;  /* RAM[0x7514] at time of byte */
     uint32_t cop0_sr;       /* COP0 SR at time of byte (IEc=bit0, IM2=bit10) */
+    /* Saved slot states captured AT TRACE TIME (after the byte was processed
+     * and any mc_save/load_slot has run). Lets the audit show whether a
+     * SELECT-deassert preserved state into the next 0x81. */
+    uint8_t  slot0_state;
+    uint8_t  slot1_state;
 } SioTraceEntry;
 
 /* Get pointer to ring buffer and current write index.

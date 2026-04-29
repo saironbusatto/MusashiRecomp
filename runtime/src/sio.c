@@ -192,6 +192,11 @@ int sio_card_protocol_active(void) {
     return 0;
 }
 
+/* Forward decl: defined below sio_get_freeze_diag. */
+static int sio_card_burst_drain(int max_iters);
+extern int psx_get_in_exception(void);
+extern uint8_t psx_read_byte(uint32_t addr);
+
 
 /* ---- Card transaction ring buffer ---- */
 static SioTxnEntry sio_txn_buf[SIO_TXN_CAP];
@@ -268,6 +273,77 @@ uint32_t sio_get_irq_ring(const SioIrqEntry **buf_out, int *write_idx_out) {
     if (buf_out) *buf_out = sio_irq_buf;
     if (write_idx_out) *write_idx_out = sio_irq_idx;
     return sio_irq_seq;
+}
+
+/* ---- Card IRQ-arm audit -----------------------------------------------
+ * Per-call counters that record what happened at the IRQ-arm decision
+ * point in sio_write SIO_TX_DATA, partitioned by active_device==DEV_MEMCARD
+ * (card path) vs not (pad/none). For each card-path call we further
+ * record:
+ *   - "tx_card": total card TX writes that reached this point
+ *   - "armed_card": cases where (ACK && ACK_IRQ_EN) — countdown was set
+ *   - "no_ack": cases where SIO_STAT_ACK was clear (state machine didn't ACK)
+ *   - "no_ackirqen": cases where ACK was set but ACK_IRQ_EN bit was clear
+ *   - "ctrl_last": last ctrl seen at decision time (for sanity)
+ *   - "stat_pre_last", "stat_post_last": last seen sio_stat
+ *   - "countdown_after_last": value of sio_irq_countdown after the if-block
+ * Same fields tracked for pad path so we can compare. Always-on; cheap. */
+typedef struct {
+    uint32_t tx_total;
+    uint32_t armed;
+    uint32_t no_ack;
+    uint32_t no_ackirqen;
+    uint16_t ctrl_last;
+    uint16_t stat_pre_last;
+    uint16_t stat_post_last;
+    int32_t  countdown_after_last;
+} CardArmAudit;
+
+static CardArmAudit s_card_arm_audit_card;
+static CardArmAudit s_card_arm_audit_pad;
+static CardArmAudit s_card_arm_audit_none;
+
+void sio_card_arm_audit_record(int dev, uint16_t ctrl_pre,
+                               uint16_t stat_pre, uint16_t stat_post,
+                               int armed, int countdown_after) {
+    CardArmAudit *a = (dev == DEV_MEMCARD) ? &s_card_arm_audit_card
+                    : (dev == DEV_PAD)     ? &s_card_arm_audit_pad
+                    :                        &s_card_arm_audit_none;
+    a->tx_total++;
+    if (armed) {
+        a->armed++;
+    } else {
+        /* SIO_STAT_ACK = (1<<7) = 0x0080;
+         * SIO_CTRL_ACK_IRQ_EN = (1<<12) = 0x1000.
+         * Constants are #define'd later in this file; re-state them here
+         * to avoid forward-decl ordering issues. */
+        if (!(stat_post & 0x0080u))      a->no_ack++;
+        else if (!(ctrl_pre & 0x1000u))  a->no_ackirqen++;
+    }
+    a->ctrl_last            = ctrl_pre;
+    a->stat_pre_last        = stat_pre;
+    a->stat_post_last       = stat_post;
+    a->countdown_after_last = countdown_after;
+}
+
+void sio_get_card_arm_audit(uint32_t out[3][7]) {
+    /* row 0 = card, row 1 = pad, row 2 = none.
+     * cols: tx_total, armed, no_ack, no_ackirqen, ctrl_last, stat_pre, stat_post */
+    const CardArmAudit *src[3] = {
+        &s_card_arm_audit_card, &s_card_arm_audit_pad, &s_card_arm_audit_none };
+    for (int i = 0; i < 3; i++) {
+        out[i][0] = src[i]->tx_total;
+        out[i][1] = src[i]->armed;
+        out[i][2] = src[i]->no_ack;
+        out[i][3] = src[i]->no_ackirqen;
+        out[i][4] = (uint32_t)src[i]->ctrl_last;
+        out[i][5] = (uint32_t)src[i]->stat_pre_last;
+        out[i][6] = (uint32_t)src[i]->stat_post_last;
+    }
+}
+
+int sio_get_card_arm_countdown_after(void) {
+    return s_card_arm_audit_card.countdown_after_last;
 }
 
 int sio_get_mc_probe_count(void) { return sio_mc_probe_count; }
@@ -815,6 +891,8 @@ static void sio_process_byte(uint8_t tx_byte) {
         { extern uint8_t psx_read_byte(uint32_t addr);
           /* Read card counter 0x7514 — low byte only for trace */
           e->counter_7514 = psx_read_byte(0x7514); }
+        e->slot0_state = (uint8_t)mc_slots[0].state;
+        e->slot1_state = (uint8_t)mc_slots[1].state;
         sio_trace_idx = (sio_trace_idx + 1) % SIO_TRACE_CAP;
         sio_trace_seq++;
     }
@@ -867,7 +945,16 @@ void sio_write(uint32_t addr, uint32_t value) {
         sio_last_ctrl_on_tx = sio_ctrl;
         if (!(sio_ctrl & SIO_CTRL_TX_EN)) sio_tx_gated++;
         if (sio_ctrl & SIO_CTRL_TX_EN) {
+            /* IRQ-arm chain audit: capture pre-state for diagnostics.
+             * NOTE: bucket by active_device AT-DECISION-TIME (post-process),
+             * not pre-process — sio_process_byte (re)assigns active_device
+             * on its first byte / on deselect-continuation. */
+            uint16_t arm_dbg_ctrl_pre  = sio_ctrl;
+            uint16_t arm_dbg_stat_pre  = sio_stat;
+
             sio_process_byte(sio_tx_data);
+            /* Capture the device the if-block will read. */
+            uint8_t  arm_dbg_dev_at_decision = (uint8_t)active_device;
             /* Model SIO busy: on real hardware TX_RDY clears during the
              * byte transfer (~BAUD*8 cycles) and re-sets when complete.
              * The BIOS pad polling tight-loops on TX_RDY before sending
@@ -875,6 +962,15 @@ void sio_write(uint32_t addr, uint32_t value) {
              * over a card byte that's still "in flight", interleaving
              * pad and card protocols within the same interrupt. */
             sio_stat &= ~(SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY);
+
+            /* IRQ-arm chain audit: count attempts and failure reasons.
+             * Counted only for the card path (active_device==DEV_MEMCARD).
+             * Exposed via sio_get_card_arm_audit() / debug_server. */
+            extern void sio_card_arm_audit_record(int dev, uint16_t ctrl_pre,
+                                                  uint16_t stat_pre, uint16_t stat_post,
+                                                  int armed, int countdown_after);
+
+            int armed_now = 0;
             if ((sio_stat & SIO_STAT_ACK) && (sio_ctrl & SIO_CTRL_ACK_IRQ_EN)) {
                 sio_stat &= ~SIO_STAT_ACK;
                 sio_irq_pending = 1;
@@ -889,7 +985,12 @@ void sio_write(uint32_t addr, uint32_t value) {
                 sio_irq_pending_delay    = (uint8_t)sio_irq_countdown;
                 sio_irq_pending_mc_state = (uint8_t)mc_state;
                 sio_irq_pending_byte_seq = sio_trace_seq;
+                armed_now = 1;
             }
+
+            sio_card_arm_audit_record(arm_dbg_dev_at_decision, arm_dbg_ctrl_pre,
+                                      arm_dbg_stat_pre, sio_stat,
+                                      armed_now, sio_irq_countdown);
         }
         break;
 
@@ -926,20 +1027,43 @@ void sio_write(uint32_t addr, uint32_t value) {
             sio_irq_pending = 0;
             sio_irq_countdown = 0;
         }
-        /* On SELECT deassert, reset pad_state and active_device so the
-         * next byte exchange correctly identifies the device type.
-         * However, do NOT reset mc_state — the card protocol must
-         * survive brief SELECT drops between bytes.  The BIOS writes
-         * CTRL=0x0000 between SIO byte exchanges to acknowledge IRQs,
-         * which briefly deasserts SELECT.  On real hardware the card
-         * stays selected because DSR timing prevents instant deselect.
-         * sio_process_byte resumes the card protocol via mc_state when
-         * active_device has been cleared but mc_state is still active. */
+        /* On SELECT deassert: reset all volatile protocol state.
+         *
+         * Earlier model preserved mc_state into mc_slots[] so a card
+         * protocol could resume across brief SELECT drops (e.g. CTRL
+         * ACK writes during pad polling). Audit confirmed this caused
+         * EVERY new 0x81 after a SELECT-deassert to land on a saved
+         * non-IDLE state, triggering abort_reselect bookkeeping. The
+         * abort path itself resets mc_state, so the BIOS-visible RX is
+         * still correct — but the simulated card retaining sector/cmd/
+         * counter context across what BIOS treats as independent
+         * transactions is wrong per the no$psx model: real cards
+         * restart on every fresh 0x81. SELECT is a bus-wide signal;
+         * both physical cards see the deassert and reset their state
+         * machines simultaneously.
+         *
+         * Cleared: state, cmd, sector, sector_msb, sector_lsb,
+         *          data_idx, checksum (volatile protocol state).
+         * Preserved: flag (persistent "new card" metadata, only cleared
+         *            after first read/write completes; carries across
+         *            SELECT drops on real hardware) and data (sector
+         *            buffer; harmless to retain since the next read
+         *            overwrites it). */
         if ((old_ctrl & SIO_CTRL_SELECT) && !(value & SIO_CTRL_SELECT)) {
-            /* Save card state back to slot before deselecting.  The
-             * card retains its state across brief SELECT drops. */
-            if (active_device == DEV_MEMCARD && mc_state != MC_IDLE) {
-                mc_save_slot(mc_slot);
+            if (active_device == DEV_MEMCARD && mc_state != MC_IDLE && sio_txn_open) {
+                extern uint32_t g_debug_current_func_addr;
+                txn_close(SIO_TXN_END_ABORT_OTHER, mc_state, g_debug_current_func_addr);
+            }
+            mc_state = MC_IDLE;
+            for (int i = 0; i < 2; i++) {
+                mc_slots[i].state      = MC_IDLE;
+                mc_slots[i].cmd        = 0;
+                mc_slots[i].sector     = 0;
+                mc_slots[i].sector_msb = 0;
+                mc_slots[i].sector_lsb = 0;
+                mc_slots[i].data_idx   = 0;
+                mc_slots[i].checksum   = 0;
+                /* keep mc_slots[i].flag, mc_slots[i].data */
             }
             pad_state = PAD_IDLE;
             active_device = DEV_NONE;
@@ -969,6 +1093,99 @@ void sio_get_freeze_diag(int *out_irq_pending, int *out_irq_countdown,
     if (out_sio_stat)      *out_sio_stat      = sio_stat;
     if (out_sio_ctrl)      *out_sio_ctrl      = sio_ctrl;
     if (out_card_active)   *out_card_active   = sio_card_protocol_active();
+}
+
+/* ---- Bounded SIO IRQ burst drain (active card data phase only) ---------
+ * Approved as the FIRST step on the path away from "1 byte/VBlank". This
+ * is NOT the cycle-paced rewrite. It is a transient measure that, while
+ * a card transfer is in-flight, drains the access-paced countdown so the
+ * IRQ that would have stalled until the next pad poll instead fires now.
+ *
+ * Invariants:
+ *   - Only invoked from sio_write SIO_TX_DATA, after the IRQ-arm decision.
+ *   - Caller guarantees active_device==DEV_MEMCARD and !in_exception.
+ *   - Hard cap on iterations (default 128).
+ *   - Break early if (a) no IRQ pending and countdown idle, OR
+ *                    (b) mc_state == MC_IDLE (transaction finished/aborted).
+ *   - Each iteration calls sio_tick() ONCE. sio_tick already handles "fire
+ *     when countdown==0" and updates i_stat / sio_stat / IRQ ring atomically.
+ *   - sio_tick does not enter the BIOS exception. The BIOS exception fires
+ *     later in the dispatch loop when (i_stat & i_mask & !in_exception).
+ *
+ * Stats (always-on, exposed via sio_burst_stats TCP cmd) so we can see if
+ * the bound is being hit, what the typical iter count is, and which break
+ * reason dominates. */
+typedef struct {
+    uint64_t calls;            /* total burst invocations */
+    uint64_t iters_total;      /* total sio_tick iterations across all calls */
+    uint32_t iter_max_seen;    /* max iters in a single call */
+    uint64_t break_idle;       /* broke because pending=0 && countdown=0 */
+    uint64_t break_mode_clear; /* broke because mc_state==MC_IDLE */
+    uint64_t break_capped;     /* broke at max_iters cap */
+    uint32_t fires_in_burst;   /* IRQ fires that occurred during a burst */
+    uint32_t last_iters;       /* iterations on most recent call */
+    uint8_t  last_break_reason;/* 1=idle, 2=mode_clear, 3=capped, 0=skip */
+} SioBurstStats;
+
+static SioBurstStats s_burst_stats;
+static uint32_t s_irq_seq_at_burst_start = 0;
+
+extern uint8_t psx_read_byte(uint32_t addr);
+extern int     psx_get_in_exception(void);
+
+static int sio_card_burst_drain(int max_iters) {
+    if (max_iters <= 0) max_iters = 128;
+    if (max_iters > 1024) max_iters = 1024;
+
+    s_burst_stats.calls++;
+    uint32_t fires_before = sio_irq_seq;
+    int iters = 0;
+    uint8_t reason = 1; /* default: idle break */
+
+    for (; iters < max_iters; iters++) {
+        /* Idle check (do BEFORE the tick — if there's nothing pending and
+         * countdown is 0, ticking is a no-op anyway). */
+        if (!sio_irq_pending && sio_irq_countdown == 0) {
+            reason = 1;
+            break;
+        }
+        /* Card protocol returned to IDLE — transaction finished or aborted.
+         * mc_state is the authoritative "transfer in flight" signal; the
+         * BIOS-RAM word [0x75C0] is only set during the data-byte phase
+         * (after the address handshake), so checking it here would have
+         * blocked bursting through the SELECT/CMD/ADDR setup bytes that
+         * precede the data phase. */
+        if (mc_state == MC_IDLE) {
+            reason = 2;
+            break;
+        }
+        sio_tick();
+    }
+
+    if (iters == max_iters) reason = 3;
+
+    s_burst_stats.iters_total += (uint64_t)iters;
+    if ((uint32_t)iters > s_burst_stats.iter_max_seen) s_burst_stats.iter_max_seen = (uint32_t)iters;
+    if (reason == 1) s_burst_stats.break_idle++;
+    else if (reason == 2) s_burst_stats.break_mode_clear++;
+    else if (reason == 3) s_burst_stats.break_capped++;
+    s_burst_stats.last_iters = (uint32_t)iters;
+    s_burst_stats.last_break_reason = reason;
+    s_burst_stats.fires_in_burst += (uint32_t)(sio_irq_seq - fires_before);
+    return iters;
+}
+
+void sio_get_burst_stats(uint64_t out[10]) {
+    out[0] = s_burst_stats.calls;
+    out[1] = s_burst_stats.iters_total;
+    out[2] = (uint64_t)s_burst_stats.iter_max_seen;
+    out[3] = s_burst_stats.break_idle;
+    out[4] = s_burst_stats.break_mode_clear;
+    out[5] = s_burst_stats.break_capped;
+    out[6] = (uint64_t)s_burst_stats.fires_in_burst;
+    out[7] = (uint64_t)s_burst_stats.last_iters;
+    out[8] = (uint64_t)s_burst_stats.last_break_reason;
+    out[9] = 0;
 }
 
 void sio_tick(void) {
