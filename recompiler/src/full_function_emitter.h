@@ -20,6 +20,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -33,7 +34,17 @@ struct EmitStats {
     uint32_t functions_skipped = 0;  // e.g. FPU functions
     uint32_t total_instructions = 0;
     uint32_t dispatch_entries = 0;
+    uint32_t continuation_entries = 0;
     std::vector<std::pair<uint32_t, std::string>> skipped;  // (addr, reason)
+};
+
+// A continuation label: the return point inside a calling function after
+// a jal/jalr to a separate dispatch entry.  When the callee does jr $ra,
+// the dispatch loop must route back to this label.
+struct ContinuationLabel {
+    uint32_t rom_addr;          // ROM address of the label (e.g., 0xBFC3F534)
+    uint32_t norm_addr;         // normalized dispatch address (same as rom_addr for shell)
+    uint32_t parent_func_norm;  // normalized address of the parent function
 };
 
 class FullFunctionEmitter {
@@ -54,6 +65,15 @@ public:
 
 private:
     // Emit a single function's C code to the output stream.
+    // Populates out_continuations with labels that need dispatch entries.
+    // injected_cross_targets: ROM addresses INSIDE this function that are
+    //   referenced from other functions as branch/jump targets — these need
+    //   to become dispatch-routable continuations of THIS function.
+    // out_cross_targets: collected cross-function tail-call targets discovered
+    //   while emitting THIS function. Each entry's parent_func_norm is the
+    //   function that CONTAINS the target (NOT the current emitting function).
+    //   The top-level emit pass aggregates these and feeds them as
+    //   injected_cross_targets in PASS 2.
     static bool emit_function(
         std::string&                out,
         const DiscoveredFunction&   func,
@@ -61,13 +81,17 @@ private:
         const std::set<uint32_t>&   all_function_entries,
         const std::vector<uint8_t>& rom,
         uint32_t                    base_addr,
-        uint32_t                    rom_end);
+        uint32_t                    rom_end,
+        std::vector<ContinuationLabel>& out_continuations,
+        const std::set<uint32_t>&   injected_cross_targets,
+        std::vector<ContinuationLabel>& out_cross_targets);
 
     // Emit the dispatch table.
     static void emit_dispatch(
         std::string&              out,
         const DiscoveryResult&    dr,
         const std::set<uint32_t>& emitted_normalized,
+        const std::map<uint32_t, ContinuationLabel>& continuations,
         const std::string&        bios_sha256);
 
     static uint32_t normalize_address(uint32_t addr);

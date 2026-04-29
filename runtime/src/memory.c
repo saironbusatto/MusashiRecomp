@@ -31,6 +31,46 @@ static uint8_t bios_rom[BIOS_ROM_SIZE];
 /* Expose RAM pointer for oracle comparison (find_first_divergence). */
 uint8_t *memory_get_ram_ptr(void) { return ram; }
 
+/* ---- Dirty-page tracking for install-at-runtime code (CLAUDE.md Rule 18) ----
+ *
+ * The PS1 BIOS writes 4-instruction dispatch stubs into kernel RAM at runtime
+ * (e.g. RAM 0xCF0 for the SIO data-byte handler).  A static recompiler can't
+ * see those instructions because they don't exist at compile time.  We track
+ * which RAM pages have been written-to since boot and route any psx_dispatch
+ * landing in such a page through a small MIPS interpreter (dirty_ram_interp.c).
+ *
+ * Granularity: 4 KB pages.  We only track the kernel-code region (RAM 0..0xFFFF
+ * = 16 pages = 16 bits).  Game RAM and dynamic data RAM are not tracked because
+ * dispatch never lands there in normal operation, and because tracking writes
+ * to all of RAM would mark "everything dirty" within seconds.
+ *
+ * Future option (Option B, see docs/dynamic_handler_install.md): when a page
+ * goes dirty, JIT-compile its bytes via StrictTranslator instead of running
+ * an interpreter.  Pros: one source of MIPS semantics, hot install stubs run
+ * as native compiled C.  Cons: gcc-at-runtime build dep, ~200 ms compile latency
+ * stall on first dispatch, file I/O on hot path, cache-invalidation complexity,
+ * Windows MinGW + dlopen friction.  Revisit only if install stubs become a
+ * measurable hot path; today they're cold-path glue (~4k instructions per
+ * directory-load is sub-microsecond to interpret). */
+#define DIRTY_RAM_TRACK_BYTES   0x10000u    /* track only kernel area RAM 0..0xFFFF */
+#define DIRTY_RAM_PAGE_SHIFT    12          /* 4 KB pages */
+#define DIRTY_RAM_PAGE_COUNT    (DIRTY_RAM_TRACK_BYTES >> DIRTY_RAM_PAGE_SHIFT)
+static uint32_t dirty_ram_bitmap;  /* one bit per page; up to 32 pages supported */
+
+static inline void dirty_ram_mark(uint32_t phys) {
+    if (phys >= DIRTY_RAM_TRACK_BYTES) return;
+    uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
+    dirty_ram_bitmap |= (1u << page);
+}
+
+int dirty_ram_is_dirty(uint32_t phys) {
+    if (phys >= DIRTY_RAM_TRACK_BYTES) return 0;
+    uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
+    return (dirty_ram_bitmap >> page) & 1u;
+}
+
+uint32_t dirty_ram_get_bitmap(void) { return dirty_ram_bitmap; }
+
 /* Memory control registers: 0x1F801000..0x1F80103F (16 words) + 0x1F801060 (RAM size).
  * Includes expansion base/size, COM_DELAY, SPU_DELAY, CDROM_DELAY etc. */
 static uint32_t mem_ctrl[16];   /* indices 0..15 → addresses 0x1F801000..0x1F80103C */
@@ -50,11 +90,12 @@ uint32_t i_stat;  /* 0x1F801070 — interrupt status (AND-acknowledge semantics)
 uint32_t i_mask;  /* 0x1F801074 — interrupt enable mask */
 
 /* ---- Card protocol trace: tracks I_MASK bit 7 transitions ---- */
-#define IMASK_TRACE_CAP 256
+#define IMASK_TRACE_CAP 4096
 typedef struct {
     uint32_t old_mask;
     uint32_t new_mask;
     uint32_t caller;     /* g_debug_current_func_addr */
+    uint32_t store_pc;   /* g_debug_last_store_pc — exact PC of the SW/SH */
     uint8_t  width;      /* 16 or 32 */
     uint8_t  bit7_set;   /* 1 if this write SET bit 7 */
     uint8_t  bit7_clear; /* 1 if this write CLEARED bit 7 */
@@ -68,11 +109,13 @@ static int imask_bit7_clear_count = 0;
 
 static void imask_trace_record(uint32_t old_val, uint32_t new_val, uint8_t width) {
     extern uint32_t g_debug_current_func_addr;
+    extern uint32_t g_debug_last_store_pc;
     extern int psx_get_in_exception(void);
     ImaskTraceEntry *e = &imask_trace[imask_trace_idx];
     e->old_mask   = old_val;
     e->new_mask   = new_val;
     e->caller     = g_debug_current_func_addr;
+    e->store_pc   = g_debug_last_store_pc;
     e->width      = width;
     e->bit7_set   = (!(old_val & 0x80) && (new_val & 0x80)) ? 1 : 0;
     e->bit7_clear = ((old_val & 0x80) && !(new_val & 0x80)) ? 1 : 0;
@@ -110,6 +153,7 @@ static inline uint16_t read_ram_half(uint32_t phys) {
 /* SPU registers are now handled by spu.c */
 
 void memory_set_sr_ptr(const uint32_t *p) { sr_ptr = p; }
+uint32_t memory_get_sr(void) { return sr_ptr ? *sr_ptr : 0; }
 
 void memory_init(const char* bios_path) {
     memset(ram, 0, sizeof(ram));
@@ -426,6 +470,7 @@ void psx_write_word(uint32_t addr, uint32_t val) {
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
+        dirty_ram_mark(phys);
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         ram[phys + 2] = (uint8_t)(val >> 16);
@@ -482,6 +527,7 @@ void psx_write_half(uint32_t addr, uint16_t val) {
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
+        dirty_ram_mark(phys);
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         return;
@@ -530,6 +576,7 @@ void psx_write_byte(uint32_t addr, uint8_t val) {
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
+        dirty_ram_mark(phys);
         ram[phys] = val;
         return;
     }

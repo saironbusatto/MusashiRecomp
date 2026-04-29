@@ -32,8 +32,9 @@ void sio_connect_pad(int slot);
 /* Return current pad button state (for debug server). */
 uint16_t sio_get_pad_buttons(void);
 
-/* ---- SIO byte-level trace ring buffer ---- */
-#define SIO_TRACE_CAP 65536
+/* ---- SIO byte-level trace ring buffer ----
+ * 1M entries × ~28 B ≈ 32 MB.  At ~600 byte/sec that's ~30 min of history. */
+#define SIO_TRACE_CAP (1 << 20)
 
 typedef struct {
     uint32_t seq;           /* monotonic sequence number */
@@ -56,6 +57,9 @@ typedef struct {
  * Returns number of entries ever written (seq of next write). */
 uint32_t sio_get_trace(const SioTraceEntry **buf_out, int *write_idx_out);
 
+/* Current SIO byte sequence — used by SIO PC tracer for cross-referencing. */
+uint32_t sio_get_seq(void);
+
 /* Returns 1 if a memcard protocol exchange is in progress on either
  * slot. Callers (notably the VBlank scheduler) use this to defer
  * interrupt delivery so the BIOS's pad polling routine — which fires
@@ -63,12 +67,17 @@ uint32_t sio_get_trace(const SioTraceEntry **buf_out, int *write_idx_out);
  * transaction by issuing 0x01 on the SIO bus mid-read. */
 int sio_card_protocol_active(void);
 
+/* Snapshot SIO IRQ-pacing internals for the freeze_check diagnostic. */
+void sio_get_freeze_diag(int *out_irq_pending, int *out_irq_countdown,
+                         uint16_t *out_sio_stat, uint16_t *out_sio_ctrl,
+                         int *out_card_active);
+
 /* ---- Card transaction ring buffer ----
  *
  * One entry per card protocol transaction (0x81 → terminal state / abort).
- * Always-on. Sized for ~4096 transactions; each holds the full TX/RX byte
- * stream of the transaction up to SIO_TXN_MAX_BYTES. */
-#define SIO_TXN_CAP        4096
+ * Always-on.  64K entries × ~544 B ≈ 35 MB — holds tens of minutes of card
+ * activity at typical detection-cycle rates. */
+#define SIO_TXN_CAP        (1 << 16)
 #define SIO_TXN_MAX_BYTES  256
 
 typedef enum {
@@ -110,10 +119,9 @@ const SioTxnEntry *sio_get_card_txn_live(void);
 
 /* ---- SIO IRQ #7 delivery ring ----
  *
- * Captures every time IRQ #7 (SIO0) is raised into I_STAT. Always-on,
- * 4096 entries (~64 KB). The handoff hypothesis "SIO IRQ pacing too slow"
- * needs this ring to be falsifiable. */
-#define SIO_IRQ_RING_CAP 4096
+ * Captures every time IRQ #7 (SIO0) is raised into I_STAT.  Always-on.
+ * 1M entries × ~64 B ≈ 64 MB — holds tens of minutes of IRQ history. */
+#define SIO_IRQ_RING_CAP (1 << 20)
 
 typedef enum {
     SIO_IRQ_SRC_UNKNOWN  = 0,

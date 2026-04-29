@@ -17,6 +17,7 @@ set(PSX_SHARED_SOURCES
     src/sio.c
     src/memcard.c
     src/debug_server.c
+    src/dirty_ram_interp.c
     src/traps.c
     src/gte.cpp
     src/crc32.c

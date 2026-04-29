@@ -118,6 +118,24 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
 /* Dispatch trace — record every function dispatched. */
 void debug_server_trace_dispatch(uint32_t func_addr);
 
+/* Direct-call entry hook — emitted by the recompiler at the top of every
+ * generated function so we can see direct-jal targets that never go through
+ * psx_dispatch.  Logs into the fn_entry ring (subject to fn_filter) without
+ * touching the shadow stack — the native C call/return discipline already
+ * handles unwinding for direct calls. */
+void debug_server_log_call_entry(uint32_t func_addr);
+
+/* Last store instruction PC — set by the recompiler before every memory
+ * store (sb/sh/sw/swl/swr/swc2).  Read by SIO/MMIO write handlers to
+ * attribute the writing instruction without needing a full call-stack
+ * walk.  Stale across non-store instructions but every store updates it. */
+extern uint32_t g_debug_last_store_pc;
+
+/* SIO write PC tracer ring — records (pc, addr, value, byte_seq) for every
+ * write to SIO_DATA / SIO_CTRL / SIO_STAT.  Always-on; pulled via TCP cmd
+ * "sio_pc_trace". */
+void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width);
+
 /* ---- Watchpoint notifications ---- */
 
 void debug_server_check_watchpoints(void);

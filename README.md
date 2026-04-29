@@ -1,3 +1,33 @@
+## Architecture note: install-at-runtime code
+
+PSXRecomp v4 is a **static recompiler with a small interpreter for
+self-modifying / install-at-runtime RAM**. The PS1 BIOS writes 4-instruction
+dispatch stubs into kernel RAM at runtime (e.g. RAM 0xCF0 for the SIO
+data-byte handler) and then transfers control to those addresses. A pure
+static recompiler can't see those instructions because they don't exist at
+compile time — only the program's *intent to install them* does.
+
+The runtime detects writes into kernel-RAM code regions, marks the affected
+pages "dirty", and routes any dispatch into a dirty page through a tiny MIPS
+interpreter that runs the actual installed instructions on the CPU register
+state. Static-recompiled C continues to handle the rest of the BIOS and all
+game code.
+
+**This is not HLE.** We do not synthesize what the handler "would have done".
+We execute the BIOS author's own instructions, exactly as written, just from
+a different code source (RAM-at-runtime instead of ROM-at-compile-time).
+Mature static recompilers (N64Recomp, mednafen-PSX's dynarec) handle this
+the same way. See [`docs/dynamic_handler_install.md`](docs/dynamic_handler_install.md)
+for the detailed analysis (kernel exception handler at RAM 0xC80 falls
+through to the installed stub at RAM 0xCF0 → handler at 0x641C).
+
+The interpreter is **not** a fallback for code the recompiler failed to
+translate. Code that the recompiler can statically see must be statically
+recompiled. The interpreter exists solely for code that did not exist at
+recompile time.
+
+---
+
 ## Current Milestone
 
 The authoritative milestone document is [`FIRST_MILESTONE.md`](./FIRST_MILESTONE.md).

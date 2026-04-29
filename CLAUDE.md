@@ -52,24 +52,27 @@ whatever you're testing belongs to a phase that hasn't started yet.
 
 ---
 
-## 2. DuckStation is the oracle, always
+## 2. Three sources of truth, in priority order
 
-Truth comes from two sources:
+Truth comes from three sources, in this order:
 
-- **Ghidra** for what the BIOS code is supposed to do (static analysis
-  of `SCPH1001.BIN` loaded at `0xBFC00000`)
-- **DuckStation** at `F:/Projects/psxrecomp-v4/duckstation/build/bin/duckstation-qt.exe`
-  for what real PS1 hardware does at runtime (dynamic oracle). The `duckstation/`
-  directory is a **git submodule** pinned at upstream `stenzek/duckstation`
-  commit `ffb33c281` (release-20260328 era). Our PSXRecomp TCP debug server
-  patch lives at `tools/duckstation/psxrecomp_oracle.patch` and auto-applies
-  via `tools/duckstation/setup.sh`. Never commit changes into the submodule —
-  edit files freely for local experimentation, then regenerate the patch with
-  `git -C duckstation diff <base> > tools/duckstation/psxrecomp_oracle.patch`
+1. **BIOS disassembly** at `docs/psx_bios_disasm.txt` for what the BIOS
+   code is supposed to do. Human-annotated pseudocode with named functions,
+   kernel data structures (IntRP, ExCB, TCB, TCBH), A0/B0/C0 tables, boot
+   sequence, and exception handler logic. Check this FIRST.
+2. **Ghidra MCP** for what the raw bytes are at a given address (static
+   analysis of `SCPH1001.BIN` loaded at `0xBFC00000`). Use when the disasm
+   doesn't cover a function or you need exact instruction-level detail.
+3. **Beetle PSX oracle** (embedded in `psx-beetleoracle.exe`) for what real
+   PS1 hardware does at runtime. Beetle PSX (mednafen-psx libretro core)
+   runs in-process with the native runtime, sharing the same debug server.
+   Oracle commands: `find_first_divergence`, `emu_read_ram`, `emu_sio_trace`,
+   `emu_trace_addr`, `emu_step`. Where Beetle has gaps, **build new tooling
+   and visibility** — don't guess, don't route around.
 
-Use both, never just one. Don't guess. Don't say "probably". If you
-cannot answer a question from Ghidra or DuckStation, the answer is
-"I don't know yet" — not a confident guess.
+Use all three, never just one. Don't guess. Don't say "probably". If you
+cannot answer a question from the disasm, Ghidra, or the Beetle oracle,
+the answer is "I don't know yet" — not a confident guess.
 
 ---
 
@@ -119,9 +122,8 @@ At the start of every session, before any code change:
 1. Read this file (CLAUDE.md).
 2. Read PLAN.md to confirm what phase we are in and what the next
    concrete milestone is.
-3. Verify Ghidra MCP is reachable. If not, stop and ask.
-4. Verify DuckStation builds and launches with `-bios`. If not, stop
-   and ask.
+3. Verify `docs/psx_bios_disasm.txt` exists (primary reference).
+4. Verify Ghidra MCP is reachable. If not, stop and ask.
 5. State out loud: "Architecture A is locked. No interpreter. No HLE.
    No stubs. BIOS first. Game never until Phase 5."
 
@@ -275,26 +277,39 @@ the oracle.
 
 ---
 
-## 16. DuckStation oracle setup (from fresh checkout)
+## 16. Beetle PSX oracle setup (from fresh checkout)
 
-On a fresh clone of this repo, the DuckStation oracle is not yet ready. Run:
+The runtime oracle is **Beetle PSX** (mednafen-psx libretro core), embedded
+in `psx-beetleoracle.exe`. It runs in-process — no separate emulator window.
 
 ```bash
-git submodule update --init --recursive duckstation
-bash tools/duckstation/setup.sh     # clones deps, applies psxrecomp_oracle.patch
-bash tools/duckstation/build.sh     # builds Release x64 via MSBuild
+# Build beetle-psx static lib (one-time, or after modifying beetle-psx/ source)
+cd beetle-psx && make platform=mingw_x86_64 STATIC_LINKING=1 HAVE_LIGHTREC=0 -j8
+cp mednafen_psx_libretro.dll libmednafen_psx.a && cd ..
+
+# Build oracle runtime
+PATH=/c/msys64/mingw64/bin:$PATH
+cd runtime/build && cmake --build . --target psx-beetleoracle && cd ../..
+
+# Run (kills any existing instance first)
+taskkill //F //IM psx-beetleoracle.exe 2>/dev/null
+start "" "./runtime/build/psx-beetleoracle.exe" "bios/SCPH1001.BIN"
 ```
 
-The result is `duckstation/build/bin/duckstation-qt.exe` — the oracle binary.
-For headless launch it needs `settings.ini` in `duckstation/build/bin/` with
-`PathNTSCU = SCPH1001.BIN` under `[BIOS]` and `SearchDirectory = bios`, plus
-`bios/SCPH1001.BIN` copied next to the exe. `tools/duckstation/setup.sh` handles
-these post-build config steps. See `tools/duckstation/README.md` for the full
-layout and how to regenerate the patch.
+Beetle boots from `bios/scph5501.bin` (copy of SCPH1001.BIN). Oracle commands
+are served on the same TCP debug port (4370): `find_first_divergence`,
+`emu_read_ram`, `emu_sio_trace`, `emu_trace_addr`, `emu_step`.
 
-**Never edit the submodule source to work around upstream bugs.** If a change
-is needed in DuckStation's side, edit in the working tree, then regenerate the
-patch against the pinned base — so the change is reviewable in a single diff.
+**Key files:**
+- `beetle-psx/` — cloned beetle-psx-libretro repo
+- `beetle-psx/libmednafen_psx.a` — static library
+- `runtime/src/beetle_psx_bridge.cpp` — libretro bridge (C++)
+- `runtime/src/psx_oracle_cmds.c` — TCP oracle commands
+- `runtime/include/psx_oracle_backend.h` — abstract backend interface
+
+**Where Beetle has gaps, build new tooling.** Do not fall back to
+DuckStation. Do not guess. Build the diagnostic tool that gives you
+the visibility you need.
 
 ---
 
@@ -312,3 +327,39 @@ These cannot be tested until disc data flows, but they cannot be
 skipped either. The first task of Phase 5 is to implement them, not
 to load the game and see what breaks. Loading the game with known
 stubs is how v3 ended up with 1808 lines of shims.
+
+---
+
+## 18. Self-modifying / install-at-runtime RAM is interpreted, not HLE'd
+
+The PSX BIOS dynamically writes 4-instruction dispatch stubs into kernel
+RAM (e.g. RAM 0xCF0 for the SIO data-byte handler) and then transfers
+control to those addresses. The static recompiler CANNOT see those
+instructions, because they don't exist at compile time — only the
+program's intent to install them does.
+
+**The correct answer is to interpret, not to HLE.** A small MIPS
+interpreter in the runtime tracks writes into the kernel-RAM code region,
+marks affected pages "dirty", and runs any `psx_dispatch` whose target
+falls in a dirty page through the interpreter. The interpreter executes
+the program's own instructions on the CPU register state. After the basic
+block, control returns to static-recompiled C.
+
+**This is not HLE.** HLE means "the program would have produced result X,
+so we synthesize X ourselves and skip the program's code." This rule is
+the opposite: we run the program's code, exactly as the BIOS author wrote
+it. The only difference from a pure static recompile is the *source* of
+the instructions (RAM-written-at-runtime vs ROM-at-compile-time).
+
+**This rule does NOT relax Rule 0.** The interpreter is not a fallback for
+code the recompiler failed to translate. If a function exists in ROM at
+recompile time, it MUST be statically recompiled. The interpreter only
+runs against PCs in pages that have been written to since boot — i.e.,
+code that was put there at runtime by the program.
+
+Mature static-recompilation projects (N64Recomp, mednafen-PSX's dynarec)
+all handle install-at-runtime code this way. PSXRecomp v4 follows suit.
+
+Implementation lives in `runtime/src/dirty_ram_interp.c` (or similar). It
+is intentionally small (~300 LOC), modular, and isolated. It does NOT
+expand into a general-purpose CPU emulator.

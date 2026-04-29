@@ -32,6 +32,16 @@ void psx_check_interrupts(struct CPUState* cpu);
 /* Query whether we are currently inside an exception handler dispatch. */
 int psx_get_in_exception(void);
 
+/* Snapshot internal counters for the freeze_check diagnostic.  Any out_*
+ * pointer may be NULL.  All counters are monotonically non-decreasing
+ * (dispatch_count resets each VBlank). */
+void psx_get_freeze_diag(uint64_t *out_total_checks,
+                         uint32_t *out_dispatch_count,
+                         int *out_in_exception,
+                         int *out_post_exc_cooldown,
+                         uint64_t *out_exc_entries,
+                         uint64_t *out_exc_reentry_blocks);
+
 /* longjmp back to psx_check_interrupts, unwinding the exception handler.
  * Called by ReturnFromException (B0:0x17 or SYSCALL(3)) when inside
  * the exception handler to model real hardware's RFE+JR $k0 unwind. */

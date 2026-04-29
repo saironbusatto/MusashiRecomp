@@ -52,6 +52,18 @@ static uint64_t total_checks;
 /* Reentrancy guard: prevent interrupt handler from triggering interrupts. */
 static int in_exception;
 
+/* Diagnostic: total times the exception handler was entered (in_exception
+ * transitioned 0->1).  Diff this between two snapshots to measure handler
+ * dispatch rate. */
+static uint64_t exception_entries_total;
+
+/* Diagnostic: psx_check_interrupts called while already in_exception (the
+ * `return` path at line ~159).  Real hardware can't double-fault into the
+ * same handler; on our model this should stay near zero — non-zero means
+ * something is calling psx_check_interrupts from inside the recompiled
+ * exception handler tree. */
+static uint64_t exception_reentry_blocks;
+
 /* After the exception handler returns, suppress the next interrupt delivery
  * to give the interrupted code at least one block of execution — matching
  * real hardware where at least one instruction runs after RFE before the
@@ -65,11 +77,27 @@ static jmp_buf exception_jmpbuf;
 
 int psx_get_in_exception(void) { return in_exception; }
 
+void psx_get_freeze_diag(uint64_t *out_total_checks,
+                         uint32_t *out_dispatch_count,
+                         int *out_in_exception,
+                         int *out_post_exc_cooldown,
+                         uint64_t *out_exc_entries,
+                         uint64_t *out_exc_reentry_blocks) {
+    if (out_total_checks)        *out_total_checks       = total_checks;
+    if (out_dispatch_count)      *out_dispatch_count     = dispatch_count;
+    if (out_in_exception)        *out_in_exception       = in_exception;
+    if (out_post_exc_cooldown)   *out_post_exc_cooldown  = post_exception_cooldown;
+    if (out_exc_entries)         *out_exc_entries        = exception_entries_total;
+    if (out_exc_reentry_blocks)  *out_exc_reentry_blocks = exception_reentry_blocks;
+}
+
 void interrupts_init(void) {
     dispatch_count = 0;
     in_exception = 0;
     total_checks = 0;
     post_exception_cooldown = 0;
+    exception_entries_total = 0;
+    exception_reentry_blocks = 0;
 }
 
 /*
@@ -116,20 +144,50 @@ void psx_check_interrupts(CPUState* cpu) {
      * so dispatch_count can exceed VBLANK_INTERVAL during a single
      * handler invocation, causing VBlanks to stack up and starve the
      * main code.  Gating the tick on !in_exception prevents this. */
+    /* Track SIO byte progress at every check (not just at VBlank time). */
+    static uint32_t last_sio_seq_seen = 0;
+    static uint64_t total_checks_at_progress = 0;
+    {
+        uint32_t cur_sio_seq = sio_get_seq();
+        if (cur_sio_seq != last_sio_seq_seen) {
+            last_sio_seq_seen = cur_sio_seq;
+            total_checks_at_progress = total_checks;
+        }
+    }
     if (!in_exception) {
         dispatch_count++;
         if (dispatch_count >= VBLANK_INTERVAL) {
-            dispatch_count = 0;
-            i_stat |= (1 << IRQ_VBLANK);
-            gpu_vblank_tick();  /* Toggle LCF (GPUSTAT bit 31) */
-            timers_tick(33868); /* ~1 NTSC frame worth of cycles */
-            cdrom_tick();      /* Process pending CDROM responses */
+            /* Defer VBlank while a card SIO transaction is mid-flight.
+             * On real hardware a 140-byte sector read finishes (~4.5ms)
+             * well before the next VBlank (16.67ms).  Our dispatch-count
+             * pacing fires VBlank during the read window, and the BIOS
+             * VBlank pad poll injects 0x01 onto the SIO bus mid-card
+             * read, aborting the transaction via CTRL.RESET.
+             *
+             * Defer as long as the card protocol is making progress
+             * (an SIO byte was exchanged in the last VBLANK_DEFER_STALE
+             * dispatch ticks).  If no byte for that long, treat the
+             * protocol as stuck and force the VBlank to prevent deadlock. */
+            #define VBLANK_DEFER_STALE 500000  /* ~10 frames; covers inter-byte gaps in card protocol */
+            int card_active = sio_card_protocol_active();
+            uint64_t since_progress = total_checks - total_checks_at_progress;
+            int progress_stale = since_progress >= VBLANK_DEFER_STALE;
+            if (!card_active || progress_stale) {
+                dispatch_count = 0;
+                i_stat |= (1 << IRQ_VBLANK);
+                gpu_vblank_tick();  /* Toggle LCF (GPUSTAT bit 31) */
+                timers_tick(33868); /* ~1 NTSC frame worth of cycles */
+                cdrom_tick();      /* Process pending CDROM responses */
+            }
         }
     }
 
     /* Check if any interrupts are pending. */
     if ((i_stat & i_mask) == 0) return;
-    if (in_exception) return;
+    if (in_exception) {
+        exception_reentry_blocks++;
+        return;
+    }
 
     /* Post-exception cooldown: let at least one block execute after RFE. */
     if (post_exception_cooldown > 0) {
@@ -143,6 +201,7 @@ void psx_check_interrupts(CPUState* cpu) {
     if (!(sr & (1 << 10))) return; /* Hardware interrupt bit not enabled */
 
     in_exception = 1;
+    exception_entries_total++;
     uint32_t pre_handler_istat = i_stat;  /* snapshot for cooldown decision */
 
     /* Set COP0 Cause: ExcCode=0 (interrupt), IP2 pending. */

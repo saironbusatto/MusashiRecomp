@@ -14,6 +14,7 @@
 
 #include "sio.h"
 #include "memcard.h"
+#include "debug_server.h"
 #include <string.h>
 
 /* I_STAT is owned by memory.c */
@@ -178,6 +179,10 @@ uint32_t sio_get_trace(const SioTraceEntry **buf_out, int *write_idx_out) {
     return sio_trace_seq;
 }
 
+uint32_t sio_get_seq(void) {
+    return sio_trace_seq;
+}
+
 int sio_card_protocol_active(void) {
     /* Active if either slot has an in-flight protocol, or the working
      * mc_state is non-idle. */
@@ -186,6 +191,7 @@ int sio_card_protocol_active(void) {
     if (mc_slots[1].state != MC_IDLE) return 1;
     return 0;
 }
+
 
 /* ---- Card transaction ring buffer ---- */
 static SioTxnEntry sio_txn_buf[SIO_TXN_CAP];
@@ -850,6 +856,10 @@ void sio_write(uint32_t addr, uint32_t value) {
      * Ticking before a CTRL ACK write would fire the pending IRQ
      * right before the CTRL clears it — wrong order. */
 
+    /* Capture writing PC (set by recompiler before every store) into the
+     * SIO PC tracer ring before the write actually takes effect. */
+    debug_server_log_sio_write(addr, value, 4);
+
     switch (addr) {
     case 0x1F801040: /* SIO_TX_DATA */
         sio_tx_data = (uint8_t)value;
@@ -949,6 +959,16 @@ void sio_write(uint32_t addr, uint32_t value) {
      * This ensures CTRL ACK writes clear the old IRQ before the
      * pending one fires. */
     sio_tick();
+}
+
+void sio_get_freeze_diag(int *out_irq_pending, int *out_irq_countdown,
+                         uint16_t *out_sio_stat, uint16_t *out_sio_ctrl,
+                         int *out_card_active) {
+    if (out_irq_pending)   *out_irq_pending   = sio_irq_pending;
+    if (out_irq_countdown) *out_irq_countdown = sio_irq_countdown;
+    if (out_sio_stat)      *out_sio_stat      = sio_stat;
+    if (out_sio_ctrl)      *out_sio_ctrl      = sio_ctrl;
+    if (out_card_active)   *out_card_active   = sio_card_protocol_active();
 }
 
 void sio_tick(void) {

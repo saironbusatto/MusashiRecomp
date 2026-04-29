@@ -73,7 +73,10 @@ bool FullFunctionEmitter::emit_function(
     const std::set<uint32_t>&   all_function_entries_norm,
     const std::vector<uint8_t>& rom,
     uint32_t                    base_addr,
-    uint32_t                    /* rom_end */)
+    uint32_t                    /* rom_end */,
+    std::vector<ContinuationLabel>& out_continuations,
+    const std::set<uint32_t>&   injected_cross_targets,
+    std::vector<ContinuationLabel>& out_cross_targets)
 {
     const uint32_t norm = func.normalized_addr;
 
@@ -114,8 +117,64 @@ bool FullFunctionEmitter::emit_function(
     // The function entry is always a leader.
     block_leaders.insert(func.entry_addr);
 
-    // Emit function header.
-    out += fmt::format("void func_{:08X}(CPUState* cpu) {{\n", norm);
+    // Collect continuation labels for this function (populated during emit).
+    std::vector<ContinuationLabel> local_continuations;
+
+    // Inject cross-function targets BEFORE body emission. These are addresses
+    // INSIDE this function that other functions branch/jump to. Without these:
+    //   - block_leaders doesn't have them → no `label_<addr>:` is emitted
+    //   - local_continuations doesn't have them → no `case 0x<addr>u: goto`
+    // → dispatch table won't route mid-function tail-calls (root cause of
+    //   card-read silent halt).
+    // Both must be added together to keep label use/definition consistent.
+    for (uint32_t cross : injected_cross_targets) {
+        if (!addr_to_raw.count(cross)) continue;
+        uint32_t cross_norm = normalize_address(cross);
+        if (all_function_entries_norm.count(cross_norm)) continue;
+        block_leaders.insert(cross);
+        local_continuations.push_back({cross, cross_norm, norm});
+    }
+
+    // Helper: find which function (in all_function_entries_norm) contains a
+    // given ROM target address.  Returns the largest function-entry norm that
+    // is <= target_norm.  Returns 0 if no containing function found.
+    auto find_containing_function = [&](uint32_t target_rom) -> uint32_t {
+        uint32_t target_norm = normalize_address(target_rom);
+        uint32_t best = 0;
+        for (uint32_t fn : all_function_entries_norm) {
+            if (fn <= target_norm && fn > best) best = fn;
+        }
+        return best;
+    };
+
+    // Helper: register a cross-function tail-call target as a continuation
+    // in the function that contains it.  Without this, dispatching to a
+    // mid-function address misses the dispatch table and silently halts —
+    // root cause of card-read failure where state-11 chain handler's branch
+    // target 0xBFC15548 (mid func_00005A44) wasn't dispatchable.
+    auto register_cross_function_target = [&](uint32_t target_rom) {
+        uint32_t target_norm = normalize_address(target_rom);
+        // If target IS already a function entry, no continuation needed.
+        if (all_function_entries_norm.count(target_norm)) return;
+        // If target is inside the CURRENT function, no continuation needed
+        // (handled by goto labels).
+        if (addr_to_raw.count(target_rom)) return;
+        // Find containing function.
+        uint32_t parent_norm = find_containing_function(target_rom);
+        if (parent_norm == 0) return;  // No containing function — nothing to register
+        // Push to OUT_CROSS_TARGETS (NOT local_continuations). The top-level
+        // emit pass aggregates these and re-injects them as the containing
+        // function's continuations in PASS 2.
+        out_cross_targets.push_back({target_rom, target_norm, parent_norm});
+    };
+
+    // Emit function body to a temporary buffer so we can prepend the
+    // continuation entry-switch after we know which labels exist.
+    std::string body;
+    // Shadow 'out' with a reference to 'body' so all existing out+= lines
+    // write to the temporary buffer.  The real 'out' is assembled at the end.
+    std::string& func_out = body;
+    #define out func_out
 
     // --- Emit instructions in address order ---
     // Delay slots are emitted at their natural address (NOT inline with
@@ -288,19 +347,180 @@ bool FullFunctionEmitter::emit_function(
             // delay slot falls outside this function, resolve NOW (the
             // delay-slot side effect is in the adjacent function and will
             // execute when dispatch routes there).
-            if (orphaned_delay_slots.count(addr) && kind == "jr") {
-                uint8_t rs = (raw >> 21) & 0x1F;
-                if (rs == 31) {
-                    if (ra_loaded_from_non_sp)
-                        out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
-                    else
-                        out += "    return;\n";
-                } else {
-                    out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
+            //
+            // For BRANCHES with orphaned delay slots: also inline the
+            // delay slot instruction here (read raw from rom) so its side
+            // effect isn't lost on the branch-taken path.  Without this,
+            // a function that ends on a `beq ..., target` whose delay slot
+            // is the first instruction of the next function would fall off
+            // its own end with cpu->pc unset, silently halting the chain
+            // dispatcher (root cause of card-read truncation at byte 11).
+            if (orphaned_delay_slots.count(addr)) {
+                if (kind == "jr") {
+                    uint8_t rs = (raw >> 21) & 0x1F;
+                    if (rs == 31) {
+                        if (ra_loaded_from_non_sp)
+                            out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
+                        else
+                            out += "    return;\n";
+                    } else {
+                        out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
+                                           static_cast<int>(rs));
+                    }
+                } else if (is_branch_kind(kind.c_str())) {
+                    // Inline the orphaned delay slot from rom.
+                    uint32_t ds_addr = addr + 4;
+                    uint32_t base_phys = base_addr & 0x1FFFFFFFu;
+                    uint32_t ds_phys = ds_addr & 0x1FFFFFFFu;
+                    if (ds_phys >= base_phys && ds_phys + 4 <= base_phys + rom.size()) {
+                        uint32_t ds_offset = ds_phys - base_phys;
+                        uint32_t ds_raw = read_u32_le(rom, ds_offset);
+                        auto ds_d = PSXRecomp::MipsDecoder::decode(ds_raw, ds_addr);
+                        auto ds_tr = StrictTranslator::translate(ds_d);
+                        if (ds_tr.supported && !ds_tr.is_terminator) {
+                            out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
+                                               ds_addr, ds_raw, ds_tr.comment);
+                            out += fmt::format("    {}\n", ds_tr.c_code);
+                        }
+                    }
+                    // Resolve branch.  Target was decoded as absolute virtual addr.
+                    uint32_t target = tr.terminator_target;
+                    register_cross_function_target(target);
+                    out += fmt::format("    if (psx_taken_{:08X}) {{ cpu->pc = 0x{:08X}u; return; }}\n",
+                                       addr, target);
+                    // Not-taken: dispatch to delay-slot address (next function's entry).
+                    // The next function's prologue will re-execute the delay slot — that's
+                    // a duplicate side effect we accept for correctness on the not-taken
+                    // path. (For unconditional branches like beq $zero,$zero this path
+                    // is structurally dead.)
+                    register_cross_function_target(ds_addr);
+                    out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", ds_addr);
+                } else if (kind == "j") {
+                    // Inline orphaned delay slot, then unconditional jump.
+                    uint32_t ds_addr = addr + 4;
+                    uint32_t base_phys = base_addr & 0x1FFFFFFFu;
+                    uint32_t ds_phys = ds_addr & 0x1FFFFFFFu;
+                    if (ds_phys >= base_phys && ds_phys + 4 <= base_phys + rom.size()) {
+                        uint32_t ds_offset = ds_phys - base_phys;
+                        uint32_t ds_raw = read_u32_le(rom, ds_offset);
+                        auto ds_d = PSXRecomp::MipsDecoder::decode(ds_raw, ds_addr);
+                        auto ds_tr = StrictTranslator::translate(ds_d);
+                        if (ds_tr.supported && !ds_tr.is_terminator) {
+                            out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
+                                               ds_addr, ds_raw, ds_tr.comment);
+                            out += fmt::format("    {}\n", ds_tr.c_code);
+                        }
+                    }
+                    uint32_t target = relocate_j_target(addr, tr.terminator_target);
+                    register_cross_function_target(target);
+                    out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", target);
+                } else if (kind == "jal") {
+                    // Inline orphaned delay slot, set $ra, dispatch to target.
+                    uint32_t ds_addr = addr + 4;
+                    uint32_t base_phys = base_addr & 0x1FFFFFFFu;
+                    uint32_t ds_phys = ds_addr & 0x1FFFFFFFu;
+                    if (ds_phys >= base_phys && ds_phys + 4 <= base_phys + rom.size()) {
+                        uint32_t ds_offset = ds_phys - base_phys;
+                        uint32_t ds_raw = read_u32_le(rom, ds_offset);
+                        auto ds_d = PSXRecomp::MipsDecoder::decode(ds_raw, ds_addr);
+                        auto ds_tr = StrictTranslator::translate(ds_d);
+                        if (ds_tr.supported && !ds_tr.is_terminator) {
+                            out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
+                                               ds_addr, ds_raw, ds_tr.comment);
+                            out += fmt::format("    {}\n", ds_tr.c_code);
+                        }
+                    }
+                    uint32_t target = relocate_j_target(addr, tr.terminator_target);
+                    uint32_t return_addr = relocate_ra(addr + 8);
+                    out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
+                    out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
+                    out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", return_addr);
+                } else if (kind == "jalr") {
+                    uint32_t ds_addr = addr + 4;
+                    uint32_t base_phys = base_addr & 0x1FFFFFFFu;
+                    uint32_t ds_phys = ds_addr & 0x1FFFFFFFu;
+                    if (ds_phys >= base_phys && ds_phys + 4 <= base_phys + rom.size()) {
+                        uint32_t ds_offset = ds_phys - base_phys;
+                        uint32_t ds_raw = read_u32_le(rom, ds_offset);
+                        auto ds_d = PSXRecomp::MipsDecoder::decode(ds_raw, ds_addr);
+                        auto ds_tr = StrictTranslator::translate(ds_d);
+                        if (ds_tr.supported && !ds_tr.is_terminator) {
+                            out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
+                                               ds_addr, ds_raw, ds_tr.comment);
+                            out += fmt::format("    {}\n", ds_tr.c_code);
+                        }
+                    }
+                    uint8_t rs = (raw >> 21) & 0x1F;
+                    uint8_t rd = (raw >> 11) & 0x1F;
+                    uint32_t return_addr = relocate_ra(addr + 8);
+                    if (rd != 0) {
+                        out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
+                                           static_cast<int>(rd), return_addr);
+                    }
+                    out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
                                        static_cast<int>(rs));
+                    out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", return_addr);
                 }
             }
             continue;
+        }
+
+        // Install-slot hook (CLAUDE.md Rule 18 / docs/dynamic_handler_install.md).
+        // The PS1 BIOS overwrites specific kernel-RAM addresses at runtime
+        // with dispatch stubs (e.g. RAM 0xCF0 for the SIO data-byte handler).
+        // The recompiler emitted NOPs from the ROM image; if we just run those
+        // statically, the installed stub never executes.  At known install-slot
+        // PCs, emit a runtime check: if the page is dirty (RAM was written-to),
+        // dispatch into RAM to run the installed code.  Otherwise fall through
+        // to the static NOP.
+        //
+        // Add new install slot PCs here as they're discovered.  See
+        // docs/dynamic_handler_install.md for how to find them.
+        auto rom_to_ram = [](uint32_t rom_addr) -> uint32_t {
+            uint32_t phys = rom_addr & 0x1FFFFFFFu;
+            if (phys >= 0x1FC10000u && phys <= 0x1FC17FFFu) {
+                return phys - 0x1FC10000u + 0x00000500u;
+            }
+            return phys;
+        };
+        uint32_t ram_pc = rom_to_ram(addr);
+        bool is_install_slot =
+            (ram_pc == 0x00000CF0u);  /* SIO data-byte handler dispatch slot */
+        if (is_install_slot) {
+            /* The installed stub is 4 instructions: lui, addiu, jalr, nop.
+             * The jalr captures ra = stub_PC + 8 = install_slot + 0x10.  When
+             * the stub's called function returns via jr ra, control flows back
+             * to install_slot + 0x10.  Register that ROM address as both a
+             * block leader (so label_<post_stub>: is emitted) and a local
+             * continuation (so the entry-switch routes to it).  Without this,
+             * external dispatch to the post-stub PC misses and falls into
+             * interpretation, which doesn't have COP0 and crashes the
+             * exception handler. */
+            uint32_t post_stub_rom = addr + 0x10u;
+            if (addr_to_raw.count(post_stub_rom)) {
+                block_leaders.insert(post_stub_rom);
+                uint32_t post_stub_norm = normalize_address(post_stub_rom);
+                if (!all_function_entries_norm.count(post_stub_norm)) {
+                    local_continuations.push_back({post_stub_rom, post_stub_norm, norm});
+                }
+            }
+            /* Hook fires only when the FIRST instruction word at this PC
+             * differs from the ROM-baked value (= 0x00000000 NOP for these
+             * slots).  A page-level dirty bit is too coarse: the kernel
+             * handler dirties page 0 on every exception by saving registers,
+             * which would unconditionally redirect into the interpreter.
+             * Word-level check is exact: the slot is "live" iff the BIOS
+             * install function has actually overwritten it. */
+            out += fmt::format(
+                "    /* 0x{:08X}: install-slot hook (RAM 0x{:08X}) — if the BIOS\n"
+                "     * has overwritten this slot with an install stub, dispatch\n"
+                "     * into the stub.  Otherwise fall through to static NOP.\n"
+                "     * After the stub's jalr returns, ra=RAM 0x{:08X} routes\n"
+                "     * back here as a registered continuation target. */\n"
+                "    if (cpu->read_word(0x{:08X}u) != 0u) {{\n"
+                "        cpu->pc = 0x{:08X}u; return;\n"
+                "    }}\n",
+                addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc);
         }
 
         // Non-terminator: emit normally.
@@ -321,6 +541,10 @@ bool FullFunctionEmitter::emit_function(
                                        pb.terminator_addr, target);
                 } else {
                     // Tail call: set cpu->pc and return; dispatch loop re-dispatches.
+                    // Register the cross-function target as a continuation so
+                    // the dispatch table can route to it (otherwise mid-function
+                    // targets miss the table — root cause of card-read failure).
+                    register_cross_function_target(target);
                     out += fmt::format("    if (psx_taken_{:08X}) {{ cpu->pc = 0x{:08X}u; return; }}\n",
                                        pb.terminator_addr, target);
                 }
@@ -331,6 +555,7 @@ bool FullFunctionEmitter::emit_function(
                     out += fmt::format("    goto label_{:08X};\n", target);
                 } else {
                     // Tail call: set cpu->pc and return; dispatch loop re-dispatches.
+                    register_cross_function_target(target);
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", target);
                 }
             } else if (kind == "jal") {
@@ -342,6 +567,18 @@ bool FullFunctionEmitter::emit_function(
                 // Safety net: if continuation falls outside this function, tail-call to it.
                 if (!addr_to_raw.count(pb.terminator_addr + 8)) {
                     out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jal cont: outside func */\n", return_addr);
+                }
+                // Register continuation label if the return point is inside
+                // this function and the callee is a separate dispatch entry.
+                // The callee's jr $ra will set cpu->pc = return_addr, and the
+                // dispatch loop needs a table entry to route back here.
+                if (addr_to_raw.count(pb.terminator_addr + 8)) {
+                    uint32_t cont_rom = pb.terminator_addr + 8;
+                    uint32_t cont_norm = normalize_address(cont_rom);
+                    // Only needed if the continuation isn't already a function entry.
+                    if (!all_function_entries_norm.count(cont_norm)) {
+                        local_continuations.push_back({cont_rom, cont_norm, norm});
+                    }
                 }
             } else if (kind == "jalr") {
                 uint8_t rs = (pb.raw >> 21) & 0x1F;
@@ -356,6 +593,14 @@ bool FullFunctionEmitter::emit_function(
                 // Safety net: if continuation falls outside this function, tail-call to it.
                 if (!addr_to_raw.count(pb.terminator_addr + 8)) {
                     out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jalr cont: outside func */\n", return_addr);
+                }
+                // Register continuation for jalr too (same logic as jal).
+                if (addr_to_raw.count(pb.terminator_addr + 8)) {
+                    uint32_t cont_rom = pb.terminator_addr + 8;
+                    uint32_t cont_norm = normalize_address(cont_rom);
+                    if (!all_function_entries_norm.count(cont_norm)) {
+                        local_continuations.push_back({cont_rom, cont_norm, norm});
+                    }
                 }
             } else if (kind == "jr") {
                 uint8_t rs = (pb.raw >> 21) & 0x1F;
@@ -495,6 +740,57 @@ bool FullFunctionEmitter::emit_function(
     }
 
     out += "}\n\n";
+    #undef out
+
+    // --- Assemble the final function output ---
+    // Now 'body' has the full function body (labels, instructions, etc.)
+    // 'local_continuations' has the continuation labels we found.
+
+    /* (cross-function target injection moved above the body-emit loop) */
+
+    // Deduplicate local continuations by ROM address (multiple jal/jalr
+    // within the same function may share a return label).
+    {
+        std::set<uint32_t> seen;
+        std::vector<ContinuationLabel> deduped;
+        for (auto& cl : local_continuations) {
+            if (seen.insert(cl.rom_addr).second)
+                deduped.push_back(cl);
+        }
+        local_continuations = std::move(deduped);
+    }
+
+    // Copy local continuations to the output parameter.
+    for (auto& cl : local_continuations) {
+        out_continuations.push_back(cl);
+    }
+
+    // Emit function header.
+    out += fmt::format("void func_{:08X}(CPUState* cpu) {{\n", norm);
+    // Direct-call entry hook: captures into fn_entry ring (gated by
+    // fn_filter at runtime).  Lets us see direct-jal call paths that
+    // never go through psx_dispatch.
+    out += fmt::format("    debug_server_log_call_entry(0x{:08X}u);\n", norm);
+
+    // If there are continuation labels, prepend an entry-switch so the
+    // dispatch loop can route to internal labels when called from a
+    // continuation wrapper.
+    if (!local_continuations.empty()) {
+        out += "    if (cpu->pc != 0) {\n";
+        out += "        uint32_t _cont = cpu->pc;\n";
+        out += "        cpu->pc = 0;\n";
+        out += "        switch (_cont) {\n";
+        for (const auto& cl : local_continuations) {
+            out += fmt::format("            case 0x{:08X}u: goto label_{:08X};\n",
+                               cl.rom_addr, cl.rom_addr);
+        }
+        out += "            default: break;\n";
+        out += "        }\n";
+        out += "    }\n";
+    }
+
+    // Append the body.
+    out += body;
     return true;
 }
 
@@ -506,6 +802,7 @@ void FullFunctionEmitter::emit_dispatch(
     std::string&              out,
     const DiscoveryResult&    dr,
     const std::set<uint32_t>& emitted_normalized,
+    const std::map<uint32_t, ContinuationLabel>& continuations,
     const std::string&        bios_sha256)
 {
     out += "/* AUTO-GENERATED by psxrecomp-bios --emit-full. DO NOT EDIT.\n";
@@ -530,7 +827,14 @@ void FullFunctionEmitter::emit_dispatch(
 
     // Forward declarations for all emitted functions.
     for (uint32_t norm : emitted_normalized) {
-        out += fmt::format("extern void func_{:08X}(CPUState* cpu);\n", norm);
+        if (continuations.count(norm)) {
+            // Continuation wrapper: use the wrapper name.
+            const auto& cl = continuations.at(norm);
+            out += fmt::format("extern void func_{:08X}_cont_{:08X}(CPUState* cpu);\n",
+                               cl.parent_func_norm, cl.rom_addr);
+        } else {
+            out += fmt::format("extern void func_{:08X}(CPUState* cpu);\n", norm);
+        }
     }
     out += "\n";
 
@@ -544,7 +848,13 @@ void FullFunctionEmitter::emit_dispatch(
     out += fmt::format("static const DispatchEntry dispatch_table[{}] = {{\n",
                        emitted_normalized.size());
     for (uint32_t norm : emitted_normalized) {
-        out += fmt::format("    {{ 0x{:08X}u, func_{:08X} }},\n", norm, norm);
+        if (continuations.count(norm)) {
+            const auto& cl = continuations.at(norm);
+            out += fmt::format("    {{ 0x{:08X}u, func_{:08X}_cont_{:08X} }},\n",
+                               norm, cl.parent_func_norm, cl.rom_addr);
+        } else {
+            out += fmt::format("    {{ 0x{:08X}u, func_{:08X} }},\n", norm, norm);
+        }
     }
     out += "};\n\n";
 
@@ -560,6 +870,8 @@ void FullFunctionEmitter::emit_dispatch(
     out += "    return phys;\n";
     out += "}\n\n";
 
+    out += "extern int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);\n";
+    out += "\n";
     out += "void psx_dispatch(CPUState* cpu, uint32_t addr) {\n";
     out += "    /* Tail-call trampoline: functions signal tail calls by setting\n";
     out += "     * cpu->pc to the target and returning. We loop here to re-dispatch\n";
@@ -583,7 +895,18 @@ void FullFunctionEmitter::emit_dispatch(
     out += "                hi = mid - 1;\n";
     out += "            }\n";
     out += "        }\n";
-    out += "        if (!found) psx_unknown_dispatch(cpu, addr, phys);\n";
+    out += "        /* Static dispatch miss.  Self-modifying / install-at-runtime RAM\n";
+    out += "         * (CLAUDE.md Rule 18): the BIOS writes dispatch stubs into kernel\n";
+    out += "         * RAM at runtime.  If the target page has been written-to since\n";
+    out += "         * boot, interpret the basic block on cpu state.  Falls back to\n";
+    out += "         * psx_unknown_dispatch for genuinely unmapped PCs. */\n";
+    out += "        if (!found) {\n";
+    out += "            if (dirty_ram_dispatch(cpu, addr)) {\n";
+    out += "                found = 1;\n";
+    out += "            } else {\n";
+    out += "                psx_unknown_dispatch(cpu, addr, phys);\n";
+    out += "            }\n";
+    out += "        }\n";
     out += "        if (cpu->pc == 0) { psx_check_interrupts(cpu); return; }\n";
     out += "        addr = cpu->pc;  /* tail call: re-dispatch */\n";
     out += "    }\n";
@@ -650,7 +973,9 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void psx_restore_state_escape(void);\n";
     full_c += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     full_c += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
-    full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n\n";
+    full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
+    full_c += "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
+    full_c += "extern uint32_t g_debug_last_store_pc;\n\n";
 
     // Forward declare ALL functions so intra-file calls resolve.
     for (const auto& fn : dr.functions) {
@@ -659,7 +984,32 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "\n";
 
     std::set<uint32_t> emitted_normalized;
+    std::vector<ContinuationLabel> all_continuations;
 
+    // ---- PASS 1: dry run to collect cross-function tail-call targets ----
+    std::map<uint32_t, std::set<uint32_t>> cross_targets_by_parent;
+    {
+        std::vector<ContinuationLabel> dry_run_continuations;
+        std::vector<ContinuationLabel> dry_run_cross;
+        for (const auto& fn : dr.functions) {
+            std::string lineage = fn.discovered_by;
+            uint32_t cap = hard_caps.count(fn.entry_addr)
+                               ? hard_caps[fn.entry_addr]
+                               : rom_end + 1;
+            FunctionDiscovery::SingleFunctionResult sfr =
+                FunctionDiscovery::walk_function(rom, base_addr, rom_end, fn.entry_addr, cap, lineage);
+            if (!sfr.unsupported.empty()) continue;
+            std::string tmp;
+            std::set<uint32_t> empty;
+            (void)emit_function(tmp, fn, sfr, all_function_entries_norm, rom, base_addr, rom_end,
+                                dry_run_continuations, empty, dry_run_cross);
+        }
+        for (const auto& cl : dry_run_cross) {
+            cross_targets_by_parent[cl.parent_func_norm].insert(cl.rom_addr);
+        }
+    }
+
+    // ---- PASS 2: real emission with injected cross-targets ----
     for (const auto& fn : dr.functions) {
         // Re-walk the function to get raw instructions.
         std::string lineage = fn.discovered_by;
@@ -678,7 +1028,14 @@ EmitStats FullFunctionEmitter::emit(
             continue;
         }
 
-        bool ok = emit_function(full_c, fn, sfr, all_function_entries_norm, rom, base_addr, rom_end);
+        std::set<uint32_t> injected;
+        if (cross_targets_by_parent.count(fn.normalized_addr)) {
+            injected = cross_targets_by_parent[fn.normalized_addr];
+        }
+
+        std::vector<ContinuationLabel> discard_cross;  /* PASS 2 cross is unused */
+        bool ok = emit_function(full_c, fn, sfr, all_function_entries_norm, rom, base_addr, rom_end,
+                                all_continuations, injected, discard_cross);
         if (!ok) {
             stats.skipped.emplace_back(fn.entry_addr, "emit_function failed");
             stats.functions_skipped++;
@@ -704,6 +1061,33 @@ EmitStats FullFunctionEmitter::emit(
         stats.dispatch_entries++;
     }
 
+    // --- Emit continuation wrappers ---
+    // Deduplicate continuations by norm_addr (same label from multiple callers).
+    std::map<uint32_t, ContinuationLabel> unique_continuations;
+    for (const auto& cl : all_continuations) {
+        // Only add if not already a function entry (shouldn't be, but guard).
+        if (!emitted_normalized.count(cl.norm_addr)) {
+            unique_continuations[cl.norm_addr] = cl;
+        }
+    }
+
+    if (!unique_continuations.empty()) {
+        full_c += fmt::format("\n/* --- {} continuation wrappers for jal/jalr return routing --- */\n\n",
+                              unique_continuations.size());
+        for (const auto& [cnorm, cl] : unique_continuations) {
+            // Wrapper: sets cpu->pc to the ROM label address so the parent's
+            // entry-switch routes to the correct goto label.
+            full_c += fmt::format("void func_{:08X}_cont_{:08X}(CPUState* cpu) {{\n",
+                                  cl.parent_func_norm, cl.rom_addr);
+            full_c += fmt::format("    cpu->pc = 0x{:08X}u;\n", cl.rom_addr);
+            full_c += fmt::format("    func_{:08X}(cpu);\n", cl.parent_func_norm);
+            full_c += "}\n\n";
+            emitted_normalized.insert(cnorm);
+        }
+        stats.continuation_entries = static_cast<uint32_t>(unique_continuations.size());
+        stats.dispatch_entries += stats.continuation_entries;
+    }
+
     // Write SCPH1001_full.c
     {
         std::string path = out_dir + "/SCPH1001_full.c";
@@ -715,7 +1099,7 @@ EmitStats FullFunctionEmitter::emit(
     // Emit and write SCPH1001_dispatch.c
     {
         std::string dispatch_c;
-        emit_dispatch(dispatch_c, dr, emitted_normalized, bios_sha256);
+        emit_dispatch(dispatch_c, dr, emitted_normalized, unique_continuations, bios_sha256);
         std::string path = out_dir + "/SCPH1001_dispatch.c";
         std::ofstream f(path, std::ios::binary);
         if (!f) throw std::runtime_error(fmt::format("cannot write {}", path));

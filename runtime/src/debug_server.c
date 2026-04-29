@@ -13,6 +13,7 @@
 #include "gpu.h"
 #include "sio.h"
 #include "memcard.h"
+#include "interrupts.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -121,6 +122,39 @@ static int s_wtrace_range_count = 0;
 /* Function attribution global — set by psx_dispatch() before each call. */
 uint32_t g_debug_current_func_addr = 0;
 
+/* Last store PC — set by recompiler emitter before every store instruction. */
+uint32_t g_debug_last_store_pc = 0;
+
+/* ---- SIO write PC tracer ring ----
+ * Captures (pc, addr, value, byte_seq, ctr) for every write to a SIO
+ * register, attributing the exact writing instruction.  Used to find what
+ * code is putting bytes on the SIO bus when chain-dispatcher attribution
+ * (g_debug_current_func_addr) is too coarse. 1<<16 = 64K entries. */
+#define SIO_PC_TRACE_CAP (1 << 16)
+typedef struct {
+    uint64_t seq;
+    uint32_t pc;            /* g_debug_last_store_pc at the moment of write */
+    uint32_t func;          /* g_debug_current_func_addr — outer frame */
+    uint32_t addr;          /* full MMIO address written */
+    uint32_t value;         /* value written (low 16/32 bits) */
+    uint32_t byte_seq;      /* sio_get_seq() — cross-ref with sio_trace */
+    uint8_t  width;         /* 1=byte, 2=half, 4=word */
+    uint8_t  pad[3];
+} SioPcTraceEntry;
+static SioPcTraceEntry s_sio_pc_trace[SIO_PC_TRACE_CAP];
+static uint64_t s_sio_pc_trace_seq = 0;
+
+void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width) {
+    SioPcTraceEntry *e = &s_sio_pc_trace[s_sio_pc_trace_seq % SIO_PC_TRACE_CAP];
+    e->seq      = s_sio_pc_trace_seq++;
+    e->pc       = g_debug_last_store_pc;
+    e->func     = g_debug_current_func_addr;
+    e->addr     = addr;
+    e->value    = value;
+    e->byte_seq = sio_get_seq();
+    e->width    = width;
+}
+
 /* ---- Dispatch trace ring buffer ----
  * Records every dispatched function address for post-mortem analysis.
  * 64K entries, stack-allocated (256 KB). */
@@ -163,7 +197,8 @@ static int dispatch_trace_contains(uint32_t target) {
  * Size 4096 — only writes when prev target was a chain state (states 1..13
  * read or 1..4 detection). Other dispatches go through trace_dispatch
  * untouched. */
-#define CHAIN_TRACE_CAP 4096
+/* 64K entries × ~24 B ≈ 1.5 MB; holds tens of minutes of chain transitions. */
+#define CHAIN_TRACE_CAP (1 << 16)
 typedef struct {
     uint64_t seq;
     uint32_t prev_target;     /* phys addr of the dispatch that just returned */
@@ -202,7 +237,13 @@ static uint32_t s_chain_state_active = 0;  /* 0 if not in a state, else state ad
  * Default: trace everything; user sets [lo, hi) range to focus.
  *
  * Memory: 1M entries × 32B = 32 MB per ring × 2 = 64 MB. Heap-allocated. */
-#define FN_TRACE_CAP   (1 << 20)
+/* Entry ring sized for ≥3 min of unrotated history at peak capture rate
+ * (~600k/sec under a wide direct-call filter): 1<<27 ≈ 134M entries × 56 B
+ * ≈ 7 GB.  Lazily resident — only pages actually written use RAM, so the
+ * footprint grows from 0 toward the cap as the ring fills.
+ * Exit ring stays modest (1<<22, ~192 MB) — exits are auxiliary.  */
+#define FN_TRACE_CAP        (1 << 27)
+#define FN_EXIT_TRACE_CAP   (1 << 22)
 #define FN_STACK_DEPTH 4096
 
 typedef struct {
@@ -257,7 +298,8 @@ static uint64_t     s_fn_tail_calls        = 0;
  *
  * Memory: 256 snapshots × ~960B = ~240 KB. */
 #define EVCB_DELIVER_EVENT_ADDR 0x00001C5Cu  /* func_00001C5C, RAM */
-#define EVCB_RING_CAP           256
+/* 4096 snapshots × 32 entries × ~28 B ≈ 3.7 MB — holds many minutes. */
+#define EVCB_RING_CAP           4096
 #define EVCB_MAX_ENTRIES        32
 #define EVCB_ENTRY_SIZE         28           /* sizeof EvCB on real PSX */
 
@@ -373,7 +415,7 @@ static int fn_trace_in_filter(uint32_t phys) {
 /* Helper: record an exit event for a popped frame. */
 static void fn_record_exit(FnStackFrame *f) {
     if (!fn_trace_in_filter(f->func_addr)) return;
-    FnExitEntry *e = &s_fn_exit[s_fn_exit_seq % FN_TRACE_CAP];
+    FnExitEntry *e = &s_fn_exit[s_fn_exit_seq % FN_EXIT_TRACE_CAP];
     e->seq        = s_fn_exit_seq;
     e->entry_seq  = f->entry_seq;
     e->func_addr  = f->func_addr;
@@ -520,6 +562,30 @@ static int is_chain_epilogue(uint32_t phys) {
     return phys == 0x00005B54u || phys == 0x00005B58u;
 }
 
+/* Direct-call entry hook — emitted by the recompiler at the top of every
+ * generated function.  Captures into the fn_entry ring without touching the
+ * shadow stack, so we see direct-jal call paths that never go through
+ * psx_dispatch (e.g. shell -> firstfile -> bu_read -> card_read).  The shadow
+ * stack is owned by function_trace_record and is only meaningful for
+ * indirect dispatches; direct calls return through the native C stack. */
+void debug_server_log_call_entry(uint32_t func_addr) {
+    if (!s_fn_entry || !debug_cpu_ptr) return;
+    if (!fn_trace_in_filter(func_addr)) return;
+    FnEntryEntry *e = &s_fn_entry[s_fn_entry_seq % FN_TRACE_CAP];
+    e->seq             = s_fn_entry_seq;
+    e->paired_exit_seq = 0;
+    e->func_addr       = func_addr;
+    e->ra              = debug_cpu_ptr->gpr[31];
+    e->a0              = debug_cpu_ptr->gpr[4];
+    e->a1              = debug_cpu_ptr->gpr[5];
+    e->a2              = debug_cpu_ptr->gpr[6];
+    e->a3              = debug_cpu_ptr->gpr[7];
+    e->t1              = debug_cpu_ptr->gpr[9];
+    e->depth           = (uint32_t)s_fn_stack_top;
+    e->frame           = (uint32_t)s_frame_count;
+    s_fn_entry_seq++;
+}
+
 void debug_server_trace_dispatch(uint32_t func_addr) {
     /* Function entry/exit rings (always-on, hooked here so every dispatch
      * is recorded with args and a return value when the call unwinds). */
@@ -561,6 +627,10 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
 }
 
 static int json_get_int(const char *json, const char *key, int def);
+static const char *json_get_str(const char *json, const char *key,
+                                char *out, int out_sz);
+static uint32_t hex_to_u32(const char *s);
+static void handle_dirty_ram_stats(int id, const char *json);
 void debug_server_send_fmt(const char *fmt, ...);
 #define send_fmt debug_server_send_fmt
 
@@ -593,6 +663,86 @@ static void handle_chain_trace(int id, const char *json)
     }
     n += snprintf(buf + n, sizeof(buf) - n, "]}");
     send_fmt("%s", buf);
+}
+
+/* ---- Dirty-RAM interpreter counters ---- */
+#include "dirty_ram_interp.h"
+static void handle_dirty_ram_stats(int id, const char *json)
+{
+    extern uint64_t g_dirty_ram_blocks_run;
+    extern uint64_t g_dirty_ram_insns_run;
+    extern uint64_t g_dirty_ram_aborts;
+    extern uint32_t dirty_ram_get_bitmap(void);
+    (void)json;
+
+    char buf[16 * 1024];
+    int n = snprintf(buf, sizeof(buf),
+             "{\"id\":%d,\"ok\":true,\"blocks_run\":%llu,"
+             "\"insns_run\":%llu,\"aborts\":%llu,"
+             "\"dirty_bitmap\":\"0x%08X\",\"per_pc\":[",
+             id,
+             (unsigned long long)g_dirty_ram_blocks_run,
+             (unsigned long long)g_dirty_ram_insns_run,
+             (unsigned long long)g_dirty_ram_aborts,
+             (unsigned)dirty_ram_get_bitmap());
+
+    int first = 1;
+    for (int i = 0; i < DIRTY_RAM_PC_TABLE_SIZE; i++) {
+        DirtyRamPcEntry *e = &g_dirty_ram_pc_table[i];
+        if (e->pc == 0 || e->hits == 0) continue;
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "%s{\"pc\":\"0x%08X\",\"hits\":%llu,\"insns\":%llu}",
+                      first ? "" : ",",
+                      (unsigned)e->pc,
+                      (unsigned long long)e->hits,
+                      (unsigned long long)e->insns);
+        first = 0;
+        if (n >= (int)sizeof(buf) - 128) break;
+    }
+    n += snprintf(buf + n, sizeof(buf) - n, "]}\n");
+    send_fmt("%s", buf);
+}
+
+/* ---- SIO write PC tracer dump ----
+ * Returns the most recent N entries from the SIO PC tracer ring.
+ * Optional addr_lo/addr_hi (hex-string) filter restricts to a single
+ * MMIO register range — typical use: filter for SIO_DATA (0x1F801040)
+ * or SIO_CTRL (0x1F80104A) writes only. */
+static void handle_sio_pc_trace(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 200);
+    char addr_lo_buf[32], addr_hi_buf[32];
+    uint32_t addr_lo = 0, addr_hi = 0;
+    if (json_get_str(json, "addr_lo", addr_lo_buf, sizeof(addr_lo_buf)))
+        addr_lo = hex_to_u32(addr_lo_buf);
+    if (json_get_str(json, "addr_hi", addr_hi_buf, sizeof(addr_hi_buf)))
+        addr_hi = hex_to_u32(addr_hi_buf);
+    int filter = (addr_hi > addr_lo);
+
+    int total = (int)(s_sio_pc_trace_seq < SIO_PC_TRACE_CAP
+                      ? s_sio_pc_trace_seq : SIO_PC_TRACE_CAP);
+    if (count > total) count = total;
+    if (count < 0) count = 0;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%d,"
+             "\"entries\":[",
+             id, (unsigned long long)s_sio_pc_trace_seq, total);
+
+    int start_idx = (int)(s_sio_pc_trace_seq - (uint64_t)count);
+    int emitted = 0;
+    for (int i = 0; i < count; i++) {
+        int idx = (start_idx + i) % SIO_PC_TRACE_CAP;
+        SioPcTraceEntry *e = &s_sio_pc_trace[idx];
+        if (filter && (e->addr < addr_lo || e->addr >= addr_hi)) continue;
+        send_fmt("%s{\"seq\":%llu,\"pc\":\"0x%08X\","
+                 "\"func\":\"0x%08X\",\"addr\":\"0x%08X\","
+                 "\"value\":\"0x%08X\",\"byte_seq\":%u,\"width\":%u}",
+                 emitted == 0 ? "" : ",",
+                 (unsigned long long)e->seq, e->pc, e->func,
+                 e->addr, e->value, e->byte_seq, e->width);
+        emitted++;
+    }
+    send_fmt("]}\n");
 }
 
 /* ---- MMIO write trace (separate ring buffer) ----
@@ -668,7 +818,7 @@ static uint32_t hex_to_u32(const char *s)
 
 /* ---- Send helpers ---- */
 
-static void send_all_blocking(sock_t sock, const char *data, int len)
+static void send_all_blocking(sock_t sock, const char *data, size_t len)
 {
 #ifdef _WIN32
     u_long mode = 0;
@@ -677,10 +827,13 @@ static void send_all_blocking(sock_t sock, const char *data, int len)
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
 #endif
-    int sent = 0;
+    /* send() takes int on Win32; chunk so we can transmit > 2 GB payloads. */
+    size_t sent = 0;
     while (sent < len) {
-        int n = send(sock, data + sent, len - sent, 0);
-        if (n > 0) { sent += n; continue; }
+        size_t want = len - sent;
+        if (want > (1u << 30)) want = (1u << 30);
+        int n = send(sock, data + sent, (int)want, 0);
+        if (n > 0) { sent += (size_t)n; continue; }
         break;
     }
 #ifdef _WIN32
@@ -694,7 +847,7 @@ static void send_all_blocking(sock_t sock, const char *data, int len)
 void debug_server_send_line(const char *json)
 {
     if (s_client == SOCK_INVALID) return;
-    int len = (int)strlen(json);
+    size_t len = strlen(json);
     send_all_blocking(s_client, json, len);
     send_all_blocking(s_client, "\n", 1);
 }
@@ -779,16 +932,25 @@ static void handle_read_ram(int id, const char *json)
     uint32_t addr = hex_to_u32(addr_str);
     int len = json_get_int(json, "len", 1);
     if (len < 1) len = 1;
-    if (len > 16384) len = 16384;  /* 16KB max */
+    /* Effectively the entire 2 MB RAM in one shot.  Response uses a heap-
+     * sized envelope so we don't truncate. */
+    if (len > 0x200000) len = 0x200000;
 
-    char *hex = (char *)malloc(len * 2 + 1);
-    if (!hex) { send_err(id, "alloc failed"); return; }
+    /* Heap buffer for hex chars + JSON envelope.  Each byte = 2 hex chars. */
+    size_t env = 256;
+    size_t total = (size_t)len * 2 + env;
+    char *out = (char *)malloc(total);
+    if (!out) { send_err(id, "alloc failed"); return; }
+    int hdr = snprintf(out, env,
+                       "{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"len\":%d,\"hex\":\"",
+                       id, addr, len);
+    char *hex = out + hdr;
     for (int i = 0; i < len; i++)
-        snprintf(hex + i * 2, 3, "%02x", psx_read_byte(addr + i));
-
-    send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"len\":%d,\"hex\":\"%s\"}",
-             id, addr, len, hex);
-    free(hex);
+        snprintf(hex + (size_t)i * 2, 3, "%02x", psx_read_byte(addr + (uint32_t)i));
+    char *tail = hex + (size_t)len * 2;
+    memcpy(tail, "\"}", 3);
+    debug_server_send_line(out);
+    free(out);
 }
 
 static void handle_dump_ram(int id, const char *json)
@@ -1097,6 +1259,7 @@ typedef struct {
     uint32_t old_mask;
     uint32_t new_mask;
     uint32_t caller;
+    uint32_t store_pc;
     uint8_t  width;
     uint8_t  bit7_set;
     uint8_t  bit7_clear;
@@ -1108,10 +1271,11 @@ extern const ImaskTraceEntry *memory_get_imask_trace(int *idx_out, int *count_ou
 
 static void handle_imask_trace(int id, const char *json)
 {
-    int count = json_get_int(json, "count", 32);
+    int count = json_get_int(json, "count", 64);
+    int only_b7c = json_get_int(json, "only_b7c", 0);
     int idx, total;
     const ImaskTraceEntry *buf = memory_get_imask_trace(&idx, &total);
-    int cap = 256; /* IMASK_TRACE_CAP */
+    int cap = 4096; /* IMASK_TRACE_CAP */
     int avail = total < cap ? total : cap;
     if (count > avail) count = avail;
     if (count < 1) count = 1;
@@ -1123,15 +1287,18 @@ static void handle_imask_trace(int id, const char *json)
              id, memory_get_imask_bit7_set_count(),
              memory_get_imask_bit7_clear_count(), total, count);
 
+    int first = 1;
     for (int i = 0; i < count; i++) {
         int ii = (start + i) % cap;
         const ImaskTraceEntry *e = &buf[ii];
-        if (i > 0) send_fmt(",");
+        if (only_b7c && !e->bit7_clear) continue;
+        if (!first) send_fmt(",");
+        first = 0;
         send_fmt("{\"old\":\"0x%03X\",\"new\":\"0x%03X\","
-                 "\"func\":\"0x%08X\",\"w\":%d,"
+                 "\"func\":\"0x%08X\",\"pc\":\"0x%08X\",\"w\":%d,"
                  "\"b7s\":%d,\"b7c\":%d,\"exc\":%d}",
                  e->old_mask, e->new_mask,
-                 (unsigned)e->caller, e->width,
+                 (unsigned)e->caller, (unsigned)e->store_pc, e->width,
                  e->bit7_set, e->bit7_clear, e->in_exc);
     }
     send_fmt("]}\n");
@@ -2071,6 +2238,181 @@ static void handle_wtrace_ranges(int id, const char *json)
     free(buf);
 }
 
+/* Liveness/freeze diagnostic: returns a single snapshot of every counter
+ * that distinguishes "stuck in a tight handler loop" from "just slow" or
+ * "starved on TCP poll".  Pass {"window":N} (default 256) to also include
+ * a top-N histogram of function entries within the last `window` slots
+ * of the fn_entry ring, and a sample of the last `window` SIO IRQ ring
+ * entries (delay_applied + i_stat_after).
+ *
+ * Discriminators:
+ *   - exc_entries delta between two snapshots  → handler dispatch rate
+ *   - exc_reentry_blocks > 0                   → check_interrupts called
+ *                                                 from inside the handler
+ *   - dirty_ram blocks/insns delta              → install-stub interp loop
+ *   - fn_entry histogram dominance               → stuck-in-N-functions loop
+ *   - dispatch_count change between calls       → recompiled code progressing
+ *   - sio.irq_pending + countdown stuck         → IRQ pacing breakdown */
+static void handle_freeze_check(int id, const char *json)
+{
+    int window = json_get_int(json, "window", 256);
+    if (window < 1) window = 1;
+    if (window > 65536) window = 65536;
+
+    extern int sio_get_mc_max_state(void);
+    extern int sio_get_mc_abort_count(void);
+    extern int sio_get_mc_read_done(void);
+    extern int sio_get_tx_writes(void);
+
+    uint64_t total_checks = 0;
+    uint32_t dispatch_count = 0;
+    int in_exc = 0;
+    int post_cool = 0;
+    uint64_t exc_entries = 0;
+    uint64_t exc_reentry = 0;
+    psx_get_freeze_diag(&total_checks, &dispatch_count, &in_exc,
+                        &post_cool, &exc_entries, &exc_reentry);
+
+    int sio_irq_pending = 0;
+    int sio_irq_countdown = 0;
+    uint16_t sio_stat = 0;
+    uint16_t sio_ctrl = 0;
+    int card_active = 0;
+    sio_get_freeze_diag(&sio_irq_pending, &sio_irq_countdown,
+                        &sio_stat, &sio_ctrl, &card_active);
+
+    extern uint64_t g_dirty_ram_blocks_run;
+    extern uint64_t g_dirty_ram_insns_run;
+    extern uint64_t g_dirty_ram_aborts;
+
+    /* Top-K fn_entry histogram over the last `window` slots. */
+    typedef struct { uint32_t func; uint32_t count; } HistBucket;
+    enum { HIST_CAP = 16 };
+    HistBucket hist[HIST_CAP];
+    int hist_n = 0;
+    uint32_t recent_total = 0;
+    uint32_t recent_min_func = 0xFFFFFFFFu, recent_max_func = 0;
+    if (s_fn_entry && s_fn_entry_seq > 0) {
+        uint64_t end_seq = s_fn_entry_seq;
+        uint64_t start_seq = (end_seq > (uint64_t)window) ? end_seq - window : 0;
+        for (uint64_t i = start_seq; i < end_seq; i++) {
+            FnEntryEntry *e = &s_fn_entry[i % FN_TRACE_CAP];
+            uint32_t f = e->func_addr;
+            if (f < recent_min_func) recent_min_func = f;
+            if (f > recent_max_func) recent_max_func = f;
+            recent_total++;
+            int found = 0;
+            for (int k = 0; k < hist_n; k++) {
+                if (hist[k].func == f) { hist[k].count++; found = 1; break; }
+            }
+            if (!found) {
+                if (hist_n < HIST_CAP) {
+                    hist[hist_n].func = f;
+                    hist[hist_n].count = 1;
+                    hist_n++;
+                } else {
+                    /* Replace lowest count with this one if the lowest is 1
+                     * (rare bucket, may be noise).  Keeps the top-K mostly
+                     * stable for repeating-function-loop diagnosis. */
+                    int min_idx = 0;
+                    for (int k = 1; k < hist_n; k++)
+                        if (hist[k].count < hist[min_idx].count) min_idx = k;
+                    if (hist[min_idx].count <= 1) {
+                        hist[min_idx].func = f;
+                        hist[min_idx].count = 1;
+                    }
+                }
+            }
+        }
+    }
+    /* Sort hist descending by count (insertion sort, n<=16). */
+    for (int i = 1; i < hist_n; i++) {
+        HistBucket cur = hist[i];
+        int j = i - 1;
+        while (j >= 0 && hist[j].count < cur.count) {
+            hist[j+1] = hist[j];
+            j--;
+        }
+        hist[j+1] = cur;
+    }
+
+    /* Recent SIO IRQ ring sample. */
+    const SioIrqEntry *irq_buf = NULL;
+    int irq_widx = 0;
+    uint32_t irq_total = sio_get_irq_ring(&irq_buf, &irq_widx);
+
+    char buf[8192];
+    size_t pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "{\"id\":%d,\"ok\":true,"
+                    "\"current_func\":\"0x%08X\","
+                    "\"last_store_pc\":\"0x%08X\","
+                    "\"total_checks\":%llu,"
+                    "\"dispatch_count\":%u,"
+                    "\"in_exception\":%d,"
+                    "\"post_exception_cooldown\":%d,"
+                    "\"exception_entries\":%llu,"
+                    "\"exception_reentry_blocks\":%llu,"
+                    "\"sio_irq_pending\":%d,"
+                    "\"sio_irq_countdown\":%d,"
+                    "\"sio_stat\":\"0x%04X\","
+                    "\"sio_ctrl\":\"0x%04X\","
+                    "\"sio_card_active\":%d,"
+                    "\"i_stat\":\"0x%08X\","
+                    "\"i_mask\":\"0x%08X\","
+                    "\"dirty_ram_blocks\":%llu,"
+                    "\"dirty_ram_insns\":%llu,"
+                    "\"dirty_ram_aborts\":%llu,"
+                    "\"fn_entry_total\":%llu,"
+                    "\"sio_irq_total\":%u,"
+                    "\"sio_byte_seq\":%u,"
+                    "\"mc_max_state\":%d,"
+                    "\"mc_aborts\":%d,"
+                    "\"mc_read_done\":%d,"
+                    "\"tx_writes\":%d,"
+                    "\"window\":%d,"
+                    "\"recent_func_min\":\"0x%08X\","
+                    "\"recent_func_max\":\"0x%08X\","
+                    "\"recent_total\":%u,"
+                    "\"hist\":[",
+                    id,
+                    g_debug_current_func_addr,
+                    g_debug_last_store_pc,
+                    (unsigned long long)total_checks,
+                    dispatch_count,
+                    in_exc,
+                    post_cool,
+                    (unsigned long long)exc_entries,
+                    (unsigned long long)exc_reentry,
+                    sio_irq_pending,
+                    sio_irq_countdown,
+                    (unsigned)sio_stat,
+                    (unsigned)sio_ctrl,
+                    card_active,
+                    i_stat, i_mask,
+                    (unsigned long long)g_dirty_ram_blocks_run,
+                    (unsigned long long)g_dirty_ram_insns_run,
+                    (unsigned long long)g_dirty_ram_aborts,
+                    (unsigned long long)s_fn_entry_seq,
+                    irq_total,
+                    sio_get_seq(),
+                    sio_get_mc_max_state(),
+                    sio_get_mc_abort_count(),
+                    sio_get_mc_read_done(),
+                    sio_get_tx_writes(),
+                    window,
+                    (recent_total ? recent_min_func : 0),
+                    recent_max_func,
+                    recent_total);
+    for (int i = 0; i < hist_n && pos < sizeof(buf) - 64; i++) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "%s{\"func\":\"0x%08X\",\"count\":%u}",
+                        i ? "," : "", hist[i].func, hist[i].count);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    debug_server_send_line(buf);
+}
+
 static void handle_wtrace_stats(int id, const char *json)
 {
     (void)json;
@@ -2108,10 +2450,9 @@ static void handle_wtrace_dump(int id, const char *json)
     uint32_t avail = (total < WRITE_TRACE_CAP) ? (uint32_t)total : WRITE_TRACE_CAP;
     uint32_t start = (total < WRITE_TRACE_CAP) ? 0 : s_wtrace_head;
 
-    /* Dynamically size buffer: each JSON entry is ~160 bytes max.
-     * Cap output at 8192 entries to avoid multi-MB responses. */
-    const uint32_t MAX_OUT = 8192;
-    const size_t BUF_SZ = 2 * 1024 * 1024;
+    /* 1 GB response buffer; emit up to MAX_OUT (effectively whole ring). */
+    const uint32_t MAX_OUT = WRITE_TRACE_CAP;
+    const size_t BUF_SZ = (size_t)1 * 1024 * 1024 * 1024;
     char *buf = (char *)malloc(BUF_SZ);
     if (!buf) { send_err(id, "oom"); return; }
     size_t pos = 0;
@@ -2154,8 +2495,9 @@ static void handle_mmio_dump(int id, const char *json)
     uint32_t avail = (total < MMIO_TRACE_CAP) ? (uint32_t)total : MMIO_TRACE_CAP;
     uint32_t start = (total < MMIO_TRACE_CAP) ? 0 : s_mmio_trace_head;
 
-    const uint32_t MAX_OUT = 8192;
-    const size_t BUF_SZ = 2 * 1024 * 1024;
+    /* 1 GB response buffer; emit up to MAX_OUT (effectively whole ring). */
+    const uint32_t MAX_OUT = MMIO_TRACE_CAP;
+    const size_t BUF_SZ = (size_t)1 * 1024 * 1024 * 1024;
     char *buf = (char *)malloc(BUF_SZ);
     if (!buf) { send_err(id, "oom"); return; }
     size_t pos = 0;
@@ -2252,7 +2594,7 @@ static void handle_fn_clear(int id, const char *json) {
     s_fn_stack_overflows   = 0;
     s_fn_tail_calls        = 0;
     if (s_fn_entry) memset(s_fn_entry, 0, (size_t)FN_TRACE_CAP * sizeof(FnEntryEntry));
-    if (s_fn_exit)  memset(s_fn_exit,  0, (size_t)FN_TRACE_CAP * sizeof(FnExitEntry));
+    if (s_fn_exit)  memset(s_fn_exit,  0, (size_t)FN_EXIT_TRACE_CAP * sizeof(FnExitEntry));
     send_ok(id);
 }
 
@@ -2262,7 +2604,7 @@ static void handle_fn_stats(int id, const char *json) {
              "\"entry_total\":%llu,\"exit_total\":%llu,"
              "\"stack_top\":%d,\"unmatched_returns\":%llu,"
              "\"stack_overflows\":%llu,\"tail_calls\":%llu,"
-             "\"capacity\":%d,"
+             "\"entry_capacity\":%llu,\"exit_capacity\":%llu,"
              "\"filter_lo\":\"0x%08X\",\"filter_hi\":\"0x%08X\"}\n",
              id,
              (unsigned long long)s_fn_entry_seq,
@@ -2271,7 +2613,8 @@ static void handle_fn_stats(int id, const char *json) {
              (unsigned long long)s_fn_unmatched_returns,
              (unsigned long long)s_fn_stack_overflows,
              (unsigned long long)s_fn_tail_calls,
-             FN_TRACE_CAP,
+             (unsigned long long)FN_TRACE_CAP,
+             (unsigned long long)FN_EXIT_TRACE_CAP,
              s_fn_trace_filter_lo, s_fn_trace_filter_hi);
 }
 
@@ -2285,18 +2628,18 @@ static void fn_dump_parse(const char *json, uint64_t total,
     *out_seq_hi  = total;
     *out_addr_lo = 0;
     *out_addr_hi = 0xFFFFFFFFu;
-    *out_max     = 256;
+    /* Default: emit up to ~4M filtered hits.  Caller can override.  Trust the
+     * client; we have plenty of RAM and a 1 GB response buffer. */
+    *out_max     = 4 * 1024 * 1024;
     if (json_get_str(json, "seq_lo", buf, sizeof(buf))) *out_seq_lo = strtoull(buf, NULL, 0);
     if (json_get_str(json, "seq_hi", buf, sizeof(buf))) *out_seq_hi = strtoull(buf, NULL, 0);
     if (json_get_str(json, "addr_lo", buf, sizeof(buf))) *out_addr_lo = hex_to_u32(buf) & 0x1FFFFFFFu;
     if (json_get_str(json, "addr_hi", buf, sizeof(buf))) *out_addr_hi = hex_to_u32(buf) & 0x1FFFFFFFu;
-    *out_max = json_get_int(json, "count", 256);
+    *out_max = json_get_int(json, "count", *out_max);
     if (*out_max < 1) *out_max = 1;
-    if (*out_max > 4096) *out_max = 4096;
-    /* If seq_lo not specified, default to "tail N entries". */
-    if (*out_seq_lo == 0 && total > (uint64_t)*out_max) {
-        *out_seq_lo = total - (uint64_t)*out_max;
-    }
+    /* No artificial upper bound; trust the caller and the response buffer. */
+    /* No "tail-N" auto-trim: scan the entire visible range by default so we
+     * never silently miss filtered hits earlier in the ring. */
 }
 
 static void handle_fn_entry_dump(int id, const char *json) {
@@ -2311,7 +2654,9 @@ static void handle_fn_entry_dump(int id, const char *json) {
     if (seq_lo < oldest) seq_lo = oldest;
     if (seq_hi > s_fn_entry_seq) seq_hi = s_fn_entry_seq;
 
-    const size_t BUF_SZ = 2 * 1024 * 1024;
+    /* 1 GB response buffer.  Each entry serializes to ~256 bytes JSON, so we
+     * can emit up to ~4M entries per dump.  No artificial truncation. */
+    const size_t BUF_SZ = (size_t)1 * 1024 * 1024 * 1024;
     char *buf = (char *)malloc(BUF_SZ);
     if (!buf) { send_err(id, "oom"); return; }
     size_t pos = 0;
@@ -2350,11 +2695,11 @@ static void handle_fn_exit_dump(int id, const char *json) {
     int max_count;
     fn_dump_parse(json, s_fn_exit_seq, &seq_lo, &seq_hi, &addr_lo, &addr_hi, &max_count);
 
-    uint64_t oldest = (s_fn_exit_seq > FN_TRACE_CAP) ? s_fn_exit_seq - FN_TRACE_CAP : 0;
+    uint64_t oldest = (s_fn_exit_seq > FN_EXIT_TRACE_CAP) ? s_fn_exit_seq - FN_EXIT_TRACE_CAP : 0;
     if (seq_lo < oldest) seq_lo = oldest;
     if (seq_hi > s_fn_exit_seq) seq_hi = s_fn_exit_seq;
 
-    const size_t BUF_SZ = 2 * 1024 * 1024;
+    const size_t BUF_SZ = (size_t)1 * 1024 * 1024 * 1024;
     char *buf = (char *)malloc(BUF_SZ);
     if (!buf) { send_err(id, "oom"); return; }
     size_t pos = 0;
@@ -2367,7 +2712,7 @@ static void handle_fn_exit_dump(int id, const char *json) {
     int emitted = 0;
     int first = 1;
     for (uint64_t s = seq_lo; s < seq_hi && emitted < max_count && pos < BUF_SZ - 512; s++) {
-        FnExitEntry *e = &s_fn_exit[s % FN_TRACE_CAP];
+        FnExitEntry *e = &s_fn_exit[s % FN_EXIT_TRACE_CAP];
         if (e->func_addr < addr_lo || e->func_addr >= addr_hi) continue;
         pos += snprintf(buf + pos, BUF_SZ - pos,
             "%s{\"seq\":%llu,\"entry_seq\":%llu,\"func\":\"0x%08X\","
@@ -2400,6 +2745,8 @@ static const CmdEntry s_commands[] = {
     { "mc_status",         handle_mc_status },
     { "chain_trace",       handle_chain_trace },
     { "sio_trace",         handle_sio_trace },
+    { "sio_pc_trace",      handle_sio_pc_trace },
+    { "dirty_ram_stats",   handle_dirty_ram_stats },
     { "card_txn_dump",     handle_card_txn_dump },
     { "sio_irq_dump",      handle_sio_irq_dump },
     { "evcb_snapshot",     handle_evcb_snapshot },
@@ -2415,6 +2762,7 @@ static const CmdEntry s_commands[] = {
     { "wtrace_dump",       handle_wtrace_dump },
     { "wtrace_clear",      handle_wtrace_clear },
     { "wtrace_stats",      handle_wtrace_stats },
+    { "freeze_check",      handle_freeze_check },
     { "mmio_dump",         handle_mmio_dump },
     { "mmio_clear",        handle_mmio_clear },
     { "set_input",         handle_set_input },
@@ -2540,7 +2888,7 @@ void debug_server_init(int port)
 
     /* Function entry/exit ring buffers (32 MB each, 64 MB total). */
     if (!s_fn_entry) s_fn_entry = (FnEntryEntry *)calloc(FN_TRACE_CAP, sizeof(FnEntryEntry));
-    if (!s_fn_exit)  s_fn_exit  = (FnExitEntry *)calloc(FN_TRACE_CAP, sizeof(FnExitEntry));
+    if (!s_fn_exit)  s_fn_exit  = (FnExitEntry *)calloc(FN_EXIT_TRACE_CAP, sizeof(FnExitEntry));
     s_fn_entry_seq = 0;
     s_fn_exit_seq  = 0;
     s_fn_stack_top = 0;
@@ -2585,7 +2933,25 @@ void debug_server_init(int port)
     /* 0x74A4 is the chain status flag */
     s_wtrace_ranges[9].lo = 0x000074A4u;
     s_wtrace_ranges[9].hi = 0x000074A8u;
-    s_wtrace_range_count = 10;
+    /* 0x75C0 = SIO data-mode flag (set 1 by func_6380, cleared 0 by 0xBFC15EBC).
+     * 0x75C4 = current buffer pointer.  The data-byte handler at RAM 0x641C
+     * exits early via beq v0,zero if [0x75C0]==0; tracking these tells us
+     * whether the install-stub data path is engaging at all. */
+    s_wtrace_ranges[10].lo = 0x000075C0u;
+    s_wtrace_ranges[10].hi = 0x000075C8u;
+    /* 0x74B8 = pad-poll gate: if 0, pad poll function at BFC144BC SKIPS pad
+     * polling. 0x74BC = card-running gate: if non-zero, calls 0xBFC14B00
+     * (outer card coordinator). Tracking both tells us whether the BIOS is
+     * attempting the gate-flip serialization that prevents pad/card races. */
+    s_wtrace_ranges[11].lo = 0x000074B8u;
+    s_wtrace_ranges[11].hi = 0x000074C0u;
+    /* 0x72F0 = data-byte counter (halfword). Install handler at RAM 0x641C
+     * increments this per SIO IRQ during data phase; should reach 128 for a
+     * full sector read. Handoff says it stops at ~16. Track every write
+     * (including any abort-clear) to identify the byte-count regression PC. */
+    s_wtrace_ranges[12].lo = 0x000072F0u;
+    s_wtrace_ranges[12].hi = 0x000072F4u;
+    s_wtrace_range_count = 13;
 
     /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */
     if (!s_mmio_trace) {
