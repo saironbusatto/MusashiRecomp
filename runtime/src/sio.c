@@ -1196,6 +1196,61 @@ void sio_get_burst_stats(uint64_t out[10]) {
 #define SIO_MODEL_CYCLE_PACED 0
 #endif
 
+#if SIO_MODEL_CYCLE_PACED
+/* ---- Phase 1.0b: cycle-paced SIO state (inert) ---------------------------
+ *
+ * Declared under macro guard so they exist only in cycle-paced builds.
+ * Phase 1.0b adds the variables; Phase 1.0c+ wires them into sio_tick /
+ * sio_write SIO_TX_DATA / sio_write SIO_CTRL paths. With the macro
+ * defaulting to 0 (Phase 1.0a/b posture), no code references these — they
+ * are file-scope statics with no callers, no readers, no telemetry hooks.
+ *
+ * Hardware-time constants. PSX SIO0 default baud (BAUD=0x88, factor 8) is
+ * approximately 1088 CPU cycles per byte; the device-side ACK arrives
+ * about 170 cycles after the byte completes shifting on the bus. */
+#define SIO_BAUD_CYCLES_DEFAULT 1088
+#define SIO_ACK_CYCLES_DEFAULT  170
+
+/* Dispatch-loop quantum: SIO time advance per !in_exception
+ * psx_check_interrupts call. Tunable in Phase 1.0c+ via TCP. Phase 1.0b:
+ * declared only, never referenced. */
+static int sio_tick_quantum_cycles = 64;
+
+/* TX shifter and one-byte TX buffer modelling JOY_TX_DATA. */
+static int     sio_shift_active     = 0;
+static uint8_t sio_shift_byte       = 0;
+static int     sio_shift_remaining  = 0;
+static int     sio_tx_buffered      = 0;
+static uint8_t sio_tx_buffer        = 0;
+static int     sio_pending_ack      = 0;
+static int     sio_ack_remaining    = 0;
+
+/* Bus ownership over the SELECT lifetime. Set on FIRST accepted byte of
+ * each SELECT-asserted lifetime; never reclassified. Cleared on SELECT
+ * deassert / RESET / TX_EN clear. Not used in 1.0b. */
+typedef enum {
+    SIO_OWNER_NONE    = 0,
+    SIO_OWNER_CARD    = 1,
+    SIO_OWNER_PAD     = 2,
+    SIO_OWNER_UNKNOWN = 3,
+} SioBusOwner;
+static SioBusOwner sio_bus_owner      = SIO_OWNER_NONE;
+static uint32_t    sio_bus_byte_index = 0;
+
+/* Telemetry counters (Phase 1.0d will populate; Phase 1.0b just declares).
+ * pad_byte_processed_in_card_data is the hard-failure assertion: must
+ * remain 0 once cycle-paced TX path is wired. */
+static uint64_t s_pace_tx_writes_buffered;
+static uint64_t s_pace_tx_writes_dropped_busy;
+static uint64_t s_pace_tx_writes_dropped_cross_device;
+static uint64_t s_pace_cross_device_pad_during_card;
+static uint64_t s_pace_tx_buffer_promoted;
+static uint64_t s_pace_tx_buffer_promoted_during_card;
+static uint64_t s_pace_pad_byte_processed_in_card_data;
+static uint64_t s_pace_shift_completes;
+static uint64_t s_pace_ack_fires;
+#endif /* SIO_MODEL_CYCLE_PACED */
+
 void sio_tick(int cycles) {
     (void)cycles;  /* reserved for cycle-paced model (Phase 1.0c+) */
     if (sio_irq_pending && sio_irq_countdown > 0) {
