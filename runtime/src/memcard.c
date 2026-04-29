@@ -151,3 +151,15 @@ int memcard_debug_info(int card, const char **path_out,
     if (dirty_out)   *dirty_out   = cards[card].dirty;
     return 0;
 }
+
+int memcard_debug_read_buffer(int card, uint32_t offset, uint32_t len,
+                              uint8_t *dst) {
+    if (card < 0 || card >= MAX_CARDS) return 0;
+    if (!cards[card].present) return 0;
+    if (!dst || len == 0) return 0;
+    if (offset >= MEMCARD_SIZE) return 0;
+    uint32_t avail = (uint32_t)MEMCARD_SIZE - offset;
+    if (len > avail) len = avail;
+    memcpy(dst, cards[card].data + offset, len);
+    return (int)len;
+}

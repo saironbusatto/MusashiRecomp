@@ -90,11 +90,34 @@ def send_cmd(sock, cmd_dict):
     line = json.dumps(cmd_dict) + "\n"
     sock.sendall(line.encode())
     buf = b""
-    while b"\n" not in buf:
+    # Server may emit one large JSON object across many TCP chunks, with raw
+    # newlines inside arrays. Track brace/bracket balance (string-aware) and
+    # parse once balance returns to zero.
+    depth_curly = 0
+    depth_sq = 0
+    in_str = False
+    esc = False
+    started = False
+    while True:
         chunk = sock.recv(65536)
         if not chunk:
             break
-        buf += chunk
+        for b in chunk:
+            buf += bytes([b])
+            c = chr(b)
+            if in_str:
+                if esc: esc = False
+                elif c == "\\": esc = True
+                elif c == '"': in_str = False
+                continue
+            if c == '"': in_str = True
+            elif c == "{": depth_curly += 1; started = True
+            elif c == "}": depth_curly -= 1
+            elif c == "[": depth_sq += 1
+            elif c == "]": depth_sq -= 1
+            if started and depth_curly == 0 and depth_sq == 0:
+                # Message complete.
+                return json.loads(buf.decode().strip())
     return json.loads(buf.decode().strip())
 
 
@@ -115,12 +138,23 @@ def pretty_regs(resp):
     if not resp.get("ok"):
         return json.dumps(resp, indent=2)
     lines = [f"  PC: {resp.get('pc','?')}  HI: {resp.get('hi','?')}  LO: {resp.get('lo','?')}"]
+    cop0 = []
+    for k in ("cop0_sr", "cop0_cause", "cop0_epc", "i_stat", "i_mask"):
+        if k in resp:
+            cop0.append(f"{k}={resp[k]}")
+    if cop0:
+        lines.append("  " + "  ".join(cop0))
+    # Server returns either a `gpr` array (positional) or a `regs` dict (named).
+    gpr = resp.get("gpr")
     regs = resp.get("regs", {})
     for i in range(0, 32, 4):
         parts = []
         for j in range(4):
             name = REG_NAMES[i + j]
-            val = regs.get(name, "?")
+            if isinstance(gpr, list) and i + j < len(gpr):
+                val = gpr[i + j]
+            else:
+                val = regs.get(name, "?")
             parts.append(f"{name:>4s}: {val}")
         lines.append("  " + "  ".join(parts))
     return "\n".join(lines)
