@@ -43,6 +43,7 @@ target_include_directories(psx-runtime PRIVATE include)
 target_compile_definitions(psx-runtime PRIVATE
     PSX_NATIVE_BUILD=1
     DEFAULT_DEBUG_PORT=4370
+    PSX_ENABLE_BLOCK_CYCLES=1
     $<$<CXX_COMPILER_ID:MSVC>:SDL_MAIN_HANDLED>
 )
 
@@ -168,6 +169,7 @@ if(NOT MSVC AND EXISTS "${BEETLE_LIB}")
         PSX_NATIVE_BUILD=1
         ENABLE_BEETLE_PSX_ORACLE=1
         DEFAULT_DEBUG_PORT=4370
+        PSX_ENABLE_BLOCK_CYCLES=1
     )
 
     target_link_libraries(psx-beetleoracle PRIVATE

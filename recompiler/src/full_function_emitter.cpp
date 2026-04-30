@@ -265,6 +265,27 @@ bool FullFunctionEmitter::emit_function(
         }
     }
 
+    // Phase 1.0e-d: precompute per-block cycle estimates. For each block
+    // leader L, count instructions from L up to (but not including) the
+    // next leader address (or end of function). Conservative 1 cycle per
+    // instruction; precise R3000A timing (load delays, multiply/divide,
+    // memory stalls) is a future refinement. Includes terminator and
+    // delay slot in the block before the next leader. */
+    std::map<uint32_t, uint32_t> block_cycles;
+    for (auto it = addr_to_raw.begin(); it != addr_to_raw.end(); ++it) {
+        uint32_t leader = it->first;
+        if (!block_leaders.count(leader)) continue;
+        uint32_t count = 0;
+        auto walker = it;
+        while (walker != addr_to_raw.end()) {
+            count++;
+            ++walker;
+            if (walker == addr_to_raw.end()) break;
+            if (block_leaders.count(walker->first)) break;
+        }
+        block_cycles[leader] = count;
+    }
+
     for (auto it = addr_to_raw.begin(); it != addr_to_raw.end(); ++it) {
         uint32_t addr = it->first;
         uint32_t raw = it->second;
@@ -274,6 +295,16 @@ bool FullFunctionEmitter::emit_function(
         // can service vblank and other hardware interrupts.
         if (block_leaders.count(addr)) {
             out += fmt::format("label_{:08X}:\n", addr);
+            // Phase 1.0e-d: advance guest cycles for this block. Macro-
+            // gated; when off, generated code matches pre-1.0e-d output.
+            uint32_t bcyc = 0;
+            auto bcit = block_cycles.find(addr);
+            if (bcit != block_cycles.end()) bcyc = bcit->second;
+            if (bcyc > 0) {
+                out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+                out += fmt::format("    psx_advance_cycles({}u);\n", bcyc);
+                out += "#endif\n";
+            }
             out += "    psx_check_interrupts(cpu);\n";
         }
 
@@ -975,7 +1006,13 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
     full_c += "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
-    full_c += "extern uint32_t g_debug_last_store_pc;\n\n";
+    full_c += "extern uint32_t g_debug_last_store_pc;\n";
+    full_c += "/* Phase 1.0e-d: per-block guest cycle accounting.\n";
+    full_c += " * Compile generated code with -DPSX_ENABLE_BLOCK_CYCLES=1 to\n";
+    full_c += " * activate cycle advancement at every block leader. */\n";
+    full_c += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+    full_c += "extern void psx_advance_cycles(uint32_t cycles);\n";
+    full_c += "#endif\n\n";
 
     // Forward declare ALL functions so intra-file calls resolve.
     for (const auto& fn : dr.functions) {
