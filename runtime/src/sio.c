@@ -197,6 +197,60 @@ static int sio_card_burst_drain(int max_iters);
 extern int psx_get_in_exception(void);
 extern uint8_t psx_read_byte(uint32_t addr);
 
+/* ---- Phase 1.0e-e2 cycle-paced SIO state (lifted above sio_write) ----
+ *
+ * Pad and card share a single shifter / one-byte buffer / ACK pipeline.
+ * No device-specific paths. Macro is in sio.h; defaults to 1. */
+volatile int g_sio_timing_active = 0;
+#if SIO_MODEL_CYCLE_PACED
+#define SIO_BAUD_CYCLES_DEFAULT 1088
+#define SIO_ACK_CYCLES_DEFAULT  170
+static int sio_tick_quantum_cycles = 64;
+static int     sio_shift_active     = 0;
+static uint8_t sio_shift_byte       = 0;
+static int     sio_shift_remaining  = 0;
+static int     sio_tx_buffered      = 0;
+static uint8_t sio_tx_buffer        = 0;
+static int     sio_pending_ack      = 0;
+static int     sio_ack_remaining    = 0;
+typedef enum {
+    SIO_OWNER_NONE = 0, SIO_OWNER_CARD = 1, SIO_OWNER_PAD = 2, SIO_OWNER_UNKNOWN = 3
+} SioBusOwner;
+static SioBusOwner sio_bus_owner = SIO_OWNER_NONE;
+static uint32_t sio_bus_byte_index = 0;
+static uint64_t s_pace_tx_writes_buffered;
+static uint64_t s_pace_tx_writes_dropped_busy;
+static uint64_t s_pace_tx_writes_dropped_cross_device;
+static uint64_t s_pace_cross_device_pad_during_card;
+static uint64_t s_pace_tx_buffer_promoted;
+static uint64_t s_pace_tx_buffer_promoted_during_card;
+static uint64_t s_pace_pad_byte_processed_in_card_data;
+static uint64_t s_pace_shift_completes;
+static uint64_t s_pace_ack_fires;
+#endif
+
+/* ---- Starvation-ring helper -------------------------------------------
+ * Fill in current SIO state at every recorded event. */
+#include "starvation_ring.h"
+static void sr_record(uint8_t kind, uint8_t tx, uint8_t rx) {
+#if SIO_MODEL_CYCLE_PACED
+    starvation_ring_record(kind, tx, rx,
+                           sio_ctrl, sio_stat,
+                           sio_shift_active, sio_shift_remaining,
+                           sio_tx_buffered, sio_pending_ack,
+                           sio_ack_remaining,
+                           (uint8_t)sio_bus_owner, sio_bus_byte_index,
+                           (uint8_t)active_device, (uint8_t)mc_state,
+                           (uint8_t)pad_state, (uint8_t)selected_slot,
+                           g_sio_timing_active);
+#else
+    starvation_ring_record(kind, tx, rx, sio_ctrl, sio_stat,
+                           0, 0, 0, 0, 0, 0, 0,
+                           (uint8_t)active_device, (uint8_t)mc_state,
+                           (uint8_t)pad_state, (uint8_t)selected_slot, 0);
+#endif
+}
+
 
 /* ---- Card transaction ring buffer ---- */
 static SioTxnEntry sio_txn_buf[SIO_TXN_CAP];
@@ -908,12 +962,21 @@ uint32_t sio_read(uint32_t addr) {
     sio_tick(0);
 
     switch (addr) {
-    case 0x1F801040: /* SIO_RX_DATA */
+    case 0x1F801040: /* SIO_RX_DATA */ {
+        uint8_t b = sio_rx_data;
         sio_stat &= ~SIO_STAT_RX_RDY;
-        return sio_rx_data;
+        sr_record(SR_EVT_RX_DATA_READ, 0, b);
+        return b;
+    }
 
-    case 0x1F801044: /* SIO_STAT */
+    case 0x1F801044: { /* SIO_STAT — record only on value transitions */
+        static uint16_t s_last_stat_observed = 0xFFFF;
+        if (sio_stat != s_last_stat_observed) {
+            s_last_stat_observed = sio_stat;
+            sr_record(SR_EVT_STAT_READ, 0, 0);
+        }
         return sio_stat;
+    }
 
     case 0x1F801048: /* SIO_MODE */
         return sio_mode;
@@ -943,42 +1006,56 @@ void sio_write(uint32_t addr, uint32_t value) {
         sio_tx_data = (uint8_t)value;
         sio_tx_writes++;
         sio_last_ctrl_on_tx = sio_ctrl;
-        if (!(sio_ctrl & SIO_CTRL_TX_EN)) sio_tx_gated++;
-        if (sio_ctrl & SIO_CTRL_TX_EN) {
-            /* IRQ-arm chain audit: capture pre-state for diagnostics.
-             * NOTE: bucket by active_device AT-DECISION-TIME (post-process),
-             * not pre-process — sio_process_byte (re)assigns active_device
-             * on its first byte / on deselect-continuation. */
+        if (!(sio_ctrl & SIO_CTRL_TX_EN)) {
+            sio_tx_gated++;
+            sr_record(SR_EVT_TX_DATA_WRITE, (uint8_t)value, 0);
+            break;
+        }
+#if SIO_MODEL_CYCLE_PACED
+        /* Cycle-paced TX. Pad and card share single bus. */
+        {
+            uint8_t b = (uint8_t)value;
+            sr_record(SR_EVT_TX_DATA_WRITE, b, 0);
+            if (sio_bus_byte_index == 0) {
+                sio_bus_owner = (b == 0x81) ? SIO_OWNER_CARD
+                              : (b == 0x01) ? SIO_OWNER_PAD
+                              :               SIO_OWNER_UNKNOWN;
+            }
+            sio_bus_byte_index++;
+            if (!sio_shift_active) {
+                sio_shift_byte      = b;
+                sio_shift_active    = 1;
+                sio_shift_remaining = SIO_BAUD_CYCLES_DEFAULT;
+                sio_stat &= ~(SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY);
+                g_sio_timing_active = 1;
+                sr_record(SR_EVT_SHIFT_START, b, 0);
+            } else if (!sio_tx_buffered) {
+                sio_tx_buffer  = b;
+                sio_tx_buffered = 1;
+                sio_stat &= ~SIO_STAT_TX_EMPTY;
+                s_pace_tx_writes_buffered++;
+                sr_record(SR_EVT_BUFFER_LOAD, b, 0);
+            } else {
+                s_pace_tx_writes_dropped_busy++;
+                sr_record(SR_EVT_TX_DROPPED, b, 0);
+            }
+        }
+#else
+        {
             uint16_t arm_dbg_ctrl_pre  = sio_ctrl;
             uint16_t arm_dbg_stat_pre  = sio_stat;
-
             sio_process_byte(sio_tx_data);
-            /* Capture the device the if-block will read. */
             uint8_t  arm_dbg_dev_at_decision = (uint8_t)active_device;
-            /* Model SIO busy: on real hardware TX_RDY clears during the
-             * byte transfer (~BAUD*8 cycles) and re-sets when complete.
-             * The BIOS pad polling tight-loops on TX_RDY before sending
-             * each byte.  Without this, pad polling proceeds instantly
-             * over a card byte that's still "in flight", interleaving
-             * pad and card protocols within the same interrupt. */
             sio_stat &= ~(SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY);
-
-            /* IRQ-arm chain audit: count attempts and failure reasons.
-             * Counted only for the card path (active_device==DEV_MEMCARD).
-             * Exposed via sio_get_card_arm_audit() / debug_server. */
             extern void sio_card_arm_audit_record(int dev, uint16_t ctrl_pre,
                                                   uint16_t stat_pre, uint16_t stat_post,
                                                   int armed, int countdown_after);
-
             int armed_now = 0;
             if ((sio_stat & SIO_STAT_ACK) && (sio_ctrl & SIO_CTRL_ACK_IRQ_EN)) {
                 sio_stat &= ~SIO_STAT_ACK;
                 sio_irq_pending = 1;
-                /* Use a longer delay for card transfers to keep TX_RDY
-                 * cleared through pad polling within the same ISR. */
                 sio_irq_countdown = (active_device == DEV_MEMCARD)
                     ? SIO_IRQ_DELAY_CARD : SIO_IRQ_DELAY_PAD;
-                /* Arm IRQ ring context for capture at fire time. */
                 sio_irq_pending_source   = (active_device == DEV_MEMCARD)
                                            ? SIO_IRQ_SRC_CARD_ACK : SIO_IRQ_SRC_PAD_ACK;
                 sio_irq_pending_slot     = (uint8_t)selected_slot;
@@ -987,20 +1064,22 @@ void sio_write(uint32_t addr, uint32_t value) {
                 sio_irq_pending_byte_seq = sio_trace_seq;
                 armed_now = 1;
             }
-
             sio_card_arm_audit_record(arm_dbg_dev_at_decision, arm_dbg_ctrl_pre,
                                       arm_dbg_stat_pre, sio_stat,
                                       armed_now, sio_irq_countdown);
         }
+#endif
         break;
 
     case 0x1F801048: /* SIO_MODE */
         sio_mode = (uint16_t)value;
+        sr_record(SR_EVT_MODE_WRITE, (uint8_t)(value & 0xFF), (uint8_t)((value >> 8) & 0xFF));
         break;
 
     case 0x1F80104A: /* SIO_CTRL */ {
         uint16_t old_ctrl = sio_ctrl;
         sio_ctrl = (uint16_t)value;
+        sr_record(SR_EVT_CTRL_WRITE, (uint8_t)(value & 0xFF), (uint8_t)((value >> 8) & 0xFF));
         if (value & SIO_CTRL_ACK) {
             sio_stat &= ~SIO_STAT_IRQ;
             sio_stat &= ~SIO_STAT_ACK;
@@ -1026,7 +1105,39 @@ void sio_write(uint32_t addr, uint32_t value) {
             active_device = DEV_NONE;
             sio_irq_pending = 0;
             sio_irq_countdown = 0;
+#if SIO_MODEL_CYCLE_PACED
+            sio_shift_active = 0; sio_shift_remaining = 0;
+            sio_tx_buffered = 0;
+            sio_pending_ack = 0; sio_ack_remaining = 0;
+            sio_bus_owner = SIO_OWNER_NONE; sio_bus_byte_index = 0;
+            g_sio_timing_active = 0;
+#endif
+            sr_record(SR_EVT_RESET, 0, 0);
         }
+#if SIO_MODEL_CYCLE_PACED
+        if (!(old_ctrl & SIO_CTRL_SELECT) && (value & SIO_CTRL_SELECT)) {
+            sio_bus_owner = SIO_OWNER_NONE;
+            sio_bus_byte_index = 0;
+            sr_record(SR_EVT_SELECT_ASSERT, 0, 0);
+        }
+        /* TX_EN 1→0 transition kills any in-flight shifter the same
+         * way SELECT-deassert does. Restore TX_RDY/TX_EMPTY so the
+         * SIO returns to an idle status word, matching the recovery
+         * the SELECT-deassert path now performs. */
+        if ((old_ctrl & SIO_CTRL_TX_EN) && !(value & SIO_CTRL_TX_EN)) {
+            if (sio_shift_active || sio_tx_buffered || sio_pending_ack) {
+                sio_shift_active = 0; sio_shift_remaining = 0;
+                sio_tx_buffered = 0;
+                sio_pending_ack = 0; sio_ack_remaining = 0;
+                if (!(value & SIO_CTRL_SELECT)) {
+                    sio_bus_owner = SIO_OWNER_NONE;
+                    sio_bus_byte_index = 0;
+                }
+                g_sio_timing_active = 0;
+                sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
+            }
+        }
+#endif
         /* On SELECT deassert: reset all volatile protocol state.
          *
          * Earlier model preserved mc_state into mc_slots[] so a card
@@ -1067,12 +1178,27 @@ void sio_write(uint32_t addr, uint32_t value) {
             }
             pad_state = PAD_IDLE;
             active_device = DEV_NONE;
+#if SIO_MODEL_CYCLE_PACED
+            sio_shift_active = 0; sio_shift_remaining = 0;
+            sio_tx_buffered = 0;
+            sio_pending_ack = 0; sio_ack_remaining = 0;
+            sio_bus_owner = SIO_OWNER_NONE; sio_bus_byte_index = 0;
+            g_sio_timing_active = 0;
+            /* Killing an in-flight shifter mid-cycle leaves sio_stat
+             * with TX_RDY/TX_EMPTY clear (they were masked by
+             * SHIFT_START and only sio_handle_shift_complete restores
+             * them). Restore here so the next handler sees an idle
+             * SIO instead of busy-waiting forever on TX_RDY=0. */
+            sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
+#endif
+            sr_record(SR_EVT_SELECT_DEASS, 0, 0);
         }
         break;
     }
 
     case 0x1F80104E: /* SIO_BAUD */
         sio_baud = (uint16_t)value;
+        sr_record(SR_EVT_BAUD_WRITE, (uint8_t)(value & 0xFF), (uint8_t)((value >> 8) & 0xFF));
         break;
 
     default:
@@ -1201,64 +1327,7 @@ void sio_get_burst_stats(uint64_t out[10]) {
 #define SIO_MODEL_CYCLE_PACED 1
 #endif
 
-/* Hot-path active guard. Defined unconditionally (so its address exists
- * for any caller), but only meaningfully used when macro=1. */
-volatile int g_sio_timing_active = 0;
-
-#if SIO_MODEL_CYCLE_PACED
-/* ---- Phase 1.0b: cycle-paced SIO state (inert) ---------------------------
- *
- * Declared under macro guard so they exist only in cycle-paced builds.
- * Phase 1.0b adds the variables; Phase 1.0c+ wires them into sio_tick /
- * sio_write SIO_TX_DATA / sio_write SIO_CTRL paths. With the macro
- * defaulting to 0 (Phase 1.0a/b posture), no code references these — they
- * are file-scope statics with no callers, no readers, no telemetry hooks.
- *
- * Hardware-time constants. PSX SIO0 default baud (BAUD=0x88, factor 8) is
- * approximately 1088 CPU cycles per byte; the device-side ACK arrives
- * about 170 cycles after the byte completes shifting on the bus. */
-#define SIO_BAUD_CYCLES_DEFAULT 1088
-#define SIO_ACK_CYCLES_DEFAULT  170
-
-/* Dispatch-loop quantum: SIO time advance per !in_exception
- * psx_check_interrupts call. Tunable in Phase 1.0c+ via TCP. Phase 1.0b:
- * declared only, never referenced. */
-static int sio_tick_quantum_cycles = 64;
-
-/* TX shifter and one-byte TX buffer modelling JOY_TX_DATA. */
-static int     sio_shift_active     = 0;
-static uint8_t sio_shift_byte       = 0;
-static int     sio_shift_remaining  = 0;
-static int     sio_tx_buffered      = 0;
-static uint8_t sio_tx_buffer        = 0;
-static int     sio_pending_ack      = 0;
-static int     sio_ack_remaining    = 0;
-
-/* Bus ownership over the SELECT lifetime. Set on FIRST accepted byte of
- * each SELECT-asserted lifetime; never reclassified. Cleared on SELECT
- * deassert / RESET / TX_EN clear. Not used in 1.0b. */
-typedef enum {
-    SIO_OWNER_NONE    = 0,
-    SIO_OWNER_CARD    = 1,
-    SIO_OWNER_PAD     = 2,
-    SIO_OWNER_UNKNOWN = 3,
-} SioBusOwner;
-static SioBusOwner sio_bus_owner      = SIO_OWNER_NONE;
-static uint32_t    sio_bus_byte_index = 0;
-
-/* Telemetry counters (Phase 1.0d will populate; Phase 1.0b just declares).
- * pad_byte_processed_in_card_data is the hard-failure assertion: must
- * remain 0 once cycle-paced TX path is wired. */
-static uint64_t s_pace_tx_writes_buffered;
-static uint64_t s_pace_tx_writes_dropped_busy;
-static uint64_t s_pace_tx_writes_dropped_cross_device;
-static uint64_t s_pace_cross_device_pad_during_card;
-static uint64_t s_pace_tx_buffer_promoted;
-static uint64_t s_pace_tx_buffer_promoted_during_card;
-static uint64_t s_pace_pad_byte_processed_in_card_data;
-static uint64_t s_pace_shift_completes;
-static uint64_t s_pace_ack_fires;
-#endif /* SIO_MODEL_CYCLE_PACED */
+/* Cycle-paced SIO state moved above sio_write (after forward decls). */
 
 #if SIO_MODEL_CYCLE_PACED
 /* ---- Phase 1.0c-v2: cycle-paced sio_tick helpers (inert in 1.0c-v2) ---
@@ -1276,6 +1345,7 @@ static int sio_consume_ack_event(void) {
 
 static void sio_fire_ack_irq(void) {
     sio_stat |= SIO_STAT_ACK;
+    sr_record(SR_EVT_ACK_FIRE, 0, 0);
     if (!(sio_ctrl & SIO_CTRL_ACK_IRQ_EN)) return;
     sio_stat |= SIO_STAT_IRQ;
 
@@ -1307,6 +1377,7 @@ static void sio_fire_ack_irq(void) {
 
 static void sio_handle_shift_complete(void) {
     uint8_t b = sio_shift_byte;
+    sr_record(SR_EVT_SHIFT_DONE, b, 0);
     if (b == 0x01 && mc_state >= MC_READ_DATA && mc_state <= MC_READ_END) {
         s_pace_pad_byte_processed_in_card_data++;
     }

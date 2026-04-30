@@ -3105,6 +3105,12 @@ void debug_server_init(int port)
 
 void debug_server_poll(void)
 {
+    /* Phase 1.0e-e2 starvation watchdog heartbeat. Refreshes the
+     * "last poll wall-clock" timestamp; if too much time passes
+     * between calls, the ring is dumped and the runtime aborts. */
+    extern void starvation_watchdog_heartbeat(void);
+    starvation_watchdog_heartbeat();
+
     if (s_listen == SOCK_INVALID) return;
 
     if (s_client == SOCK_INVALID) {

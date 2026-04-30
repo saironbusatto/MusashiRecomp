@@ -28,6 +28,7 @@ set(PSX_SHARED_SOURCES
     src/psx_oracle_stub.c
     src/psx_oracle_cmds.c
     src/psx_cycles.c
+    src/starvation_ring.c
 )
 
 # ---- Native target: recompiled BIOS, stub interpreter ----
