@@ -376,6 +376,129 @@ extern uint32_t beetle_get_sio_trace(uint32_t *out_seq, uint8_t *out_tx,
                                       int max_count);
 extern uint32_t beetle_get_sio_trace_total(void);
 
+/* ---- Beetle wtrace (from beetle_psx_bridge.cpp) ---- */
+extern int      beetle_wtrace_arm(uint32_t lo, uint32_t hi);
+extern void     beetle_wtrace_disarm_all(void);
+extern int      beetle_wtrace_range_count(void);
+extern int      beetle_wtrace_get_range(int slot, uint32_t *out_lo, uint32_t *out_hi);
+extern void     beetle_wtrace_reset(void);
+extern uint64_t beetle_wtrace_total(void);
+extern uint32_t beetle_wtrace_get(uint64_t *out_seq, uint32_t *out_addr,
+                                  uint32_t *out_value, uint32_t *out_pc,
+                                  uint32_t *out_ra, uint32_t *out_frame,
+                                  uint8_t *out_slot, uint8_t *out_size,
+                                  int max_count);
+
+static void h_beetle_wtrace_arm(int id, const char *json) {
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded");
+        return;
+    }
+    char lo_str[32], hi_str[32];
+    if (!json_get_str(json, "lo", lo_str, sizeof(lo_str)) ||
+        !json_get_str(json, "hi", hi_str, sizeof(hi_str))) {
+        send_err(id, "missing lo/hi");
+        return;
+    }
+    uint32_t lo = hex_to_u32(lo_str);
+    uint32_t hi = hex_to_u32(hi_str);
+    int slot = beetle_wtrace_arm(lo, hi);
+    if (slot < 0) {
+        send_err(id, slot == -1 ? "ranges full" : "lo >= hi");
+        return;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"slot\":%d,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}\n",
+             id, slot, lo, hi);
+}
+
+static void h_beetle_wtrace_disarm(int id, const char *json) {
+    (void)json;
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded");
+        return;
+    }
+    beetle_wtrace_disarm_all();
+    send_ok(id);
+}
+
+static void h_beetle_wtrace_ranges(int id, const char *json) {
+    (void)json;
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded");
+        return;
+    }
+    int n = beetle_wtrace_range_count();
+    send_fmt("{\"id\":%d,\"ok\":true,\"count\":%d,\"ranges\":[", id, n);
+    for (int i = 0; i < n; i++) {
+        uint32_t lo = 0, hi = 0;
+        beetle_wtrace_get_range(i, &lo, &hi);
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"slot\":%d,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}", i, lo, hi);
+    }
+    send_fmt("]}\n");
+}
+
+static void h_beetle_wtrace_reset(int id, const char *json) {
+    (void)json;
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded");
+        return;
+    }
+    beetle_wtrace_reset();
+    send_ok(id);
+}
+
+static void h_beetle_wtrace(int id, const char *json) {
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded");
+        return;
+    }
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 65536) count = 65536;  /* match BEETLE_WTRACE_CAP */
+
+    uint64_t *seqs    = (uint64_t *)malloc(count * sizeof(uint64_t));
+    uint32_t *addrs   = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *values  = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *pcs     = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *ras     = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *frames  = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint8_t  *slots   = (uint8_t  *)malloc(count);
+    uint8_t  *sizes   = (uint8_t  *)malloc(count);
+    if (!seqs || !addrs || !values || !pcs || !ras || !frames || !slots || !sizes) {
+        free(seqs); free(addrs); free(values); free(pcs);
+        free(ras); free(frames); free(slots); free(sizes);
+        send_err(id, "alloc");
+        return;
+    }
+
+    uint32_t got   = beetle_wtrace_get(seqs, addrs, values, pcs, ras,
+                                       frames, slots, sizes, count);
+    uint64_t total = beetle_wtrace_total();
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"entries\":[",
+             id, (unsigned long long)total, (unsigned)got);
+    for (uint32_t i = 0; i < got; i++) {
+        if (i > 0) send_fmt(",");
+        /* Classify PC: BIOS ROM (0xBFC00000-0xBFC80000) vs RAM (KSEG0/KUSEG). */
+        const char *region = "other";
+        uint32_t pc = pcs[i];
+        if (pc >= 0xBFC00000u && pc < 0xBFC80000u) region = "rom";
+        else if ((pc & 0xE0000000u) == 0x80000000u) region = "ram_kseg0";
+        else if ((pc & 0xE0000000u) == 0xA0000000u) region = "ram_kseg1";
+        else if (pc < 0x00800000u)                  region = "ram_kuseg";
+        send_fmt("{\"seq\":%llu,\"addr\":\"0x%08X\",\"val\":\"0x%08X\","
+                 "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"frame\":%u,"
+                 "\"slot\":%u,\"size\":%u,\"region\":\"%s\"}",
+                 (unsigned long long)seqs[i], addrs[i], values[i],
+                 pcs[i], ras[i], frames[i], slots[i], sizes[i], region);
+    }
+    send_fmt("]}\n");
+
+    free(seqs); free(addrs); free(values); free(pcs);
+    free(ras); free(frames); free(slots); free(sizes);
+}
+
 static void h_emu_sio_trace(int id, const char *json) {
     if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
         send_err(id, "oracle not loaded");
@@ -849,6 +972,11 @@ static const OracleCmd s_oracle_cmds[] = {
     { "emu_screenshot",         h_emu_screenshot },
     { "sio_first_divergence",   h_sio_first_divergence },
     { "card_txn_diff",          h_card_txn_diff },
+    { "beetle_wtrace_arm",      h_beetle_wtrace_arm },
+    { "beetle_wtrace_disarm",   h_beetle_wtrace_disarm },
+    { "beetle_wtrace_ranges",   h_beetle_wtrace_ranges },
+    { "beetle_wtrace_reset",    h_beetle_wtrace_reset },
+    { "beetle_wtrace",          h_beetle_wtrace },
     { NULL, NULL }
 };
 

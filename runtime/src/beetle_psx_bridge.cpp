@@ -67,6 +67,74 @@ static void beetle_sio_trace_callback(uint8_t tx, uint8_t rx, uint16_t ctrl) {
     s_beetle_sio_trace_seq++;
 }
 
+/* ---- Beetle RAM write trace ring buffer ----
+ * Always-on capture of writes to armed physical RAM ranges. Mirrors the
+ * recomp-side debug_server.c wtrace, so a Python client can diff the two.
+ * Hook lives in mednafen/psx/cpu.cpp (SB/SH/SW), fires AFTER the write. */
+#define BEETLE_WTRACE_CAP        65536
+#define BEETLE_WTRACE_MAX_RANGES 16
+
+struct BeetleWtraceEntry {
+    uint64_t seq;        /* monotonic */
+    uint32_t addr;       /* virtual address from store insn */
+    uint32_t value;      /* stored value (sized) */
+    uint32_t pc;         /* PC of the store instruction */
+    uint32_t ra;         /* GPR[31] at store time */
+    uint32_t frame;      /* Beetle frame counter */
+    uint8_t  slot_idx;   /* MainRAM[0x7264] at store time (card slot toggle) */
+    uint8_t  size;       /* 1, 2, 4 */
+    uint8_t  pad[2];
+};
+
+static BeetleWtraceEntry s_beetle_wtrace[BEETLE_WTRACE_CAP];
+static uint32_t s_beetle_wtrace_idx   = 0;
+static uint64_t s_beetle_wtrace_seq   = 0;
+static struct { uint32_t lo, hi; } s_beetle_wtrace_ranges[BEETLE_WTRACE_MAX_RANGES];
+static int       s_beetle_wtrace_range_count = 0;
+
+/* Callback fired by mednafen-PSX cpu.cpp on every SB/SH/SW.
+ * `addr` is the virtual address; we mask to physical for the range filter
+ * but record the original virtual addr for context. */
+static void beetle_wtrace_callback(uint32_t addr, uint32_t value,
+                                    uint32_t pc, uint32_t ra, uint8_t size)
+{
+    if (s_beetle_wtrace_range_count == 0) return;
+
+    /* Physical address: mednafen masks via addr_mask[] inside WriteMemory
+     * before doing the actual store; here we replicate just the mask we
+     * care about (RAM mirror collapse). */
+    uint32_t phys = addr & 0x1FFFFFFFu;
+
+    /* Range filter (inclusive lo, exclusive hi). Multi-byte store writes
+     * `size` bytes starting at phys; consider it in-range if any byte
+     * touched falls within an armed range. */
+    int hit = 0;
+    for (int i = 0; i < s_beetle_wtrace_range_count; i++) {
+        uint32_t lo = s_beetle_wtrace_ranges[i].lo;
+        uint32_t hi = s_beetle_wtrace_ranges[i].hi;
+        uint32_t phi = phys + size;        /* one past last touched byte */
+        if (phi > lo && phys < hi) { hit = 1; break; }
+    }
+    if (!hit) return;
+
+    /* Snapshot RAM[0x7264] for slot context; safe even mid-store since
+     * 0x7264 is byte-sized and rarely written. */
+    uint8_t slot = 0;
+    if (MainRAM)
+        slot = MainRAM->data8[0x7264];
+
+    BeetleWtraceEntry *e = &s_beetle_wtrace[s_beetle_wtrace_idx];
+    e->seq      = s_beetle_wtrace_seq++;
+    e->addr     = addr;
+    e->value    = value;
+    e->pc       = pc;
+    e->ra       = ra;
+    e->frame    = s_frame_count;
+    e->slot_idx = slot;
+    e->size     = size;
+    s_beetle_wtrace_idx = (s_beetle_wtrace_idx + 1) % BEETLE_WTRACE_CAP;
+}
+
 /* Pointer to system directory (where BIOS lives). */
 static char s_system_dir[4096] = ".";
 
@@ -355,6 +423,14 @@ static int beetle_init(const char *bios_path) {
         std::fprintf(stderr, "[beetle-psx] SIO trace callback registered\n");
     }
 
+    /* Register RAM write trace callback. Default-arm the card-gate window
+     * (0x7568..0x756C covers slots 0..3) so writes are captured from boot. */
+    g_psxrecomp_wtrace_cb = beetle_wtrace_callback;
+    s_beetle_wtrace_ranges[0].lo = 0x00007568u;
+    s_beetle_wtrace_ranges[0].hi = 0x0000756Cu;
+    s_beetle_wtrace_range_count = 1;
+    std::fprintf(stderr, "[beetle-psx] wtrace callback registered, default-armed [0x7568..0x756C)\n");
+
     std::fprintf(stderr, "[beetle-psx] Oracle backend loaded (system_dir=%s)\n", s_system_dir);
     return 0;
 }
@@ -597,6 +673,70 @@ extern "C" uint32_t beetle_get_sio_trace(uint32_t *out_seq, uint8_t *out_tx,
 
 extern "C" uint32_t beetle_get_sio_trace_total(void) {
     return s_beetle_sio_trace_seq;
+}
+
+/* ---- Beetle wtrace access (for psx_oracle_cmds.c) ---- */
+
+extern "C" int beetle_wtrace_arm(uint32_t lo, uint32_t hi) {
+    if (s_beetle_wtrace_range_count >= BEETLE_WTRACE_MAX_RANGES) return -1;
+    if (lo >= hi) return -2;
+    int slot = s_beetle_wtrace_range_count++;
+    s_beetle_wtrace_ranges[slot].lo = lo & 0x1FFFFFFFu;
+    s_beetle_wtrace_ranges[slot].hi = hi & 0x1FFFFFFFu;
+    return slot;
+}
+
+extern "C" void beetle_wtrace_disarm_all(void) {
+    s_beetle_wtrace_range_count = 0;
+}
+
+extern "C" int beetle_wtrace_range_count(void) {
+    return s_beetle_wtrace_range_count;
+}
+
+extern "C" int beetle_wtrace_get_range(int slot, uint32_t *out_lo, uint32_t *out_hi) {
+    if (slot < 0 || slot >= s_beetle_wtrace_range_count) return -1;
+    *out_lo = s_beetle_wtrace_ranges[slot].lo;
+    *out_hi = s_beetle_wtrace_ranges[slot].hi;
+    return 0;
+}
+
+extern "C" void beetle_wtrace_reset(void) {
+    s_beetle_wtrace_idx = 0;
+    s_beetle_wtrace_seq = 0;
+    memset(s_beetle_wtrace, 0, sizeof(s_beetle_wtrace));
+}
+
+extern "C" uint64_t beetle_wtrace_total(void) {
+    return s_beetle_wtrace_seq;
+}
+
+/* Copy out the most recent `max_count` entries (oldest first).
+ * Returns the actual count written. */
+extern "C" uint32_t beetle_wtrace_get(uint64_t *out_seq, uint32_t *out_addr,
+                                      uint32_t *out_value, uint32_t *out_pc,
+                                      uint32_t *out_ra, uint32_t *out_frame,
+                                      uint8_t *out_slot, uint8_t *out_size,
+                                      int max_count)
+{
+    int avail = (int)(s_beetle_wtrace_seq < (uint64_t)BEETLE_WTRACE_CAP
+                      ? s_beetle_wtrace_seq : BEETLE_WTRACE_CAP);
+    int count = max_count < avail ? max_count : avail;
+    int start = ((int)s_beetle_wtrace_idx - count + BEETLE_WTRACE_CAP) % BEETLE_WTRACE_CAP;
+
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % BEETLE_WTRACE_CAP;
+        const BeetleWtraceEntry *e = &s_beetle_wtrace[idx];
+        out_seq[i]   = e->seq;
+        out_addr[i]  = e->addr;
+        out_value[i] = e->value;
+        out_pc[i]    = e->pc;
+        out_ra[i]    = e->ra;
+        out_frame[i] = e->frame;
+        out_slot[i]  = e->slot_idx;
+        out_size[i]  = e->size;
+    }
+    return (uint32_t)count;
 }
 
 #endif /* ENABLE_BEETLE_PSX_ORACLE */
