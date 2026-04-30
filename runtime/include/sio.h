@@ -10,20 +10,41 @@ extern "C" {
 /* SIO0 register base: 0x1F801040 */
 #define SIO_BASE 0x1F801040
 
+/* Phase 1.0c-v2: cycle-paced SIO model. Default 1 enables the dispatch-
+ * loop quantum tick (gated by g_sio_timing_active). Set to 0 to revert
+ * to legacy access-paced behavior across all callers. */
+#ifndef SIO_MODEL_CYCLE_PACED
+#define SIO_MODEL_CYCLE_PACED 1
+#endif
+
 void sio_init(void);
 
 /* MMIO read/write (0x1F801040-0x1F80104E) */
 uint32_t sio_read(uint32_t addr);
 void sio_write(uint32_t addr, uint32_t value);
 
-/* Advance SIO timing.
+/* Advance SIO timing by `cycles` PSX cycles.
  *
- * Phase 1.0a signature change. The cycles arg is reserved for a future
- * cycle-paced model (SIO_MODEL_CYCLE_PACED=1). With the default macro
- * setting (SIO_MODEL_CYCLE_PACED=0) the cycles arg is ignored and the
- * body behaves identically to the prior tick-once-per-call semantics —
- * fires pending IRQ7 after the transfer delay expires. */
+ * In cycle-paced mode (SIO_MODEL_CYCLE_PACED=1, default in 1.0c+): walks
+ * shift-complete and ACK-fire events scheduled in cycles ahead. In 1.0c
+ * the shifter is never armed (TX path still synchronous), so the body
+ * is effectively inert. Phase 1.0d will route TX through the shifter.
+ *
+ * The legacy access-paced IRQ countdown body always runs and is the
+ * actual IRQ delivery mechanism in 1.0c. */
 void sio_tick(int cycles);
+
+/* Convenience: advance SIO by the dispatch-loop quantum. Called from
+ * psx_check_interrupts inside !in_exception, gated by g_sio_timing_active
+ * (no-op when no SIO cycle-paced work is pending). No-op under macro=0. */
+void sio_tick_quantum(void);
+
+/* Hot-path active guard. Set to 1 by future 1.0d code when sio_shift or
+ * sio_pending_ack arms; cleared back to 0 when both shifter and buffer
+ * and ACK are empty. The dispatch loop reads this BEFORE calling
+ * sio_tick_quantum, so when no SIO time is pending the per-call cost is
+ * one load + one branch. In 1.0c-v2 nothing sets this — it stays 0. */
+extern volatile int g_sio_timing_active;
 
 /* Update pad button state. Buttons use PS1 convention: 0=pressed, 1=released.
    Bit layout: SELECT, L3, R3, START, UP, RIGHT, DOWN, LEFT,

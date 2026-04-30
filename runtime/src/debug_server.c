@@ -1262,6 +1262,50 @@ static void handle_mc_status(int id, const char *json)
 extern void sio_get_card_arm_audit(uint32_t out[3][7]);
 extern int  sio_get_card_arm_countdown_after(void);
 extern void sio_get_burst_stats(uint64_t out[10]);
+extern void sio_get_pace_state(uint64_t out[16]);
+extern volatile int g_sio_timing_active;
+
+/* Phase 1.0c-v2 telemetry: cycle-paced SIO state snapshot. Read-only.
+ * In 1.0c-v2 the TX path is still synchronous, g_sio_timing_active
+ * stays 0, and all dynamic shifter/ack fields stay zero. */
+static void handle_pace_state(int id, const char *json)
+{
+    (void)json;
+    uint64_t s[16];
+    sio_get_pace_state(s);
+    const char *model = s[0] ? "cycle_paced" : "access_legacy";
+    const char *owner = s[7] == 0 ? "none" : s[7] == 1 ? "card"
+                      : s[7] == 2 ? "pad"  : "unknown";
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"sio_model\":\"%s\","
+             "\"sio_quantum_cycles\":%llu,"
+             "\"timing_active\":%d,"
+             "\"shift_active\":%llu,"
+             "\"shift_remaining\":%llu,"
+             "\"tx_buffered\":%llu,"
+             "\"ack_active\":%llu,"
+             "\"ack_remaining\":%llu,"
+             "\"bus_owner\":\"%s\","
+             "\"bus_byte_index\":%llu,"
+             "\"tx_writes_buffered\":%llu,"
+             "\"tx_writes_dropped_busy\":%llu,"
+             "\"tx_writes_dropped_cross_device\":%llu,"
+             "\"tx_buffer_promoted\":%llu,"
+             "\"tx_buffer_promoted_during_card\":%llu,"
+             "\"pad_byte_processed_in_card_data\":%llu,"
+             "\"cross_device_pad_during_card\":%llu}\n",
+             id, model,
+             (unsigned long long)s[1],
+             g_sio_timing_active,
+             (unsigned long long)s[2], (unsigned long long)s[3],
+             (unsigned long long)s[4], (unsigned long long)s[5],
+             (unsigned long long)s[6],
+             owner,
+             (unsigned long long)s[8], (unsigned long long)s[9],
+             (unsigned long long)s[10], (unsigned long long)s[11],
+             (unsigned long long)s[12], (unsigned long long)s[13],
+             (unsigned long long)s[14], (unsigned long long)s[15]);
+}
 
 static void handle_sio_burst_stats(int id, const char *json)
 {
@@ -2833,6 +2877,7 @@ static const CmdEntry s_commands[] = {
     { "card_buffer_dump",  handle_card_buffer_dump },
     { "sio_arm_audit",     handle_sio_arm_audit },
     { "sio_burst_stats",   handle_sio_burst_stats },
+    { "pace_state",        handle_pace_state },
     { "chain_trace",       handle_chain_trace },
     { "sio_trace",         handle_sio_trace },
     { "sio_pc_trace",      handle_sio_pc_trace },

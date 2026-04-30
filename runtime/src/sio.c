@@ -1188,13 +1188,22 @@ void sio_get_burst_stats(uint64_t out[10]) {
     out[9] = 0;
 }
 
-/* Phase 1.0a: SIO_MODEL_CYCLE_PACED defaulting to 0 keeps the legacy
- * access-paced behavior unchanged. The cycles arg on sio_tick is
- * reserved for a future cycle-paced model and is ignored under
- * macro=0. */
+/* Phase 1.0c-v2: flip default to 1, but gate the dispatch-loop quantum
+ * tick by g_sio_timing_active so the per-call cost on the
+ * psx_check_interrupts hot path is one load + one branch when no SIO
+ * cycle-paced work is pending. TX path remains synchronous in 1.0c-v2
+ * — nothing sets g_sio_timing_active, so the gate stays 0 and
+ * sio_tick_quantum is never invoked. Phase 1.0d will reroute TX into
+ * the shifter and arm the guard.
+ *
+ * Macro=0 still available to revert to legacy entirely. */
 #ifndef SIO_MODEL_CYCLE_PACED
-#define SIO_MODEL_CYCLE_PACED 0
+#define SIO_MODEL_CYCLE_PACED 1
 #endif
+
+/* Hot-path active guard. Defined unconditionally (so its address exists
+ * for any caller), but only meaningfully used when macro=1. */
+volatile int g_sio_timing_active = 0;
 
 #if SIO_MODEL_CYCLE_PACED
 /* ---- Phase 1.0b: cycle-paced SIO state (inert) ---------------------------
@@ -1251,8 +1260,139 @@ static uint64_t s_pace_shift_completes;
 static uint64_t s_pace_ack_fires;
 #endif /* SIO_MODEL_CYCLE_PACED */
 
+#if SIO_MODEL_CYCLE_PACED
+/* ---- Phase 1.0c-v2: cycle-paced sio_tick helpers (inert in 1.0c-v2) ---
+ *
+ * In 1.0c-v2, the TX path is still synchronous and nothing arms
+ * sio_shift_active or sio_pending_ack. Therefore these helpers exist
+ * but are never reached at runtime: sio_tick_quantum is gated by
+ * g_sio_timing_active (which stays 0), and even if called the cycle-
+ * paced loop in sio_tick would find no events to fire. */
+static int sio_consume_ack_event(void) {
+    int acked = (sio_stat & SIO_STAT_ACK) ? 1 : 0;
+    sio_stat &= ~SIO_STAT_ACK;
+    return acked;
+}
+
+static void sio_fire_ack_irq(void) {
+    sio_stat |= SIO_STAT_ACK;
+    if (!(sio_ctrl & SIO_CTRL_ACK_IRQ_EN)) return;
+    sio_stat |= SIO_STAT_IRQ;
+
+    uint32_t i_stat_before = i_stat;
+    i_stat |= (1 << IRQ_SIO0);
+
+    extern uint32_t g_debug_current_func_addr;
+    extern uint8_t psx_read_byte(uint32_t addr);
+    SioIrqEntry *e = &sio_irq_buf[sio_irq_idx];
+    e->seq            = sio_irq_seq;
+    e->byte_seq       = sio_irq_pending_byte_seq;
+    e->i_stat_before  = i_stat_before;
+    e->i_stat_after   = i_stat;
+    e->mc_state       = (uint32_t)sio_irq_pending_mc_state;
+    e->active_device  = (uint32_t)active_device;
+    e->ctrl           = (uint32_t)sio_ctrl;
+    e->func_addr      = g_debug_current_func_addr;
+    e->counter_7514   = (uint32_t)psx_read_byte(0x7514);
+    e->source         = sio_irq_pending_source;
+    e->slot           = sio_irq_pending_slot;
+    e->delay_applied  = sio_irq_pending_delay;
+    sio_irq_idx = (sio_irq_idx + 1) % SIO_IRQ_RING_CAP;
+    sio_irq_seq++;
+    s_pace_ack_fires++;
+}
+
+static void sio_handle_shift_complete(void) {
+    uint8_t b = sio_shift_byte;
+    if (b == 0x01 && mc_state >= MC_READ_DATA && mc_state <= MC_READ_END) {
+        s_pace_pad_byte_processed_in_card_data++;
+    }
+    sio_process_byte(b);
+    int acked = sio_consume_ack_event();
+    sio_shift_active = 0;
+    sio_stat |= SIO_STAT_RX_RDY;
+    s_pace_shift_completes++;
+
+    sio_irq_pending_source   = (active_device == DEV_MEMCARD)
+                               ? SIO_IRQ_SRC_CARD_ACK : SIO_IRQ_SRC_PAD_ACK;
+    sio_irq_pending_slot     = (uint8_t)selected_slot;
+    sio_irq_pending_delay    = (uint8_t)SIO_ACK_CYCLES_DEFAULT;
+    sio_irq_pending_mc_state = (uint8_t)mc_state;
+    sio_irq_pending_byte_seq = sio_trace_seq;
+
+    if (acked) {
+        sio_pending_ack   = 1;
+        sio_ack_remaining = SIO_ACK_CYCLES_DEFAULT;
+    }
+
+    if (sio_tx_buffered) {
+        sio_shift_byte      = sio_tx_buffer;
+        sio_shift_active    = 1;
+        sio_shift_remaining = SIO_BAUD_CYCLES_DEFAULT;
+        sio_tx_buffered     = 0;
+        sio_stat |= SIO_STAT_TX_EMPTY;
+        sio_bus_byte_index++;
+        s_pace_tx_buffer_promoted++;
+        if (sio_bus_owner == SIO_OWNER_CARD)
+            s_pace_tx_buffer_promoted_during_card++;
+    } else {
+        sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
+    }
+}
+#endif /* SIO_MODEL_CYCLE_PACED */
+
 void sio_tick(int cycles) {
-    (void)cycles;  /* reserved for cycle-paced model (Phase 1.0c+) */
+#if SIO_MODEL_CYCLE_PACED
+    /* Cycle-paced advance. In 1.0c-v2 sio_shift_active and
+     * sio_pending_ack are never set (TX path still synchronous), so this
+     * loop finds no events and returns immediately. Plus, the dispatch
+     * caller is gated by g_sio_timing_active so this function isn't even
+     * called when nothing is pending. */
+    if (cycles > 0) {
+        int remaining = cycles;
+        int transitions = 0;
+        const int MAX_TRANSITIONS = 8;
+        while (remaining > 0 && transitions < MAX_TRANSITIONS) {
+            int dt = remaining;
+            int next_event = -1;
+            if (sio_shift_active && sio_shift_remaining > 0
+                && sio_shift_remaining < dt) {
+                dt = sio_shift_remaining;
+                next_event = 0;
+            }
+            if (sio_pending_ack && sio_ack_remaining > 0
+                && sio_ack_remaining < dt) {
+                dt = sio_ack_remaining;
+                next_event = 1;
+            }
+            if (sio_shift_active && sio_shift_remaining <= 0) {
+                dt = 0; next_event = 0;
+            } else if (sio_pending_ack && sio_ack_remaining <= 0) {
+                dt = 0; next_event = 1;
+            }
+            if (sio_shift_active) sio_shift_remaining -= dt;
+            if (sio_pending_ack)  sio_ack_remaining   -= dt;
+            remaining -= dt;
+            if (next_event == 0) {
+                sio_handle_shift_complete();
+                transitions++;
+            } else if (next_event == 1) {
+                sio_pending_ack = 0;
+                sio_fire_ack_irq();
+                transitions++;
+            } else {
+                break;
+            }
+        }
+    }
+#else
+    (void)cycles;
+#endif
+
+    /* Legacy access-paced IRQ countdown. Always live. In 1.0c-v2 this
+     * remains the actual IRQ delivery path because the TX path arms it.
+     * Phase 1.0d will stop arming this and rely on the cycle-paced
+     * shifter+ack path instead. */
     if (sio_irq_pending && sio_irq_countdown > 0) {
         sio_irq_countdown--;
         if (sio_irq_countdown == 0) {
@@ -1286,4 +1426,34 @@ void sio_tick(int cycles) {
             sio_irq_seq++;
         }
     }
+}
+
+void sio_tick_quantum(void) {
+#if SIO_MODEL_CYCLE_PACED
+    sio_tick(sio_tick_quantum_cycles);
+#endif
+}
+
+/* Telemetry accessor for pace_state TCP probe. Read-only. */
+void sio_get_pace_state(uint64_t out[16]) {
+#if SIO_MODEL_CYCLE_PACED
+    out[ 0] = 1;  /* sio_model = cycle_paced */
+    out[ 1] = (uint64_t)sio_tick_quantum_cycles;
+    out[ 2] = (uint64_t)sio_shift_active;
+    out[ 3] = (uint64_t)sio_shift_remaining;
+    out[ 4] = (uint64_t)sio_tx_buffered;
+    out[ 5] = (uint64_t)sio_pending_ack;
+    out[ 6] = (uint64_t)sio_ack_remaining;
+    out[ 7] = (uint64_t)sio_bus_owner;
+    out[ 8] = (uint64_t)sio_bus_byte_index;
+    out[ 9] = s_pace_tx_writes_buffered;
+    out[10] = s_pace_tx_writes_dropped_busy;
+    out[11] = s_pace_tx_writes_dropped_cross_device;
+    out[12] = s_pace_tx_buffer_promoted;
+    out[13] = s_pace_tx_buffer_promoted_during_card;
+    out[14] = s_pace_pad_byte_processed_in_card_data;
+    out[15] = s_pace_cross_device_pad_during_card;
+#else
+    for (int i = 0; i < 16; i++) out[i] = 0;
+#endif
 }

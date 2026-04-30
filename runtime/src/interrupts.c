@@ -155,6 +155,16 @@ void psx_check_interrupts(CPUState* cpu) {
         }
     }
     if (!in_exception) {
+#if SIO_MODEL_CYCLE_PACED
+        /* Phase 1.0c-v2: advance cycle-paced SIO bus by one quantum, but
+         * only when something is actually pending. g_sio_timing_active
+         * stays 0 throughout 1.0c-v2 (TX path still synchronous, never
+         * arms shift/ack), so this gate never opens — per-call cost on
+         * this hot path is one volatile load + one branch. */
+        if (g_sio_timing_active) {
+            sio_tick_quantum();
+        }
+#endif
         dispatch_count++;
         if (dispatch_count >= VBLANK_INTERVAL) {
             /* Defer VBlank while a card SIO transaction is mid-flight.
