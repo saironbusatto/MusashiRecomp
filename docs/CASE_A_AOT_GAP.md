@@ -2,6 +2,7 @@
 
 **Date:** 2026-04-30
 **Decision:** stop memcard symptom debugging; build trace-generated AOT RAM-code manifest.
+**Update (2026-04-30, post seed-add):** vertical slice partially landed — see "Vertical slice result" at bottom.
 **Predecessor:** every memo named `phase4_*real*root_cause*` is downstream of this gap.
 
 ---
@@ -91,8 +92,13 @@ this work:
 > will be wrong in a way that is almost impossible to debug.
 
 `PLAN.md:933` lists `address_aliases.json` (backed by
-`relocation_proofs/`) as a Phase 1 exit gate.  Neither artifact exists
-on disk today.  The work is overdue, not speculative.
+`relocation_proofs/`) as a Phase 1 exit gate.  Both files exist on disk —
+the **primary copy alias was implemented** in a prior session
+(`generated/address_aliases.json`: 69 ROM↔RAM aliases for the single
+proven copy ROM 0xBFC10000..0xBFC18BEF → RAM 0x500..0x90EF).  What was
+missing: *additional entry points inside the copied region that aren't
+Ghidra-known function starts.*  These reach the recompiler via
+`recompiler/seeds/dispatch_miss_seeds.json`.
 
 `CLAUDE.md:333-365` (Rule 18) authorizes `dirty_ram_interp` for
 truly *assembled-at-runtime* stubs (e.g. the 4-instruction SIO
@@ -106,51 +112,97 @@ relocation framework, not the interpreter.
 ## Decision
 
 **Stop memcard symptom debugging.**  Implement trace-generated AOT
-RAM-code manifest support as a vertical slice:
+RAM-code support as a vertical slice:
 
-1. Define minimal `generated/address_aliases.json` schema.
-2. Capture proof artifacts via Beetle (RAM bytes + hash + entrypoints
-   + writer/first-exec PCs) for the two dark windows.
-3. Teach the recompiler to ingest the manifest and emit functions at
-   the manifest's RAM destination addresses.
+1. Define minimal manifest schema.
+2. Capture proof artifacts via Beetle.
+3. Teach the recompiler to ingest the manifest.
 4. Add runtime hash check before dispatching AOT RAM functions.
-5. Re-test memcard.  Either it works (validating the AOT path) or the
-   next failure points at something further down (e.g. interp
-   semantics in code we now reach but mishandle).
+5. Re-test memcard.
 
 **Do not** hand-clear `[0x7568+slot]`, write a C shim, add HLE, or add
-a runtime JIT.  The phantom-fix history is exactly what those would
-extend.
+a runtime JIT.
+
+---
+
+## Vertical slice result (2026-04-30, post seed-add)
+
+The plan above was followed but collapsed dramatically when we discovered
+the Phase 1e infrastructure already exists and the right hook is the
+existing `dispatch_miss_seeds.json`.  Five seeds added:
+
+| Seed (ROM) | Becomes (RAM) | Purpose |
+|---|---|---|
+| 0xBFC14A54 | 0x00004F54 | chain BUSY-writer |
+| 0xBFC158D0 | 0x00005DD0 | chain init slot-0 BUSY |
+| 0xBFC158D8 | 0x00005DD8 | chain init slot-1 BUSY |
+| **0xBFC159F4** | **0x00005EF4** | **chain step 0x02-OPEN writer (KEY)** |
+| **0xBFC15AA8** | **0x00005FA8** | **chain step 0x04-OPEN writer (KEY)** |
+
+After regen + rebuild:
+
+- ✓ All 5 standalone functions emitted (e.g. `func_00005EF4` is a 3-instruction leaf: `sb t3, 0(a3); addiu v0, zero, 1; jr ra`).
+- ✓ All 5 in `dispatch_table`.
+- ✗ **None of the 5 are dispatched at runtime — chain still doesn't reach them.**
+- ✗ `[0x80007568]`, `[0x80007569]` still all-zero post-CROSS.
+- ✗ `[0x80007510..0x00007570]` chain state region all-zero — **chain init function `FUN_bfc158a8` (= func_00005DA8) never runs in our recomp, regardless of seeds**.
+
+### What this proves
+
+The "writer is unreachable" gap had two layers:
+1. **Writer PC missing from dispatch table** — fixed by these 5 seeds.  Confirmed.
+2. **Caller chain (init + chain coordinator) never runs in our recomp** — independent issue, surfaced by the validation.
+
+The seeds are correct prerequisites. They unblock layer 1.  Layer 2 is
+the actual remaining blocker: the BIOS shell is on the memcard screen
+(`[0x80066948] = 0x32` confirms MEMORY CARD selected) but `FUN_bfc14b00`
+(chain coordinator, `func_00005000`) is never dispatched.  The memcard
+chain subsystem has never been initialized in our recomp during this
+session — gate bytes have never been written, even to 0x01 (which the
+init function writes at the very first call).
+
+The Beetle wtrace also revealed a misread on my part: the writer at
+RAM 0x5EF4 is a tiny leaf utility (write byte through pointer), called
+from many BIOS sites — not specifically a chain-step jump-table target.
+The chain step jump tables at RAM 0x6c70 / 0x6c98 / 0x6ccc point at
+addresses in the 0x52xx / 0x56xx-0x5Axx / 0x5Bxx-0x5Dxx ranges, NOT at
+0x5EF4 / 0x5FA8.  So the writers aren't reached via the chain step
+dispatcher — they're reached via direct calls from BIOS code at
+`BFC08{B98,C94,D08,F28}` (`$ra` in the Beetle wtrace).  Those BIOS
+caller sites must execute for our writers to be reached.
+
+### Vertical slice status
+
+- AOT/seed work for the writer PCs: **done and committed**.
+- Validation: **partial**.  Writers exist; callers don't run.
+- Next blocker: why the BIOS chain init / coordinator never runs in our
+  recomp.  This is an upstream issue from the writer-emission fix and
+  needs its own diagnostic pass — explicitly NOT "memcard symptom
+  debugging" because the symptom (chain init never runs) is a different
+  category from "chain runs but fails on byte N".
 
 ---
 
 ## Verification reproducer
 
 ```bash
-# 1. Build & launch Beetle oracle (its wtrace is default-armed on 0x7568..0x756C).
-cd beetle-psx && make platform=mingw_x86_64 STATIC_LINKING=1 HAVE_LIGHTREC=0 -j8
-cp mednafen_psx_libretro.dll libmednafen_psx.a && cd ..
+# 1. Build & launch Beetle oracle.
 PATH=/c/msys64/mingw64/bin:$PATH cmake --build runtime/build --target psx-beetleoracle -j8
 taskkill //F //IM psx-beetleoracle.exe 2>/dev/null
 PATH=/c/msys64/mingw64/bin:$PATH ./runtime/build/psx-beetleoracle.exe bios/SCPH1001.BIN &
+python tools/probe_beetle_wtrace_cross.py    # ground-truth writer PCs
 
-# 2. Drive CROSS in Beetle, dump writers (oracle-side ground truth).
-python tools/probe_beetle_wtrace_cross.py
-
-# 3. Build & launch recomp.
+# 2. Build & launch recomp.
 PATH=/c/msys64/mingw64/bin:$PATH cmake --build runtime/build --target psx-runtime -j8
 taskkill //F //IM psx-runtime.exe 2>/dev/null
 PATH=/c/msys64/mingw64/bin:$PATH ./runtime/build/psx-runtime.exe &
 
-# 4. Verify recomp: arm wtrace on 0x7568..0x756C, press CROSS, query everything.
-python tools/verify_with_cross.py
+# 3. Validate.
+python tools/verify_with_cross.py            # should now show func_00005EF4 in dispatch table
+python tools/check_chain_init.py             # surfaces "chain init never ran" upstream blocker
 ```
 
-Expected pre-AOT outcome (today): recomp `dispatch_check` returns
-`False` for `0x5EF4`, `0x5FA8`, `0x4F54`; recomp wtrace shows 0 hits at
-`0x7568..0x756C`; `dirty_ram_interp` histogram contains 0xCF0 / 0x52xx /
-0x6xxx but no entry in `0x4F00..0x4FFF` or `0x5800..0x5FFF`.
-
-Post-AOT success criterion: recomp `dispatch_check` returns `True` for
-`0x5EF4` and `0x5FA8`; wtrace captures LSB-clear writes to `0x7568` /
-`0x7569` matching Beetle's transitions.
+Expected vertical-slice outcome: dispatch table contains
+`{0x00005EF4u, func_00005EF4}` (✓ confirmed today); 
+recomp-side `dispatch_check 0x00005EF4` returns `True` *if and when*
+the chain coordinator runs (✗ blocked today on upstream init issue).
