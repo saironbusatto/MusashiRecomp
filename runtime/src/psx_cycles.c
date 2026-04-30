@@ -1,9 +1,12 @@
 /* psx_cycles.c — PSX guest CPU cycle clock.
  *
- * Phase 1.0e-a: scaffold only. psx_advance_cycles updates the counter
- * but invokes no peripheral hooks. 1.0e-b will dispatch to
- * sio_advance(cycles); 1.0e-c will add gpu_advance for VBlank; later
- * slices add timers/CDROM. */
+ * Phase 1.0e-d minimal slice: receives per-block cycle counts from
+ * generated code (when compiled with -DPSX_ENABLE_BLOCK_CYCLES=1) and
+ * accumulates them in psx_cycle_count. NO peripheral hooks — wiring
+ * sio_tick here would corrupt the legacy IRQ countdown (it decrements
+ * unconditionally per call; millions of calls per second drain it in
+ * microseconds). A future slice with a peripheral-only sio_advance
+ * (no legacy countdown side effect) will wire SIO. */
 
 #include "psx_cycles.h"
 
@@ -12,8 +15,7 @@ uint64_t psx_cycle_count = 0;
 void psx_advance_cycles(uint32_t cycles) {
     if (cycles == 0) return;
     psx_cycle_count += (uint64_t)cycles;
-    /* Phase 1.0e-a: peripheral hooks empty.
-     * 1.0e-b will call: sio_advance(cycles), gpu_advance(cycles), etc. */
+    /* No peripheral dispatch in this slice — see comment above. */
 }
 
 uint64_t psx_get_cycle_count(void) {
