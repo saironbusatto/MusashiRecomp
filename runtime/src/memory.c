@@ -140,6 +140,9 @@ extern void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                            uint32_t new_val, uint8_t width);
 extern void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
 
+/* Card-byte destination capture (Phase 3 audit). Always-on. */
+extern int card_data_writes_check(uint32_t phys, uint32_t value, uint8_t width);
+
 static inline uint32_t read_ram_word(uint32_t phys) {
     return  (uint32_t)ram[phys]
          | ((uint32_t)ram[phys + 1] << 8)
@@ -470,6 +473,7 @@ void psx_write_word(uint32_t addr, uint32_t val) {
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
+        card_data_writes_check(phys, val, 4);
         dirty_ram_mark(phys);
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
@@ -527,6 +531,7 @@ void psx_write_half(uint32_t addr, uint16_t val) {
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
+        card_data_writes_check(phys, (uint32_t)val, 2);
         dirty_ram_mark(phys);
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
@@ -576,6 +581,7 @@ void psx_write_byte(uint32_t addr, uint8_t val) {
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
+        card_data_writes_check(phys, (uint32_t)val, 1);
         dirty_ram_mark(phys);
         ram[phys] = val;
         return;

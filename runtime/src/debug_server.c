@@ -15,6 +15,8 @@
 #include "memcard.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
+#include "card_read_summary.h"
+#include "card_data_writes.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1736,6 +1738,98 @@ static void handle_card_txn_dump(int id, const char *json)
     send_fmt("],\"emitted\":%d}\n", emitted);
 }
 
+static void handle_card_read_summary(int id, const char *json)
+{
+    (void)json;
+    const CardReadSummary *buf = NULL;
+    uint32_t n = card_read_summary_get(&buf);
+
+    char out[16 * 1024];
+    int o = snprintf(out, sizeof(out),
+                     "{\"id\":%d,\"ok\":true,\"count\":%u,\"cap\":%d,\"entries\":[",
+                     id, (unsigned)n, CARD_READ_SUMMARY_CAP);
+    for (uint32_t i = 0; i < n; i++) {
+        const CardReadSummary *e = &buf[i];
+        char peek[2 * CARD_READ_SUMMARY_PEEK + 1];
+        int pi = 0;
+        for (int b = 0; b < CARD_READ_SUMMARY_PEEK; b++) {
+            pi += snprintf(peek + pi, sizeof(peek) - pi, "%02X", e->data_peek[b]);
+        }
+        peek[pi] = 0;
+        o += snprintf(out + o, sizeof(out) - o,
+                      "%s{\"seq\":%llu,\"cyc\":%llu,"
+                      "\"slot\":%u,\"cmd\":\"0x%02X\",\"sector\":%u,"
+                      "\"checksum\":\"0x%02X\",\"data_idx\":%u,"
+                      "\"current_func\":\"0x%08X\",\"last_store_pc\":\"0x%08X\","
+                      "\"dest_ram\":\"0x%08X\",\"data_peek\":\"%s\"}",
+                      i == 0 ? "" : ",",
+                      (unsigned long long)e->seq,
+                      (unsigned long long)e->psx_cycle_count,
+                      e->slot, e->cmd, e->sector,
+                      e->checksum_card, e->data_idx_at_end,
+                      e->current_func, e->last_store_pc,
+                      e->dest_ram_addr, peek);
+        if (o >= (int)sizeof(out) - 512) break;
+    }
+    snprintf(out + o, sizeof(out) - o, "]}");
+    send_fmt("%s", out);
+}
+
+static void handle_card_read_summary_reset(int id, const char *json)
+{
+    (void)json;
+    card_read_summary_reset();
+    send_fmt("{\"id\":%d,\"ok\":true}\n", id);
+}
+
+static void handle_card_data_writes(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > CARD_DATA_WRITES_CAP) count = CARD_DATA_WRITES_CAP;
+
+    const CardDataWriteEntry *buf = NULL;
+    uint64_t total_seq = 0;
+    uint32_t head = 0;
+    uint32_t avail = card_data_writes_get(&buf, &total_seq, &head);
+    if ((uint32_t)count > avail) count = (int)avail;
+
+    char out[64 * 1024];
+    int o = snprintf(out, sizeof(out),
+                     "{\"id\":%d,\"ok\":true,\"total_seq\":%llu,"
+                     "\"avail\":%u,\"count\":%d,\"entries\":[",
+                     id, (unsigned long long)total_seq, avail, count);
+
+    /* Iterate the OLDEST `count` entries first (reading from
+     * (head - avail) forward, then taking the last `count`). */
+    int start = ((int)head - count + (int)CARD_DATA_WRITES_CAP) % (int)CARD_DATA_WRITES_CAP;
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % (int)CARD_DATA_WRITES_CAP;
+        const CardDataWriteEntry *e = &buf[idx];
+        o += snprintf(out + o, sizeof(out) - o,
+                      "%s{\"seq\":%llu,\"cyc\":%llu,\"addr\":\"0x%08X\","
+                      "\"value\":\"0x%08X\",\"width\":%u,"
+                      "\"mc_state\":%u,\"mc_idx\":%u,\"slot\":%u,"
+                      "\"store_pc\":\"0x%08X\",\"func\":\"0x%08X\"}",
+                      i == 0 ? "" : ",",
+                      (unsigned long long)e->seq,
+                      (unsigned long long)e->psx_cycle_count,
+                      e->addr, e->value, e->width,
+                      e->mc_state_at_read, e->mc_data_idx_at_read,
+                      e->slot, e->store_pc, e->func_addr);
+        if (o >= (int)sizeof(out) - 512) break;
+    }
+    snprintf(out + o, sizeof(out) - o, "]}");
+    send_fmt("%s", out);
+}
+
+static void handle_card_data_writes_reset(int id, const char *json)
+{
+    (void)json;
+    card_data_writes_reset();
+    send_fmt("{\"id\":%d,\"ok\":true}\n", id);
+}
+
 static void handle_watch(int id, const char *json)
 {
     char addr_str[32];
@@ -2886,6 +2980,10 @@ static const CmdEntry s_commands[] = {
     { "sio_pc_trace",      handle_sio_pc_trace },
     { "dirty_ram_stats",   handle_dirty_ram_stats },
     { "card_txn_dump",     handle_card_txn_dump },
+    { "card_read_summary", handle_card_read_summary },
+    { "card_read_summary_reset", handle_card_read_summary_reset },
+    { "card_data_writes",  handle_card_data_writes },
+    { "card_data_writes_reset", handle_card_data_writes_reset },
     { "sio_irq_dump",      handle_sio_irq_dump },
     { "evcb_snapshot",     handle_evcb_snapshot },
     { "evcb_walk_dump",    handle_evcb_walk_dump },
