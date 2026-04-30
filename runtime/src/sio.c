@@ -708,15 +708,23 @@ static void mc_process_byte(uint8_t tx_byte) {
         sio_stat |= SIO_STAT_ACK;
         break;
 
-    case MC_READ_END:
+    case MC_READ_END: {
         mc_state = MC_IDLE;
         sio_mc_read_done++;
+        extern void card_read_summary_record(uint8_t slot, uint8_t cmd,
+                                             uint16_t sector,
+                                             uint8_t checksum,
+                                             uint8_t data_idx,
+                                             const uint8_t *data128);
+        card_read_summary_record(mc_slot, mc_cmd, mc_sector,
+                                 mc_checksum, mc_data_idx, mc_data);
         if (mc_sector < MEMCARD_SECTORS) {
             sio_rx_data = 0x47; /* 'G' = Good */
         } else {
             sio_rx_data = 0xFF;
         }
         break;
+    }
 
     /* ---- WRITE states ---- */
     case MC_WRITE_DATA:
@@ -966,6 +974,15 @@ uint32_t sio_read(uint32_t addr) {
         uint8_t b = sio_rx_data;
         sio_stat &= ~SIO_STAT_RX_RDY;
         sr_record(SR_EVT_RX_DATA_READ, 0, b);
+        if (active_device == DEV_MEMCARD &&
+            mc_state >= MC_READ_DATA && mc_state <= MC_READ_END) {
+            extern void card_data_writes_arm(uint8_t value,
+                                             uint16_t mc_state,
+                                             uint8_t mc_data_idx,
+                                             uint8_t slot);
+            card_data_writes_arm(b, (uint16_t)mc_state,
+                                 mc_data_idx, (uint8_t)mc_slot);
+        }
         return b;
     }
 
