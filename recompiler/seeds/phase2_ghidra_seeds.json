@@ -1,7 +1,7 @@
 {
   "schema": "psxrecomp-v4 phase2 seeds",
-  "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual + gte_lib_seeds",
-  "seed_count": 1006,
+  "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
+  "seed_count": 1013,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -3309,21 +3309,6 @@
       "rationale": "Ghidra function start"
     },
     {
-      "address": "0xBFC421D8",
-      "label": "shell_vblank_restore_entry",
-      "rationale": "Mid-function entry: SaveState/RestoreState (A0:0x13/0x14) longjmp target inside func_1FC42160; after RestoreState returns v0!=0 the callback loop runs"
-    },
-    {
-      "address": "0xBFC4231C",
-      "label": "shell_vblank_init_body",
-      "rationale": "Mid-function entry: SaveState returns v0=0 \u00e2\u2020\u2019 BEQ at 0xBFC421D8 taken \u00e2\u2020\u2019 callback table setup at 0xBFC4231C. Split from func_1FC42160"
-    },
-    {
-      "address": "0xBFC42370",
-      "label": "shell_vblank_epilogue",
-      "rationale": "Mid-function entry: func_1FC42160 epilogue (restore ra/sp, return). Branch target from BNE at 0xBFC4216C when init flag is set"
-    },
-    {
       "address": "0xBFC42424",
       "label": "ghidra_BFC42424",
       "rationale": "Ghidra function start"
@@ -3372,11 +3357,6 @@
       "address": "0xBFC38AD4",
       "label": "dmiss_BFC38AD4",
       "rationale": "dispatch miss: Shell function, indirect call via table"
-    },
-    {
-      "address": "0xBFC42910",
-      "label": "shell_post_callback_cleanup",
-      "rationale": "Called from func_1FC42160 after 256-iteration callback countdown expires; was dispatch miss"
     },
     {
       "address": "0xBFC42A90",
@@ -3474,6 +3454,31 @@
       "rationale": "dispatch miss: KP2 function, tail-call target from 0xBFC11524 exception handler path"
     },
     {
+      "address": "0xBFC14A54",
+      "label": "dmiss_BFC14A54",
+      "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain BUSY-writer at RAM 0x4F54; alias rule RAM=ROM-0xBFC10000+0x500. Reached via JAL inside FUN_bfc147f4; never emitted as standalone entry."
+    },
+    {
+      "address": "0xBFC158D0",
+      "label": "dmiss_BFC158D0",
+      "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain init slot-0 BUSY writer at RAM 0x5DD0; alias RAM=ROM-0xBFC10000+0x500. Inside FUN_bfc158a8 body."
+    },
+    {
+      "address": "0xBFC158D8",
+      "label": "dmiss_BFC158D8",
+      "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain init slot-1 BUSY writer at RAM 0x5DD8; alias RAM=ROM-0xBFC10000+0x500. Inside FUN_bfc158a8 body."
+    },
+    {
+      "address": "0xBFC159F4",
+      "label": "dmiss_BFC159F4",
+      "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain step handler that writes 0x02 OPEN to [0x7568+slot] at RAM 0x5EF4. Indirect-jr target from RAM 0x6c98 jump table; alias RAM=ROM-0xBFC10000+0x500. KEY entry \u00e2\u20ac\u201d without this the gate never clears."
+    },
+    {
+      "address": "0xBFC15AA8",
+      "label": "dmiss_BFC15AA8",
+      "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain step handler that writes 0x04 OPEN to [0x7568+slot] at RAM 0x5FA8. Indirect-jr target from RAM 0x6c98 jump table; alias RAM=ROM-0xBFC10000+0x500. KEY entry \u00e2\u20ac\u201d paired with 0xBFC159F4."
+    },
+    {
       "address": "0xBFC0193C",
       "label": "cache_flush_continuation",
       "rationale": "Jump target of cache-flush jr k0 at BFC01938"
@@ -3497,6 +3502,16 @@
       "address": "0xBFC06FDC",
       "label": "indirect_BFC06FDC",
       "rationale": "Reached via indirect dispatch during boot"
+    },
+    {
+      "address": "0xBFC0BA8C",
+      "label": "bios_BA8C",
+      "rationale": "BIOS boot code function. Dispatch miss from shell input path."
+    },
+    {
+      "address": "0xBFC0C1DC",
+      "label": "bios_C1DC",
+      "rationale": "BIOS boot code function. Dispatch miss from shell input path."
     },
     {
       "address": "0xBFC0DA70",
@@ -3909,6 +3924,11 @@
       "rationale": "runtime dispatch miss"
     },
     {
+      "address": "0xBFC137D0",
+      "label": "kernel_ram_function",
+      "rationale": "Dispatch miss at 0xBFC137D0 (phys 0x00003CD0) \u00e2\u20ac\u201d 3 misses. Kernel RAM function."
+    },
+    {
       "address": "0xBFC138AC",
       "label": "kernel_BFC138AC",
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
@@ -3994,9 +4014,149 @@
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
     },
     {
+      "address": "0xBFC151E8",
+      "label": "kernel_56E8",
+      "rationale": "Kernel function at RAM 0x56E8. Dispatch miss from shell input path."
+    },
+    {
+      "address": "0xBFC15268",
+      "label": "kernel_5768",
+      "rationale": "Kernel function at RAM 0x5768. Cascade from input path seeds."
+    },
+    {
+      "address": "0xBFC1529C",
+      "label": "kernel_579C",
+      "rationale": "Kernel function at RAM 0x579C. Cascade from input path."
+    },
+    {
+      "address": "0xBFC15334",
+      "label": "kernel_5834",
+      "rationale": "Kernel function at RAM 0x5834. Cascade."
+    },
+    {
+      "address": "0xBFC15370",
+      "label": "kernel_5870",
+      "rationale": "Kernel (CARD driver) function. Cascade."
+    },
+    {
+      "address": "0xBFC153B4",
+      "label": "kernel_58B4",
+      "rationale": "Kernel (CARD driver) function at RAM 0x58B4. Cascade."
+    },
+    {
+      "address": "0xBFC153E8",
+      "label": "kernel_58E8",
+      "rationale": "Kernel (CARD driver) function at RAM 0x58E8. Cascade."
+    },
+    {
+      "address": "0xBFC15418",
+      "label": "kernel_5918",
+      "rationale": "Kernel (CARD driver) leaf function at RAM 0x5918. Cascade."
+    },
+    {
+      "address": "0xBFC15454",
+      "label": "kernel_5954",
+      "rationale": "CARD driver cascade."
+    },
+    {
+      "address": "0xBFC15490",
+      "label": "kernel_5990",
+      "rationale": "CARD driver cascade."
+    },
+    {
+      "address": "0xBFC154CC",
+      "label": "kernel_59CC",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC15500",
+      "label": "kernel_5A00",
+      "rationale": "CARD driver cascade."
+    },
+    {
+      "address": "0xBFC15508",
+      "label": "kernel_5A08",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC15544",
+      "label": "kernel_5A44",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC15558",
+      "label": "kernel_5A58",
+      "rationale": "CARD read chain state 12 (data-byte-store): SIO_RX -> a1[0x7F], XOR-updates checksum at 0x7560+slot*4, returns v0=0. Targeted by jump table at RAM 0x6c98 entry 12."
+    },
+    {
+      "address": "0xBFC15580",
+      "label": "kernel_5A80",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC155B0",
+      "label": "kernel_5AB0",
+      "rationale": "CARD read chain state 13 (data-loop completion): reads byte vs checksum at 0x7560+slot*4, polls SIO_STAT for RX_RDY, reads END byte; v0=1 if 'G' else v0=-1. Targeted by jump table at RAM 0x6c98 entry 13."
+    },
+    {
+      "address": "0xBFC155BC",
+      "label": "kernel_5ABC",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC155F8",
+      "label": "kernel_5AF8",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC15634",
+      "label": "kernel_5B34",
+      "rationale": "CARD driver cascade (predicted)."
+    },
+    {
+      "address": "0xBFC15650",
+      "label": "kernel_5B50",
+      "rationale": "Kernel function. Cascade from input path."
+    },
+    {
+      "address": "0xBFC15654",
+      "label": "kernel_5B54",
+      "rationale": "Kernel function. Cascade from input path."
+    },
+    {
       "address": "0xBFC15664",
       "label": "kernel_BFC15664",
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
+    },
+    {
+      "address": "0xBFC156A4",
+      "label": "kernel_5BA4",
+      "rationale": "Kernel function at RAM 0x5BA4. Dispatch miss from shell input path."
+    },
+    {
+      "address": "0xBFC15724",
+      "label": "kernel_5C24",
+      "rationale": "Kernel function at RAM 0x5C24. Cascade from input path seeds."
+    },
+    {
+      "address": "0xBFC15758",
+      "label": "kernel_5C58",
+      "rationale": "Kernel function at RAM 0x5C58. Cascade."
+    },
+    {
+      "address": "0xBFC15848",
+      "label": "kernel_5D48",
+      "rationale": "Kernel (CARD driver) function. Cascade."
+    },
+    {
+      "address": "0xBFC15894",
+      "label": "kernel_5D94",
+      "rationale": "Kernel function. Cascade from input path."
+    },
+    {
+      "address": "0xBFC15898",
+      "label": "kernel_5D98",
+      "rationale": "Kernel (CARD driver) function. Cascade."
     },
     {
       "address": "0xBFC15930",
@@ -4134,59 +4294,9 @@
       "rationale": "Kernel ROM function (auto-discovered from tables/boundaries)"
     },
     {
-      "address": "0xBFC33CC0",
-      "label": "jal_BFC33CC0",
-      "rationale": "JAL target from code region"
-    },
-    {
-      "address": "0xBFC41FC0",
-      "label": "shell_InitRCnt_setup",
-      "rationale": "Undiscovered function: calls B0:0x15 (InitRCnt) with arg 0x20000001. Only reachable via indirect jalr from shell init table. Missing seed causes VSync counter to never increment."
-    },
-    {
-      "address": "0xBFC425BC",
-      "label": "vblank_chain_handler",
-      "rationale": "VBlank chain handler: the ONLY instruction in the entire BIOS ROM that stores to 0x80079D9C (VSync counter) is at 0xBFC425E0, inside this 15-instruction function at 0xBFC425BC. Function reads counter, increments it, optionally calls user callback at *0x800DFF40. Not reachable via any JAL/literal/lui in ROM \u00e2\u20ac\u201d installed at runtime by kernel chain-registration code. Missing seed means counter-increment code is never recompiled, so even if kernel installs the handler pointer it cannot dispatch to recompiled code."
-    },
-    {
-      "address": "0xBFC1E3C0",
-      "label": "sio_event_opener_epilogue",
-      "rationale": "Epilogue fragment at BFC1E3C0 (addiu sp,sp,0x18; jr ra; nop). Reached via branch from SIO state machine. Dispatch miss after fall-through fix exposed new code paths."
-    },
-    {
-      "address": "0xBFC336F0",
-      "label": "gte_cop2_init",
-      "rationale": "GTE/COP2 initialization: enables COP2 in SR, sets COP2 control registers. Contains COP2 instructions (Phase 5). Reached after fall-through fix."
-    },
-    {
-      "address": "0xBFC42BA0",
-      "label": "shell_vblank_dispatch",
-      "rationale": "Called from chain-E004 verify (func_1FC40700) via jal 0x8005ABA0. Walks VBlank callback chain \u00e2\u2020\u2019 calls VSync counter incrementer. Missing seed blocks VSync counter from incrementing."
-    },
-    {
-      "address": "0xBFC38AF0",
-      "label": "shell_hot_function",
-      "rationale": "Dispatch miss at 0x80050AF0 (phys 0x1FC38AF0) \u00e2\u20ac\u201d 178 misses. Hot shell function during rendering loop."
-    },
-    {
-      "address": "0xBFC137D0",
-      "label": "kernel_ram_function",
-      "rationale": "Dispatch miss at 0xBFC137D0 (phys 0x00003CD0) \u00e2\u20ac\u201d 3 misses. Kernel RAM function."
-    },
-    {
-      "address": "0xBFC42BF0",
-      "label": "shell_register_callback",
-      "rationale": "Called from func_1FC42160 init path at 0xBFC42330 to register VBlank callbacks; missing seed caused callback table corruption"
-    },
-    {
-      "address": "0xBFC42BE0",
-      "label": "shell_vblank_process",
-      "rationale": "Called from chain-E004 verify (jal 0x8005ABE0). Also called from shell main loop to process VBlank events. Missing seed causes VBlank callback chain to never execute."
-    },
-    {
-      "address": "0xBFC4226C",
-      "label": "shell_vblank_callback_loop",
-      "rationale": "Mid-function entry point inside func_1FC42160. The BIOS shell jumps here directly to walk VBlank callbacks, bypassing the init-gate at the function top. Needed for VSync counter increment."
+      "address": "0xBFC19FD0",
+      "label": "shell_input_handler_2",
+      "rationale": "Second shell input handler at RAM 0x80031FD0. Similar to BFC1A050. Dispatch miss after adding BFC1A050."
     },
     {
       "address": "0xBFC1A050",
@@ -4194,164 +4304,19 @@
       "rationale": "Shell function called via RAM 0x80032050 after pad input detected. Dispatch miss blocked shell from processing button presses."
     },
     {
-      "address": "0xBFC19FD0",
-      "label": "shell_input_handler_2",
-      "rationale": "Second shell input handler at RAM 0x80031FD0. Similar to BFC1A050. Dispatch miss after adding BFC1A050."
+      "address": "0xBFC1E3C0",
+      "label": "sio_event_opener_epilogue",
+      "rationale": "Epilogue fragment at BFC1E3C0 (addiu sp,sp,0x18; jr ra; nop). Reached via branch from SIO state machine. Dispatch miss after fall-through fix exposed new code paths."
     },
     {
-      "address": "0xBFC151E8",
-      "label": "kernel_56E8",
-      "rationale": "Kernel function at RAM 0x56E8. Dispatch miss from shell input path."
+      "address": "0xBFC210F0",
+      "label": "shell_handler_BFC210F0",
+      "rationale": "Recomp TCB saved PC - handler function"
     },
     {
-      "address": "0xBFC156A4",
-      "label": "kernel_5BA4",
-      "rationale": "Kernel function at RAM 0x5BA4. Dispatch miss from shell input path."
-    },
-    {
-      "address": "0xBFC0BA8C",
-      "label": "bios_BA8C",
-      "rationale": "BIOS boot code function. Dispatch miss from shell input path."
-    },
-    {
-      "address": "0xBFC0C1DC",
-      "label": "bios_C1DC",
-      "rationale": "BIOS boot code function. Dispatch miss from shell input path."
-    },
-    {
-      "address": "0xBFC15268",
-      "label": "kernel_5768",
-      "rationale": "Kernel function at RAM 0x5768. Cascade from input path seeds."
-    },
-    {
-      "address": "0xBFC15724",
-      "label": "kernel_5C24",
-      "rationale": "Kernel function at RAM 0x5C24. Cascade from input path seeds."
-    },
-    {
-      "address": "0xBFC42308",
-      "label": "shell_42308",
-      "rationale": "Shell function near VSync callback area. Dispatch miss from input path."
-    },
-    {
-      "address": "0xBFC1529C",
-      "label": "kernel_579C",
-      "rationale": "Kernel function at RAM 0x579C. Cascade from input path."
-    },
-    {
-      "address": "0xBFC15650",
-      "label": "kernel_5B50",
-      "rationale": "Kernel function. Cascade from input path."
-    },
-    {
-      "address": "0xBFC15894",
-      "label": "kernel_5D94",
-      "rationale": "Kernel function. Cascade from input path."
-    },
-    {
-      "address": "0xBFC15334",
-      "label": "kernel_5834",
-      "rationale": "Kernel function at RAM 0x5834. Cascade."
-    },
-    {
-      "address": "0xBFC15758",
-      "label": "kernel_5C58",
-      "rationale": "Kernel function at RAM 0x5C58. Cascade."
-    },
-    {
-      "address": "0xBFC15654",
-      "label": "kernel_5B54",
-      "rationale": "Kernel function. Cascade from input path."
-    },
-    {
-      "address": "0xBFC15370",
-      "label": "kernel_5870",
-      "rationale": "Kernel (CARD driver) function. Cascade."
-    },
-    {
-      "address": "0xBFC15848",
-      "label": "kernel_5D48",
-      "rationale": "Kernel (CARD driver) function. Cascade."
-    },
-    {
-      "address": "0xBFC15898",
-      "label": "kernel_5D98",
-      "rationale": "Kernel (CARD driver) function. Cascade."
-    },
-    {
-      "address": "0xBFC153B4",
-      "label": "kernel_58B4",
-      "rationale": "Kernel (CARD driver) function at RAM 0x58B4. Cascade."
-    },
-    {
-      "address": "0xBFC153E8",
-      "label": "kernel_58E8",
-      "rationale": "Kernel (CARD driver) function at RAM 0x58E8. Cascade."
-    },
-    {
-      "address": "0xBFC15418",
-      "label": "kernel_5918",
-      "rationale": "Kernel (CARD driver) leaf function at RAM 0x5918. Cascade."
-    },
-    {
-      "address": "0xBFC15454",
-      "label": "kernel_5954",
-      "rationale": "CARD driver cascade."
-    },
-    {
-      "address": "0xBFC15490",
-      "label": "kernel_5990",
-      "rationale": "CARD driver cascade."
-    },
-    {
-      "address": "0xBFC154CC",
-      "label": "kernel_59CC",
-      "rationale": "CARD driver cascade (predicted)."
-    },
-    {
-      "address": "0xBFC15508",
-      "label": "kernel_5A08",
-      "rationale": "CARD driver cascade (predicted)."
-    },
-    {
-      "address": "0xBFC15544",
-      "label": "kernel_5A44",
-      "rationale": "CARD driver cascade (predicted)."
-    },
-    {
-      "address": "0xBFC15558",
-      "label": "kernel_5A58",
-      "rationale": "CARD read chain state 12 (data-byte-store): SIO_RX -> a1[0x7F], XOR-updates checksum at 0x7560+slot*4, returns v0=0. Targeted by jump table at RAM 0x6c98 entry 12."
-    },
-    {
-      "address": "0xBFC15580",
-      "label": "kernel_5A80",
-      "rationale": "CARD driver cascade (predicted)."
-    },
-    {
-      "address": "0xBFC155B0",
-      "label": "kernel_5AB0",
-      "rationale": "CARD read chain state 13 (data-loop completion): reads byte vs checksum at 0x7560+slot*4, polls SIO_STAT for RX_RDY, reads END byte; v0=1 if 'G' else v0=-1. Targeted by jump table at RAM 0x6c98 entry 13."
-    },
-    {
-      "address": "0xBFC155BC",
-      "label": "kernel_5ABC",
-      "rationale": "CARD driver cascade (predicted)."
-    },
-    {
-      "address": "0xBFC155F8",
-      "label": "kernel_5AF8",
-      "rationale": "CARD driver cascade (predicted)."
-    },
-    {
-      "address": "0xBFC15634",
-      "label": "kernel_5B34",
-      "rationale": "CARD driver cascade (predicted)."
-    },
-    {
-      "address": "0xBFC15500",
-      "label": "kernel_5A00",
-      "rationale": "CARD driver cascade."
+      "address": "0xBFC336F0",
+      "label": "gte_cop2_init",
+      "rationale": "GTE/COP2 initialization: enables COP2 in SR, sets COP2 control registers. Contains COP2 instructions (Phase 5). Reached after fall-through fix."
     },
     {
       "address": "0xBFC33758",
@@ -4402,6 +4367,11 @@
       "address": "0xBFC33C84",
       "label": "gte_lib_BFC33C84",
       "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC33CC0",
+      "label": "jal_BFC33CC0",
+      "rationale": "JAL target from code region"
     },
     {
       "address": "0xBFC33D24",
@@ -4569,9 +4539,19 @@
       "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
     },
     {
+      "address": "0xBFC34928",
+      "label": "gte_lib_BFC34928",
+      "rationale": "GTE library sub-entry. Cascade from batch."
+    },
+    {
       "address": "0xBFC34954",
       "label": "gte_lib_BFC34954",
       "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34958",
+      "label": "gte_lib_BFC34958",
+      "rationale": "GTE library sub-entry. Cascade."
     },
     {
       "address": "0xBFC34980",
@@ -4579,9 +4559,19 @@
       "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
     },
     {
+      "address": "0xBFC34984",
+      "label": "gte_lib_BFC34984",
+      "rationale": "GTE library sub-entry. Cascade."
+    },
+    {
       "address": "0xBFC34A04",
       "label": "gte_lib_BFC34A04",
       "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34A08",
+      "label": "gte_lib_BFC34A08",
+      "rationale": "GTE library sub-entry. Cascade from batch."
     },
     {
       "address": "0xBFC34A30",
@@ -4589,9 +4579,19 @@
       "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
     },
     {
+      "address": "0xBFC34A34",
+      "label": "gte_lib_BFC34A34",
+      "rationale": "GTE library sub-entry. Cascade."
+    },
+    {
       "address": "0xBFC34A60",
       "label": "gte_lib_BFC34A60",
       "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34A64",
+      "label": "gte_lib_BFC34A64",
+      "rationale": "GTE library sub-entry. Cascade."
     },
     {
       "address": "0xBFC34A90",
@@ -4607,6 +4607,10 @@
       "address": "0xBFC34B08",
       "label": "gte_lib_BFC34B08",
       "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34E00",
+      "name": "gte_lib_BFC34E00"
     },
     {
       "address": "0xBFC34EC0",
@@ -4659,9 +4663,33 @@
       "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
     },
     {
+      "address": "0xBFC3586C",
+      "name": "gte_lib_BFC3586C"
+    },
+    {
       "address": "0xBFC35890",
       "label": "gte_lib_BFC35890",
       "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC359B4",
+      "name": "gte_lib_BFC359B4"
+    },
+    {
+      "address": "0xBFC35AD8",
+      "name": "gte_lib_BFC35AD8"
+    },
+    {
+      "address": "0xBFC35B08",
+      "name": "gte_lib_BFC35B08"
+    },
+    {
+      "address": "0xBFC35B38",
+      "name": "gte_lib_BFC35B38"
+    },
+    {
+      "address": "0xBFC35B68",
+      "name": "gte_lib_BFC35B68"
     },
     {
       "address": "0xBFC35B88",
@@ -4757,89 +4785,6 @@
       "address": "0xBFC35FD0",
       "label": "gte_lib_BFC35FD0",
       "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
-    },
-    {
-      "address": "0xBFC34928",
-      "label": "gte_lib_BFC34928",
-      "rationale": "GTE library sub-entry. Cascade from batch."
-    },
-    {
-      "address": "0xBFC34A08",
-      "label": "gte_lib_BFC34A08",
-      "rationale": "GTE library sub-entry. Cascade from batch."
-    },
-    {
-      "address": "0xBFC34958",
-      "label": "gte_lib_BFC34958",
-      "rationale": "GTE library sub-entry. Cascade."
-    },
-    {
-      "address": "0xBFC34A34",
-      "label": "gte_lib_BFC34A34",
-      "rationale": "GTE library sub-entry. Cascade."
-    },
-    {
-      "address": "0xBFC34984",
-      "label": "gte_lib_BFC34984",
-      "rationale": "GTE library sub-entry. Cascade."
-    },
-    {
-      "address": "0xBFC34A64",
-      "label": "gte_lib_BFC34A64",
-      "rationale": "GTE library sub-entry. Cascade."
-    },
-    {
-      "address": "0xBFC41D18",
-      "label": "shell_3d_callback_BFC41D18",
-      "rationale": "DuckStation oracle TCB saved PC - shell 3D rendering callback"
-    },
-    {
-      "address": "0xBFC41DFC",
-      "label": "shell_3d_callback_BFC41DFC",
-      "rationale": "DuckStation oracle TCB saved EPC - shell 3D rendering"
-    },
-    {
-      "address": "0xBFC210F0",
-      "label": "shell_handler_BFC210F0",
-      "rationale": "Recomp TCB saved PC - handler function"
-    },
-    {
-      "address": "0xBFC41DC8",
-      "label": "dispatch_miss_0xBFC41DC8",
-      "rationale": "Phase 4.5 dispatch miss from 3D rendering seeds"
-    },
-    {
-      "address": "0xBFC41E14",
-      "label": "dispatch_miss_0xBFC41E14",
-      "rationale": "Phase 4.5 dispatch miss from 3D rendering seeds"
-    },
-    {
-      "address": "0xBFC34E00",
-      "name": "gte_lib_BFC34E00"
-    },
-    {
-      "address": "0xBFC3586C",
-      "name": "gte_lib_BFC3586C"
-    },
-    {
-      "address": "0xBFC359B4",
-      "name": "gte_lib_BFC359B4"
-    },
-    {
-      "address": "0xBFC35AD8",
-      "name": "gte_lib_BFC35AD8"
-    },
-    {
-      "address": "0xBFC35B08",
-      "name": "gte_lib_BFC35B08"
-    },
-    {
-      "address": "0xBFC35B38",
-      "name": "gte_lib_BFC35B38"
-    },
-    {
-      "address": "0xBFC35B68",
-      "name": "gte_lib_BFC35B68"
     },
     {
       "address": "0xBFC36000",
@@ -4996,6 +4941,86 @@
     {
       "address": "0xBFC36FF0",
       "name": "gte_lib_BFC36FF0"
+    },
+    {
+      "address": "0xBFC38AF0",
+      "label": "shell_hot_function",
+      "rationale": "Dispatch miss at 0x80050AF0 (phys 0x1FC38AF0) \u00e2\u20ac\u201d 178 misses. Hot shell function during rendering loop."
+    },
+    {
+      "address": "0xBFC41D18",
+      "label": "shell_3d_callback_BFC41D18",
+      "rationale": "DuckStation oracle TCB saved PC - shell 3D rendering callback"
+    },
+    {
+      "address": "0xBFC41DC8",
+      "label": "dispatch_miss_0xBFC41DC8",
+      "rationale": "Phase 4.5 dispatch miss from 3D rendering seeds"
+    },
+    {
+      "address": "0xBFC41DFC",
+      "label": "shell_3d_callback_BFC41DFC",
+      "rationale": "DuckStation oracle TCB saved EPC - shell 3D rendering"
+    },
+    {
+      "address": "0xBFC41E14",
+      "label": "dispatch_miss_0xBFC41E14",
+      "rationale": "Phase 4.5 dispatch miss from 3D rendering seeds"
+    },
+    {
+      "address": "0xBFC41FC0",
+      "label": "shell_InitRCnt_setup",
+      "rationale": "Undiscovered function: calls B0:0x15 (InitRCnt) with arg 0x20000001. Only reachable via indirect jalr from shell init table. Missing seed causes VSync counter to never increment."
+    },
+    {
+      "address": "0xBFC421D8",
+      "label": "shell_vblank_restore_entry",
+      "rationale": "Mid-function entry: SaveState/RestoreState (A0:0x13/0x14) longjmp target inside func_1FC42160; after RestoreState returns v0!=0 the callback loop runs"
+    },
+    {
+      "address": "0xBFC4226C",
+      "label": "shell_vblank_callback_loop",
+      "rationale": "Mid-function entry point inside func_1FC42160. The BIOS shell jumps here directly to walk VBlank callbacks, bypassing the init-gate at the function top. Needed for VSync counter increment."
+    },
+    {
+      "address": "0xBFC42308",
+      "label": "shell_42308",
+      "rationale": "Shell function near VSync callback area. Dispatch miss from input path."
+    },
+    {
+      "address": "0xBFC4231C",
+      "label": "shell_vblank_init_body",
+      "rationale": "Mid-function entry: SaveState returns v0=0 \u00e2\u2020\u2019 BEQ at 0xBFC421D8 taken \u00e2\u2020\u2019 callback table setup at 0xBFC4231C. Split from func_1FC42160"
+    },
+    {
+      "address": "0xBFC42370",
+      "label": "shell_vblank_epilogue",
+      "rationale": "Mid-function entry: func_1FC42160 epilogue (restore ra/sp, return). Branch target from BNE at 0xBFC4216C when init flag is set"
+    },
+    {
+      "address": "0xBFC425BC",
+      "label": "vblank_chain_handler",
+      "rationale": "VBlank chain handler: the ONLY instruction in the entire BIOS ROM that stores to 0x80079D9C (VSync counter) is at 0xBFC425E0, inside this 15-instruction function at 0xBFC425BC. Function reads counter, increments it, optionally calls user callback at *0x800DFF40. Not reachable via any JAL/literal/lui in ROM \u00e2\u20ac\u201d installed at runtime by kernel chain-registration code. Missing seed means counter-increment code is never recompiled, so even if kernel installs the handler pointer it cannot dispatch to recompiled code."
+    },
+    {
+      "address": "0xBFC42910",
+      "label": "shell_post_callback_cleanup",
+      "rationale": "Called from func_1FC42160 after 256-iteration callback countdown expires; was dispatch miss"
+    },
+    {
+      "address": "0xBFC42BA0",
+      "label": "shell_vblank_dispatch",
+      "rationale": "Called from chain-E004 verify (func_1FC40700) via jal 0x8005ABA0. Walks VBlank callback chain \u00e2\u2020\u2019 calls VSync counter incrementer. Missing seed blocks VSync counter from incrementing."
+    },
+    {
+      "address": "0xBFC42BE0",
+      "label": "shell_vblank_process",
+      "rationale": "Called from chain-E004 verify (jal 0x8005ABE0). Also called from shell main loop to process VBlank events. Missing seed causes VBlank callback chain to never execute."
+    },
+    {
+      "address": "0xBFC42BF0",
+      "label": "shell_register_callback",
+      "rationale": "Called from func_1FC42160 init path at 0xBFC42330 to register VBlank callbacks; missing seed caused callback table corruption"
     }
   ],
   "excluded": [

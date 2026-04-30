@@ -24,6 +24,12 @@
     {"address": "0xBFC11840", "rationale": "dispatch miss: KP2 function, indirect call"},
     {"address": "0xBFC36DF8", "rationale": "dispatch miss: Shell function, indirect call"},
     {"address": "0xBFC11524", "rationale": "dispatch miss: KP2 secondary entry point for exception handler, mid-function split of func_00001A00, called during VBlank"},
-    {"address": "0xBFC11610", "rationale": "dispatch miss: KP2 function, tail-call target from 0xBFC11524 exception handler path"}
+    {"address": "0xBFC11610", "rationale": "dispatch miss: KP2 function, tail-call target from 0xBFC11524 exception handler path"},
+
+    {"address": "0xBFC14A54", "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain BUSY-writer at RAM 0x4F54; alias rule RAM=ROM-0xBFC10000+0x500. Reached via JAL inside FUN_bfc147f4; never emitted as standalone entry."},
+    {"address": "0xBFC158D0", "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain init slot-0 BUSY writer at RAM 0x5DD0; alias RAM=ROM-0xBFC10000+0x500. Inside FUN_bfc158a8 body."},
+    {"address": "0xBFC158D8", "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain init slot-1 BUSY writer at RAM 0x5DD8; alias RAM=ROM-0xBFC10000+0x500. Inside FUN_bfc158a8 body."},
+    {"address": "0xBFC159F4", "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain step handler that writes 0x02 OPEN to [0x7568+slot] at RAM 0x5EF4. Indirect-jr target from RAM 0x6c98 jump table; alias RAM=ROM-0xBFC10000+0x500. KEY entry — without this the gate never clears."},
+    {"address": "0xBFC15AA8", "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain step handler that writes 0x04 OPEN to [0x7568+slot] at RAM 0x5FA8. Indirect-jr target from RAM 0x6c98 jump table; alias RAM=ROM-0xBFC10000+0x500. KEY entry — paired with 0xBFC159F4."}
   ]
 }
