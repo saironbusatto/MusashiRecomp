@@ -1300,6 +1300,9 @@ static void sio_fire_ack_irq(void) {
     sio_irq_idx = (sio_irq_idx + 1) % SIO_IRQ_RING_CAP;
     sio_irq_seq++;
     s_pace_ack_fires++;
+    if (!sio_shift_active && !sio_tx_buffered && !sio_pending_ack) {
+        g_sio_timing_active = 0;
+    }
 }
 
 static void sio_handle_shift_complete(void) {
@@ -1338,7 +1341,72 @@ static void sio_handle_shift_complete(void) {
     } else {
         sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
     }
+    if (!sio_shift_active && !sio_tx_buffered && !sio_pending_ack) {
+        g_sio_timing_active = 0;
+    }
 }
+
+/* Phase 1.0e-e1: peripheral-only advance.
+ *
+ * Drives the cycle-paced shifter+ack scheduler ONLY. Does NOT touch the
+ * legacy sio_irq_pending/sio_irq_countdown — that's the unconditional-
+ * decrement that broke pad timing when called from psx_advance_cycles
+ * in earlier slices. Until the TX path is rerouted (1.0e-e2), nothing
+ * arms the shifter, so this body returns immediately at the
+ * g_sio_timing_active==0 gate without doing any work. */
+static uint64_t s_sio_advance_called    = 0;
+static uint64_t s_sio_advance_with_work = 0;
+
+uint64_t sio_get_advance_called(void)    { return s_sio_advance_called; }
+uint64_t sio_get_advance_with_work(void) { return s_sio_advance_with_work; }
+
+void sio_advance(uint32_t cycles) {
+    if (cycles == 0) return;
+    s_sio_advance_called++;
+    if (!g_sio_timing_active) return;
+    s_sio_advance_with_work++;
+
+    int remaining = (int)cycles;
+    int transitions = 0;
+    const int MAX_TRANSITIONS = 8;
+    while (remaining > 0 && transitions < MAX_TRANSITIONS) {
+        int dt = remaining;
+        int next_event = -1;
+        if (sio_shift_active && sio_shift_remaining > 0
+            && sio_shift_remaining < dt) {
+            dt = sio_shift_remaining;
+            next_event = 0;
+        }
+        if (sio_pending_ack && sio_ack_remaining > 0
+            && sio_ack_remaining < dt) {
+            dt = sio_ack_remaining;
+            next_event = 1;
+        }
+        if (sio_shift_active && sio_shift_remaining <= 0) {
+            dt = 0; next_event = 0;
+        } else if (sio_pending_ack && sio_ack_remaining <= 0) {
+            dt = 0; next_event = 1;
+        }
+        if (sio_shift_active) sio_shift_remaining -= dt;
+        if (sio_pending_ack)  sio_ack_remaining   -= dt;
+        remaining -= dt;
+        if (next_event == 0) {
+            sio_handle_shift_complete();
+            transitions++;
+        } else if (next_event == 1) {
+            sio_pending_ack = 0;
+            sio_fire_ack_irq();
+            transitions++;
+        } else {
+            break;
+        }
+    }
+}
+#else
+/* Macro=0: stubs for ABI symmetry. */
+void sio_advance(uint32_t cycles) { (void)cycles; }
+uint64_t sio_get_advance_called(void)    { return 0; }
+uint64_t sio_get_advance_with_work(void) { return 0; }
 #endif /* SIO_MODEL_CYCLE_PACED */
 
 void sio_tick(int cycles) {

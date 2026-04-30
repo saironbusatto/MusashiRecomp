@@ -39,12 +39,19 @@ void sio_tick(int cycles);
  * (no-op when no SIO cycle-paced work is pending). No-op under macro=0. */
 void sio_tick_quantum(void);
 
-/* Hot-path active guard. Set to 1 by future 1.0d code when sio_shift or
- * sio_pending_ack arms; cleared back to 0 when both shifter and buffer
- * and ACK are empty. The dispatch loop reads this BEFORE calling
- * sio_tick_quantum, so when no SIO time is pending the per-call cost is
- * one load + one branch. In 1.0c-v2 nothing sets this — it stays 0. */
+/* Hot-path active guard. Set to 1 when sio_shift / sio_pending_ack /
+ * buffer arms; cleared when all three empty. */
 extern volatile int g_sio_timing_active;
+
+/* Phase 1.0e-e1: peripheral-only cycle advance. Drives shifter+ack
+ * scheduler. Does NOT touch the legacy sio_irq_pending/countdown. Safe
+ * to call from psx_advance_cycles per emitted block. No-op when
+ * g_sio_timing_active is 0. */
+void sio_advance(uint32_t cycles);
+
+/* Telemetry counters for sio_advance. */
+uint64_t sio_get_advance_called(void);
+uint64_t sio_get_advance_with_work(void);
 
 /* Update pad button state. Buttons use PS1 convention: 0=pressed, 1=released.
    Bit layout: SELECT, L3, R3, START, UP, RIGHT, DOWN, LEFT,
