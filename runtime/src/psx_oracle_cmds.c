@@ -499,6 +499,194 @@ static void h_beetle_wtrace(int id, const char *json) {
     free(ras); free(frames); free(slots); free(sizes);
 }
 
+/* ---- Beetle fn_trace (from beetle_psx_bridge.cpp) ---- */
+extern int      beetle_fntrace_arm(uint32_t target_pc);
+extern void     beetle_fntrace_disarm_all(void);
+extern int      beetle_fntrace_arm_count(void);
+extern uint32_t beetle_fntrace_get_arm(int slot);
+extern void     beetle_fntrace_set_unfiltered(int on);
+extern void     beetle_fntrace_reset(void);
+extern uint64_t beetle_fntrace_total(void);
+extern uint32_t beetle_fntrace_get(uint64_t *out_seq, uint32_t *out_caller,
+                                    uint32_t *out_target, uint32_t *out_ra,
+                                    uint32_t *out_a0, uint32_t *out_a1,
+                                    uint32_t *out_frame, uint8_t *out_kind,
+                                    int max_count);
+extern uint32_t beetle_fntrace_get_callers(uint32_t target_pc,
+                                            uint64_t *out_seq, uint32_t *out_caller,
+                                            uint32_t *out_target, uint32_t *out_ra,
+                                            uint32_t *out_a0, uint32_t *out_a1,
+                                            uint32_t *out_frame, uint8_t *out_kind,
+                                            int max_count);
+
+static const char *fn_kind_str(uint8_t k) {
+    switch (k) {
+        case 1: return "J";
+        case 2: return "JAL";
+        case 3: return "JR";
+        case 4: return "JALR";
+        default: return "?";
+    }
+}
+
+static void h_beetle_fntrace_arm(int id, const char *json) {
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded");
+        return;
+    }
+    char target_str[32];
+    if (!json_get_str(json, "target", target_str, sizeof(target_str))) {
+        send_err(id, "missing target");
+        return;
+    }
+    uint32_t target = hex_to_u32(target_str);
+    int slot = beetle_fntrace_arm(target);
+    if (slot < 0) {
+        send_err(id, "arms full");
+        return;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"slot\":%d,\"target\":\"0x%08X\"}\n",
+             id, slot, target);
+}
+
+static void h_beetle_fntrace_disarm(int id, const char *json) {
+    (void)json;
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded");
+        return;
+    }
+    beetle_fntrace_disarm_all();
+    send_ok(id);
+}
+
+static void h_beetle_fntrace_arms(int id, const char *json) {
+    (void)json;
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded");
+        return;
+    }
+    int n = beetle_fntrace_arm_count();
+    send_fmt("{\"id\":%d,\"ok\":true,\"count\":%d,\"arms\":[", id, n);
+    for (int i = 0; i < n; i++) {
+        if (i > 0) send_fmt(",");
+        send_fmt("\"0x%08X\"", beetle_fntrace_get_arm(i));
+    }
+    send_fmt("]}\n");
+}
+
+static void h_beetle_fntrace_unfiltered(int id, const char *json) {
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded");
+        return;
+    }
+    int on = json_get_int(json, "on", 0);
+    beetle_fntrace_set_unfiltered(on);
+    send_fmt("{\"id\":%d,\"ok\":true,\"unfiltered\":%d}\n", id, on);
+}
+
+static void h_beetle_fntrace_reset(int id, const char *json) {
+    (void)json;
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded");
+        return;
+    }
+    beetle_fntrace_reset();
+    send_ok(id);
+}
+
+static void h_beetle_fntrace_dump(int id, const char *json) {
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded");
+        return;
+    }
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 65536) count = 65536;
+
+    uint64_t *seqs    = (uint64_t *)malloc(count * sizeof(uint64_t));
+    uint32_t *callers = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *targets = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *ras     = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *a0s     = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *a1s     = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *frames  = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint8_t  *kinds   = (uint8_t  *)malloc(count);
+    if (!seqs || !callers || !targets || !ras || !a0s || !a1s || !frames || !kinds) {
+        free(seqs); free(callers); free(targets); free(ras);
+        free(a0s); free(a1s); free(frames); free(kinds);
+        send_err(id, "alloc");
+        return;
+    }
+
+    uint32_t got   = beetle_fntrace_get(seqs, callers, targets, ras,
+                                         a0s, a1s, frames, kinds, count);
+    uint64_t total = beetle_fntrace_total();
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"entries\":[",
+             id, (unsigned long long)total, (unsigned)got);
+    for (uint32_t i = 0; i < got; i++) {
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"seq\":%llu,\"caller\":\"0x%08X\",\"target\":\"0x%08X\","
+                 "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                 "\"frame\":%u,\"kind\":\"%s\"}",
+                 (unsigned long long)seqs[i], callers[i], targets[i],
+                 ras[i], a0s[i], a1s[i], frames[i], fn_kind_str(kinds[i]));
+    }
+    send_fmt("]}\n");
+
+    free(seqs); free(callers); free(targets); free(ras);
+    free(a0s); free(a1s); free(frames); free(kinds);
+}
+
+static void h_beetle_fntrace_callers(int id, const char *json) {
+    if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
+        send_err(id, "oracle not loaded");
+        return;
+    }
+    char target_str[32];
+    if (!json_get_str(json, "target", target_str, sizeof(target_str))) {
+        send_err(id, "missing target");
+        return;
+    }
+    uint32_t target = hex_to_u32(target_str);
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 65536) count = 65536;
+
+    uint64_t *seqs    = (uint64_t *)malloc(count * sizeof(uint64_t));
+    uint32_t *callers = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *targets = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *ras     = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *a0s     = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *a1s     = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint32_t *frames  = (uint32_t *)malloc(count * sizeof(uint32_t));
+    uint8_t  *kinds   = (uint8_t  *)malloc(count);
+    if (!seqs || !callers || !targets || !ras || !a0s || !a1s || !frames || !kinds) {
+        free(seqs); free(callers); free(targets); free(ras);
+        free(a0s); free(a1s); free(frames); free(kinds);
+        send_err(id, "alloc");
+        return;
+    }
+
+    uint32_t got = beetle_fntrace_get_callers(target, seqs, callers, targets, ras,
+                                               a0s, a1s, frames, kinds, count);
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"target\":\"0x%08X\",\"count\":%u,\"entries\":[",
+             id, target, (unsigned)got);
+    for (uint32_t i = 0; i < got; i++) {
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"seq\":%llu,\"caller\":\"0x%08X\",\"target\":\"0x%08X\","
+                 "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                 "\"frame\":%u,\"kind\":\"%s\"}",
+                 (unsigned long long)seqs[i], callers[i], targets[i],
+                 ras[i], a0s[i], a1s[i], frames[i], fn_kind_str(kinds[i]));
+    }
+    send_fmt("]}\n");
+
+    free(seqs); free(callers); free(targets); free(ras);
+    free(a0s); free(a1s); free(frames); free(kinds);
+}
+
 static void h_emu_sio_trace(int id, const char *json) {
     if (!g_psx_oracle || !g_psx_oracle->is_loaded()) {
         send_err(id, "oracle not loaded");
@@ -977,6 +1165,13 @@ static const OracleCmd s_oracle_cmds[] = {
     { "beetle_wtrace_ranges",   h_beetle_wtrace_ranges },
     { "beetle_wtrace_reset",    h_beetle_wtrace_reset },
     { "beetle_wtrace",          h_beetle_wtrace },
+    { "beetle_fntrace_arm",         h_beetle_fntrace_arm },
+    { "beetle_fntrace_disarm",      h_beetle_fntrace_disarm },
+    { "beetle_fntrace_arms",        h_beetle_fntrace_arms },
+    { "beetle_fntrace_unfiltered",  h_beetle_fntrace_unfiltered },
+    { "beetle_fntrace_reset",       h_beetle_fntrace_reset },
+    { "beetle_fntrace_dump",        h_beetle_fntrace_dump },
+    { "beetle_fntrace_callers",     h_beetle_fntrace_callers },
     { NULL, NULL }
 };
 

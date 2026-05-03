@@ -1182,6 +1182,16 @@ void sio_write(uint32_t addr, uint32_t value) {
                 extern uint32_t g_debug_current_func_addr;
                 txn_close(SIO_TXN_END_ABORT_OTHER, mc_state, g_debug_current_func_addr);
             }
+            /* Persist mc_flag back to the active slot before resetting. mc_flag
+             * was loaded from mc_slots[mc_slot].flag on the 0x81 select and
+             * cleared to 0x00 in MC_CMD on the first 0x52/0x57/0x53. Without
+             * writing it back here, every reselect re-loads the stale 0x08
+             * "new card" value, and the BIOS aborts every multi-sector read
+             * after the first one (sees FLAG=0x08 → "card was just inserted,
+             * re-init" → 2-byte 0x81-0x52 abort). */
+            if (active_device == DEV_MEMCARD && mc_slot >= 0 && mc_slot <= 1) {
+                mc_slots[mc_slot].flag = mc_flag;
+            }
             mc_state = MC_IDLE;
             for (int i = 0; i < 2; i++) {
                 mc_slots[i].state      = MC_IDLE;

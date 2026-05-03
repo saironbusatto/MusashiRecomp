@@ -135,6 +135,60 @@ static void beetle_wtrace_callback(uint32_t addr, uint32_t value,
     s_beetle_wtrace_idx = (s_beetle_wtrace_idx + 1) % BEETLE_WTRACE_CAP;
 }
 
+/* ---- Beetle function-call (JAL/JALR/J/JR) trace ring buffer ----
+ * Always-on capture, filtered by an arm-list of target PCs. Hit count is
+ * bounded by the number of times the armed targets fire — typically very
+ * few for boot-init functions (one call per boot). Ring rolls on overflow.
+ * Hook lives in mednafen/psx/cpu.cpp J/JAL/JR/JALR retire. */
+#define BEETLE_FNTRACE_CAP        65536
+#define BEETLE_FNTRACE_MAX_ARMS   64
+
+struct BeetleFnTraceEntry {
+    uint64_t seq;        /* monotonic */
+    uint32_t caller_pc;  /* PC of the J/JAL/JR/JALR */
+    uint32_t target_pc;  /* computed target */
+    uint32_t parent_ra;  /* GPR[31] at call time */
+    uint32_t a0, a1;     /* arg regs */
+    uint32_t frame;      /* Beetle frame counter */
+    uint8_t  kind;       /* 1=J 2=JAL 3=JR 4=JALR */
+    uint8_t  pad[3];
+};
+
+static BeetleFnTraceEntry s_beetle_fntrace[BEETLE_FNTRACE_CAP];
+static uint32_t s_beetle_fntrace_idx = 0;
+static uint64_t s_beetle_fntrace_seq = 0;
+/* Armed target PCs (physical, post 0x1FFFFFFF mask). 0 in slot = unused. */
+static uint32_t s_beetle_fntrace_arms[BEETLE_FNTRACE_MAX_ARMS];
+static int      s_beetle_fntrace_arm_count = 0;
+/* If non-zero, capture EVERY JAL/JALR/J/JR (huge volume; for short windows). */
+static int      s_beetle_fntrace_unfiltered = 0;
+
+static void beetle_fntrace_callback(uint32_t caller_pc, uint32_t target_pc,
+                                     uint32_t parent_ra, uint32_t a0,
+                                     uint32_t a1, uint8_t kind)
+{
+    if (!s_beetle_fntrace_unfiltered) {
+        if (s_beetle_fntrace_arm_count == 0) return;
+        uint32_t tphys = target_pc & 0x1FFFFFFFu;
+        int hit = 0;
+        for (int i = 0; i < s_beetle_fntrace_arm_count; i++) {
+            if (s_beetle_fntrace_arms[i] == tphys) { hit = 1; break; }
+        }
+        if (!hit) return;
+    }
+
+    BeetleFnTraceEntry *e = &s_beetle_fntrace[s_beetle_fntrace_idx];
+    e->seq       = s_beetle_fntrace_seq++;
+    e->caller_pc = caller_pc;
+    e->target_pc = target_pc;
+    e->parent_ra = parent_ra;
+    e->a0        = a0;
+    e->a1        = a1;
+    e->frame     = s_frame_count;
+    e->kind      = kind;
+    s_beetle_fntrace_idx = (s_beetle_fntrace_idx + 1) % BEETLE_FNTRACE_CAP;
+}
+
 /* Pointer to system directory (where BIOS lives). */
 static char s_system_dir[4096] = ".";
 
@@ -430,6 +484,30 @@ static int beetle_init(const char *bios_path) {
     s_beetle_wtrace_ranges[0].hi = 0x0000756Cu;
     s_beetle_wtrace_range_count = 1;
     std::fprintf(stderr, "[beetle-psx] wtrace callback registered, default-armed [0x7568..0x756C)\n");
+
+    /* Register fn_trace callback. Default-arm boot-init + memcard-chain
+     * entry points so we capture caller context from reset. */
+    g_psxrecomp_fntrace_cb = beetle_fntrace_callback;
+    {
+        const uint32_t default_arms[] = {
+            0x1FC0C2E8u, /* FUN_bfc0c2e8 (BootInitMemcards: InitCARD+StartCARD) */
+            0x1FC0DA50u, /* B0:0x4A InitCARD trampoline */
+            0x1FC0DA60u, /* B0:0x4B StartCARD trampoline */
+            0x1FC09914u, /* finalize after StartCARD */
+            0x00005DA8u, /* FUN_bfc158a8 (chain init, RAM-aliased) */
+            0x00004C70u, /* FUN_bfc14770 (chain enabler [0x74BC]=1) */
+            0x00004CF4u, /* FUN_bfc147F4 (StopCARD body) */
+            0x0000609Cu, /* FUN_bfc15b9c (card open dispatch) */
+            0x00004B90u, /* FUN_bfc14690 (chain installer B0:0x13) */
+            0x00005000u, /* FUN_bfc14b00 (chain coordinator) */
+            0x000049BCu, /* FUN_bfc144bc (chain dispatcher tick) */
+        };
+        for (size_t i = 0; i < sizeof(default_arms)/sizeof(default_arms[0]); i++) {
+            s_beetle_fntrace_arms[s_beetle_fntrace_arm_count++] = default_arms[i];
+        }
+        std::fprintf(stderr, "[beetle-psx] fn_trace callback registered, %d default-armed targets\n",
+                     s_beetle_fntrace_arm_count);
+    }
 
     std::fprintf(stderr, "[beetle-psx] Oracle backend loaded (system_dir=%s)\n", s_system_dir);
     return 0;
@@ -737,6 +815,113 @@ extern "C" uint32_t beetle_wtrace_get(uint64_t *out_seq, uint32_t *out_addr,
         out_size[i]  = e->size;
     }
     return (uint32_t)count;
+}
+
+/* ---- Beetle fn_trace access (for psx_oracle_cmds.c) ---- */
+
+extern "C" int beetle_fntrace_arm(uint32_t target_pc) {
+    if (s_beetle_fntrace_arm_count >= BEETLE_FNTRACE_MAX_ARMS) return -1;
+    uint32_t phys = target_pc & 0x1FFFFFFFu;
+    /* Avoid duplicate arm. */
+    for (int i = 0; i < s_beetle_fntrace_arm_count; i++) {
+        if (s_beetle_fntrace_arms[i] == phys) return i;
+    }
+    int slot = s_beetle_fntrace_arm_count++;
+    s_beetle_fntrace_arms[slot] = phys;
+    return slot;
+}
+
+extern "C" void beetle_fntrace_disarm_all(void) {
+    s_beetle_fntrace_arm_count = 0;
+}
+
+extern "C" int beetle_fntrace_arm_count(void) {
+    return s_beetle_fntrace_arm_count;
+}
+
+extern "C" uint32_t beetle_fntrace_get_arm(int slot) {
+    if (slot < 0 || slot >= s_beetle_fntrace_arm_count) return 0;
+    return s_beetle_fntrace_arms[slot];
+}
+
+extern "C" void beetle_fntrace_set_unfiltered(int on) {
+    s_beetle_fntrace_unfiltered = on ? 1 : 0;
+}
+
+extern "C" void beetle_fntrace_reset(void) {
+    s_beetle_fntrace_idx = 0;
+    s_beetle_fntrace_seq = 0;
+    memset(s_beetle_fntrace, 0, sizeof(s_beetle_fntrace));
+}
+
+extern "C" uint64_t beetle_fntrace_total(void) {
+    return s_beetle_fntrace_seq;
+}
+
+/* Copy out the most recent `max_count` entries (oldest first). */
+extern "C" uint32_t beetle_fntrace_get(uint64_t *out_seq,
+                                        uint32_t *out_caller,
+                                        uint32_t *out_target,
+                                        uint32_t *out_ra,
+                                        uint32_t *out_a0,
+                                        uint32_t *out_a1,
+                                        uint32_t *out_frame,
+                                        uint8_t  *out_kind,
+                                        int max_count)
+{
+    int avail = (int)(s_beetle_fntrace_seq < (uint64_t)BEETLE_FNTRACE_CAP
+                      ? s_beetle_fntrace_seq : BEETLE_FNTRACE_CAP);
+    int count = max_count < avail ? max_count : avail;
+    int start = ((int)s_beetle_fntrace_idx - count + BEETLE_FNTRACE_CAP) % BEETLE_FNTRACE_CAP;
+
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % BEETLE_FNTRACE_CAP;
+        const BeetleFnTraceEntry *e = &s_beetle_fntrace[idx];
+        out_seq[i]    = e->seq;
+        out_caller[i] = e->caller_pc;
+        out_target[i] = e->target_pc;
+        out_ra[i]     = e->parent_ra;
+        out_a0[i]     = e->a0;
+        out_a1[i]     = e->a1;
+        out_frame[i]  = e->frame;
+        out_kind[i]   = e->kind;
+    }
+    return (uint32_t)count;
+}
+
+/* Filter entries by target_pc (post-mask). Returns matching entries oldest-first. */
+extern "C" uint32_t beetle_fntrace_get_callers(uint32_t target_pc,
+                                                uint64_t *out_seq,
+                                                uint32_t *out_caller,
+                                                uint32_t *out_target,
+                                                uint32_t *out_ra,
+                                                uint32_t *out_a0,
+                                                uint32_t *out_a1,
+                                                uint32_t *out_frame,
+                                                uint8_t  *out_kind,
+                                                int max_count)
+{
+    uint32_t tphys = target_pc & 0x1FFFFFFFu;
+    int avail = (int)(s_beetle_fntrace_seq < (uint64_t)BEETLE_FNTRACE_CAP
+                      ? s_beetle_fntrace_seq : BEETLE_FNTRACE_CAP);
+    int start = ((int)s_beetle_fntrace_idx - avail + BEETLE_FNTRACE_CAP) % BEETLE_FNTRACE_CAP;
+
+    int written = 0;
+    for (int i = 0; i < avail && written < max_count; i++) {
+        int idx = (start + i) % BEETLE_FNTRACE_CAP;
+        const BeetleFnTraceEntry *e = &s_beetle_fntrace[idx];
+        if ((e->target_pc & 0x1FFFFFFFu) != tphys) continue;
+        out_seq[written]    = e->seq;
+        out_caller[written] = e->caller_pc;
+        out_target[written] = e->target_pc;
+        out_ra[written]     = e->parent_ra;
+        out_a0[written]     = e->a0;
+        out_a1[written]     = e->a1;
+        out_frame[written]  = e->frame;
+        out_kind[written]   = e->kind;
+        written++;
+    }
+    return (uint32_t)written;
 }
 
 #endif /* ENABLE_BEETLE_PSX_ORACLE */

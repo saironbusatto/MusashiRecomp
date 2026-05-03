@@ -14,8 +14,21 @@ ghidra/
 # Build artifacts
 recompiler/build/
 runtime/build/
+runtime/build-msvc/
+test_msvc/
 generated/*.o
 generated/*.obj
+
+# Vendored upstream sources (cloned locally, not checked in)
+beetle-psx/
+
+# Prebuilt SDL2 / dep zips (large, regenerable)
+sdl2-dev.zip
+sdl2-msvc/
+
+# Diagnostic dumps & smoke logs (transient)
+*.log
+*.jsonl
 
 # Runtime diagnostic/crash files
 psx_crash.txt

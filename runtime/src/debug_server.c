@@ -109,9 +109,10 @@ typedef struct {
     uint32_t new_val;    /* post-write value */
     uint32_t ra;         /* $ra (caller return address) */
     uint32_t func_addr;  /* dispatch target (which recompiled function) */
+    uint32_t pc;         /* g_debug_last_store_pc — exact PC of the SW/SH/SB */
     uint32_t frame;      /* VBlank frame number */
     uint8_t  width;      /* 1, 2, or 4 */
-    uint8_t  pad[3];     /* align to 32 bytes */
+    uint8_t  pad[3];     /* align to 8 bytes */
 } WriteTraceEntry;
 static WriteTraceEntry *s_wtrace = NULL;
 static uint64_t s_wtrace_seq  = 0;  /* total writes ever recorded */
@@ -2366,6 +2367,7 @@ static void wtrace_record(uint32_t phys, uint32_t old_val, uint32_t new_val, uin
     e->new_val   = new_val;
     e->ra        = ra;
     e->func_addr = g_debug_current_func_addr;
+    e->pc        = g_debug_last_store_pc;
     e->frame     = (uint32_t)s_frame_count;
     e->width     = width;
     s_wtrace_head = (s_wtrace_head + 1) % WRITE_TRACE_CAP;
@@ -2695,11 +2697,11 @@ static void handle_wtrace_dump(int id, const char *json)
         pos += snprintf(buf + pos, BUF_SZ - pos,
                         "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"old\":\"0x%08X\","
                         "\"new\":\"0x%08X\",\"ra\":\"0x%08X\",\"func\":\"0x%08X\","
-                        "\"frame\":%u,\"w\":%u}",
+                        "\"pc\":\"0x%08X\",\"frame\":%u,\"w\":%u}",
                         (emitted == 0) ? "" : ",",
                         (unsigned long long)e->seq,
                         e->addr, e->old_val, e->new_val, e->ra, e->func_addr,
-                        e->frame, (unsigned)e->width);
+                        e->pc, e->frame, (unsigned)e->width);
         emitted++;
     }
     pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%u}", emitted);
@@ -2846,14 +2848,21 @@ static void handle_fn_stats(int id, const char *json) {
              s_fn_trace_filter_lo, s_fn_trace_filter_hi);
 }
 
-/* Helper: parse filter / range / count for fn_*_dump. */
+/* Helper: parse filter / range / count for fn_*_dump.
+ *
+ * Windowing: with FN_TRACE_CAP at 128M, scanning the full ring on every
+ * dump call wedges the debug server thread for many seconds (single
+ * thread, all other commands stall). Default to the most recent 1M
+ * entries unless the caller explicitly passes seq_lo. Callers that need
+ * to scan the whole ring pass seq_lo=0 explicitly. */
 static void fn_dump_parse(const char *json, uint64_t total,
                          uint64_t *out_seq_lo, uint64_t *out_seq_hi,
                          uint32_t *out_addr_lo, uint32_t *out_addr_hi,
                          int *out_max) {
     char buf[32];
-    *out_seq_lo  = 0;
+    static const uint64_t DEFAULT_WINDOW = 1ull << 20; /* 1M entries */
     *out_seq_hi  = total;
+    *out_seq_lo  = (total > DEFAULT_WINDOW) ? total - DEFAULT_WINDOW : 0;
     *out_addr_lo = 0;
     *out_addr_hi = 0xFFFFFFFFu;
     /* Default: emit up to ~4M filtered hits.  Caller can override.  Trust the
@@ -2865,9 +2874,6 @@ static void fn_dump_parse(const char *json, uint64_t total,
     if (json_get_str(json, "addr_hi", buf, sizeof(buf))) *out_addr_hi = hex_to_u32(buf) & 0x1FFFFFFFu;
     *out_max = json_get_int(json, "count", *out_max);
     if (*out_max < 1) *out_max = 1;
-    /* No artificial upper bound; trust the caller and the response buffer. */
-    /* No "tail-N" auto-trim: scan the entire visible range by default so we
-     * never silently miss filtered hits earlier in the ring. */
 }
 
 static void handle_fn_entry_dump(int id, const char *json) {
@@ -3187,7 +3193,15 @@ void debug_server_init(int port)
      * (including any abort-clear) to identify the byte-count regression PC. */
     s_wtrace_ranges[12].lo = 0x000072F0u;
     s_wtrace_ranges[12].hi = 0x000072F4u;
-    s_wtrace_range_count = 13;
+    /* Card op result flags (kernel page 0xA000B9D0): B9D0 = success flag (set by
+     * SIO IRQ chain handler on op success); B9D4..B9E0 = error flags (timeout,
+     * checksum mismatch, etc.). FUN_bfc09144() in card_read returns the value
+     * at B9D0 — sector-≥1 read bail at FUN_bfc08b3c gates on this. Capture
+     * every writer to determine which writer fires for sector ≥1 (success vs
+     * error path) and which PC sets the failure flag. */
+    s_wtrace_ranges[13].lo = 0x0000B9D0u;
+    s_wtrace_ranges[13].hi = 0x0000B9F0u;
+    s_wtrace_range_count = 14;
 
     /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */
     if (!s_mmio_trace) {
