@@ -3258,7 +3258,11 @@ void debug_server_poll(void)
                 sock_close(s_client);
                 s_client = SOCK_INVALID;
                 s_paused = 0;
-                s_input_override = -1;
+                /* Don't reset s_input_override here. A scheduled press
+                 * (s_input_frames > 0) must continue to hold across the
+                 * client disconnect — Python clients open a fresh socket
+                 * per command, so clearing on every connection close
+                 * would truncate every press to a 1-frame edge. */
                 return;
             }
         }
