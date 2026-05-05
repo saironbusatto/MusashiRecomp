@@ -210,7 +210,7 @@ bool FullFunctionEmitter::emit_function(
             return (runtime_addr & 0xF0000000u) | target26;
         }
         /* Shell: ROM runs at RAM 0x80030000+ */
-        if (phys >= 0x1FC18000u && phys <= 0x1FC427FFu) {
+        if (phys >= 0x1FC18000u && phys <= 0x1FC42FFFu) {
             uint32_t runtime_addr = 0x80030000u + (phys - 0x1FC18000u);
             uint32_t target26 = target & 0x0FFFFFFFu;
             return (runtime_addr & 0xF0000000u) | target26;
@@ -225,7 +225,12 @@ bool FullFunctionEmitter::emit_function(
      * RAM addresses, breaking pointer comparisons in the BIOS. */
     auto relocate_ra = [](uint32_t rom_ra) -> uint32_t {
         uint32_t phys = rom_ra & 0x1FFFFFFFu;
-        if (phys >= 0x1FC18000u && phys <= 0x1FC427FFu) {
+        /* Shell relocation upper bound matches the runtime dispatcher's
+         * normalize() in SCPH1001_dispatch.c: shell covers RAM 0x30000-0x5AFFF
+         * (= ROM 0x1FC18000-0x1FC42FFF inclusive). Previously this was
+         * 0x1FC427FF, which left BFC42800-BFC42FFF JAL targets un-relocated
+         * (target kept ROM PC[31:28]=0xB instead of RAM PC[31:28]=0x8). */
+        if (phys >= 0x1FC18000u && phys <= 0x1FC42FFFu) {
             return 0x80030000u + (phys - 0x1FC18000u);
         }
         if (phys >= 0x1FC10000u && phys <= 0x1FC17FFFu) {

@@ -1,7 +1,7 @@
 {
   "schema": "psxrecomp-v4 phase2 seeds",
-  "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
-  "seed_count": 1013,
+  "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual + audit_2026_05_04 trampoline dispatch-miss + audit_2026_05_04 trampoline dispatch-miss",
+  "seed_count": 1063,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -5021,6 +5021,256 @@
       "address": "0xBFC42BF0",
       "label": "shell_register_callback",
       "rationale": "Called from func_1FC42160 init path at 0xBFC42330 to register VBlank callbacks; missing seed caused callback table corruption"
+    },
+    {
+      "address": "0xBFC428D0",
+      "label": "trampoline_BFC428D0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC428E0",
+      "label": "trampoline_BFC428E0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC428F0",
+      "label": "trampoline_BFC428F0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42900",
+      "label": "trampoline_BFC42900",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42920",
+      "label": "trampoline_BFC42920",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42930",
+      "label": "trampoline_BFC42930",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42940",
+      "label": "trampoline_BFC42940",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42950",
+      "label": "trampoline_BFC42950",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42960",
+      "label": "trampoline_BFC42960",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42970",
+      "label": "trampoline_BFC42970",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42980",
+      "label": "trampoline_BFC42980",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42990",
+      "label": "trampoline_BFC42990",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC429A0",
+      "label": "trampoline_BFC429A0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC429B0",
+      "label": "trampoline_BFC429B0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC429C0",
+      "label": "trampoline_BFC429C0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC429D0",
+      "label": "trampoline_BFC429D0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC429E0",
+      "label": "trampoline_BFC429E0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC429F0",
+      "label": "trampoline_BFC429F0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42A00",
+      "label": "trampoline_BFC42A00",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42A20",
+      "label": "trampoline_BFC42A20",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42A30",
+      "label": "trampoline_BFC42A30",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42A40",
+      "label": "trampoline_BFC42A40",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42A50",
+      "label": "trampoline_BFC42A50",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42A60",
+      "label": "trampoline_BFC42A60",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42A70",
+      "label": "trampoline_BFC42A70",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42A80",
+      "label": "trampoline_BFC42A80",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42AA0",
+      "label": "trampoline_BFC42AA0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42AB0",
+      "label": "trampoline_BFC42AB0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42AC0",
+      "label": "trampoline_BFC42AC0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42AD0",
+      "label": "trampoline_BFC42AD0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42AE0",
+      "label": "trampoline_BFC42AE0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42AF0",
+      "label": "trampoline_BFC42AF0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42B00",
+      "label": "trampoline_BFC42B00",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42B10",
+      "label": "trampoline_BFC42B10",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42B20",
+      "label": "trampoline_BFC42B20",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42B30",
+      "label": "trampoline_BFC42B30",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42B40",
+      "label": "trampoline_BFC42B40",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42B50",
+      "label": "trampoline_BFC42B50",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42B60",
+      "label": "trampoline_BFC42B60",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42B70",
+      "label": "trampoline_BFC42B70",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42B80",
+      "label": "trampoline_BFC42B80",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42B90",
+      "label": "trampoline_BFC42B90",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42BB0",
+      "label": "trampoline_BFC42BB0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42BC0",
+      "label": "trampoline_BFC42BC0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42BD0",
+      "label": "trampoline_BFC42BD0",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC42C00",
+      "label": "trampoline_BFC42C00",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC304AC",
+      "label": "trampoline_BFC304AC",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC30584",
+      "label": "trampoline_BFC30584",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC33C90",
+      "label": "trampoline_BFC33C90",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
+    },
+    {
+      "address": "0xBFC33D1C",
+      "label": "trampoline_BFC33D1C",
+      "rationale": "audit-detected dispatch miss \u2014 A0/B0/C0 syscall trampoline"
     }
   ],
   "excluded": [
