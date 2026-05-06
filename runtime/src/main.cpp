@@ -126,6 +126,23 @@ static void sdl_vblank_present(void) {
     }
     sio_set_pad_state(pad_buttons_this_frame);
 
+    /* Turbo mode: while TAB is held, skip both VRAM->ARGB conversion and
+     * SDL_RenderPresent. The recompiled BIOS still advances simulated
+     * cycles every vblank, so the BIOS proceeds at whatever rate the host
+     * CPU sustains without graphics-driver vsync overhead. Present once
+     * every TURBO_PRESENT_EVERY frames so the user sees visual progress. */
+    {
+        const Uint8* keys = SDL_GetKeyboardState(NULL);
+        static int turbo_skip = 0;
+        const int TURBO_PRESENT_EVERY = 30;
+        if (keys[SDL_SCANCODE_TAB]) {
+            turbo_skip = (turbo_skip + 1) % TURBO_PRESENT_EVERY;
+            if (turbo_skip != 0) return;  /* skip render this frame */
+        } else {
+            turbo_skip = 0;
+        }
+    }
+
     /* ---- Display from our VRAM ---- */
     uint32_t w = 0, h = 0;
     {
