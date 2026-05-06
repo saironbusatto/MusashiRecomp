@@ -1,7 +1,8 @@
 {
   "schema": "psxrecomp-v4 phase2 seeds",
-  "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual + audit_2026_05_04 trampoline dispatch-miss + audit_2026_05_04 trampoline dispatch-miss + modal_stub_2026_05_05",
-  "seed_count": 1064,
+  "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual + audit_2026_05_04 trampoline dispatch-miss + audit_2026_05_04 trampoline dispatch-miss + modal_stub_2026_05_05 + card_copy_dispatch_miss_2026_05_05",
+  "seed_count": 1066,
+  "_bisect_2026_05_05": "0xBFC0989C explicitly NOT seeded. Bisect confirmed seeding it causes a misaligned-dispatch crash from caller at ra=0xBFC09790; suspected mid-function label, not function entry. 0xBFC09890 alone tested safe.",
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -147,6 +148,11 @@
       "address": "0xBFC02738",
       "label": "ghidra_BFC02738",
       "rationale": "Ghidra function start"
+    },
+    {
+      "address": "0xBFC02918",
+      "label": "card_copy_dispatch_miss_2026_05_05",
+      "rationale": "Runtime dispatch miss: 8 hits during YES/NO COPY confirm execution. BANDAID per user permission."
     },
     {
       "address": "0xBFC02950",
@@ -787,6 +793,11 @@
       "address": "0xBFC09720",
       "label": "ghidra_BFC09720",
       "rationale": "Ghidra function start"
+    },
+    {
+      "address": "0xBFC09890",
+      "label": "card_copy_dispatch_miss_2026_05_05_safe",
+      "rationale": "Runtime dispatch miss: 120 hits during COPY. BANDAID per user permission. Bisect 2026-05-05 confirmed safe alone, but pair with 0xBFC0989C causes freeze and 0xBFC0989C alone causes crash (misaligned dispatch from caller 0xBFC09790). Suspected mid-function label, not true function entry. NOT seeding 0xBFC0989C."
     },
     {
       "address": "0xBFC098A8",
