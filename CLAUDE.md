@@ -256,14 +256,20 @@ Do NOT guess behavior.
 
 ---
 
-## 15. Broken tooling is never acceptable. Fix it.
+## 15. Broken tooling is never acceptable. Fix it when identified.
 
 If a tool, command, or verification mechanism fails or returns
 unexpected results:
 
-→ **Fix the tool.** Diagnose why it failed and repair it.  
-→ Do NOT route around it with indirect evidence.  
-→ Do NOT infer correctness from two broken implementations agreeing.  
+→ **Fix the tool, immediately, the moment you identify the breakage.**
+   Diagnose why it failed and repair it before continuing the
+   investigation that surfaced it.
+→ Do NOT route around it with indirect evidence.
+→ Do NOT infer correctness from two broken implementations agreeing.
+→ Do NOT log the breakage as a "caveat to live with" or carry it forward
+   in handoffs as a known limitation. A known-broken tool is a debt that
+   compounds: every later session pays interest in the form of
+   reconstructed-from-fragments evidence and shaky conclusions.
 
 "The screenshot command returns black" is not a reason to skip visual
 verification. It is a reason to fix the screenshot command.
@@ -271,41 +277,65 @@ verification. It is a reason to fix the screenshot command.
 "Both the native runtime and interpreter show the same wrong value"
 does not make the value correct. It means both have the same bug.
 
+"Beetle's fntrace caller_pc field is always 0, so we'll lean on ra
+chains" is not an acceptable workaround. It is a reason to fix the
+fntrace hook before the next investigation pass.
+
 If you cannot fix the tool, **ask the user** what they observe.
 Never declare a result "correct" without direct verification against
 the oracle.
 
 ---
 
-## 16. Beetle PSX oracle setup (from fresh checkout)
+## 16. Two independent processes, identical debug harness
 
-The runtime oracle is **Beetle PSX** (mednafen-psx libretro core), embedded
-in `psx-beetleoracle.exe`. It runs in-process — no separate emulator window.
+v4 runs two processes for cross-checking, NEVER one process with both
+backends in it:
+
+- **`psx-runtime.exe`** — recompiled BIOS only. SDL window, keyboard
+  input, TCP debug server on port **4370**.
+- **`psx-beetle.exe`** — Beetle PSX (mednafen-psx libretro core) only.
+  SDL window, keyboard input, TCP debug server on port **4380**.
+
+Both binaries expose the **same JSON wire protocol** for debug
+commands — `read_ram`, `press`, `set_input`, `clear_input`,
+`pad_status`, `wtrace_*`, `fntrace_*`, `screenshot`, `ping`, etc.
+This means a tool written against psx-runtime works unchanged against
+psx-beetle just by switching ports. Implementations differ (psx-beetle
+uses libretro hooks; psx-runtime uses recomp-emitted instrumentation),
+but the protocol is identical.
+
+**Why two processes, not one:** the embedded-oracle approach
+(`psx-beetleoracle.exe`, retired 2026-05-05) shared input across both
+backends in lockstep. They desynced constantly — once their internal
+state diverged, the same keypress drove them to different screens, and
+"compare on the same press" became unreliable. Two independent
+processes is the only setup where each backend can be navigated to its
+own state and queried on its own timeline. Cross-process comparison
+is done by querying both ports from a tool, NOT by sharing memory.
 
 ```bash
 # Build beetle-psx static lib (one-time, or after modifying beetle-psx/ source)
 cd beetle-psx && make platform=mingw_x86_64 STATIC_LINKING=1 HAVE_LIGHTREC=0 -j8
 cp mednafen_psx_libretro.dll libmednafen_psx.a && cd ..
 
-# Build oracle runtime
+# Build both binaries
 PATH=/c/msys64/mingw64/bin:$PATH
-cd runtime/build && cmake --build . --target psx-beetleoracle && cd ../..
+cd runtime/build && cmake --build . --target psx-runtime psx-beetle && cd ../..
 
-# Run (kills any existing instance first)
-taskkill //F //IM psx-beetleoracle.exe 2>/dev/null
-start "" "./runtime/build/psx-beetleoracle.exe" "bios/SCPH1001.BIN"
+# Run independently. Either can run alone; both can run together.
+taskkill //F //IM psx-runtime.exe 2>/dev/null
+taskkill //F //IM psx-beetle.exe   2>/dev/null
+start "" "./runtime/build/psx-runtime.exe" "./bios/SCPH1001.BIN"
+start "" "./runtime/build/psx-beetle.exe"  "./bios/SCPH1001.BIN"
 ```
-
-Beetle boots from `bios/scph5501.bin` (copy of SCPH1001.BIN). Oracle commands
-are served on the same TCP debug port (4370): `find_first_divergence`,
-`emu_read_ram`, `emu_sio_trace`, `emu_trace_addr`, `emu_step`.
 
 **Key files:**
 - `beetle-psx/` — cloned beetle-psx-libretro repo
-- `beetle-psx/libmednafen_psx.a` — static library
-- `runtime/src/beetle_psx_bridge.cpp` — libretro bridge (C++)
-- `runtime/src/psx_oracle_cmds.c` — TCP oracle commands
-- `runtime/include/psx_oracle_backend.h` — abstract backend interface
+- `beetle-psx/libmednafen_psx.a` — static library used by psx-beetle
+- `runtime/src/main.cpp` + `runtime/src/debug_server.c` — psx-runtime
+- `runtime/src/beetle_main.cpp` + `runtime/src/beetle_debug_server.c`
+  + `runtime/src/beetle_libretro.cpp` — psx-beetle
 
 **Where Beetle has gaps, build new tooling.** Do not fall back to
 DuckStation. Do not guess. Build the diagnostic tool that gives you

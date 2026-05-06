@@ -67,7 +67,9 @@ static char s_recv_buf[RECV_BUF_SIZE];
 static int  s_recv_len = 0;
 
 /* ---- Frame counter (set by record_frame caller) ---- */
-static uint64_t s_frame_count = 0;
+/* Non-static so other instrumentation (e.g. dirty_ram_interp.c) can stamp
+ * ring-buffer entries with the current frame for cross-correlation. */
+uint64_t s_frame_count = 0;
 
 /* ---- CPU state pointer (set at init) ---- */
 static CPUState *s_cpu = NULL;
@@ -118,8 +120,9 @@ static WriteTraceEntry *s_wtrace = NULL;
 static uint64_t s_wtrace_seq  = 0;  /* total writes ever recorded */
 static uint32_t s_wtrace_head = 0;
 
-/* Multi-range filter: up to 8 [lo, hi) address ranges. */
-#define WTRACE_MAX_RANGES 16
+/* Multi-range filter: up to 64 [lo, hi) address ranges. Boot defaults
+ * occupy ~15; investigative arms must always have headroom. */
+#define WTRACE_MAX_RANGES 64
 static struct { uint32_t lo, hi; } s_wtrace_ranges[WTRACE_MAX_RANGES];
 static int s_wtrace_range_count = 0;
 
@@ -705,6 +708,60 @@ static void handle_dirty_ram_stats(int id, const char *json)
     }
     n += snprintf(buf + n, sizeof(buf) - n, "]}\n");
     send_fmt("%s", buf);
+}
+
+/* ---- Dirty-RAM block-entry log: dump (target,ra,frame) tuples to find
+ * the caller of any RAM-installed stub. Optional target_lo/target_hi
+ * filters the response to a target-PC range; with no filter, dumps the
+ * most recent `count` entries (default 256, max DIRTY_RAM_BLOCK_LOG_CAP). */
+static void handle_dirty_block_log(int id, const char *json)
+{
+    char buf[32];
+    uint32_t target_lo = 0, target_hi = 0xFFFFFFFFu;
+    if (json_get_str(json, "target_lo", buf, sizeof(buf))) target_lo = hex_to_u32(buf);
+    if (json_get_str(json, "target_hi", buf, sizeof(buf))) target_hi = hex_to_u32(buf);
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > (int)DIRTY_RAM_BLOCK_LOG_CAP) count = DIRTY_RAM_BLOCK_LOG_CAP;
+
+    uint64_t total = g_dirty_ram_block_log_seq;
+    uint64_t avail = (total < DIRTY_RAM_BLOCK_LOG_CAP) ? total : DIRTY_RAM_BLOCK_LOG_CAP;
+    uint64_t scan_start = (total > avail) ? (total - avail) : 0;
+
+    /* Generous response buffer — 16K log entries * ~96 chars/entry < 2 MB. */
+    const size_t BUF_SZ = 4 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) {
+        send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"oom\"}\n", id);
+        return;
+    }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+                    "\"target_lo\":\"0x%08X\",\"target_hi\":\"0x%08X\",\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)avail,
+                    target_lo, target_hi);
+    int emitted = 0;
+    /* Walk newest-first so callers naturally get the latest dispatches.
+     * Stop once we've emitted `count` matches or scanned the whole window. */
+    for (uint64_t i = 0; i < avail && emitted < count; i++) {
+        uint64_t seq = total - 1 - i;
+        DirtyRamBlockLogEntry *e =
+            &g_dirty_ram_block_log[seq & (DIRTY_RAM_BLOCK_LOG_CAP - 1u)];
+        if (e->target < target_lo || e->target >= target_hi) continue;
+        if (pos > BUF_SZ - 256) break;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"target\":\"0x%08X\","
+                        "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                        "\"frame\":%u}",
+                        emitted == 0 ? "" : ",",
+                        (unsigned long long)e->seq,
+                        e->target, e->ra, e->a0, e->a1, e->frame);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%d}\n", emitted);
+    debug_server_send_line(out);
+    free(out);
 }
 
 /* ---- SIO write PC tracer dump ----
@@ -1891,27 +1948,15 @@ static void handle_press(int id, const char *json)
     send_ok(id);
 }
 
-/* Reports BOTH ours' and Beetle's current pad word so the operator can
- * empirically verify input dispatch symmetry. Note: ours' pad is what
- * sio_set_pad_state stored last; Beetle's is whatever the last frame
- * set s_joypad to. They should match when override is active. */
+/* Reports the current pad word and any active input override. */
 extern uint16_t sio_get_pad_buttons(void);
-#if defined(ENABLE_BEETLE_PSX_ORACLE)
-extern uint16_t beetle_get_pad(void);
-#endif
 static void handle_pad_status(int id, const char *json)
 {
     (void)json;
-    uint16_t ours = sio_get_pad_buttons();
-#if defined(ENABLE_BEETLE_PSX_ORACLE)
-    uint16_t beetle = beetle_get_pad();
-#else
-    uint16_t beetle = 0xFFFF;
-#endif
-    send_fmt("{\"id\":%d,\"ok\":true,\"ours\":\"0x%04X\",\"beetle\":\"0x%04X\","
-             "\"override\":%d,\"override_frames\":%d,\"match\":%s}\n",
-             id, ours, beetle, s_input_override, s_input_frames,
-             (ours == beetle) ? "true" : "false");
+    uint16_t pad = sio_get_pad_buttons();
+    send_fmt("{\"id\":%d,\"ok\":true,\"pad\":\"0x%04X\","
+             "\"override\":%d,\"override_frames\":%d}\n",
+             id, pad, s_input_override, s_input_frames);
 }
 
 static void handle_clear_input(int id, const char *json)
@@ -1920,25 +1965,6 @@ static void handle_clear_input(int id, const char *json)
     s_input_override = -1;
     s_input_frames   = 0;
     send_ok(id);
-}
-
-/* ---- display_source: toggle SDL window between our VRAM and Beetle's framebuffer ---- */
-extern void display_source_set(int src);
-extern int  display_source_get(void);
-static void handle_display_source(int id, const char *json)
-{
-    char val[16] = {0};
-    if (!json_get_str(json, "src", val, sizeof(val))) {
-        /* No arg = report current */
-        send_fmt("{\"id\":%d,\"ok\":true,\"src\":\"%s\"}",
-                 id, display_source_get() ? "beetle" : "ours");
-        return;
-    }
-    if (strcmp(val, "beetle") == 0)        display_source_set(1);
-    else if (strcmp(val, "ours") == 0)     display_source_set(0);
-    else { send_err(id, "src must be 'ours' or 'beetle'"); return; }
-    send_fmt("{\"id\":%d,\"ok\":true,\"src\":\"%s\"}",
-             id, display_source_get() ? "beetle" : "ours");
 }
 
 static void handle_pause(int id, const char *json)
@@ -2985,6 +3011,7 @@ static const CmdEntry s_commands[] = {
     { "sio_trace",         handle_sio_trace },
     { "sio_pc_trace",      handle_sio_pc_trace },
     { "dirty_ram_stats",   handle_dirty_ram_stats },
+    { "dirty_block_log",   handle_dirty_block_log },
     { "card_txn_dump",     handle_card_txn_dump },
     { "card_read_summary", handle_card_read_summary },
     { "card_read_summary_reset", handle_card_read_summary_reset },
@@ -3011,7 +3038,6 @@ static const CmdEntry s_commands[] = {
     { "press",             handle_press },
     { "pad_status",        handle_pad_status },
     { "clear_input",       handle_clear_input },
-    { "display_source",    handle_display_source },
     { "pause",             handle_pause },
     { "continue",          handle_continue },
     { "step",              handle_step },
@@ -3062,14 +3088,6 @@ static void process_command(const char *line)
             return;
         }
     }
-
-    /* Oracle commands (find_first_divergence, emu_read_ram, etc.) */
-#if defined(ENABLE_DUCKSTATION_ORACLE) || defined(ENABLE_BEETLE_PSX_ORACLE)
-    {
-        extern int psx_oracle_handle_cmd(const char *cmd, int id, const char *json);
-        if (psx_oracle_handle_cmd(cmd, id, line)) return;
-    }
-#endif
 
     send_err(id, "unknown command");
 }
