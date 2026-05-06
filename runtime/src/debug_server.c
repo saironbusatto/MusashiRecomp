@@ -169,6 +169,59 @@ void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width) {
 static uint32_t s_dispatch_ring[DISPATCH_TRACE_CAP];
 static uint64_t s_dispatch_seq = 0;
 
+/* ---- Unknown-dispatch ring buffer ----
+ * Always-on log of every psx_dispatch target that doesn't resolve to a
+ * generated function AND doesn't match any trampoline pattern in
+ * traps.c. Used to identify functions the recompiler missed.
+ * 64K entries × 32 bytes = 2 MB. Replaces the prior file-based log. */
+#define UNKNOWN_DISPATCH_CAP (1 << 16)
+typedef struct {
+    uint64_t seq;
+    uint32_t addr;
+    uint32_t phys;
+    uint32_t ra;
+    uint32_t a0;
+    uint32_t a1;
+    uint32_t frame;
+    uint32_t pad;
+} UnknownDispatchEntry;
+static UnknownDispatchEntry s_unknown_ring[UNKNOWN_DISPATCH_CAP];
+static uint64_t s_unknown_seq = 0;
+/* Per-target hit count — bounded set, ~N unique targets typically. */
+#define UNKNOWN_UNIQUE_CAP 1024
+typedef struct { uint32_t phys; uint64_t count; } UnknownUniqueEntry;
+static UnknownUniqueEntry s_unknown_unique[UNKNOWN_UNIQUE_CAP];
+static int s_unknown_unique_count = 0;
+
+void psx_unknown_dispatch_record(uint32_t addr, uint32_t phys,
+                                  uint32_t ra, uint32_t a0, uint32_t a1)
+{
+    uint64_t seq = s_unknown_seq++;
+    UnknownDispatchEntry *e = &s_unknown_ring[seq & (UNKNOWN_DISPATCH_CAP - 1u)];
+    e->seq   = seq;
+    e->addr  = addr;
+    e->phys  = phys;
+    e->ra    = ra;
+    e->a0    = a0;
+    e->a1    = a1;
+    e->frame = (uint32_t)s_frame_count;
+    /* Per-target count (linear probe). */
+    uint32_t idx = (phys >> 2) % UNKNOWN_UNIQUE_CAP;
+    for (int i = 0; i < UNKNOWN_UNIQUE_CAP; i++) {
+        uint32_t slot = (idx + i) % UNKNOWN_UNIQUE_CAP;
+        if (s_unknown_unique[slot].phys == phys) {
+            s_unknown_unique[slot].count++;
+            return;
+        }
+        if (s_unknown_unique[slot].phys == 0) {
+            s_unknown_unique[slot].phys = phys;
+            s_unknown_unique[slot].count = 1;
+            s_unknown_unique_count++;
+            return;
+        }
+    }
+}
+
 /* Unique dispatch set — tracks every unique function address ever dispatched.
  * Simple hash set with linear probing. */
 #define DISPATCH_UNIQUE_CAP 4096
@@ -638,6 +691,7 @@ static const char *json_get_str(const char *json, const char *key,
                                 char *out, int out_sz);
 static uint32_t hex_to_u32(const char *s);
 static void handle_dirty_ram_stats(int id, const char *json);
+static void send_err(int id, const char *msg);
 void debug_server_send_fmt(const char *fmt, ...);
 #define send_fmt debug_server_send_fmt
 
@@ -760,6 +814,108 @@ static void handle_dirty_block_log(int id, const char *json)
         emitted++;
     }
     pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%d}\n", emitted);
+    debug_server_send_line(out);
+    free(out);
+}
+
+/* ---- unknown_dispatch_log: dump psx_unknown_dispatch hits ----
+ * Two modes:
+ *   - default: per-target count summary (sorted by hit count)
+ *   - tail=N: most recent N entries from the ring */
+static void handle_unknown_dispatch_log(int id, const char *json)
+{
+    int tail = json_get_int(json, "tail", 0);
+
+    if (tail > 0) {
+        if (tail > (int)UNKNOWN_DISPATCH_CAP) tail = UNKNOWN_DISPATCH_CAP;
+        uint64_t total = s_unknown_seq;
+        uint64_t avail = (total < UNKNOWN_DISPATCH_CAP) ? total : UNKNOWN_DISPATCH_CAP;
+        if ((uint64_t)tail > avail) tail = (int)avail;
+
+        const size_t BUF_SZ = 2 * 1024 * 1024;
+        char *out = (char *)malloc(BUF_SZ);
+        if (!out) { send_err(id, "oom"); return; }
+        size_t pos = 0;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "{\"id\":%d,\"ok\":true,\"total\":%llu,\"unique\":%d,"
+                        "\"tail\":%d,\"entries\":[",
+                        id, (unsigned long long)total, s_unknown_unique_count, tail);
+        uint64_t start = total - (uint64_t)tail;
+        for (int i = 0; i < tail; i++) {
+            UnknownDispatchEntry *e =
+                &s_unknown_ring[(start + i) & (UNKNOWN_DISPATCH_CAP - 1u)];
+            if (pos > BUF_SZ - 256) break;
+            pos += snprintf(out + pos, BUF_SZ - pos,
+                            "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"phys\":\"0x%08X\","
+                            "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                            "\"frame\":%u}",
+                            i == 0 ? "" : ",",
+                            (unsigned long long)e->seq,
+                            e->addr, e->phys, e->ra, e->a0, e->a1, e->frame);
+        }
+        pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
+        debug_server_send_line(out);
+        free(out);
+        return;
+    }
+
+    /* Summary mode: per-phys hit count, sorted descending. */
+    const size_t BUF_SZ = 2 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"unique\":%d,"
+                    "\"summary\":[",
+                    id, (unsigned long long)s_unknown_seq, s_unknown_unique_count);
+    /* Sort by count desc — small cap, simple selection. */
+    int emitted = 0;
+    for (int round = 0; round < UNKNOWN_UNIQUE_CAP && emitted < 200; round++) {
+        uint64_t best_count = 0;
+        int best_idx = -1;
+        for (int i = 0; i < UNKNOWN_UNIQUE_CAP; i++) {
+            if (s_unknown_unique[i].phys == 0) continue;
+            if (s_unknown_unique[i].count > best_count) {
+                best_count = s_unknown_unique[i].count;
+                best_idx = i;
+            }
+        }
+        if (best_idx < 0) break;
+        if (pos > BUF_SZ - 128) break;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "%s{\"phys\":\"0x%08X\",\"count\":%llu}",
+                        emitted == 0 ? "" : ",",
+                        s_unknown_unique[best_idx].phys,
+                        (unsigned long long)s_unknown_unique[best_idx].count);
+        s_unknown_unique[best_idx].count = 0; /* mark consumed */
+        emitted++;
+    }
+    /* Restore: re-walk the ring once to rebuild counts. Cheap since cap is 1024. */
+    /* (We mutated counts above to drive selection; rebuild by replaying the
+     * ring's most recent UNKNOWN_DISPATCH_CAP entries.) */
+    for (int i = 0; i < UNKNOWN_UNIQUE_CAP; i++) s_unknown_unique[i].phys = 0;
+    s_unknown_unique_count = 0;
+    uint64_t avail = (s_unknown_seq < UNKNOWN_DISPATCH_CAP) ? s_unknown_seq : UNKNOWN_DISPATCH_CAP;
+    uint64_t start = s_unknown_seq - avail;
+    for (uint64_t i = 0; i < avail; i++) {
+        UnknownDispatchEntry *e = &s_unknown_ring[(start + i) & (UNKNOWN_DISPATCH_CAP - 1u)];
+        uint32_t phys = e->phys;
+        uint32_t idx = (phys >> 2) % UNKNOWN_UNIQUE_CAP;
+        for (int k = 0; k < UNKNOWN_UNIQUE_CAP; k++) {
+            uint32_t slot = (idx + k) % UNKNOWN_UNIQUE_CAP;
+            if (s_unknown_unique[slot].phys == phys) {
+                s_unknown_unique[slot].count++;
+                break;
+            }
+            if (s_unknown_unique[slot].phys == 0) {
+                s_unknown_unique[slot].phys = phys;
+                s_unknown_unique[slot].count = 1;
+                s_unknown_unique_count++;
+                break;
+            }
+        }
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
     debug_server_send_line(out);
     free(out);
 }
@@ -3012,6 +3168,7 @@ static const CmdEntry s_commands[] = {
     { "sio_pc_trace",      handle_sio_pc_trace },
     { "dirty_ram_stats",   handle_dirty_ram_stats },
     { "dirty_block_log",   handle_dirty_block_log },
+    { "unknown_dispatch_log", handle_unknown_dispatch_log },
     { "card_txn_dump",     handle_card_txn_dump },
     { "card_read_summary", handle_card_read_summary },
     { "card_read_summary_reset", handle_card_read_summary_reset },

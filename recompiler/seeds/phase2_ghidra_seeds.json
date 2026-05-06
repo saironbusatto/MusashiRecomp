@@ -1,7 +1,7 @@
 {
   "schema": "psxrecomp-v4 phase2 seeds",
-  "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual + audit_2026_05_04 trampoline dispatch-miss + audit_2026_05_04 trampoline dispatch-miss",
-  "seed_count": 1063,
+  "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual + audit_2026_05_04 trampoline dispatch-miss + audit_2026_05_04 trampoline dispatch-miss + modal_stub_2026_05_05",
+  "seed_count": 1064,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -1727,6 +1727,11 @@
       "address": "0xBFC1A19C",
       "label": "ghidra_BFC1A19C",
       "rationale": "Ghidra function start"
+    },
+    {
+      "address": "0xBFC1A1BC",
+      "label": "modal_stub_dispatch_miss",
+      "rationale": "Runtime dispatch miss confirmed 2026-05-05: psx_unknown_dispatch hit during YES/NO COPY confirm modal CROSS press. Beetle wtrace+fntrace shows this PC fires on modal close via JAL caller_pc=0x8004673C. Ghidra function discovery missed it. BANDAID per user permission — should be replaced by an improved heuristic that catches this gap."
     },
     {
       "address": "0xBFC1A430",

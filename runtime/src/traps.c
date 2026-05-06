@@ -359,22 +359,14 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
     }
 
     {
-        /* Log dispatch miss to file and continue (collect all misses). */
-        static FILE* miss_log = NULL;
-        static int miss_count = 0;
-        if (!miss_log) miss_log = fopen("psx_dispatch_misses.txt", "w");
-        if (miss_log) {
-            fprintf(miss_log, "0x%08X phys=0x%08X ra=0x%08X t9=0x%08X pc=0x%08X\n",
-                    addr, phys, cpu->gpr[31], cpu->gpr[25], cpu->pc);
-            fflush(miss_log);
-        }
-        miss_count++;
-        if (miss_count > 100000) {
-            fprintf(stderr, "DISPATCH MISS limit reached (%d misses). See psx_dispatch_misses.txt\n", miss_count);
-            fflush(stderr);
-            if (miss_log) fclose(miss_log);
-            exit(1);
-        }
+        /* Always-on ring buffer of dispatch misses. Queryable via the
+         * `unknown_dispatch_log` debug command. Replaces the prior
+         * file-based log per CLAUDE.md §3. */
+        extern void psx_unknown_dispatch_record(uint32_t addr, uint32_t phys,
+                                                 uint32_t ra, uint32_t a0,
+                                                 uint32_t a1);
+        psx_unknown_dispatch_record(addr, phys, cpu->gpr[31],
+                                    cpu->gpr[4], cpu->gpr[5]);
         /* Return without executing — function is a no-op. */
         cpu->pc = 0;
     }
