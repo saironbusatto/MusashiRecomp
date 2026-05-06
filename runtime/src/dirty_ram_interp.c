@@ -46,6 +46,12 @@ const char *g_dirty_ram_last_unsupported_reason = NULL;
 
 DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE] = {0};
 
+DirtyRamBlockLogEntry g_dirty_ram_block_log[DIRTY_RAM_BLOCK_LOG_CAP] = {0};
+uint64_t              g_dirty_ram_block_log_seq = 0;
+
+/* Current frame counter, defined in debug_server.c. */
+extern uint64_t s_frame_count;
+
 /* Linear-probed insert/lookup keyed on entry PC.  Table is small (64) and
  * the working set of install-stub PCs is tiny (handful), so this stays
  * O(1) in practice.  Returns NULL if the table is full — caller treats
@@ -396,6 +402,21 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
     /* Per-PC entry counter (visible via dirty_ram_stats). */
     DirtyRamPcEntry *pc_entry = pc_table_get_or_insert(phys);
     if (pc_entry) pc_entry->hits++;
+
+    /* Block-entry ring buffer — answers "who tried to JALR into this RAM
+     * stub" by capturing cpu->gpr[31] (the caller's RA) at dispatch time.
+     * Always-on; eviction keeps memory bounded. */
+    {
+        uint64_t s = g_dirty_ram_block_log_seq++;
+        DirtyRamBlockLogEntry *e =
+            &g_dirty_ram_block_log[s & (DIRTY_RAM_BLOCK_LOG_CAP - 1u)];
+        e->seq    = s;
+        e->target = addr;
+        e->ra     = cpu->gpr[31];
+        e->a0     = cpu->gpr[4];
+        e->a1     = cpu->gpr[5];
+        e->frame  = (uint32_t)s_frame_count;
+    }
 
     /* Run instructions until a control-transfer terminates the block.
      * Cap iterations as a safety net — install stubs are tiny. */

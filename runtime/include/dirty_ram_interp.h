@@ -52,6 +52,36 @@ typedef struct {
 } DirtyRamPcEntry;
 extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
 
+/* Block-entry ring buffer. Records every dispatch into dirty RAM with the
+ * caller's RA at entry, plus a0/a1 for call-arg context — answers
+ * "who tried to JALR into this RAM stub, with what args".
+ * Always-on, eviction keeps memory bounded; callers query the window of
+ * interest (CLAUDE.md global rule on ring buffers).
+ *
+ * Limitation: this captures dispatches into RAM-resident code only. ROM
+ * recompiled-C → recompiled-C calls (direct C function calls in
+ * generated dispatch table) are NOT captured here. For BIOS shell
+ * investigation that's fine — shell code lives in RAM (0x800XXXXX).
+ *
+ * `ra` is cpu->gpr[31] at dispatch time. For normal JAL-style calls,
+ * (ra - 8) gives the caller's PC. For J/JR/tail-calls it's only a
+ * heuristic — treat ra as "ra_callsite_guess", not authoritative. */
+#define DIRTY_RAM_BLOCK_LOG_CAP (1u << 22) /* 4M entries (~128 MB).
+ * At ~580K dispatches/s during boot, this retains ~7s of history; at
+ * ~10K/s during modal idle, ~400s. Sized for retroactive press-window
+ * analysis without the prior 16K ring's 28-ms eviction problem. */
+typedef struct {
+    uint64_t seq;       /* monotonic, unique per entry */
+    uint32_t target;    /* entry PC (RAM address) */
+    uint32_t ra;        /* cpu->gpr[31] at dispatch — caller's return target */
+    uint32_t a0;        /* cpu->gpr[4] at dispatch */
+    uint32_t a1;        /* cpu->gpr[5] at dispatch */
+    uint32_t frame;     /* s_frame_count at the time of dispatch */
+    uint32_t pad;       /* align to 32 bytes */
+} DirtyRamBlockLogEntry;
+extern DirtyRamBlockLogEntry g_dirty_ram_block_log[DIRTY_RAM_BLOCK_LOG_CAP];
+extern uint64_t              g_dirty_ram_block_log_seq;
+
 #ifdef __cplusplus
 }
 #endif
