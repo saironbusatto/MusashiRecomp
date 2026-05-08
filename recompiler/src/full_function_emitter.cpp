@@ -923,12 +923,17 @@ void FullFunctionEmitter::emit_dispatch(
     out += "}\n\n";
 
     out += "extern int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);\n";
+    out += "extern void fntrace_record(CPUState* cpu, uint32_t target);\n";
     out += "\n";
     out += "void psx_dispatch(CPUState* cpu, uint32_t addr) {\n";
     out += "    /* Tail-call trampoline: functions signal tail calls by setting\n";
     out += "     * cpu->pc to the target and returning. We loop here to re-dispatch\n";
     out += "     * without growing the native stack. */\n";
     out += "    for (;;) {\n";
+    out += "        /* Always-on call ring: every iteration counts as a separate\n";
+    out += "         * call (initial entry + each tail-call re-dispatch). a0..a3\n";
+    out += "         * reflect the args being passed for THIS iteration. */\n";
+    out += "        fntrace_record(cpu, addr);\n";
     out += "        cpu->pc = 0;\n";
     out += "        uint32_t phys = normalize(addr);\n";
     out += fmt::format("        int lo = 0, hi = {} - 1;\n", emitted_normalized.size());

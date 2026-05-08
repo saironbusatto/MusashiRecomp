@@ -706,6 +706,7 @@ static const char *json_get_str(const char *json, const char *key,
 static uint32_t hex_to_u32(const char *s);
 static void handle_dirty_ram_stats(int id, const char *json);
 static void send_err(int id, const char *msg);
+static void send_ok(int id);
 void debug_server_send_fmt(const char *fmt, ...);
 #define send_fmt debug_server_send_fmt
 
@@ -825,6 +826,110 @@ static void handle_dirty_block_log(int id, const char *json)
                         emitted == 0 ? "" : ",",
                         (unsigned long long)e->seq,
                         e->target, e->ra, e->a0, e->a1, e->frame);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%d}\n", emitted);
+    debug_server_send_line(out);
+    free(out);
+}
+
+/* ---- fntrace: always-on psx_dispatch call ring ----
+ * Mirrors beetle_libretro.cpp's fntrace; covers every static-recomp +
+ * dirty-RAM dispatch on this side. Use to find indirect callers, walk
+ * argument-passing chains, and answer "who called X with what args"
+ * across processes (psx-runtime port 4370, psx-beetle port 4380). */
+#include "fntrace.h"
+
+static void handle_fntrace_arm(int id, const char *json)
+{
+    char buf[32];
+    if (!json_get_str(json, "target", buf, sizeof(buf))) {
+        send_err(id, "missing target"); return;
+    }
+    uint32_t target = hex_to_u32(buf);
+    if (target == 0) { fntrace_arm_clear(); send_ok(id); return; }
+    fntrace_arm(target);
+    send_fmt("{\"id\":%d,\"ok\":true,\"target\":\"0x%08X\",\"armed\":%u}",
+             id, target, fntrace_arm_count());
+}
+
+static void handle_fntrace_arm_clear(int id, const char *json)
+{
+    (void)json;
+    fntrace_arm_clear();
+    send_ok(id);
+}
+
+static void handle_fntrace_armed(int id, const char *json)
+{
+    (void)json;
+    const size_t BUF_SZ = 2048;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    uint32_t n = fntrace_arm_count();
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"count\":%u,\"targets\":[", id, n);
+    for (uint32_t i = 0; i < n; i++) {
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+                        "%s\"0x%08X\"", (i == 0) ? "" : ",", fntrace_arm_get(i));
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_fntrace_clear(int id, const char *json)
+{
+    (void)json;
+    fntrace_clear();
+    send_ok(id);
+}
+
+/* fntrace_dump: paginated tail of the ring.
+ * Optional filters:
+ *   - target_lo / target_hi:  half-open virtual-address range filter on `target`
+ *   - count: max entries to return (default 256, cap = ring size)
+ * Walks newest-first; emits up to `count` matches.  When no filter is
+ * given, returns the most recent `count` entries verbatim. */
+static void handle_fntrace_dump(int id, const char *json)
+{
+    char buf[32];
+    uint32_t target_lo = 0, target_hi = 0xFFFFFFFFu;
+    if (json_get_str(json, "target_lo", buf, sizeof(buf))) target_lo = hex_to_u32(buf);
+    if (json_get_str(json, "target_hi", buf, sizeof(buf))) target_hi = hex_to_u32(buf);
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > (int)FNTRACE_RING_CAP) count = FNTRACE_RING_CAP;
+
+    uint64_t total = g_fntrace_seq;
+    uint64_t avail = (total < FNTRACE_RING_CAP) ? total : FNTRACE_RING_CAP;
+
+    const size_t BUF_SZ = 4 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+                    "\"target_lo\":\"0x%08X\",\"target_hi\":\"0x%08X\","
+                    "\"armed\":%u,\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)avail,
+                    target_lo, target_hi, fntrace_arm_count());
+    int emitted = 0;
+    for (uint64_t i = 0; i < avail && emitted < count; i++) {
+        uint64_t seq = total - 1 - i;
+        FntraceEntry *e = &g_fntrace_ring[seq & (FNTRACE_RING_CAP - 1u)];
+        if (e->target < target_lo || e->target >= target_hi) continue;
+        if (pos > BUF_SZ - 256) break;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"target\":\"0x%08X\","
+                        "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                        "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+                        "\"s3\":\"0x%08X\",\"frame\":%u}",
+                        emitted == 0 ? "" : ",",
+                        (unsigned long long)seq,
+                        e->target, e->ra, e->a0, e->a1, e->a2, e->a3,
+                        e->s3, e->frame);
         emitted++;
     }
     pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%d}\n", emitted);
@@ -3182,6 +3287,11 @@ static const CmdEntry s_commands[] = {
     { "sio_pc_trace",      handle_sio_pc_trace },
     { "dirty_ram_stats",   handle_dirty_ram_stats },
     { "dirty_block_log",   handle_dirty_block_log },
+    { "fntrace_arm",       handle_fntrace_arm },
+    { "fntrace_arm_clear", handle_fntrace_arm_clear },
+    { "fntrace_armed",     handle_fntrace_armed },
+    { "fntrace_clear",     handle_fntrace_clear },
+    { "fntrace_dump",      handle_fntrace_dump },
     { "unknown_dispatch_log", handle_unknown_dispatch_log },
     { "card_txn_dump",     handle_card_txn_dump },
     { "card_read_summary", handle_card_read_summary },

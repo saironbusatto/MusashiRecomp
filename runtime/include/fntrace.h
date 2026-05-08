@@ -1,0 +1,68 @@
+/* fntrace.h — always-on call ring for recomp psx_dispatch.
+ *
+ * Records every entry into psx_dispatch with the caller's argument
+ * registers and return address. Mirrors beetle_libretro.cpp's fntrace
+ * ring (same wire commands: fntrace_arm / fntrace_dump / fntrace_clear)
+ * so cross-process tools that already speak Beetle's protocol work
+ * unchanged against psx-runtime.
+ *
+ * Why "always-on" rather than arm-then-record: see CLAUDE.md global
+ * rule "Never time/attach for observability". The ring captures every
+ * dispatch from boot; arming only narrows what the dump command
+ * reports, never what is recorded. To investigate a window of
+ * interest, fntrace_dump it after the fact.
+ *
+ * Coverage: every psx_dispatch entry — both static-recompiled targets
+ * (ROM functions, shell-relocated functions) and dirty-RAM dispatches.
+ * dirty_ram_block_log overlaps with the dirty-RAM subset; this ring is
+ * the superset.
+ */
+#ifndef PSXRECOMP_V4_FNTRACE_H
+#define PSXRECOMP_V4_FNTRACE_H
+
+#include <stdint.h>
+#include "cpu_state.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* 4M entries × 32 bytes = 128 MB.  At ~580K dispatches/s peak (boot)
+ * that's ~7s; at ~10K/s during modal idle, ~400s.  Sized for press-
+ * window retrospectives without per-second eviction. */
+#define FNTRACE_RING_CAP (1u << 22)
+
+typedef struct {
+    uint32_t frame;     /* s_frame_count at dispatch */
+    uint32_t target;    /* psx_dispatch addr argument (virtual) */
+    uint32_t ra;        /* cpu->gpr[31] at dispatch — caller's return PC */
+    uint32_t a0;        /* cpu->gpr[4]  */
+    uint32_t a1;        /* cpu->gpr[5]  */
+    uint32_t a2;        /* cpu->gpr[6]  */
+    uint32_t a3;        /* cpu->gpr[7]  */
+    uint32_t s3;        /* cpu->gpr[19] — callee-saved, useful for arg-passing chains */
+} FntraceEntry;
+
+extern FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
+extern uint64_t     g_fntrace_seq;     /* monotonic; index into ring = seq % CAP */
+
+/* Hot path. Called from psx_dispatch on every entry. Inlinable. */
+void fntrace_record(CPUState* cpu, uint32_t target);
+
+/* Arm a target filter. arm_count == 0 means "record all" (default).
+ * When arm_count > 0, only dispatches whose target matches one of the
+ * armed entries are recorded. Use for noise reduction on a hot ring. */
+#define FNTRACE_ARM_MAX 32
+void fntrace_arm(uint32_t target);     /* add to arm list, or 0 to clear */
+void fntrace_arm_clear(void);
+uint32_t fntrace_arm_count(void);
+uint32_t fntrace_arm_get(uint32_t i);
+
+/* Reset ring (clears seq, leaves storage in place). */
+void fntrace_clear(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* PSXRECOMP_V4_FNTRACE_H */
