@@ -3543,9 +3543,13 @@ static void handle_wtrace_dump(int id, const char *json)
     uint32_t avail = (total < WRITE_TRACE_CAP) ? (uint32_t)total : WRITE_TRACE_CAP;
     uint32_t start = (total < WRITE_TRACE_CAP) ? 0 : s_wtrace_head;
 
-    /* 1 GB response buffer; emit up to MAX_OUT (effectively whole ring). */
-    const uint32_t MAX_OUT = WRITE_TRACE_CAP;
-    const size_t BUF_SZ = (size_t)1 * 1024 * 1024 * 1024;
+    int max_out = json_get_int(json, "count", 65536);
+    if (max_out < 1) max_out = 1;
+    if (max_out > WRITE_TRACE_CAP) max_out = WRITE_TRACE_CAP;
+
+    const uint32_t MAX_OUT = (uint32_t)max_out;
+    size_t BUF_SZ = 256u + (size_t)MAX_OUT * 256u;
+    if (BUF_SZ > (size_t)64 * 1024 * 1024) BUF_SZ = (size_t)64 * 1024 * 1024;
     char *buf = (char *)malloc(BUF_SZ);
     if (!buf) { send_err(id, "oom"); return; }
     size_t pos = 0;

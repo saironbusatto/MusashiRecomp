@@ -181,6 +181,7 @@ bool FullFunctionEmitter::emit_function(
 
     // Emit function body to a temporary buffer so we can prepend the
     // continuation entry-switch after we know which labels exist.
+    std::string branch_decls;
     std::string body;
     // Shadow 'out' with a reference to 'body' so all existing out+= lines
     // write to the temporary buffer.  The real 'out' is assembled at the end.
@@ -305,13 +306,14 @@ bool FullFunctionEmitter::emit_function(
     /* Emit branch-predicate variable declarations at function entry,
      * each initialized to 0.  Subsequent terminator-emit assigns instead of
      * declares, so a `goto label_X` that lands on the delay slot of a
-     * preceding beq does NOT execute the dangling `if (psx_taken_X) goto Y`
-     * with an indeterminate value (would be UB per C; on MinGW the stack
-     * garbage was non-zero, causing a spurious branch — root cause of the
-     * memcard COPY confirm-modal freeze in widget 0xB → BFC21800 loop). */
+     * preceding beq does NOT execute stale delay-slot branch resolution.
+     * Some BIOS blocks use the same address as both a branch delay slot and
+     * a normal branch target; the DELETE modal hit BFC21860 that way and
+     * reused the prior BFC2185C predicate, causing the BFC21800 loop. */
     for (const auto& [ds_addr, pb] : pending_at) {
+        branch_decls += fmt::format("    int psx_delay_{:08X} = 0;\n", pb.terminator_addr);
         if (is_branch_kind(pb.kind.c_str())) {
-            out += fmt::format("    int psx_taken_{:08X} = 0;\n", pb.terminator_addr);
+            branch_decls += fmt::format("    int psx_taken_{:08X} = 0;\n", pb.terminator_addr);
         }
     }
 
@@ -425,6 +427,9 @@ bool FullFunctionEmitter::emit_function(
                     // Standalone RFE (no pending JR): emit as-is with return.
                     out += fmt::format("    {}\n", tr.c_code);
                 }
+            }
+            if (kind != "rfe" && !orphaned_delay_slots.count(addr)) {
+                out += fmt::format("    psx_delay_{:08X} = 1;\n", addr);
             }
             // For J/JAL/JALR/JR: normally nothing emitted at terminator
             // address — resolution happens after delay slot.  But if the
@@ -615,6 +620,8 @@ bool FullFunctionEmitter::emit_function(
         if (pending_at.count(addr)) {
             const PendingBranch& pb = pending_at[addr];
             const std::string& kind = pb.kind;
+            out += fmt::format("    if (psx_delay_{:08X}) {{\n", pb.terminator_addr);
+            out += fmt::format("        psx_delay_{:08X} = 0;\n", pb.terminator_addr);
 
             if (is_branch_kind(kind.c_str())) {
                 // Conditional branch resolution.
@@ -791,6 +798,7 @@ bool FullFunctionEmitter::emit_function(
                 }
             }
             // RFE: already emitted at terminator address, no delay slot.
+            out += "    }\n";
         }
     }
 
@@ -857,6 +865,10 @@ bool FullFunctionEmitter::emit_function(
     // fn_filter at runtime).  Lets us see direct-jal call paths that
     // never go through psx_dispatch.
     out += fmt::format("    debug_server_log_call_entry(0x{:08X}u);\n", norm);
+    // Branch predicate locals must be initialized before the continuation
+    // switch. Continuation entry can jump directly to a merge block that reads
+    // a predicate set only on a different inbound path.
+    out += branch_decls;
 
     // If there are continuation labels, prepend an entry-switch so the
     // dispatch loop can route to internal labels when called from a

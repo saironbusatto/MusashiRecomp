@@ -25,6 +25,7 @@
 
 #include "dirty_ram_interp.h"
 #include "cpu_state.h"
+#include "interrupts.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -394,6 +395,12 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
  * not dirty). */
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
+
+    if (addr == 0x80000048u && psx_get_in_exception()) {
+        cpu->pc = 0;
+        psx_exception_longjmp(); /* does not return */
+    }
+
     if (!dirty_ram_is_dirty(phys)) return 0;
 
     /* Reset soft-fail state at block entry. */
