@@ -92,27 +92,33 @@ static std::filesystem::path resolve_memcard_dir(const char* requested,
                                                  const char* argv0) {
     namespace fs = std::filesystem;
     std::error_code ec;
+
+    // 1. Explicit --memcard-dir always wins.
     if (requested && requested[0]) return fs::path(requested);
 
-    fs::path absolute_bios = fs::absolute(bios_path, ec);
-    if (ec) absolute_bios = bios_path;
-    fs::path project_root = absolute_bios.parent_path().parent_path();
-    if (fs::exists(project_root / "card1.mcd", ec) ||
-        fs::exists(project_root / "card2.mcd", ec))
-        return project_root;
-
-    fs::path cwd = fs::current_path();
-    if (fs::exists(cwd / "card1.mcd", ec) || fs::exists(cwd / "card2.mcd", ec))
-        return cwd;
-
+    // 2. Locate exe directory (production layout anchor).
+    fs::path exe_dir;
     if (argv0 && argv0[0]) {
-        fs::path exe_dir = fs::absolute(argv0, ec).parent_path();
-        if (fs::exists(exe_dir / "card1.mcd", ec) ||
-            fs::exists(exe_dir / "card2.mcd", ec))
-            return exe_dir;
+        exe_dir = fs::absolute(argv0, ec).parent_path();
+        if (ec) exe_dir.clear();
+    }
+    if (exe_dir.empty()) exe_dir = fs::current_path();
+
+    // 3. Dev-build detection: exe lives inside a CMake build tree. Keep
+    //    cards in the project root (next to bios/) so a runtime rebuild
+    //    never blows them away.
+    bool is_dev_build = fs::exists(exe_dir / "CMakeFiles", ec) ||
+                        fs::exists(exe_dir / "CMakeCache.txt", ec) ||
+                        fs::exists(exe_dir.parent_path() / "CMakeCache.txt", ec);
+    if (is_dev_build) {
+        fs::path absolute_bios = fs::absolute(bios_path, ec);
+        if (ec) absolute_bios = bios_path;
+        fs::path project_root = absolute_bios.parent_path().parent_path();
+        return project_root;
     }
 
-    return cwd;
+    // 4. Production: cards sit next to the exe.
+    return exe_dir;
 }
 
 static void shutdown_runtime(void) {

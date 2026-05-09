@@ -796,8 +796,13 @@
     },
     {
       "address": "0xBFC09890",
-      "label": "card_copy_dispatch_miss_2026_05_05_safe",
-      "rationale": "Runtime dispatch miss: 120 hits during COPY. BANDAID per user permission. Bisect 2026-05-05 confirmed safe alone, but pair with 0xBFC0989C causes freeze and 0xBFC0989C alone causes crash (misaligned dispatch from caller 0xBFC09790). Suspected mid-function label, not true function entry. NOT seeding 0xBFC0989C."
+      "label": "card_cmd_is_not_read",
+      "rationale": "3-instruction predicate function: xori $v0,$a0,0x52; jr $ra; sltu $v0,$0,$v0. Returns ($a0 != 0x52 READ). Sibling of 0xBFC0989C."
+    },
+    {
+      "address": "0xBFC0989C",
+      "label": "card_cmd_is_not_write_2026_05_09",
+      "rationale": "3-instruction predicate function: xori $v0,$a0,0x51; jr $ra; sltu $v0,$0,$v0. Returns ($a0 != 0x51 WRITE). Sibling of 0xBFC09890. Discovery missed it because it sits between 0xBFC09898 (end of 0xBFC09890) and 0xBFC098A8 (next discovered fn). Called via JALR at 0xBFC09788 in func_1FC09598 — without this seed, JALR dispatches to unknown, write predicate returns junk via uninitialized v0, BIOS COPY silently no-ops the SIO write protocol (60 misses per copy, no 0x57 ever sent). Earlier bisect (2026-05-05) said this crashed; that was before the predicate-init fix and dispatch-miss class fixes. Retry 2026-05-09."
     },
     {
       "address": "0xBFC098A8",
