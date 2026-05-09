@@ -136,6 +136,13 @@ extern uint32_t g_debug_last_store_pc;
  * "sio_pc_trace". */
 void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width);
 
+/* Targeted generated-PC probe ring used for narrow control-flow diagnostics. */
+void debug_server_log_probe(uint32_t pc, CPUState *cpu);
+
+/* RestoreState / exception longjmp tracer. Records nonlocal exception
+ * control-flow events that can skip normal function epilogues. */
+void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t jmp_val);
+
 /* ---- Watchpoint notifications ---- */
 
 void debug_server_check_watchpoints(void);

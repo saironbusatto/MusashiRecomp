@@ -44,6 +44,17 @@ static uint32_t normalize_address(uint32_t addr) {
     return phys;
 }
 
+static uint32_t ram_alias_to_rom(uint32_t addr) {
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys >= 0x00000500u && phys < 0x00008500u) {
+        return 0xBFC10000u + (phys - 0x00000500u);
+    }
+    if (phys >= 0x00030000u && phys <= 0x0005AFFFu) {
+        return 0xBFC18000u + (phys - 0x00030000u);
+    }
+    return addr;
+}
+
 // Relocated code (Shell, Kernel Part 2) runs at RAM addresses, not ROM
 // addresses. J/JAL targets use (PC & 0xF0000000) as the region base, so
 // when the instruction is analyzed at its ROM address the target lands in
@@ -422,20 +433,14 @@ FunctionDiscovery::SingleFunctionResult FunctionDiscovery::walk_function(
                         uint32_t tb = (lui_v + (fa[0] ? (uint32_t)(int32_t)av[0] : 0u))
                                     + (uint32_t)lw_off;
                         // tb is a RAM address; map to ROM for reading.
-                        uint32_t tb_phys = tb & 0x1FFFFFFFu;
-                        uint32_t rom_tb = tb;
-                        if (tb_phys >= 0x00030000u && tb_phys <= 0x0005AFFFu)
-                            rom_tb = 0xBFC18000u + (tb_phys - 0x00030000u);
+                        uint32_t rom_tb = ram_alias_to_rom(tb);
 
                         for (uint32_t i = 0; i < tc; i++) {
                             uint32_t taddr = rom_tb + i * 4;
                             if (!in_bounds(taddr)) continue;
                             uint32_t tval = fetch(taddr);
                             // tval is a RAM address; map to ROM.
-                            uint32_t tv_phys = tval & 0x1FFFFFFFu;
-                            uint32_t rom_target = tval;
-                            if (tv_phys >= 0x00030000u && tv_phys <= 0x0005AFFFu)
-                                rom_target = 0xBFC18000u + (tv_phys - 0x00030000u);
+                            uint32_t rom_target = ram_alias_to_rom(tval);
 
                             if (in_bounds(rom_target)) {
                                 work.push(rom_target);

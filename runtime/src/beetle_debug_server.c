@@ -2,7 +2,8 @@
  *
  * Mirrors the wire protocol of psx-runtime's runtime/src/debug_server.c
  * for the commands that apply to a libretro core: ping, read_ram, press,
- * set_input, clear_input, pad_status, screenshot_file, wtrace_*, fntrace_*.
+ * set_input, clear_input, pad_status, screenshot_file, sio_trace_*,
+ * wtrace_*, fntrace_*.
  *
  * Default port: 4380 (compile-time DEFAULT_DEBUG_PORT).
  * JSON-over-newline protocol, same as recomp side.
@@ -46,6 +47,7 @@ extern uint32_t beetle_get_sio_trace(uint32_t *out_seq, uint8_t *out_tx,
                                       uint8_t *out_rx, uint16_t *out_ctrl,
                                       int max_count);
 extern uint32_t beetle_get_sio_trace_total(void);
+extern void     beetle_reset_sio_trace(void);
 
 /* wtrace */
 extern int      beetle_wtrace_arm(uint32_t lo, uint32_t hi);
@@ -274,6 +276,102 @@ static void h_screenshot_file(int id, const char *json) {
              id, path, w, h);
 }
 
+/* ---- SIO trace ---- */
+static void h_sio_trace_reset(int id, const char *json) {
+    (void)json;
+    beetle_reset_sio_trace();
+    send_ok(id);
+}
+
+static void h_sio_trace(int id, const char *json) {
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 65536) count = 65536;
+
+    uint32_t *seqs = (uint32_t*)malloc(count * sizeof(uint32_t));
+    uint8_t  *txs  = (uint8_t*) malloc(count);
+    uint8_t  *rxs  = (uint8_t*) malloc(count);
+    uint16_t *ctrl = (uint16_t*)malloc(count * sizeof(uint16_t));
+    if (!seqs || !txs || !rxs || !ctrl) {
+        free(seqs); free(txs); free(rxs); free(ctrl);
+        send_err(id, "alloc"); return;
+    }
+
+    uint32_t got = beetle_get_sio_trace(seqs, txs, rxs, ctrl, count);
+    uint32_t total = beetle_get_sio_trace_total();
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"count\":%u,\"entries\":[",
+             id, total, got);
+    for (uint32_t i = 0; i < got; i++) {
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"seq\":%u,\"tx\":\"0x%02X\",\"rx\":\"0x%02X\","
+                 "\"ctrl\":\"0x%04X\"}",
+                 seqs[i], txs[i], rxs[i], ctrl[i]);
+    }
+    send_fmt("]}\n");
+
+    free(seqs); free(txs); free(rxs); free(ctrl);
+}
+
+static void h_sio_write_window(int id, const char *json) {
+    int which = json_get_int(json, "which", 0);
+    int before = json_get_int(json, "before", 4);
+    int after = json_get_int(json, "after", 156);
+    if (which < 0) which = 0;
+    if (before < 0) before = 0;
+    if (before > 64) before = 64;
+    if (after < 1) after = 1;
+    if (after > 512) after = 512;
+
+    const int count = 65536;
+    uint32_t *seqs = (uint32_t*)malloc(count * sizeof(uint32_t));
+    uint8_t  *txs  = (uint8_t*) malloc(count);
+    uint8_t  *rxs  = (uint8_t*) malloc(count);
+    uint16_t *ctrl = (uint16_t*)malloc(count * sizeof(uint16_t));
+    if (!seqs || !txs || !rxs || !ctrl) {
+        free(seqs); free(txs); free(rxs); free(ctrl);
+        send_err(id, "alloc"); return;
+    }
+
+    uint32_t got = beetle_get_sio_trace(seqs, txs, rxs, ctrl, count);
+    uint32_t total = beetle_get_sio_trace_total();
+    int write_count = 0;
+    int start_idx = -1;
+    for (uint32_t i = 0; i + 1 < got; i++) {
+        if (txs[i] == 0x81 && txs[i + 1] == 0x57) {
+            if (write_count == which) start_idx = (int)i;
+            write_count++;
+        }
+    }
+
+    if (start_idx < 0) {
+        send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"count\":%u,"
+                 "\"write_count\":%d,\"found\":false}\n",
+                 id, total, got, write_count);
+        free(seqs); free(txs); free(rxs); free(ctrl);
+        return;
+    }
+
+    int window_start = start_idx - before;
+    if (window_start < 0) window_start = 0;
+    int window_end = start_idx + after;
+    if (window_end > (int)got) window_end = (int)got;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"count\":%u,"
+             "\"write_count\":%d,\"found\":true,\"which\":%d,"
+             "\"start_seq\":%u,\"expected_write_bytes\":138,\"entries\":[",
+             id, total, got, write_count, which, seqs[start_idx]);
+    for (int i = window_start; i < window_end; i++) {
+        if (i > window_start) send_fmt(",");
+        send_fmt("{\"rel\":%d,\"seq\":%u,\"tx\":\"0x%02X\",\"rx\":\"0x%02X\","
+                 "\"ctrl\":\"0x%04X\"}",
+                 i - start_idx, seqs[i], txs[i], rxs[i], ctrl[i]);
+    }
+    send_fmt("]}\n");
+
+    free(seqs); free(txs); free(rxs); free(ctrl);
+}
+
 /* ---- wtrace ---- */
 static void h_wtrace_arm(int id, const char *json) {
     char lo_s[32] = {0}, hi_s[32] = {0};
@@ -444,6 +542,9 @@ static const CmdEntry CMDS[] = {
     { "clear_input",           h_clear_input },
     { "pad_status",            h_pad_status },
     { "screenshot_file",       h_screenshot_file },
+    { "sio_trace_reset",       h_sio_trace_reset },
+    { "sio_trace",             h_sio_trace },
+    { "sio_write_window",      h_sio_write_window },
     { "wtrace_arm",            h_wtrace_arm },
     { "wtrace_disarm",         h_wtrace_disarm },
     { "wtrace_reset",          h_wtrace_reset },

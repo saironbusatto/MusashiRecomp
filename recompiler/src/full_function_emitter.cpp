@@ -35,6 +35,17 @@ uint32_t FullFunctionEmitter::normalize_address(uint32_t addr) {
     return phys;
 }
 
+static uint32_t ram_alias_to_rom(uint32_t addr) {
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys >= 0x00000500u && phys < 0x00008500u) {
+        return 0xBFC10000u + (phys - 0x00000500u);
+    }
+    if (phys >= 0x00030000u && phys <= 0x0005AFFFu) {
+        return 0xBFC18000u + (phys - 0x00030000u);
+    }
+    return addr;
+}
+
 uint32_t FullFunctionEmitter::read_u32_le(const std::vector<uint8_t>& rom, uint32_t offset) {
     return  static_cast<uint32_t>(rom[offset + 0])
          | (static_cast<uint32_t>(rom[offset + 1]) << 8)
@@ -304,6 +315,24 @@ bool FullFunctionEmitter::emit_function(
         }
     }
 
+    auto should_probe_pc = [](uint32_t pc) -> bool {
+        switch (pc) {
+        case 0xBFC148DCu:
+        case 0xBFC148F0u:
+        case 0xBFC148F8u:
+        case 0xBFC14900u:
+        case 0xBFC14908u:
+        case 0xBFC14934u:
+        case 0xBFC14F80u:
+        case 0xBFC15174u:
+        case 0xBFC15178u:
+        case 0xBFC15E80u:
+            return true;
+        default:
+            return false;
+        }
+    };
+
     for (auto it = addr_to_raw.begin(); it != addr_to_raw.end(); ++it) {
         uint32_t addr = it->first;
         uint32_t raw = it->second;
@@ -324,6 +353,9 @@ bool FullFunctionEmitter::emit_function(
                 out += "#endif\n";
             }
             out += "    psx_check_interrupts(cpu);\n";
+            if (should_probe_pc(addr)) {
+                out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n", addr);
+            }
         }
 
         // Decode and translate.
@@ -615,7 +647,15 @@ bool FullFunctionEmitter::emit_function(
                 uint32_t return_addr = relocate_ra(pb.terminator_addr + 8);
                 out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
                 // Regular call: always go through psx_dispatch (handles tail-call loop).
+                if (target == 0x00006380u) {
+                    out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
+                                       pb.terminator_addr);
+                }
                 out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
+                if (target == 0x00006380u) {
+                    out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
+                                       pb.terminator_addr + 1);
+                }
                 // Safety net: if continuation falls outside this function, tail-call to it.
                 if (!addr_to_raw.count(pb.terminator_addr + 8)) {
                     out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jal cont: outside func */\n", return_addr);
@@ -710,10 +750,7 @@ bool FullFunctionEmitter::emit_function(
                             uint32_t tb = (lui_v + (fa[0] ? (uint32_t)(int32_t)av[0] : 0u))
                                         + (uint32_t)lw_off;
                             // Map RAM table address to ROM for reading.
-                            uint32_t tb_phys = tb & 0x1FFFFFFFu;
-                            uint32_t rom_tb = tb;
-                            if (tb_phys >= 0x00030000u && tb_phys <= 0x0005AFFFu)
-                                rom_tb = 0xBFC18000u + (tb_phys - 0x00030000u);
+                            uint32_t rom_tb = ram_alias_to_rom(tb);
 
                             // Read table entries and map to ROM labels.
                             // Deduplicate by runtime address to avoid duplicate
@@ -726,10 +763,7 @@ bool FullFunctionEmitter::emit_function(
                                 if (rom_off + i*4 + 3 >= rom.size()) break;
                                 uint32_t rv = read_u32_le(rom, rom_off + i * 4);
                                 if (!seen_runtime.insert(rv).second) continue;
-                                uint32_t rv_phys = rv & 0x1FFFFFFFu;
-                                uint32_t rom_target = rv;
-                                if (rv_phys >= 0x00030000u && rv_phys <= 0x0005AFFFu)
-                                    rom_target = 0xBFC18000u + (rv_phys - 0x00030000u);
+                                uint32_t rom_target = ram_alias_to_rom(rv);
                                 if (addr_to_raw.count(rom_target) && block_leaders.count(rom_target))
                                     targets.push_back({rv, rom_target});
                             }
@@ -925,10 +959,14 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);\n";
     out += "extern void fntrace_record(CPUState* cpu, uint32_t target);\n";
     out += "\n";
+    out += "int g_psx_dispatch_depth = 0;\n\n";
     out += "void psx_dispatch(CPUState* cpu, uint32_t addr) {\n";
     out += "    /* Tail-call trampoline: functions signal tail calls by setting\n";
     out += "     * cpu->pc to the target and returning. We loop here to re-dispatch\n";
-    out += "     * without growing the native stack. */\n";
+    out += "     * without growing the native stack. Interrupts are only checked when\n";
+    out += "     * the outermost dispatch returns, so a nested callee cannot interrupt\n";
+    out += "     * before its generated caller runs the post-call continuation. */\n";
+    out += "    int outermost = (g_psx_dispatch_depth++ == 0);\n";
     out += "    for (;;) {\n";
     out += "        /* Always-on call ring: every iteration counts as a separate\n";
     out += "         * call (initial entry + each tail-call re-dispatch). a0..a3\n";
@@ -964,7 +1002,13 @@ void FullFunctionEmitter::emit_dispatch(
     out += "                psx_unknown_dispatch(cpu, addr, phys);\n";
     out += "            }\n";
     out += "        }\n";
-    out += "        if (cpu->pc == 0) { psx_check_interrupts(cpu); return; }\n";
+    out += "        if (cpu->pc == 0) {\n";
+    out += "            --g_psx_dispatch_depth;\n";
+    out += "            if (outermost) {\n";
+    out += "                psx_check_interrupts(cpu);\n";
+    out += "            }\n";
+    out += "            return;\n";
+    out += "        }\n";
     out += "        addr = cpu->pc;  /* tail call: re-dispatch */\n";
     out += "    }\n";
     out += "}\n";
@@ -1032,6 +1076,7 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
     full_c += "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
+    full_c += "extern void debug_server_log_probe(uint32_t pc, CPUState *cpu);\n";
     full_c += "extern uint32_t g_debug_last_store_pc;\n";
     full_c += "/* Phase 1.0e-d: per-block guest cycle accounting.\n";
     full_c += " * Compile generated code with -DPSX_ENABLE_BLOCK_CYCLES=1 to\n";
