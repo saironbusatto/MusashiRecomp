@@ -8823,10 +8823,15 @@ static uint32_t normalize(uint32_t addr) {
 extern int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);
 extern void fntrace_record(CPUState* cpu, uint32_t target);
 
+int g_psx_dispatch_depth = 0;
+
 void psx_dispatch(CPUState* cpu, uint32_t addr) {
     /* Tail-call trampoline: functions signal tail calls by setting
      * cpu->pc to the target and returning. We loop here to re-dispatch
-     * without growing the native stack. */
+     * without growing the native stack. Interrupts are only checked when
+     * the outermost dispatch returns, so a nested callee cannot interrupt
+     * before its generated caller runs the post-call continuation. */
+    int outermost = (g_psx_dispatch_depth++ == 0);
     for (;;) {
         /* Always-on call ring: every iteration counts as a separate
          * call (initial entry + each tail-call re-dispatch). a0..a3
@@ -8862,7 +8867,13 @@ void psx_dispatch(CPUState* cpu, uint32_t addr) {
                 psx_unknown_dispatch(cpu, addr, phys);
             }
         }
-        if (cpu->pc == 0) { psx_check_interrupts(cpu); return; }
+        if (cpu->pc == 0) {
+            --g_psx_dispatch_depth;
+            if (outermost) {
+                psx_check_interrupts(cpu);
+            }
+            return;
+        }
         addr = cpu->pc;  /* tail call: re-dispatch */
     }
 }

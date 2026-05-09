@@ -6,7 +6,7 @@
  *   - beetle_get_framebuffer / beetle_get_pad           (display + input)
  *   - beetle_read_byte / beetle_read_word               (RAM read)
  *   - beetle_get_ram / beetle_get_vram / beetle_get_scratchpad
- *   - SIO trace ring buffer (beetle_get_sio_trace, beetle_get_sio_trace_total)
+ *   - SIO trace ring buffer (beetle_get_sio_trace/reset/total)
  *   - wtrace ring buffer (beetle_wtrace_arm/disarm/reset/get/total/...)
  *   - fntrace ring buffer (beetle_fntrace_arm/disarm/reset/get/total/...)
  */
@@ -426,6 +426,11 @@ extern "C" uint32_t beetle_get_sio_trace(uint32_t *out_seq, uint8_t *out_tx,
     return (uint32_t)count;
 }
 extern "C" uint32_t beetle_get_sio_trace_total(void) { return s_sio_trace_seq; }
+extern "C" void beetle_reset_sio_trace(void) {
+    s_sio_trace_idx = 0;
+    s_sio_trace_seq = 0;
+    memset(s_sio_trace, 0, sizeof(s_sio_trace));
+}
 
 /* ---- wtrace accessors ---- */
 extern "C" int beetle_wtrace_arm(uint32_t lo, uint32_t hi) {

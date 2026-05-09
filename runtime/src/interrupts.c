@@ -31,6 +31,7 @@
 #include "gpu.h"
 #include "cdrom.h"
 #include "cpu_state.h"
+#include "debug_server.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
@@ -74,6 +75,7 @@ static int post_exception_cooldown;
 
 /* setjmp target for ReturnFromException during handler dispatch. */
 static jmp_buf exception_jmpbuf;
+extern int g_psx_dispatch_depth;
 
 int psx_get_in_exception(void) { return in_exception; }
 
@@ -94,6 +96,7 @@ void psx_get_freeze_diag(uint64_t *out_total_checks,
 void interrupts_init(void) {
     dispatch_count = 0;
     in_exception = 0;
+    g_psx_dispatch_depth = 0;
     total_checks = 0;
     post_exception_cooldown = 0;
     exception_entries_total = 0;
@@ -115,12 +118,15 @@ void interrupts_init(void) {
  * code resume at the saved EPC through normal dispatch.
  */
 void psx_exception_longjmp(void) {
+    debug_server_log_restore_event(2, debug_cpu_ptr ? debug_cpu_ptr->pc : 0, 1);
     longjmp(exception_jmpbuf, 1);
 }
 
 void psx_restore_state_escape(void) {
-    if (in_exception)
+    if (in_exception) {
+        debug_server_log_restore_event(1, debug_cpu_ptr ? debug_cpu_ptr->pc : 0, 2);
         longjmp(exception_jmpbuf, 2);
+    }
     /* Not in exception context — return normally, let caller's `return;` handle it. */
 }
 
@@ -156,14 +162,16 @@ void psx_check_interrupts(CPUState* cpu) {
     }
     if (!in_exception) {
 #if SIO_MODEL_CYCLE_PACED
-        /* Phase 1.0c-v2: advance cycle-paced SIO bus by one quantum, but
-         * only when something is actually pending. g_sio_timing_active
-         * stays 0 throughout 1.0c-v2 (TX path still synchronous, never
+        /* Builds without block-cycle accounting need a small dispatch-loop
+         * SIO quantum. With PSX_ENABLE_BLOCK_CYCLES, psx_advance_cycles()
+         * already drives SIO timing, so the fixed quantum would double-count.
          * arms shift/ack), so this gate never opens — per-call cost on
          * this hot path is one volatile load + one branch. */
+#ifndef PSX_ENABLE_BLOCK_CYCLES
         if (g_sio_timing_active) {
             sio_tick_quantum();
         }
+#endif
 #endif
         dispatch_count++;
         if (dispatch_count >= VBLANK_INTERVAL) {
@@ -282,8 +290,14 @@ void psx_check_interrupts(CPUState* cpu) {
             /* RestoreState redirect: re-dispatch to cpu->pc.
              * GPRs were already set by RestoreState — do NOT restore.
              * Stay in exception context so ReturnFromException works. */
+            g_psx_dispatch_depth = 0;
+            debug_server_log_restore_event(3, cpu->pc, (uint32_t)jmp_val);
             target_pc = cpu->pc;
             continue;
+        }
+        if (jmp_val == 1) {
+            g_psx_dispatch_depth = 0;
+            debug_server_log_restore_event(4, cpu->pc, (uint32_t)jmp_val);
         }
         if (jmp_val == 0) {
             /* Normal entry (or after RestoreState redirect): dispatch. */

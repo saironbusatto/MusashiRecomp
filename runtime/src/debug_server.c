@@ -136,8 +136,12 @@ uint32_t g_debug_last_store_pc = 0;
  * Captures (pc, addr, value, byte_seq, ctr) for every write to a SIO
  * register, attributing the exact writing instruction.  Used to find what
  * code is putting bytes on the SIO bus when chain-dispatcher attribution
- * (g_debug_current_func_addr) is too coarse. 1<<16 = 64K entries. */
-#define SIO_PC_TRACE_CAP (1 << 16)
+ * (g_debug_current_func_addr) is too coarse.
+ *
+ * 1<<22 entries x 32 bytes = 128 MiB. This is intentionally much larger
+ * than the old 64K ring because BIOS pad/card polling can burn through
+ * tens of thousands of MMIO writes before a useful post-failure query. */
+#define SIO_PC_TRACE_CAP (1 << 22)
 typedef struct {
     uint64_t seq;
     uint32_t pc;            /* g_debug_last_store_pc at the moment of write */
@@ -151,15 +155,194 @@ typedef struct {
 static SioPcTraceEntry s_sio_pc_trace[SIO_PC_TRACE_CAP];
 static uint64_t s_sio_pc_trace_seq = 0;
 
+/* Compact register sidecar for SIO_CTRL writes.  The broad SIO PC ring keeps
+ * the long timeline; this smaller ring carries the CPU state needed to explain
+ * BIOS chain-driver branch decisions around SELECT resets. */
+#define SIO_CTRL_REG_TRACE_CAP (1 << 16)
+typedef struct {
+    uint64_t seq;
+    uint32_t pc;
+    uint32_t func;
+    uint32_t value;
+    uint32_t byte_seq;
+    uint32_t cpu_pc;
+    uint32_t ra;
+    uint32_t sp;
+    uint32_t v0;
+    uint32_t v1;
+    uint32_t a0;
+    uint32_t a1;
+    uint32_t a2;
+    uint32_t a3;
+    uint32_t sr;
+    uint32_t epc;
+    uint32_t istat;
+    uint32_t imask;
+    uint8_t  width;
+    uint8_t  in_exception;
+    uint8_t  counter_7514;
+    uint8_t  pad;
+} SioCtrlRegTraceEntry;
+static SioCtrlRegTraceEntry s_sio_ctrl_reg_trace[SIO_CTRL_REG_TRACE_CAP];
+static uint64_t s_sio_ctrl_reg_trace_seq = 0;
+
+/* RestoreState / exception longjmp trace.  This is intentionally compact:
+ * the high-volume SIO/MMIO rings show what happened on the bus, while this
+ * ring shows whether exception nonlocal control flow skipped a callback's
+ * normal return-value cleanup. */
+#define RESTORE_TRACE_CAP (1 << 16)
+typedef struct {
+    uint64_t seq;
+    uint32_t kind;
+    uint32_t jmp_val;
+    uint32_t target_pc;
+    uint32_t cpu_pc;
+    uint32_t func;
+    uint32_t last_store_pc;
+    uint32_t byte_seq;
+    uint32_t ra;
+    uint32_t sp;
+    uint32_t v0;
+    uint32_t v1;
+    uint32_t a0;
+    uint32_t a1;
+    uint32_t a2;
+    uint32_t a3;
+    uint32_t s0;
+    uint32_t s1;
+    uint32_t sr;
+    uint32_t epc;
+    uint32_t istat;
+    uint32_t imask;
+    uint32_t frame;
+    uint8_t  in_exception;
+    uint8_t  pad[3];
+} RestoreTraceEntry;
+static RestoreTraceEntry s_restore_trace[RESTORE_TRACE_CAP];
+static uint64_t s_restore_trace_seq = 0;
+
+#define PROBE_TRACE_CAP (1 << 16)
+typedef struct {
+    uint64_t seq;
+    uint32_t pc;
+    uint32_t func;
+    uint32_t last_store_pc;
+    uint32_t byte_seq;
+    uint32_t ra;
+    uint32_t sp;
+    uint32_t v0;
+    uint32_t v1;
+    uint32_t a0;
+    uint32_t a1;
+    uint32_t a2;
+    uint32_t a3;
+    uint32_t sr;
+    uint32_t epc;
+    uint32_t istat;
+    uint32_t imask;
+    uint32_t frame;
+    uint8_t  in_exception;
+    uint8_t  pad[3];
+} ProbeTraceEntry;
+static ProbeTraceEntry s_probe_trace[PROBE_TRACE_CAP];
+static uint64_t s_probe_trace_seq = 0;
+
+void debug_server_log_probe(uint32_t pc, CPUState *cpu)
+{
+    if (!cpu) return;
+    ProbeTraceEntry *e = &s_probe_trace[s_probe_trace_seq % PROBE_TRACE_CAP];
+    e->seq          = s_probe_trace_seq++;
+    e->pc           = pc;
+    e->func         = g_debug_current_func_addr;
+    e->last_store_pc = g_debug_last_store_pc;
+    e->byte_seq     = sio_get_seq();
+    e->ra           = cpu->gpr[31];
+    e->sp           = cpu->gpr[29];
+    e->v0           = cpu->gpr[2];
+    e->v1           = cpu->gpr[3];
+    e->a0           = cpu->gpr[4];
+    e->a1           = cpu->gpr[5];
+    e->a2           = cpu->gpr[6];
+    e->a3           = cpu->gpr[7];
+    e->sr           = cpu->cop0[12];
+    e->epc          = cpu->cop0[14];
+    e->istat        = i_stat;
+    e->imask        = i_mask;
+    e->frame        = (uint32_t)s_frame_count;
+    e->in_exception = (uint8_t)psx_get_in_exception();
+}
+
+void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t jmp_val)
+{
+    RestoreTraceEntry *e =
+        &s_restore_trace[s_restore_trace_seq % RESTORE_TRACE_CAP];
+    CPUState *cpu = s_cpu;
+    e->seq           = s_restore_trace_seq++;
+    e->kind          = kind;
+    e->jmp_val       = jmp_val;
+    e->target_pc     = target_pc;
+    e->cpu_pc        = cpu ? cpu->pc      : 0;
+    e->func          = g_debug_current_func_addr;
+    e->last_store_pc = g_debug_last_store_pc;
+    e->byte_seq      = sio_get_seq();
+    e->ra            = cpu ? cpu->gpr[31] : 0;
+    e->sp            = cpu ? cpu->gpr[29] : 0;
+    e->v0            = cpu ? cpu->gpr[2]  : 0;
+    e->v1            = cpu ? cpu->gpr[3]  : 0;
+    e->a0            = cpu ? cpu->gpr[4]  : 0;
+    e->a1            = cpu ? cpu->gpr[5]  : 0;
+    e->a2            = cpu ? cpu->gpr[6]  : 0;
+    e->a3            = cpu ? cpu->gpr[7]  : 0;
+    e->s0            = cpu ? cpu->gpr[16] : 0;
+    e->s1            = cpu ? cpu->gpr[17] : 0;
+    e->sr            = cpu ? cpu->cop0[12] : 0;
+    e->epc           = cpu ? cpu->cop0[14] : 0;
+    e->istat         = i_stat;
+    e->imask         = i_mask;
+    e->frame         = (uint32_t)s_frame_count;
+    e->in_exception  = (uint8_t)psx_get_in_exception();
+}
+
+static void debug_server_log_sio_ctrl_regs(uint32_t value, uint8_t width,
+                                           uint32_t byte_seq) {
+    SioCtrlRegTraceEntry *e =
+        &s_sio_ctrl_reg_trace[s_sio_ctrl_reg_trace_seq % SIO_CTRL_REG_TRACE_CAP];
+    CPUState *cpu = s_cpu;
+    e->seq      = s_sio_ctrl_reg_trace_seq++;
+    e->pc       = g_debug_last_store_pc;
+    e->func     = g_debug_current_func_addr;
+    e->value    = value;
+    e->byte_seq = byte_seq;
+    e->cpu_pc   = cpu ? cpu->pc      : 0;
+    e->ra       = cpu ? cpu->gpr[31] : 0;
+    e->sp       = cpu ? cpu->gpr[29] : 0;
+    e->v0       = cpu ? cpu->gpr[2]  : 0;
+    e->v1       = cpu ? cpu->gpr[3]  : 0;
+    e->a0       = cpu ? cpu->gpr[4]  : 0;
+    e->a1       = cpu ? cpu->gpr[5]  : 0;
+    e->a2       = cpu ? cpu->gpr[6]  : 0;
+    e->a3       = cpu ? cpu->gpr[7]  : 0;
+    e->sr       = cpu ? cpu->cop0[12] : 0;
+    e->epc      = cpu ? cpu->cop0[14] : 0;
+    e->istat    = i_stat;
+    e->imask    = i_mask;
+    e->width    = width;
+    e->in_exception = (uint8_t)psx_get_in_exception();
+    e->counter_7514 = psx_read_byte(0x7514);
+}
+
 void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width) {
     SioPcTraceEntry *e = &s_sio_pc_trace[s_sio_pc_trace_seq % SIO_PC_TRACE_CAP];
+    uint32_t byte_seq = sio_get_seq();
     e->seq      = s_sio_pc_trace_seq++;
     e->pc       = g_debug_last_store_pc;
     e->func     = g_debug_current_func_addr;
     e->addr     = addr;
     e->value    = value;
-    e->byte_seq = sio_get_seq();
+    e->byte_seq = byte_seq;
     e->width    = width;
+    if (addr == 0x1F80104Au)
+        debug_server_log_sio_ctrl_regs(value, width, byte_seq);
 }
 
 /* ---- Dispatch trace ring buffer ----
@@ -898,12 +1081,28 @@ static void handle_fntrace_dump(int id, const char *json)
     uint32_t target_lo = 0, target_hi = 0xFFFFFFFFu;
     if (json_get_str(json, "target_lo", buf, sizeof(buf))) target_lo = hex_to_u32(buf);
     if (json_get_str(json, "target_hi", buf, sizeof(buf))) target_hi = hex_to_u32(buf);
+    uint64_t seq_lo = 0, seq_hi = 0;
+    int have_seq_window = 0;
+    if (json_get_str(json, "seq_lo", buf, sizeof(buf))) {
+        seq_lo = strtoull(buf, NULL, 0);
+        have_seq_window = 1;
+    }
+    if (json_get_str(json, "seq_hi", buf, sizeof(buf))) {
+        seq_hi = strtoull(buf, NULL, 0);
+        have_seq_window = 1;
+    }
     int count = json_get_int(json, "count", 256);
     if (count < 1) count = 1;
     if (count > (int)FNTRACE_RING_CAP) count = FNTRACE_RING_CAP;
 
     uint64_t total = g_fntrace_seq;
     uint64_t avail = (total < FNTRACE_RING_CAP) ? total : FNTRACE_RING_CAP;
+    uint64_t oldest = total - avail;
+    if (have_seq_window) {
+        if (seq_hi == 0 || seq_hi > total) seq_hi = total;
+        if (seq_lo < oldest) seq_lo = oldest;
+        if (seq_lo > seq_hi) seq_lo = seq_hi;
+    }
 
     const size_t BUF_SZ = 4 * 1024 * 1024;
     char *out = (char *)malloc(BUF_SZ);
@@ -911,13 +1110,17 @@ static void handle_fntrace_dump(int id, const char *json)
     size_t pos = 0;
     pos += snprintf(out + pos, BUF_SZ - pos,
                     "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+                    "\"seq_lo\":%llu,\"seq_hi\":%llu,"
                     "\"target_lo\":\"0x%08X\",\"target_hi\":\"0x%08X\","
                     "\"armed\":%u,\"entries\":[",
                     id, (unsigned long long)total, (unsigned long long)avail,
+                    (unsigned long long)(have_seq_window ? seq_lo : 0),
+                    (unsigned long long)(have_seq_window ? seq_hi : 0),
                     target_lo, target_hi, fntrace_arm_count());
     int emitted = 0;
-    for (uint64_t i = 0; i < avail && emitted < count; i++) {
-        uint64_t seq = total - 1 - i;
+    uint64_t scan_count = have_seq_window ? (seq_hi - seq_lo) : avail;
+    for (uint64_t i = 0; i < scan_count && emitted < count; i++) {
+        uint64_t seq = have_seq_window ? (seq_lo + i) : (total - 1 - i);
         FntraceEntry *e = &g_fntrace_ring[seq & (FNTRACE_RING_CAP - 1u)];
         if (e->target < target_lo || e->target >= target_hi) continue;
         if (pos > BUF_SZ - 256) break;
@@ -1081,10 +1284,273 @@ static void handle_sio_pc_trace(int id, const char *json)
     send_fmt("]}\n");
 }
 
+static void handle_sio_pc_window(int id, const char *json)
+{
+    int seq = json_get_int(json, "byte_seq", -1);
+    int before = json_get_int(json, "before", 8);
+    int after = json_get_int(json, "after", 16);
+    char addr_lo_buf[32], addr_hi_buf[32];
+    uint32_t addr_lo = 0, addr_hi = 0;
+    if (json_get_str(json, "addr_lo", addr_lo_buf, sizeof(addr_lo_buf)))
+        addr_lo = hex_to_u32(addr_lo_buf);
+    if (json_get_str(json, "addr_hi", addr_hi_buf, sizeof(addr_hi_buf)))
+        addr_hi = hex_to_u32(addr_hi_buf);
+    int filter = (addr_hi > addr_lo);
+    if (seq < 0) { send_err(id, "missing byte_seq"); return; }
+    if (before < 0) before = 0;
+    if (after < 0) after = 0;
+
+    uint32_t lo = (uint32_t)((seq > before) ? (seq - before) : 0);
+    uint32_t hi = (uint32_t)(seq + after);
+    uint64_t total = s_sio_pc_trace_seq;
+    uint64_t avail = (total < SIO_PC_TRACE_CAP) ? total : SIO_PC_TRACE_CAP;
+    uint64_t start_seq = total - avail;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+             "\"byte_seq\":%d,\"entries\":[",
+             id, (unsigned long long)total, (unsigned long long)avail, seq);
+    int emitted = 0;
+    for (uint64_t i = 0; i < avail; i++) {
+        uint64_t s = start_seq + i;
+        SioPcTraceEntry *e = &s_sio_pc_trace[s % SIO_PC_TRACE_CAP];
+        if (e->byte_seq < lo || e->byte_seq > hi) continue;
+        if (filter && (e->addr < addr_lo || e->addr >= addr_hi)) continue;
+        if (emitted > 0) send_fmt(",");
+        send_fmt("{\"seq\":%llu,\"pc\":\"0x%08X\","
+                 "\"func\":\"0x%08X\",\"addr\":\"0x%08X\","
+                 "\"value\":\"0x%08X\",\"byte_seq\":%u,\"width\":%u}",
+                 (unsigned long long)e->seq, e->pc, e->func,
+                 e->addr, e->value, e->byte_seq, e->width);
+        emitted++;
+    }
+    send_fmt("],\"emitted\":%d}\n", emitted);
+}
+
+static void emit_sio_ctrl_reg_entry(const SioCtrlRegTraceEntry *e, int first)
+{
+    send_fmt("%s{\"seq\":%llu,\"pc\":\"0x%08X\",\"func\":\"0x%08X\","
+             "\"value\":\"0x%08X\",\"byte_seq\":%u,\"cpu_pc\":\"0x%08X\","
+             "\"ra\":\"0x%08X\",\"sp\":\"0x%08X\",\"v0\":\"0x%08X\","
+             "\"v1\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+             "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\",\"sr\":\"0x%08X\","
+             "\"epc\":\"0x%08X\",\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
+             "\"width\":%u,\"in_exc\":%u,\"ctr\":%u}",
+             first ? "" : ",",
+             (unsigned long long)e->seq, e->pc, e->func,
+             e->value, e->byte_seq, e->cpu_pc, e->ra, e->sp,
+             e->v0, e->v1, e->a0, e->a1, e->a2, e->a3,
+             e->sr, e->epc, e->istat, e->imask,
+             (unsigned)e->width, (unsigned)e->in_exception,
+             (unsigned)e->counter_7514);
+}
+
+static void handle_sio_ctrl_reg_trace(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 200);
+    if (count < 0) count = 0;
+    if (count > (int)SIO_CTRL_REG_TRACE_CAP) count = SIO_CTRL_REG_TRACE_CAP;
+
+    uint64_t total = s_sio_ctrl_reg_trace_seq;
+    uint64_t avail = (total < SIO_CTRL_REG_TRACE_CAP)
+                   ? total : SIO_CTRL_REG_TRACE_CAP;
+    if ((uint64_t)count > avail) count = (int)avail;
+    uint64_t start = total - (uint64_t)count;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+             "\"entries\":[",
+             id, (unsigned long long)total, (unsigned long long)avail);
+    for (int i = 0; i < count; i++) {
+        uint64_t s = start + (uint64_t)i;
+        const SioCtrlRegTraceEntry *e =
+            &s_sio_ctrl_reg_trace[s % SIO_CTRL_REG_TRACE_CAP];
+        emit_sio_ctrl_reg_entry(e, i == 0);
+    }
+    send_fmt("]}\n");
+}
+
+static void handle_sio_ctrl_reg_window(int id, const char *json)
+{
+    int seq = json_get_int(json, "byte_seq", -1);
+    int before = json_get_int(json, "before", 8);
+    int after = json_get_int(json, "after", 16);
+    if (seq < 0) { send_err(id, "missing byte_seq"); return; }
+    if (before < 0) before = 0;
+    if (after < 0) after = 0;
+
+    uint32_t lo = (uint32_t)((seq > before) ? (seq - before) : 0);
+    uint32_t hi = (uint32_t)(seq + after);
+    uint64_t total = s_sio_ctrl_reg_trace_seq;
+    uint64_t avail = (total < SIO_CTRL_REG_TRACE_CAP)
+                   ? total : SIO_CTRL_REG_TRACE_CAP;
+    uint64_t start_seq = total - avail;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+             "\"byte_seq\":%d,\"entries\":[",
+             id, (unsigned long long)total, (unsigned long long)avail, seq);
+    int emitted = 0;
+    for (uint64_t i = 0; i < avail; i++) {
+        uint64_t s = start_seq + i;
+        const SioCtrlRegTraceEntry *e =
+            &s_sio_ctrl_reg_trace[s % SIO_CTRL_REG_TRACE_CAP];
+        if (e->byte_seq < lo || e->byte_seq > hi) continue;
+        emit_sio_ctrl_reg_entry(e, emitted == 0);
+        emitted++;
+    }
+    send_fmt("],\"emitted\":%d}\n", emitted);
+}
+
+static void handle_sio_ctrl_reg_clear(int id, const char *json)
+{
+    (void)json;
+    memset(s_sio_ctrl_reg_trace, 0, sizeof(s_sio_ctrl_reg_trace));
+    s_sio_ctrl_reg_trace_seq = 0;
+    send_ok(id);
+}
+
+static const char *restore_kind_name(uint32_t kind)
+{
+    switch (kind) {
+    case 1: return "restore_escape";
+    case 2: return "rfe_escape";
+    case 3: return "restore_resume";
+    case 4: return "rfe_resume";
+    default: return "unknown";
+    }
+}
+
+static void emit_restore_entry(const RestoreTraceEntry *e, int first)
+{
+    send_fmt("%s{\"seq\":%llu,\"kind\":%u,\"name\":\"%s\",\"jmp\":%u,"
+             "\"target\":\"0x%08X\",\"cpu_pc\":\"0x%08X\","
+             "\"func\":\"0x%08X\",\"store_pc\":\"0x%08X\","
+             "\"byte_seq\":%u,\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+             "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\",\"a0\":\"0x%08X\","
+             "\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+             "\"s0\":\"0x%08X\",\"s1\":\"0x%08X\",\"sr\":\"0x%08X\","
+             "\"epc\":\"0x%08X\",\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
+             "\"frame\":%u,\"in_exc\":%u}",
+             first ? "" : ",",
+             (unsigned long long)e->seq, e->kind, restore_kind_name(e->kind),
+             e->jmp_val, e->target_pc, e->cpu_pc, e->func, e->last_store_pc,
+             e->byte_seq, e->ra, e->sp, e->v0, e->v1, e->a0, e->a1, e->a2,
+             e->a3, e->s0, e->s1, e->sr, e->epc, e->istat, e->imask,
+             e->frame, (unsigned)e->in_exception);
+}
+
+static void handle_restore_trace(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 200);
+    if (count < 0) count = 0;
+    if (count > (int)RESTORE_TRACE_CAP) count = RESTORE_TRACE_CAP;
+
+    uint64_t total = s_restore_trace_seq;
+    uint64_t avail = (total < RESTORE_TRACE_CAP) ? total : RESTORE_TRACE_CAP;
+    if ((uint64_t)count > avail) count = (int)avail;
+    uint64_t start = total - (uint64_t)count;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+             "\"entries\":[",
+             id, (unsigned long long)total, (unsigned long long)avail);
+    for (int i = 0; i < count; i++) {
+        uint64_t s = start + (uint64_t)i;
+        const RestoreTraceEntry *e = &s_restore_trace[s % RESTORE_TRACE_CAP];
+        emit_restore_entry(e, i == 0);
+    }
+    send_fmt("]}\n");
+}
+
+static void handle_restore_trace_window(int id, const char *json)
+{
+    int seq = json_get_int(json, "byte_seq", -1);
+    int before = json_get_int(json, "before", 8);
+    int after = json_get_int(json, "after", 16);
+    if (seq < 0) { send_err(id, "missing byte_seq"); return; }
+    if (before < 0) before = 0;
+    if (after < 0) after = 0;
+
+    uint32_t lo = (uint32_t)((seq > before) ? (seq - before) : 0);
+    uint32_t hi = (uint32_t)(seq + after);
+    uint64_t total = s_restore_trace_seq;
+    uint64_t avail = (total < RESTORE_TRACE_CAP) ? total : RESTORE_TRACE_CAP;
+    uint64_t start_seq = total - avail;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+             "\"byte_seq\":%d,\"entries\":[",
+             id, (unsigned long long)total, (unsigned long long)avail, seq);
+    int emitted = 0;
+    for (uint64_t i = 0; i < avail; i++) {
+        uint64_t s = start_seq + i;
+        const RestoreTraceEntry *e = &s_restore_trace[s % RESTORE_TRACE_CAP];
+        if (e->byte_seq < lo || e->byte_seq > hi) continue;
+        emit_restore_entry(e, emitted == 0);
+        emitted++;
+    }
+    send_fmt("],\"emitted\":%d}\n", emitted);
+}
+
+static void handle_restore_trace_clear(int id, const char *json)
+{
+    (void)json;
+    memset(s_restore_trace, 0, sizeof(s_restore_trace));
+    s_restore_trace_seq = 0;
+    send_ok(id);
+}
+
+static void emit_probe_entry(const ProbeTraceEntry *e, int first)
+{
+    send_fmt("%s{\"seq\":%llu,\"pc\":\"0x%08X\",\"func\":\"0x%08X\","
+             "\"store_pc\":\"0x%08X\",\"byte_seq\":%u,"
+             "\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+             "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
+             "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+             "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+             "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\","
+             "\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
+             "\"frame\":%u,\"in_exc\":%u}",
+             first ? "" : ",",
+             (unsigned long long)e->seq, e->pc, e->func,
+             e->last_store_pc, e->byte_seq, e->ra, e->sp,
+             e->v0, e->v1, e->a0, e->a1, e->a2, e->a3,
+             e->sr, e->epc, e->istat, e->imask,
+             e->frame, (unsigned)e->in_exception);
+}
+
+static void handle_probe_trace(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 200);
+    if (count < 0) count = 0;
+    if (count > (int)PROBE_TRACE_CAP) count = PROBE_TRACE_CAP;
+
+    uint64_t total = s_probe_trace_seq;
+    uint64_t avail = (total < PROBE_TRACE_CAP) ? total : PROBE_TRACE_CAP;
+    if ((uint64_t)count > avail) count = (int)avail;
+    uint64_t start = total - (uint64_t)count;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+             "\"entries\":[",
+             id, (unsigned long long)total, (unsigned long long)avail);
+    for (int i = 0; i < count; i++) {
+        uint64_t s = start + (uint64_t)i;
+        const ProbeTraceEntry *e = &s_probe_trace[s % PROBE_TRACE_CAP];
+        emit_probe_entry(e, i == 0);
+    }
+    send_fmt("]}\n");
+}
+
+static void handle_probe_clear(int id, const char *json)
+{
+    (void)json;
+    memset(s_probe_trace, 0, sizeof(s_probe_trace));
+    s_probe_trace_seq = 0;
+    send_ok(id);
+}
+
 /* ---- MMIO write trace (separate ring buffer) ----
  * Records every write to 0x1F801xxx MMIO registers. Unconditional (no filtering).
- * 64K entries, heap-allocated in debug_server_init(). */
-#define MMIO_TRACE_CAP (1 << 16)  /* 64K entries = 2 MB */
+ * 1<<22 entries x 32 bytes = 128 MiB, heap-allocated in debug_server_init().
+ * Kept in step with the SIO PC trace so generic MMIO history has enough
+ * retention for post-failure queries. */
+#define MMIO_TRACE_CAP (1 << 22)
 typedef struct {
     uint64_t seq;
     uint32_t addr;       /* 0x1F801xxx */
@@ -1812,6 +2278,56 @@ static void handle_sio_trace(int id, const char *json)
     send_fmt("]}\n");
 }
 
+static void handle_sio_trace_window(int id, const char *json)
+{
+    int seq = json_get_int(json, "seq", -1);
+    int before = json_get_int(json, "before", 8);
+    int after = json_get_int(json, "after", 16);
+    if (seq < 0) { send_err(id, "missing seq"); return; }
+    if (before < 0) before = 0;
+    if (after < 0) after = 0;
+
+    const SioTraceEntry *buf;
+    int write_idx;
+    uint32_t total_seq = sio_get_trace(&buf, &write_idx);
+    (void)write_idx;
+    uint32_t oldest = (total_seq > (uint32_t)SIO_TRACE_CAP)
+                    ? total_seq - (uint32_t)SIO_TRACE_CAP : 0;
+    uint32_t lo = (uint32_t)((seq > before) ? (seq - before) : 0);
+    uint32_t hi = (uint32_t)(seq + after);
+    if (lo < oldest) lo = oldest;
+    if (hi >= total_seq) hi = total_seq ? total_seq - 1 : 0;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"oldest\":%u,"
+             "\"seq\":%d,\"entries\":[",
+             id, (unsigned)total_seq, (unsigned)oldest, seq);
+
+    int emitted = 0;
+    if (total_seq > 0 && lo <= hi) {
+        for (uint32_t s = lo; s <= hi; s++) {
+            const SioTraceEntry *e = &buf[s % SIO_TRACE_CAP];
+            if (e->seq != s) continue;
+            if (emitted > 0) send_fmt(",");
+            send_fmt("{\"seq\":%u,\"tx\":\"0x%02X\",\"rx\":\"0x%02X\","
+                     "\"mc_pre\":%d,\"mc_post\":%d,"
+                     "\"dev_pre\":%d,\"dev_post\":%d,"
+                     "\"ctrl\":\"0x%04X\",\"func\":\"0x%08X\","
+                     "\"abort\":%d,\"irq_cd\":%d,\"in_exc\":%d,\"ctr\":%d,"
+                     "\"sr\":\"0x%08X\","
+                     "\"slot0\":%d,\"slot1\":%d}",
+                     (unsigned)e->seq, e->tx, e->rx,
+                     e->mc_state_pre, e->mc_state_post,
+                     e->dev_pre, e->dev_post,
+                     e->ctrl, (unsigned)e->func_addr,
+                     e->was_abort, e->irq_countdown, e->in_exception,
+                     e->counter_7514, (unsigned)e->cop0_sr,
+                     e->slot0_state, e->slot1_state);
+            emitted++;
+        }
+    }
+    send_fmt("],\"emitted\":%d}\n", emitted);
+}
+
 /* ---- Card transaction ring dump ----
  *
  * Returns the most recent N closed transactions plus the live (open) txn
@@ -2009,6 +2525,52 @@ static void handle_sio_irq_dump(int id, const char *json)
     int emitted = 0;
     for (int i = 0; i < count; i++) {
         const SioIrqEntry *e = &buf[(start + i) % SIO_IRQ_RING_CAP];
+        if (src_filter >= 0 && (int)e->source != src_filter) continue;
+        if (emitted > 0) send_fmt(",");
+        send_fmt("{\"seq\":%u,\"src\":\"%s\",\"slot\":%u,\"delay\":%u,"
+                 "\"byte_seq\":%u,\"mc_state\":%u,\"active_device\":%u,"
+                 "\"ctrl\":\"0x%04X\",\"func\":\"0x%08X\","
+                 "\"counter_7514\":%u,"
+                 "\"i_stat_before\":\"0x%08X\",\"i_stat_after\":\"0x%08X\"}",
+                 (unsigned)e->seq, sio_irq_src_str(e->source),
+                 e->slot, e->delay_applied,
+                 (unsigned)e->byte_seq, (unsigned)e->mc_state,
+                 (unsigned)e->active_device,
+                 (unsigned)e->ctrl, (unsigned)e->func_addr,
+                 (unsigned)e->counter_7514,
+                 (unsigned)e->i_stat_before, (unsigned)e->i_stat_after);
+        emitted++;
+    }
+    send_fmt("],\"emitted\":%d}\n", emitted);
+}
+
+static void handle_sio_irq_window(int id, const char *json)
+{
+    int byte_seq = json_get_int(json, "byte_seq", -1);
+    int before = json_get_int(json, "before", 8);
+    int after = json_get_int(json, "after", 16);
+    int src_filter = json_get_int(json, "src", -1);
+    if (byte_seq < 0) { send_err(id, "missing byte_seq"); return; }
+    if (before < 0) before = 0;
+    if (after < 0) after = 0;
+
+    uint32_t lo = (uint32_t)((byte_seq > before) ? (byte_seq - before) : 0);
+    uint32_t hi = (uint32_t)(byte_seq + after);
+    const SioIrqEntry *buf;
+    int write_idx;
+    uint32_t total_seq = sio_get_irq_ring(&buf, &write_idx);
+    (void)write_idx;
+    uint32_t avail = (total_seq < (uint32_t)SIO_IRQ_RING_CAP)
+                   ? total_seq : (uint32_t)SIO_IRQ_RING_CAP;
+    uint32_t start = total_seq - avail;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"available\":%u,"
+             "\"byte_seq\":%d,\"src_filter\":%d,\"entries\":[",
+             id, (unsigned)total_seq, (unsigned)avail, byte_seq, src_filter);
+    int emitted = 0;
+    for (uint32_t i = 0; i < avail; i++) {
+        const SioIrqEntry *e = &buf[(start + i) % SIO_IRQ_RING_CAP];
+        if (e->byte_seq < lo || e->byte_seq > hi) continue;
         if (src_filter >= 0 && (int)e->source != src_filter) continue;
         if (emitted > 0) send_fmt(",");
         send_fmt("{\"seq\":%u,\"src\":\"%s\",\"slot\":%u,\"delay\":%u,"
@@ -3284,7 +3846,17 @@ static const CmdEntry s_commands[] = {
     { "pace_state",        handle_pace_state },
     { "chain_trace",       handle_chain_trace },
     { "sio_trace",         handle_sio_trace },
+    { "sio_trace_window",  handle_sio_trace_window },
     { "sio_pc_trace",      handle_sio_pc_trace },
+    { "sio_pc_window",     handle_sio_pc_window },
+    { "sio_ctrl_reg_trace", handle_sio_ctrl_reg_trace },
+    { "sio_ctrl_reg_window", handle_sio_ctrl_reg_window },
+    { "sio_ctrl_reg_clear", handle_sio_ctrl_reg_clear },
+    { "restore_trace",     handle_restore_trace },
+    { "restore_trace_window", handle_restore_trace_window },
+    { "restore_trace_clear", handle_restore_trace_clear },
+    { "probe_trace",       handle_probe_trace },
+    { "probe_clear",       handle_probe_clear },
     { "dirty_ram_stats",   handle_dirty_ram_stats },
     { "dirty_block_log",   handle_dirty_block_log },
     { "fntrace_arm",       handle_fntrace_arm },
@@ -3299,6 +3871,7 @@ static const CmdEntry s_commands[] = {
     { "card_data_writes",  handle_card_data_writes },
     { "card_data_writes_reset", handle_card_data_writes_reset },
     { "sio_irq_dump",      handle_sio_irq_dump },
+    { "sio_irq_window",    handle_sio_irq_window },
     { "evcb_snapshot",     handle_evcb_snapshot },
     { "evcb_walk_dump",    handle_evcb_walk_dump },
     { "evcb_walk_stats",   handle_evcb_walk_stats },
