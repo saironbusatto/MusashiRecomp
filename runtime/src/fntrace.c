@@ -11,9 +11,15 @@ extern uint64_t s_frame_count;
 
 static uint32_t s_arm_targets[FNTRACE_ARM_MAX];
 static uint32_t s_arm_count = 0;
+static uint32_t s_arm_record_all = 0;  /* opt-in via fntrace_arm(0xFFFFFFFF) */
 
 static inline int armed_match(uint32_t target) {
-    if (s_arm_count == 0) return 1;  /* unfiltered: record all */
+    if (s_arm_record_all) return 1;
+    /* Hot path: when nothing is armed, record nothing. Recording every
+     * dispatch by default makes the ring fill in seconds and burns ~10%
+     * of host CPU. Investigators arm specific targets — see
+     * fntrace_arm(0xFFFFFFFF) for the legacy "record-all" behavior. */
+    if (s_arm_count == 0) return 0;
     for (uint32_t i = 0; i < s_arm_count; i++) {
         if (s_arm_targets[i] == target) return 1;
     }
@@ -36,6 +42,7 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
 
 void fntrace_arm(uint32_t target) {
     if (target == 0) { fntrace_arm_clear(); return; }
+    if (target == 0xFFFFFFFFu) { s_arm_record_all = 1; return; }
     /* Dedup: don't double-add. */
     for (uint32_t i = 0; i < s_arm_count; i++) {
         if (s_arm_targets[i] == target) return;
@@ -46,6 +53,7 @@ void fntrace_arm(uint32_t target) {
 
 void fntrace_arm_clear(void) {
     s_arm_count = 0;
+    s_arm_record_all = 0;
     memset(s_arm_targets, 0, sizeof(s_arm_targets));
 }
 

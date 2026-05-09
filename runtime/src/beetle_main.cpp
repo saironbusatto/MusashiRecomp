@@ -144,5 +144,28 @@ int main(int argc, char** argv) {
             SDL_RenderCopy(ren, tex, NULL, &dst);
             SDL_RenderPresent(ren);
         }
+
+        /* Wall-clock pacing to PSX-native 59.94 Hz for apples-to-apples
+         * comparison with psx-runtime. Press TAB on the Beetle window to
+         * sustain unlocked rate (turbo). */
+        const Uint8* keys = SDL_GetKeyboardState(NULL);
+        if (keys && keys[SDL_SCANCODE_TAB]) continue;
+        constexpr double FRAME_MS = 1000.0 / 59.94;
+        static Uint64 deadline = 0;
+        Uint64 freq = SDL_GetPerformanceFrequency();
+        Uint64 period = (Uint64)((double)freq * (FRAME_MS / 1000.0));
+        Uint64 now = SDL_GetPerformanceCounter();
+        if (deadline == 0 || now >= deadline + period) {
+            deadline = now + period;
+        } else {
+            while (SDL_GetPerformanceCounter() < deadline) {
+                Uint64 left = deadline - SDL_GetPerformanceCounter();
+                Uint64 ms = (left * 1000) / freq;
+                if (ms >= 2) SDL_Delay((Uint32)(ms - 1));
+                else break;
+            }
+            while (SDL_GetPerformanceCounter() < deadline) { /* spin */ }
+            deadline += period;
+        }
     }
 }

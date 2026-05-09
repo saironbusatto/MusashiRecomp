@@ -662,7 +662,13 @@ static void evcb_snapshot_capture(EvCBTag tag, uint64_t fn_entry_seq) {
     else                       s_evcb_ring_exit_count++;
 }
 
-/* Optional [lo, hi) physical-address filter; default = trace all. */
+/* Optional [lo, hi) physical-address filter for the fn_entry/fn_exit rings.
+ * Default disabled — recording every dispatch's args burns ~10 us per call
+ * (stack walk + 9-field write) and crushes wall-clock simulation rate.
+ * Enable via debug-server `fntrace_arm_filter` (sets lo/hi); investigators
+ * pick a tight range so the per-dispatch cost only fires for code under
+ * inspection. */
+static int      s_fn_trace_active    = 0;
 static uint32_t s_fn_trace_filter_lo = 0u;
 static uint32_t s_fn_trace_filter_hi = 0xFFFFFFFFu;
 
@@ -700,6 +706,7 @@ static void fn_record_exit(FnStackFrame *f) {
  * Distinguishing TAIL CALL from NEW CALL via $ra-change is what keeps the
  * shadow stack bounded under heavy code that uses fall-through dispatch. */
 static void function_trace_record(uint32_t target) {
+    if (!s_fn_trace_active) return;
     if (!s_fn_entry || !s_fn_exit || !debug_cpu_ptr) return;
 
     uint32_t cur_ra = debug_cpu_ptr->gpr[31];
@@ -3732,8 +3739,17 @@ static void handle_fn_filter(int id, const char *json) {
     char buf[32];
     if (json_get_str(json, "lo", buf, sizeof(buf))) s_fn_trace_filter_lo = hex_to_u32(buf);
     if (json_get_str(json, "hi", buf, sizeof(buf))) s_fn_trace_filter_hi = hex_to_u32(buf);
-    send_fmt("{\"id\":%d,\"ok\":true,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}\n",
-             id, s_fn_trace_filter_lo, s_fn_trace_filter_hi);
+    /* Enable per-dispatch shadow-stack tracking when a real range is set;
+     * a "lo=0,hi=0xFFFFFFFF" call also flips it on (caller wants everything). */
+    s_fn_trace_active = 1;
+    send_fmt("{\"id\":%d,\"ok\":true,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\",\"active\":%d}\n",
+             id, s_fn_trace_filter_lo, s_fn_trace_filter_hi, s_fn_trace_active);
+}
+
+static void handle_fn_disable(int id, const char *json) {
+    (void)json;
+    s_fn_trace_active = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"active\":0}\n", id);
 }
 
 static void handle_fn_clear(int id, const char *json) {
@@ -3976,6 +3992,7 @@ static const CmdEntry s_commands[] = {
     { "dispatch_check",    handle_dispatch_check },
     { "dispatch_tail",     handle_dispatch_tail },
     { "fn_filter",         handle_fn_filter },
+    { "fn_disable",        handle_fn_disable },
     { "fn_clear",          handle_fn_clear },
     { "fn_stats",          handle_fn_stats },
     { "fn_entry_dump",     handle_fn_entry_dump },

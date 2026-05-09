@@ -200,6 +200,13 @@ static void update_pad_from_keyboard(void) {
     sio_set_pad_state(buttons);
 }
 
+/* PSX native vblank cadence: NTSC ≈ 59.94 Hz. Wall-clock target keeps
+ * audio sample generation (735 samples/vblank * 60 = 44100/sec) matched
+ * to the SDL audio device drain rate, eliminating queue overflow drops
+ * and underruns. Uncapped, the host runs the simulation at whatever
+ * speed it can — typically several × realtime — and audio glitches. */
+static constexpr double PSX_FRAME_PERIOD_MS = 1000.0 / 59.94;
+
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
     /* Debug server: pause gate, poll commands, record frame, check watchpoints. */
@@ -273,6 +280,36 @@ static void sdl_vblank_present(void) {
     SDL_RenderClear(sdl_renderer);
     SDL_RenderCopy(sdl_renderer, sdl_texture, NULL, &dst);
     SDL_RenderPresent(sdl_renderer);
+
+    /* Wall-clock pacing: hold each simulated vblank to ~16.68 ms so the
+     * BIOS runs at PSX-native 59.94 Hz. Uses SDL's high-resolution
+     * counter — works around MinGW std::thread quirks. If a frame ran
+     * long the deadline resyncs to "now" rather than queueing catch-up
+     * frames. */
+    {
+        static Uint64 next_deadline = 0;
+        Uint64 freq = SDL_GetPerformanceFrequency();
+        Uint64 period = (Uint64)((double)freq * (PSX_FRAME_PERIOD_MS / 1000.0));
+        Uint64 now = SDL_GetPerformanceCounter();
+        if (next_deadline == 0 || now >= next_deadline + period) {
+            next_deadline = now + period;  /* first frame, or fell behind */
+        } else {
+            while (SDL_GetPerformanceCounter() < next_deadline) {
+                Uint64 remaining_ticks = next_deadline - SDL_GetPerformanceCounter();
+                Uint64 remaining_ms = (remaining_ticks * 1000) / freq;
+                if (remaining_ms >= 2) {
+                    SDL_Delay((Uint32)(remaining_ms - 1));
+                } else {
+                    /* Final spin for sub-ms accuracy. */
+                    break;
+                }
+            }
+            while (SDL_GetPerformanceCounter() < next_deadline) {
+                /* spin */
+            }
+            next_deadline += period;
+        }
+    }
 }
 
 int main(int argc, char** argv) {
