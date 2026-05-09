@@ -20,6 +20,7 @@ int memcard_write_sector(int card, int sector, const uint8_t* buf);
 
 /* Flush pending writes to disk */
 void memcard_flush(int card);
+void memcard_flush_all(void);
 
 /* Check if card is present */
 int memcard_is_present(int card);

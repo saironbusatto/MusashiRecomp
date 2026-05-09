@@ -129,9 +129,18 @@ void memcard_flush(int card) {
 
     FILE* f = fopen(cards[card].filepath, "wb");
     if (f) {
-        fwrite(cards[card].data, 1, MEMCARD_SIZE, f);
-        fclose(f);
-        cards[card].dirty = 0;
+        size_t n = fwrite(cards[card].data, 1, MEMCARD_SIZE, f);
+        int flush_ok = (fflush(f) == 0);
+        int close_ok = (fclose(f) == 0);
+        if (n == MEMCARD_SIZE && flush_ok && close_ok) {
+            cards[card].dirty = 0;
+        }
+    }
+}
+
+void memcard_flush_all(void) {
+    for (int i = 0; i < MAX_CARDS; i++) {
+        memcard_flush(i);
     }
 }
 

@@ -18,6 +18,9 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
+#include <string>
+#include <vector>
 
 extern "C" uint64_t gte_get_exec_count(void);
 
@@ -45,6 +48,101 @@ static SDL_Window*   sdl_window;
 static SDL_Renderer* sdl_renderer;
 static SDL_Texture*  sdl_texture;
 static uint32_t      sdl_pixel_buf[640 * 512]; /* ARGB8888 staging buffer */
+static SDL_AudioDeviceID sdl_audio_device;
+static int16_t       sdl_audio_buf[2048 * 2];
+
+static std::filesystem::path find_upward(std::filesystem::path start,
+                                         const std::filesystem::path& marker) {
+    std::error_code ec;
+    start = std::filesystem::absolute(start, ec);
+    if (ec) start = std::filesystem::current_path();
+    if (!std::filesystem::is_directory(start, ec)) start = start.parent_path();
+
+    for (;;) {
+        if (std::filesystem::exists(start / marker, ec)) return start;
+        if (!start.has_parent_path() || start.parent_path() == start) break;
+        start = start.parent_path();
+    }
+    return {};
+}
+
+static std::filesystem::path resolve_bios_path(const char* requested, const char* argv0) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path p(requested);
+    if (fs::exists(p, ec)) {
+        fs::path abs = fs::absolute(p, ec);
+        return ec ? p : abs;
+    }
+    if (p.is_absolute()) return p;
+
+    std::vector<fs::path> roots;
+    roots.push_back(fs::current_path());
+    if (argv0 && argv0[0]) roots.push_back(fs::absolute(argv0, ec).parent_path());
+
+    for (const fs::path& root : roots) {
+        fs::path found = find_upward(root, p);
+        if (!found.empty()) return found / p;
+    }
+    return p;
+}
+
+static std::filesystem::path resolve_memcard_dir(const char* requested,
+                                                 const std::filesystem::path& bios_path,
+                                                 const char* argv0) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (requested && requested[0]) return fs::path(requested);
+
+    fs::path absolute_bios = fs::absolute(bios_path, ec);
+    if (ec) absolute_bios = bios_path;
+    fs::path project_root = absolute_bios.parent_path().parent_path();
+    if (fs::exists(project_root / "card1.mcd", ec) ||
+        fs::exists(project_root / "card2.mcd", ec))
+        return project_root;
+
+    fs::path cwd = fs::current_path();
+    if (fs::exists(cwd / "card1.mcd", ec) || fs::exists(cwd / "card2.mcd", ec))
+        return cwd;
+
+    if (argv0 && argv0[0]) {
+        fs::path exe_dir = fs::absolute(argv0, ec).parent_path();
+        if (fs::exists(exe_dir / "card1.mcd", ec) ||
+            fs::exists(exe_dir / "card2.mcd", ec))
+            return exe_dir;
+    }
+
+    return cwd;
+}
+
+static void shutdown_runtime(void) {
+    memcard_flush_all();
+    if (sdl_audio_device) {
+        SDL_ClearQueuedAudio(sdl_audio_device);
+        SDL_CloseAudioDevice(sdl_audio_device);
+        sdl_audio_device = 0;
+    }
+    debug_server_shutdown();
+}
+
+static void sdl_audio_pump(void) {
+    if (!sdl_audio_device) return;
+
+    const uint32_t bytes_per_frame = sizeof(int16_t) * 2u;
+    const uint32_t max_queue_bytes = 44100u * bytes_per_frame / 5u;
+    if (SDL_GetQueuedAudioSize(sdl_audio_device) > max_queue_bytes) return;
+
+    static double sample_accum = 0.0;
+    sample_accum += 44100.0 / 60.0;
+    int frames = (int)sample_accum;
+    sample_accum -= (double)frames;
+    if (frames <= 0) return;
+    if (frames > 2048) frames = 2048;
+
+    spu_render(sdl_audio_buf, frames);
+    SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
+                   (uint32_t)frames * bytes_per_frame);
+}
 
 /* Convert PS1 16-bit color (1-5-5-5) to ARGB8888 */
 static inline uint32_t psx16_to_argb(uint16_t c) {
@@ -111,7 +209,7 @@ static void sdl_vblank_present(void) {
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT) {
-            debug_server_shutdown();
+            shutdown_runtime();
             std::exit(0);
         }
     }
@@ -126,6 +224,7 @@ static void sdl_vblank_present(void) {
         pad_buttons_this_frame = sio_get_pad_buttons();
     }
     sio_set_pad_state(pad_buttons_this_frame);
+    sdl_audio_pump();
 
     /* Turbo mode: while TAB is held, skip both VRAM->ARGB conversion and
      * SDL_RenderPresent. The recompiled BIOS still advances simulated
@@ -182,15 +281,24 @@ int main(int argc, char** argv) {
     psx_crash_trace_install_handlers();
 
     const char* bios_path = "bios/SCPH1001.BIN";
+    const char* memcard_dir_arg = nullptr;
     /* Parse positional. First non-flag arg = bios_path. */
     for (int i = 1; i < argc; i++) {
-        if (argv[i][0] != '-') {
+        if (std::strcmp(argv[i], "--memcard-dir") == 0 && i + 1 < argc) {
+            memcard_dir_arg = argv[++i];
+        } else if (argv[i][0] != '-') {
             bios_path = argv[i];
         }
     }
 
-    std::fprintf(stdout, "psxrecomp-v4 runtime: loading BIOS from %s\n", bios_path);
-    memory_init(bios_path);
+    std::filesystem::path resolved_bios = resolve_bios_path(bios_path, argv[0]);
+    std::filesystem::path memcard_dir =
+        resolve_memcard_dir(memcard_dir_arg, resolved_bios, argv[0]);
+    std::string bios_path_str = resolved_bios.string();
+    std::string memcard_dir_str = memcard_dir.string();
+
+    std::fprintf(stdout, "psxrecomp-v4 runtime: loading BIOS from %s\n", bios_path_str.c_str());
+    memory_init(bios_path_str.c_str());
     gpu_init();
     dma_init();
     timers_init();
@@ -199,7 +307,8 @@ int main(int argc, char** argv) {
     sio_connect_pad(0);  /* Controller on port 1 */
     spu_init();
     cdrom_init(NULL);    /* No disc for BIOS-only boot */
-    memcard_init(".");   /* Look for card1.mcd / card2.mcd in working directory */
+    memcard_init(memcard_dir_str.c_str());
+    std::atexit(memcard_flush_all);
 #ifdef DEFAULT_DEBUG_PORT
     debug_server_init(DEFAULT_DEBUG_PORT);
 #else
@@ -210,6 +319,19 @@ int main(int argc, char** argv) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
+    }
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
+        SDL_AudioSpec want;
+        SDL_AudioSpec have;
+        SDL_zero(want);
+        want.freq = 44100;
+        want.format = AUDIO_S16SYS;
+        want.channels = 2;
+        want.samples = 1024;
+        sdl_audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        if (sdl_audio_device) {
+            SDL_PauseAudioDevice(sdl_audio_device, 0);
+        }
     }
 
     sdl_window = SDL_CreateWindow(
@@ -355,7 +477,7 @@ int main(int argc, char** argv) {
     /* If we reach here, all execution completed without MMIO abort. */
     std::fprintf(stdout, "psxrecomp-v4 runtime: execution completed, PC=0x%08X\n", cpu.pc);
 
-    debug_server_shutdown();
+    shutdown_runtime();
     SDL_DestroyTexture(sdl_texture);
     SDL_DestroyRenderer(sdl_renderer);
     SDL_DestroyWindow(sdl_window);

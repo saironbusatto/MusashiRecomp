@@ -13,6 +13,7 @@
 #include "gpu.h"
 #include "sio.h"
 #include "memcard.h"
+#include "spu.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
 #include "card_read_summary.h"
@@ -2032,28 +2033,82 @@ static void handle_sio_state(int id, const char *json)
 }
 
 /* ---- Memory card disk-load status (per-slot) ---- */
+static void json_escape_string(char *dst, size_t dst_size, const char *src)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t out = 0;
+    if (!dst || dst_size == 0) return;
+    if (!src) src = "";
+
+    for (size_t in = 0; src[in] && out + 1 < dst_size; in++) {
+        unsigned char c = (unsigned char)src[in];
+        if (c == '"' || c == '\\') {
+            if (out + 2 >= dst_size) break;
+            dst[out++] = '\\';
+            dst[out++] = (char)c;
+        } else if (c < 0x20) {
+            if (out + 6 >= dst_size) break;
+            dst[out++] = '\\';
+            dst[out++] = 'u';
+            dst[out++] = '0';
+            dst[out++] = '0';
+            dst[out++] = hex[c >> 4];
+            dst[out++] = hex[c & 0x0F];
+        } else {
+            dst[out++] = (char)c;
+        }
+    }
+    dst[out] = '\0';
+}
+
 static void handle_mc_status(int id, const char *json)
 {
     (void)json;
     const char *p0 = "", *p1 = "";
+    char p0_json[1024], p1_json[1024];
     uint8_t m0[2] = {0,0}, m1[2] = {0,0};
     int pres0 = 0, pres1 = 0, dirty0 = 0, dirty1 = 0;
     memcard_debug_info(0, &p0, m0, &pres0, &dirty0);
     memcard_debug_info(1, &p1, m1, &pres1, &dirty1);
+    json_escape_string(p0_json, sizeof(p0_json), p0);
+    json_escape_string(p1_json, sizeof(p1_json), p1);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"slot0\":{\"present\":%s,\"dirty\":%s,\"path\":\"%s\","
              "\"magic\":\"%c%c\",\"magic_hex\":\"%02X%02X\"},"
              "\"slot1\":{\"present\":%s,\"dirty\":%s,\"path\":\"%s\","
              "\"magic\":\"%c%c\",\"magic_hex\":\"%02X%02X\"}}",
              id,
-             pres0 ? "true" : "false", dirty0 ? "true" : "false", p0,
+             pres0 ? "true" : "false", dirty0 ? "true" : "false", p0_json,
              (m0[0] >= 0x20 && m0[0] < 0x7F) ? m0[0] : '?',
              (m0[1] >= 0x20 && m0[1] < 0x7F) ? m0[1] : '?',
              m0[0], m0[1],
-             pres1 ? "true" : "false", dirty1 ? "true" : "false", p1,
+             pres1 ? "true" : "false", dirty1 ? "true" : "false", p1_json,
              (m1[0] >= 0x20 && m1[0] < 0x7F) ? m1[0] : '?',
              (m1[1] >= 0x20 && m1[1] < 0x7F) ? m1[1] : '?',
              m1[0], m1[1]);
+}
+
+static void handle_spu_status(int id, const char *json)
+{
+    (void)json;
+    SpuDebugInfo info;
+    spu_debug_info(&info);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"ctrl\":\"0x%04X\",\"active_mask\":\"0x%06X\","
+             "\"main_l\":%d,\"main_r\":%d,"
+             "\"key_on_count\":%u,"
+             "\"render_frames\":%llu,\"nonzero_frames\":%llu,"
+             "\"last_peak\":%d,\"peak\":%d}",
+             id,
+             info.ctrl & 0xFFFFu,
+             info.active_mask & 0xFFFFFFu,
+             info.main_l,
+             info.main_r,
+             info.key_on_count,
+             (unsigned long long)info.render_frames,
+             (unsigned long long)info.nonzero_frames,
+             info.last_peak,
+             info.peak);
 }
 
 /* ---- SIO IRQ-arm audit -----------------------------------------------
@@ -3844,6 +3899,7 @@ static const CmdEntry s_commands[] = {
     { "irq_state",         handle_irq_state },
     { "sio_state",         handle_sio_state },
     { "mc_status",         handle_mc_status },
+    { "spu_status",        handle_spu_status },
     { "card_buffer_dump",  handle_card_buffer_dump },
     { "sio_arm_audit",     handle_sio_arm_audit },
     { "sio_burst_stats",   handle_sio_burst_stats },

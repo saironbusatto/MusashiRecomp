@@ -8,6 +8,21 @@ extern "C" {
 #endif
 
 void spu_init(void);
+void spu_render(int16_t* out_stereo, int frames);
+
+typedef struct SpuDebugInfo {
+    uint32_t ctrl;
+    uint32_t active_mask;
+    int16_t main_l;
+    int16_t main_r;
+    uint32_t key_on_count;
+    uint64_t render_frames;
+    uint64_t nonzero_frames;
+    int32_t last_peak;
+    int32_t peak;
+} SpuDebugInfo;
+
+void spu_debug_info(SpuDebugInfo* out);
 
 /* MMIO read/write (0x1F801C00-0x1F801FFF) */
 uint32_t spu_read(uint32_t addr);
