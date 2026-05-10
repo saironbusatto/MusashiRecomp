@@ -10,6 +10,7 @@
  */
 
 #include "dma.h"
+#include "cdrom.h"
 #include "gpu.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -170,6 +171,44 @@ static void execute_ch2_gpu(void) {
     i_stat |= (1u << 3);
 }
 
+static void execute_ch3_cdrom(void) {
+    uint32_t chcr = channels[3].chcr;
+    uint32_t direction = chcr & 1;           /* 0=to RAM, 1=from RAM */
+    uint32_t step = (chcr >> 1) & 1;         /* 0=forward(+4), 1=backward(-4) */
+    uint32_t sync_mode = (chcr >> 9) & 3;
+
+    if (direction != 0) {
+        channels[3].chcr &= ~((1u << 24) | (1u << 28));
+        return;
+    }
+
+    uint32_t block_size = channels[3].bcr & 0xFFFF;
+    uint32_t block_count = (channels[3].bcr >> 16) & 0xFFFF;
+    uint32_t total_words;
+    if (sync_mode == 1) {
+        if (block_size == 0) block_size = 0x10000;
+        if (block_count == 0) block_count = 1;
+        total_words = block_size * block_count;
+    } else {
+        total_words = block_size;
+        if (total_words == 0) total_words = 0x10000;
+    }
+
+    uint32_t addr = channels[3].madr & 0x1FFFFCu;
+    int32_t addr_step = step ? -4 : 4;
+    for (uint32_t i = 0; i < total_words; i++) {
+        uint32_t word = cdrom_dma_read();
+        psx_write_word(addr, word);
+        addr = (addr + addr_step) & 0x1FFFFCu;
+    }
+
+    channels[3].madr = addr;
+    channels[3].chcr &= ~((1u << 24) | (1u << 28));
+    dicr |= (1u << (24 + 3));
+    update_master_irq();
+    i_stat |= (1u << 3);
+}
+
 static void execute_ch6_otc(void) {
     /* OTC (Ordering Table Clear): writes a backward-linked list to RAM.
      * Node N = address of node N-1, node 0 = 0xFFFFFF (end marker).
@@ -209,6 +248,9 @@ static void try_execute(int ch) {
     switch (ch) {
         case 2:
             execute_ch2_gpu();
+            break;
+        case 3:
+            execute_ch3_cdrom();
             break;
         case 6:
             execute_ch6_otc();

@@ -25,6 +25,10 @@
 #include <stdarg.h>
 #include <stdint.h>
 
+#ifndef DEFAULT_DEBUG_PORT
+#error DEFAULT_DEBUG_PORT must be defined by the runtime target.
+#endif
+
 /* ---- Platform sockets ---- */
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -61,7 +65,7 @@ extern void     psx_write_byte(uint32_t addr, uint8_t val);
 /* ---- Server state ---- */
 static sock_t s_listen  = SOCK_INVALID;
 static sock_t s_client  = SOCK_INVALID;
-static int    s_port    = 4370;
+static int    s_port    = DEFAULT_DEBUG_PORT;
 
 #define RECV_BUF_SIZE 8192
 static char s_recv_buf[RECV_BUF_SIZE];

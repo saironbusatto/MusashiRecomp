@@ -22,6 +22,25 @@
 #include <string>
 #include <vector>
 
+#ifndef PSX_DEFAULT_BIOS_PATH
+#define PSX_DEFAULT_BIOS_PATH "bios/SCPH1001.BIN"
+#endif
+#ifndef PSX_DEFAULT_GAME_ROOT
+#define PSX_DEFAULT_GAME_ROOT ""
+#endif
+#ifndef PSX_DEFAULT_MEMCARD_DIR
+#define PSX_DEFAULT_MEMCARD_DIR ""
+#endif
+#ifndef PSX_DEFAULT_DISC_PATH
+#define PSX_DEFAULT_DISC_PATH ""
+#endif
+#ifndef PSX_WINDOW_TITLE
+#define PSX_WINDOW_TITLE "psxrecomp-v4 - BIOS"
+#endif
+#ifndef DEFAULT_DEBUG_PORT
+#error DEFAULT_DEBUG_PORT must be defined by the runtime target.
+#endif
+
 extern "C" uint64_t gte_get_exec_count(void);
 
 /* memory.c */
@@ -88,7 +107,8 @@ static std::filesystem::path resolve_bios_path(const char* requested, const char
 }
 
 static std::filesystem::path resolve_memcard_dir(const char* requested,
-                                                 const std::filesystem::path& bios_path,
+                                                 const char* default_dir,
+                                                 const std::filesystem::path& game_root,
                                                  const char* argv0) {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -96,7 +116,17 @@ static std::filesystem::path resolve_memcard_dir(const char* requested,
     // 1. Explicit --memcard-dir always wins.
     if (requested && requested[0]) return fs::path(requested);
 
-    // 2. Locate exe directory (production layout anchor).
+    // 2. Runtime targets provide a stable default. BIOS-only dev builds use
+    //    the framework root; game builds use their saves/ directory.
+    if (default_dir && default_dir[0]) return fs::path(default_dir);
+
+    // 3. Sibling game roots prefer saves/ if present, then the root itself.
+    if (!game_root.empty()) {
+        if (fs::exists(game_root / "saves", ec)) return game_root / "saves";
+        return game_root;
+    }
+
+    // 4. Locate exe directory (production layout anchor).
     fs::path exe_dir;
     if (argv0 && argv0[0]) {
         exe_dir = fs::absolute(argv0, ec).parent_path();
@@ -104,20 +134,6 @@ static std::filesystem::path resolve_memcard_dir(const char* requested,
     }
     if (exe_dir.empty()) exe_dir = fs::current_path();
 
-    // 3. Dev-build detection: exe lives inside a CMake build tree. Keep
-    //    cards in the project root (next to bios/) so a runtime rebuild
-    //    never blows them away.
-    bool is_dev_build = fs::exists(exe_dir / "CMakeFiles", ec) ||
-                        fs::exists(exe_dir / "CMakeCache.txt", ec) ||
-                        fs::exists(exe_dir.parent_path() / "CMakeCache.txt", ec);
-    if (is_dev_build) {
-        fs::path absolute_bios = fs::absolute(bios_path, ec);
-        if (ec) absolute_bios = bios_path;
-        fs::path project_root = absolute_bios.parent_path().parent_path();
-        return project_root;
-    }
-
-    // 4. Production: cards sit next to the exe.
     return exe_dir;
 }
 
@@ -323,22 +339,38 @@ int main(int argc, char** argv) {
      * Writes psx_last_run_report.json on signal/SEH/atexit/fail-fast. */
     psx_crash_trace_install_handlers();
 
-    const char* bios_path = "bios/SCPH1001.BIN";
+    const char* bios_path = PSX_DEFAULT_BIOS_PATH;
+    const char* disc_path = PSX_DEFAULT_DISC_PATH;
+    const char* game_root_arg = PSX_DEFAULT_GAME_ROOT;
     const char* memcard_dir_arg = nullptr;
     /* Parse positional. First non-flag arg = bios_path. */
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--memcard-dir") == 0 && i + 1 < argc) {
             memcard_dir_arg = argv[++i];
+        } else if (std::strcmp(argv[i], "--bios") == 0 && i + 1 < argc) {
+            bios_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--disc") == 0 && i + 1 < argc) {
+            disc_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--game-root") == 0 && i + 1 < argc) {
+            game_root_arg = argv[++i];
         } else if (argv[i][0] != '-') {
             bios_path = argv[i];
         }
     }
 
     std::filesystem::path resolved_bios = resolve_bios_path(bios_path, argv[0]);
+    std::filesystem::path game_root =
+        game_root_arg && game_root_arg[0]
+            ? std::filesystem::absolute(std::filesystem::path(game_root_arg))
+            : std::filesystem::path();
     std::filesystem::path memcard_dir =
-        resolve_memcard_dir(memcard_dir_arg, resolved_bios, argv[0]);
+        resolve_memcard_dir(memcard_dir_arg, PSX_DEFAULT_MEMCARD_DIR, game_root, argv[0]);
+    std::filesystem::path resolved_disc =
+        disc_path && disc_path[0] ? resolve_bios_path(disc_path, argv[0])
+                                  : std::filesystem::path();
     std::string bios_path_str = resolved_bios.string();
     std::string memcard_dir_str = memcard_dir.string();
+    std::string disc_path_str = resolved_disc.string();
 
     std::fprintf(stdout, "psxrecomp-v4 runtime: loading BIOS from %s\n", bios_path_str.c_str());
     memory_init(bios_path_str.c_str());
@@ -349,14 +381,10 @@ int main(int argc, char** argv) {
     sio_init();
     sio_connect_pad(0);  /* Controller on port 1 */
     spu_init();
-    cdrom_init(NULL);    /* No disc for BIOS-only boot */
+    cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
     memcard_init(memcard_dir_str.c_str());
     std::atexit(memcard_flush_all);
-#ifdef DEFAULT_DEBUG_PORT
     debug_server_init(DEFAULT_DEBUG_PORT);
-#else
-    debug_server_init(4370);
-#endif
 
     /* ---- SDL init ---- */
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -378,7 +406,7 @@ int main(int argc, char** argv) {
     }
 
     sdl_window = SDL_CreateWindow(
-        "psxrecomp-v4 — BIOS",
+        PSX_WINDOW_TITLE,
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         640, 480,
         SDL_WINDOW_SHOWN

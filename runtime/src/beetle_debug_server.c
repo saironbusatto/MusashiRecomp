@@ -15,6 +15,10 @@
 #include <stdarg.h>
 #include <stdint.h>
 
+#ifndef DEFAULT_DEBUG_PORT
+#error DEFAULT_DEBUG_PORT must be defined by the beetle runtime target.
+#endif
+
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <winsock2.h>
@@ -103,7 +107,7 @@ extern uint32_t beetle_fntrace_get(uint64_t *out_seq,
 /* ---- Server state ---- */
 static sock_t s_listen = SOCK_INVALID;
 static sock_t s_client = SOCK_INVALID;
-static int    s_port   = 4380;
+static int    s_port   = DEFAULT_DEBUG_PORT;
 
 #define RECV_BUF_SIZE 8192
 static char s_recv_buf[RECV_BUF_SIZE];
