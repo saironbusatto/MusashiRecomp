@@ -11,6 +11,7 @@
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
+#include "cdrom.h"
 #include "sio.h"
 #include "memcard.h"
 #include "spu.h"
@@ -900,6 +901,7 @@ static const char *json_get_str(const char *json, const char *key,
                                 char *out, int out_sz);
 static uint32_t hex_to_u32(const char *s);
 static void handle_dirty_ram_stats(int id, const char *json);
+static void handle_dirty_ram_unsupported(int id, const char *json);
 static void send_err(int id, const char *msg);
 static void send_ok(int id);
 void debug_server_send_fmt(const char *fmt, ...);
@@ -944,6 +946,8 @@ static void handle_dirty_ram_stats(int id, const char *json)
     extern uint64_t g_dirty_ram_insns_run;
     extern uint64_t g_dirty_ram_aborts;
     extern uint32_t dirty_ram_get_bitmap(void);
+    extern uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
+    extern uint32_t dirty_ram_get_bitmap_word_count(void);
     (void)json;
 
     char buf[16 * 1024];
@@ -970,8 +974,33 @@ static void handle_dirty_ram_stats(int id, const char *json)
         first = 0;
         if (n >= (int)sizeof(buf) - 128) break;
     }
+    n += snprintf(buf + n, sizeof(buf) - n, "],\"dirty_bitmap_words\":[");
+    uint32_t word_count = dirty_ram_get_bitmap_word_count();
+    for (uint32_t i = 0; i < word_count; i++) {
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "%s\"0x%08X\"",
+                      i == 0 ? "" : ",",
+                      (unsigned)dirty_ram_get_bitmap_word(i));
+        if (n >= (int)sizeof(buf) - 64) break;
+    }
     n += snprintf(buf + n, sizeof(buf) - n, "]}\n");
     send_fmt("%s", buf);
+}
+
+static void handle_dirty_ram_unsupported(int id, const char *json)
+{
+    (void)json;
+    const char *reason = g_dirty_ram_last_unsupported_reason;
+    if (!reason) reason = "";
+    send_fmt("{\"id\":%d,\"ok\":true,\"aborts\":%llu,"
+             "\"midblock\":%llu,\"last_pc\":\"0x%08X\","
+             "\"last_insn\":\"0x%08X\",\"reason\":\"%s\"}\n",
+             id,
+             (unsigned long long)g_dirty_ram_aborts,
+             (unsigned long long)g_dirty_ram_unsupported_midblock,
+             (unsigned)g_dirty_ram_last_unsupported_pc,
+             (unsigned)g_dirty_ram_last_unsupported_insn,
+             reason);
 }
 
 /* ---- Dirty-RAM block-entry log: dump (target,ra,frame) tuples to find
@@ -1856,6 +1885,104 @@ static void handle_irq_state(int id, const char *json)
 }
 
 /* GPU opcode counter — defined in gpu.c */
+static const char *cdrom_trace_kind_name(uint8_t kind)
+{
+    switch (kind) {
+    case 'N': return "init";
+    case 'C': return "cmd";
+    case 'I': return "set_irq";
+    case 'F': return "fire_irq";
+    case 'f': return "irq_masked";
+    case 'S': return "sector";
+    case 'R': return "read";
+    case 'W': return "write";
+    case 'D': return "dma";
+    default: return "unknown";
+    }
+}
+
+static void handle_cdrom_state(int id, const char *json)
+{
+    (void)json;
+    CDROMDebugState s;
+    cdrom_debug_snapshot(&s);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"seq\":%llu,\"has_disc\":%d,"
+             "\"index\":%u,\"stat\":\"0x%02X\","
+             "\"irq_enable\":\"0x%02X\",\"irq_flag\":\"0x%02X\","
+             "\"param_count\":%d,\"response_read\":%d,\"response_count\":%d,"
+             "\"sector_available\":%d,\"sector_read_pos\":%d,"
+             "\"reading\":%d,\"read_msf\":[%d,%d,%d],"
+             "\"seek_msf\":[%u,%u,%u],"
+             "\"pending\":{\"cmd\":\"0x%02X\",\"active\":%d,\"delay\":%d,\"phase\":%d},"
+             "\"i_stat\":\"0x%08X\"}",
+             id, (unsigned long long)s.seq, s.has_disc,
+             s.index_reg, s.stat_reg, s.irq_enable, s.irq_flag,
+             s.param_count, s.response_read, s.response_count,
+             s.sector_available, s.sector_read_pos,
+             s.reading, s.read_min, s.read_sec, s.read_sect,
+             s.seek_min, s.seek_sec, s.seek_sect,
+             s.pending_cmd, s.pending_pending, s.pending_delay,
+             s.pending_phase, s.i_stat);
+}
+
+static void handle_cdrom_trace_clear(int id, const char *json)
+{
+    (void)json;
+    cdrom_debug_clear_trace();
+    send_ok(id);
+}
+
+static void handle_cdrom_trace_dump(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > CDROM_TRACE_CAP) count = CDROM_TRACE_CAP;
+
+    const CDROMTraceEntry *entries = NULL;
+    uint64_t total = cdrom_debug_get_trace(&entries);
+    uint64_t oldest = (total > CDROM_TRACE_CAP) ? total - CDROM_TRACE_CAP : 0;
+    uint64_t start = (total > (uint64_t)count) ? total - (uint64_t)count : 0;
+    if (start < oldest) start = oldest;
+
+    size_t bufsz = 256u + (size_t)count * 360u;
+    char *buf = (char *)malloc(bufsz);
+    if (!buf) { send_err(id, "oom"); return; }
+
+    size_t pos = 0;
+    int emitted = 0;
+    pos += snprintf(buf + pos, bufsz - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"oldest\":%llu,\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)oldest);
+    for (uint64_t seq = start; seq < total && pos < bufsz - 400; seq++) {
+        const CDROMTraceEntry *e = &entries[seq % CDROM_TRACE_CAP];
+        if (e->seq != seq) continue;
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s{\"seq\":%llu,\"kind\":\"%s\",\"addr\":\"0x%08X\","
+                        "\"val\":\"0x%08X\",\"w\":%u,\"func\":\"0x%08X\","
+                        "\"pc\":\"0x%08X\",\"frame\":%u,\"i_stat\":\"0x%08X\","
+                        "\"index\":%u,\"stat\":\"0x%02X\","
+                        "\"irq_enable\":\"0x%02X\",\"irq_flag\":\"0x%02X\","
+                        "\"param\":%u,\"resp_read\":%u,\"resp_count\":%u,"
+                        "\"sector_avail\":%u,\"sector_pos\":%d,"
+                        "\"pending_cmd\":\"0x%02X\",\"pending\":%u,"
+                        "\"pending_delay\":%d,\"reading\":%u}",
+                        emitted ? "," : "",
+                        (unsigned long long)e->seq, cdrom_trace_kind_name(e->kind),
+                        e->addr, e->val, (unsigned)e->width,
+                        e->func, e->pc, e->frame, e->i_stat,
+                        e->index_reg, e->stat_reg, e->irq_enable, e->irq_flag,
+                        e->param_count, e->response_read, e->response_count,
+                        e->sector_available, e->sector_read_pos,
+                        e->pending_cmd, e->pending_pending,
+                        e->pending_delay, e->reading);
+        emitted++;
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
+}
+
 extern uint32_t gpu_get_opcode_count(uint8_t op);
 
 extern int gpu_get_a0_count(void);
@@ -4027,6 +4154,9 @@ static const CmdEntry s_commands[] = {
     { "gpu_state",         handle_gpu_state },
     { "vram_peek",         handle_vram_peek },
     { "irq_state",         handle_irq_state },
+    { "cdrom_state",       handle_cdrom_state },
+    { "cdrom_trace_dump",  handle_cdrom_trace_dump },
+    { "cdrom_trace_clear", handle_cdrom_trace_clear },
     { "sio_state",         handle_sio_state },
     { "mc_status",         handle_mc_status },
     { "spu_status",        handle_spu_status },
@@ -4051,6 +4181,7 @@ static const CmdEntry s_commands[] = {
     { "probe_trace",       handle_probe_trace },
     { "probe_clear",       handle_probe_clear },
     { "dirty_ram_stats",   handle_dirty_ram_stats },
+    { "dirty_ram_unsupported", handle_dirty_ram_unsupported },
     { "dirty_block_log",   handle_dirty_block_log },
     { "fntrace_arm",       handle_fntrace_arm },
     { "fntrace_arm_clear", handle_fntrace_arm_clear },

@@ -8,6 +8,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <setjmp.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
 
 /* Forward declarations from interrupts.c */
 int psx_get_in_exception(void);
@@ -19,6 +24,300 @@ static void trap_crash(const char* msg) {
     /* Also dump the structured crash trace with rings + cpu state. */
     extern void psx_crash_trace_dump(const char *reason, void *seh_info);
     psx_crash_trace_dump("trap_crash", NULL);
+}
+
+typedef struct ThreadWaitFrame {
+    uint32_t tcb;
+    jmp_buf jmp;
+} ThreadWaitFrame;
+
+static ThreadWaitFrame s_thread_wait_stack[16];
+static int s_thread_wait_depth;
+
+static int psx_is_valid_tcb(CPUState* cpu, uint32_t tcb)
+{
+    uint32_t base = cpu->read_word(0x00000110u);
+    uint32_t size = cpu->read_word(0x00000114u);
+    if (base == 0 || size == 0) return 0;
+    uint32_t offset = tcb - base;
+    return offset < size && (offset % 0xC0u) == 0;
+}
+
+static uint32_t psx_current_tcb_ptr(CPUState* cpu)
+{
+    uint32_t tcbh = cpu->read_word(0x00000108u);
+    return tcbh ? cpu->read_word(tcbh) : 0;
+}
+
+static void psx_set_current_tcb(CPUState* cpu, uint32_t tcb)
+{
+    uint32_t tcbh = cpu->read_word(0x00000108u);
+    if (tcbh) cpu->write_word(tcbh, tcb);
+}
+
+static void psx_save_context_to_tcb(CPUState* cpu, uint32_t tcb, uint32_t resume_pc)
+{
+    uint32_t save = tcb + 8u;
+    uint32_t sr = cpu->cop0[12];
+    for (int i = 1; i < 32; i++) {
+        if (i == 26) continue; /* k0 is the BIOS restore jump register. */
+        cpu->write_word(save + (uint32_t)i * 4u, cpu->gpr[i]);
+    }
+    cpu->write_word(save + 128u, resume_pc);
+    cpu->write_word(save + 132u, cpu->hi);
+    cpu->write_word(save + 136u, cpu->lo);
+    cpu->write_word(save + 140u, (sr & ~0x3Fu) | ((sr & 0x0Fu) << 2));
+    cpu->write_word(save + 144u, cpu->cop0[13]);
+}
+
+static uint32_t psx_restore_context_from_tcb(CPUState* cpu, uint32_t tcb)
+{
+    uint32_t save = tcb + 8u;
+    for (int i = 1; i < 32; i++) {
+        if (i == 26) continue;
+        cpu->gpr[i] = cpu->read_word(save + (uint32_t)i * 4u);
+    }
+    cpu->hi = cpu->read_word(save + 132u);
+    cpu->lo = cpu->read_word(save + 136u);
+    {
+        uint32_t saved_sr = cpu->read_word(save + 140u);
+        cpu->cop0[12] = (saved_sr & 0xFFFFFFC0u) | ((saved_sr >> 2) & 0x0Fu);
+    }
+    cpu->cop0[13] = cpu->read_word(save + 144u);
+    cpu->gpr[26] = cpu->read_word(save + 128u);
+    return cpu->gpr[26];
+}
+
+#ifdef _WIN32
+
+typedef struct HostThreadFiber {
+    uint32_t tcb;
+    LPVOID fiber;
+    LPVOID return_fiber;
+    uint32_t return_tcb;
+    CPUState* cpu;
+    int used;
+    int owned;
+    int closed;
+} HostThreadFiber;
+
+static HostThreadFiber s_host_threads[32];
+static LPVOID s_main_fiber;
+
+static uint32_t psx_tcb_state(CPUState* cpu, uint32_t tcb)
+{
+    return psx_is_valid_tcb(cpu, tcb) ? cpu->read_word(tcb) : 0;
+}
+
+static LPVOID psx_current_host_fiber(void)
+{
+    if (!s_main_fiber) {
+        s_main_fiber = ConvertThreadToFiber(NULL);
+        if (!s_main_fiber) {
+            trap_crash("ConvertThreadToFiber failed");
+            exit(1);
+        }
+    }
+    return GetCurrentFiber();
+}
+
+static HostThreadFiber* psx_find_host_thread(uint32_t tcb)
+{
+    for (size_t i = 0; i < sizeof(s_host_threads) / sizeof(s_host_threads[0]); i++) {
+        if (s_host_threads[i].used && s_host_threads[i].tcb == tcb) {
+            return &s_host_threads[i];
+        }
+    }
+    return NULL;
+}
+
+static HostThreadFiber* psx_alloc_host_thread(void)
+{
+    for (size_t i = 0; i < sizeof(s_host_threads) / sizeof(s_host_threads[0]); i++) {
+        if (!s_host_threads[i].used) {
+            memset(&s_host_threads[i], 0, sizeof(s_host_threads[i]));
+            s_host_threads[i].used = 1;
+            return &s_host_threads[i];
+        }
+    }
+    trap_crash("BIOS thread fiber table full");
+    exit(1);
+}
+
+static HostThreadFiber* psx_bind_current_host_thread(CPUState* cpu, uint32_t tcb)
+{
+    LPVOID fiber = psx_current_host_fiber();
+    HostThreadFiber* slot = psx_find_host_thread(tcb);
+    if (!slot) {
+        slot = psx_alloc_host_thread();
+    }
+    slot->tcb = tcb;
+    slot->fiber = fiber;
+    slot->cpu = cpu;
+    slot->used = 1;
+    slot->owned = (fiber != s_main_fiber);
+    slot->closed = 0;
+    return slot;
+}
+
+static VOID CALLBACK psx_thread_fiber_entry(LPVOID param)
+{
+    HostThreadFiber* slot = (HostThreadFiber*)param;
+    CPUState* cpu = slot->cpu;
+
+    psx_set_current_tcb(cpu, slot->tcb);
+    uint32_t target_pc = psx_restore_context_from_tcb(cpu, slot->tcb);
+    if (target_pc != 0) {
+        psx_dispatch(cpu, target_pc);
+    }
+
+    slot->closed = 1;
+    if (psx_tcb_state(cpu, slot->tcb) == 0x4000u) {
+        cpu->write_word(slot->tcb, 0x1000u);
+    }
+
+    if (slot->return_fiber) {
+        if (psx_is_valid_tcb(cpu, slot->return_tcb)) {
+            psx_set_current_tcb(cpu, slot->return_tcb);
+            (void)psx_restore_context_from_tcb(cpu, slot->return_tcb);
+        }
+        SwitchToFiber(slot->return_fiber);
+    }
+
+    trap_crash("BIOS thread fiber returned with no scheduler target");
+    exit(1);
+}
+
+static HostThreadFiber* psx_get_or_create_host_thread(CPUState* cpu, uint32_t tcb)
+{
+    HostThreadFiber* slot = psx_find_host_thread(tcb);
+    if (psx_tcb_state(cpu, tcb) != 0x4000u) {
+        return NULL;
+    }
+
+    if (slot && slot->fiber && !slot->closed) {
+        return slot;
+    }
+
+    if (!slot) {
+        slot = psx_alloc_host_thread();
+    } else if (slot->fiber && slot->owned && slot->fiber != GetCurrentFiber()) {
+        DeleteFiber(slot->fiber);
+        slot->fiber = NULL;
+    }
+
+    slot->tcb = tcb;
+    slot->cpu = cpu;
+    slot->return_fiber = NULL;
+    slot->return_tcb = 0;
+    slot->owned = 1;
+    slot->closed = 0;
+    slot->fiber = CreateFiber(1024 * 1024, psx_thread_fiber_entry, slot);
+    if (!slot->fiber) {
+        trap_crash("CreateFiber failed for BIOS thread");
+        exit(1);
+    }
+    return slot;
+}
+
+static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
+{
+    uint32_t current_tcb = psx_current_tcb_ptr(cpu);
+    if (!psx_is_valid_tcb(cpu, current_tcb) || !psx_is_valid_tcb(cpu, target_tcb)) {
+        return 0;
+    }
+    if (current_tcb == target_tcb) {
+        cpu->pc = 0;
+        return 1;
+    }
+
+    HostThreadFiber* current = psx_bind_current_host_thread(cpu, current_tcb);
+    if (psx_tcb_state(cpu, current_tcb) == 0x4000u) {
+        psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
+    } else {
+        current->closed = 1;
+    }
+
+    HostThreadFiber* target = psx_get_or_create_host_thread(cpu, target_tcb);
+    if (!target) {
+        return 0;
+    }
+
+    target->return_fiber = current->fiber;
+    target->return_tcb = current_tcb;
+
+    psx_set_current_tcb(cpu, target_tcb);
+    (void)psx_restore_context_from_tcb(cpu, target_tcb);
+    SwitchToFiber(target->fiber);
+
+    cpu->pc = 0;
+    return 1;
+}
+
+#endif
+
+static int psx_change_thread_setjmp(CPUState* cpu, uint32_t target_tcb)
+{
+    uint32_t current_tcb = psx_current_tcb_ptr(cpu);
+    if (!psx_is_valid_tcb(cpu, current_tcb) || !psx_is_valid_tcb(cpu, target_tcb)) {
+        return 0;
+    }
+    if (current_tcb == target_tcb) {
+        cpu->pc = 0;
+        return 1;
+    }
+
+    psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
+
+    if (s_thread_wait_depth > 0 &&
+        s_thread_wait_stack[s_thread_wait_depth - 1].tcb == target_tcb) {
+        ThreadWaitFrame *frame = &s_thread_wait_stack[s_thread_wait_depth - 1];
+        s_thread_wait_depth--;
+        psx_set_current_tcb(cpu, target_tcb);
+        (void)psx_restore_context_from_tcb(cpu, target_tcb);
+        cpu->pc = 0;
+        longjmp(frame->jmp, 1);
+    }
+
+    if (s_thread_wait_depth >= (int)(sizeof(s_thread_wait_stack) / sizeof(s_thread_wait_stack[0]))) {
+        trap_crash("ChangeThread wait stack overflow");
+        exit(1);
+    }
+
+    int frame_index = s_thread_wait_depth++;
+    ThreadWaitFrame *frame = &s_thread_wait_stack[frame_index];
+    frame->tcb = current_tcb;
+
+    if (setjmp(frame->jmp) != 0) {
+        cpu->pc = 0;
+        return 1;
+    }
+
+    psx_set_current_tcb(cpu, target_tcb);
+    uint32_t target_pc = psx_restore_context_from_tcb(cpu, target_tcb);
+    if (target_pc != 0) {
+        psx_dispatch(cpu, target_pc);
+    }
+
+    if (s_thread_wait_depth > frame_index &&
+        s_thread_wait_stack[frame_index].tcb == current_tcb) {
+        s_thread_wait_depth = frame_index;
+    }
+    if (psx_current_tcb_ptr(cpu) != current_tcb) {
+        psx_set_current_tcb(cpu, current_tcb);
+        (void)psx_restore_context_from_tcb(cpu, current_tcb);
+    }
+    cpu->pc = 0;
+    return 1;
+}
+
+static int psx_change_thread(CPUState* cpu, uint32_t target_tcb)
+{
+#ifdef _WIN32
+    return psx_change_thread_fiber(cpu, target_tcb);
+#else
+    return psx_change_thread_setjmp(cpu, target_tcb);
+#endif
 }
 
 void psx_syscall(CPUState* cpu, uint32_t code) {
@@ -52,7 +351,12 @@ void psx_syscall(CPUState* cpu, uint32_t code) {
             cpu->pc = 0;
             return;
 
-        case 3: { /* ReturnFromException: restore from TCB + RFE */
+        case 3: { /* ChangeThread / ReturnFromException */
+            uint32_t target_tcb = cpu->gpr[5];
+            if (!psx_get_in_exception() && psx_change_thread(cpu, target_tcb)) {
+                return;
+            }
+
             uint32_t tcb_ptr_addr = cpu->read_word(0x00000108u);
             if (tcb_ptr_addr != 0) {
                 uint32_t save_area = cpu->read_word(tcb_ptr_addr);
