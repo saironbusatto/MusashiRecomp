@@ -47,6 +47,9 @@ typedef struct CDROMDebugState {
     int read_sec;
     int read_sect;
     uint8_t read_cmd;
+    uint8_t filter_file;
+    uint8_t filter_channel;
+    uint8_t muted;
     int read_delay;
     int pending_pending;
     int pending_delay;
