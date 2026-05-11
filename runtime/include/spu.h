@@ -15,11 +15,17 @@ typedef struct SpuDebugInfo {
     uint32_t active_mask;
     int16_t main_l;
     int16_t main_r;
+    int16_t cd_l;
+    int16_t cd_r;
     uint32_t key_on_count;
     uint64_t render_frames;
     uint64_t nonzero_frames;
     int32_t last_peak;
     int32_t peak;
+    uint32_t cd_frames;
+    uint64_t cd_push_frames;
+    uint64_t cd_overflow_frames;
+    uint64_t cd_underflow_frames;
 } SpuDebugInfo;
 
 void spu_debug_info(SpuDebugInfo* out);
@@ -93,6 +99,11 @@ void spu_write(uint32_t addr, uint32_t value);
 /* DMA channel 4 interface */
 void spu_dma_write(uint32_t word);
 int spu_dma_ready(void);
+
+/* CD-ROM XA/CDDA input path. Samples are stereo 44.1 kHz PCM entering the
+ * SPU CD input bus; SPU control bit 0 and CD volume registers gate output. */
+void spu_cd_audio_push(const int16_t* stereo, int frames);
+void spu_cd_audio_reset(void);
 
 /* Get pointer to SPU RAM for direct access (512KB) */
 const uint8_t* spu_get_ram(void);

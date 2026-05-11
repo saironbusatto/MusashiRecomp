@@ -522,7 +522,7 @@ static void pad_process_byte(uint8_t tx_byte) {
         break;
 
     case PAD_WAIT_ACCESS:
-        if (tx_byte == 0x42) {
+        if (tx_byte == 0x42 || tx_byte == 0x43 || tx_byte == 0x45) {
             pad_state = PAD_SEND_ID_LO;
             sio_rx_data = 0x41; /* Digital pad type */
             sio_stat |= SIO_STAT_ACK;
@@ -1032,6 +1032,47 @@ void sio_write(uint32_t addr, uint32_t value) {
         /* Cycle-paced TX. Pad and card share single bus. */
         {
             uint8_t b = (uint8_t)value;
+            int pad_fast_path =
+                active_device != DEV_MEMCARD &&
+                (active_device == DEV_PAD ||
+                 sio_bus_owner == SIO_OWNER_PAD ||
+                 b == 0x01);
+
+            if (pad_fast_path) {
+                uint16_t arm_dbg_ctrl_pre = sio_ctrl;
+                uint16_t arm_dbg_stat_pre = sio_stat;
+                sio_shift_active = 0;
+                sio_shift_remaining = 0;
+                sio_tx_buffered = 0;
+                sio_pending_ack = 0;
+                sio_ack_remaining = 0;
+                sio_bus_owner = SIO_OWNER_PAD;
+                sio_bus_byte_index++;
+                g_sio_timing_active = 0;
+
+                sr_record(SR_EVT_TX_DATA_WRITE, b, 0);
+                sio_process_byte(b);
+                uint8_t arm_dbg_dev_at_decision = (uint8_t)active_device;
+                int armed_now = 0;
+                if ((sio_stat & SIO_STAT_ACK) && (sio_ctrl & SIO_CTRL_ACK_IRQ_EN)) {
+                    sio_stat &= ~(SIO_STAT_ACK | SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY);
+                    sio_irq_pending = 1;
+                    sio_irq_countdown = SIO_IRQ_DELAY_PAD;
+                    sio_irq_pending_source = SIO_IRQ_SRC_PAD_ACK;
+                    sio_irq_pending_slot = (uint8_t)selected_slot;
+                    sio_irq_pending_delay = (uint8_t)sio_irq_countdown;
+                    sio_irq_pending_mc_state = (uint8_t)mc_state;
+                    sio_irq_pending_byte_seq = sio_trace_seq;
+                    armed_now = 1;
+                } else {
+                    sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
+                }
+                sio_card_arm_audit_record(arm_dbg_dev_at_decision, arm_dbg_ctrl_pre,
+                                          arm_dbg_stat_pre, sio_stat,
+                                          armed_now, sio_irq_countdown);
+                break;
+            }
+
             sr_record(SR_EVT_TX_DATA_WRITE, b, 0);
             if (sio_bus_byte_index == 0) {
                 sio_bus_owner = (b == 0x81) ? SIO_OWNER_CARD

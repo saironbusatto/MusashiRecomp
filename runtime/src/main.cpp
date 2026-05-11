@@ -292,12 +292,16 @@ static void sdl_vblank_present(void) {
         }
     }
 
-    /* Update texture and present. */
-    SDL_UpdateTexture(sdl_texture, NULL, sdl_pixel_buf, (int)(w * sizeof(uint32_t)));
+    /* Update only the active display rectangle. The backing texture is fixed
+     * at 640x512, while games can switch to smaller modes such as 320x224 for
+     * FMV; presenting the full texture would leave the active image stuck in
+     * the upper-left portion of the window. */
+    SDL_Rect src = { 0, 0, (int)w, (int)h };
+    SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf, (int)(w * sizeof(uint32_t)));
 
     SDL_Rect dst = { 0, 0, 640, 480 };
     SDL_RenderClear(sdl_renderer);
-    SDL_RenderCopy(sdl_renderer, sdl_texture, NULL, &dst);
+    SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
     SDL_RenderPresent(sdl_renderer);
 
     /* Wall-clock pacing: hold each simulated vblank to ~16.68 ms so the

@@ -11,6 +11,7 @@
  */
 
 #include "cdrom.h"
+#include "spu.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -67,6 +68,23 @@ static int read_min, read_sec, read_sect;
 static uint8_t mode_reg;
 static uint8_t read_cmd;
 static int read_delay;
+static uint8_t filter_file;
+static uint8_t filter_channel;
+static uint8_t cd_muted;
+
+#define XA_SUBHEADER_OFFSET 16
+#define XA_DATA_OFFSET      24
+#define XA_SOUND_GROUPS     18
+#define XA_NATIVE_FRAMES    (XA_SOUND_GROUPS * 4 * 28)
+#define XA_MAX_44100_FRAMES 4704
+
+#define XA_SUBMODE_AUDIO 0x04
+
+static int32_t xa_hist_l[2];
+static int32_t xa_hist_r[2];
+static uint8_t xa_stream_file;
+static uint8_t xa_stream_channel;
+static int xa_stream_active;
 
 static int sector_delay_cycles(void) {
     /* PS1 CPU is 33.8688 MHz. CD-ROM sectors arrive at 75 Hz in 1x
@@ -178,6 +196,135 @@ static uint8_t bin_to_bcd(int val) {
     return (uint8_t)(((val / 10) << 4) | (val % 10));
 }
 
+static int16_t clamp16_cd(int32_t v) {
+    if (v > 32767) return 32767;
+    if (v < -32768) return -32768;
+    return (int16_t)v;
+}
+
+static void xa_reset_decode(void) {
+    xa_hist_l[0] = xa_hist_l[1] = 0;
+    xa_hist_r[0] = xa_hist_r[1] = 0;
+    xa_stream_file = 0xFF;
+    xa_stream_channel = 0xFF;
+    xa_stream_active = 0;
+}
+
+static int xa_decode_sector_4bit_stereo(const uint8_t* data, int16_t* out) {
+    static const int k0[5] = { 0, 60, 115, 98, 122 };
+    static const int k1[5] = { 0, 0, -52, -55, -60 };
+    int pair = 0;
+
+    for (int g = 0; g < XA_SOUND_GROUPS; g++) {
+        const uint8_t* grp = data + g * 128;
+        for (int blk = 0; blk < 4; blk++) {
+            uint8_t hdr_l = grp[4 + blk * 2];
+            uint8_t hdr_r = grp[4 + blk * 2 + 1];
+            int shift_l = 12 - (int)(hdr_l & 0x0F);
+            int shift_r = 12 - (int)(hdr_r & 0x0F);
+            int filter_l = (hdr_l >> 4) & 0x03;
+            int filter_r = (hdr_r >> 4) & 0x03;
+            if (shift_l < 0) shift_l = 0;
+            if (shift_r < 0) shift_r = 0;
+
+            for (int i = 0; i < 28; i++) {
+                uint8_t b = grp[16 + blk + i * 4];
+                int32_t nib_l = b & 0x0F;
+                int32_t nib_r = (b >> 4) & 0x0F;
+                if (nib_l >= 8) nib_l -= 16;
+                if (nib_r >= 8) nib_r -= 16;
+
+                int32_t sample_l = (nib_l << shift_l)
+                    + ((k0[filter_l] * xa_hist_l[0] + k1[filter_l] * xa_hist_l[1] + 32) >> 6);
+                int32_t sample_r = (nib_r << shift_r)
+                    + ((k0[filter_r] * xa_hist_r[0] + k1[filter_r] * xa_hist_r[1] + 32) >> 6);
+                sample_l = clamp16_cd(sample_l);
+                sample_r = clamp16_cd(sample_r);
+                xa_hist_l[1] = xa_hist_l[0];
+                xa_hist_l[0] = sample_l;
+                xa_hist_r[1] = xa_hist_r[0];
+                xa_hist_r[0] = sample_r;
+
+                out[pair * 2 + 0] = (int16_t)sample_l;
+                out[pair * 2 + 1] = (int16_t)sample_r;
+                pair++;
+            }
+        }
+    }
+
+    return pair;
+}
+
+static int xa_resample_to_44100(const int16_t* in, int in_frames,
+                                int sample_rate, int16_t* out, int max_frames) {
+    if (!in || !out || in_frames <= 0 || sample_rate <= 0 || max_frames <= 0) return 0;
+    int out_frames = 0;
+    int in_pos = 0;
+    int phase = 0;
+
+    while (in_pos < in_frames && out_frames < max_frames) {
+        int next_pos = (in_pos + 1 < in_frames) ? in_pos + 1 : in_pos;
+        int32_t cur_l = in[in_pos * 2 + 0];
+        int32_t cur_r = in[in_pos * 2 + 1];
+        int32_t next_l = in[next_pos * 2 + 0];
+        int32_t next_r = in[next_pos * 2 + 1];
+        out[out_frames * 2 + 0] = (int16_t)(cur_l + ((next_l - cur_l) * phase) / 44100);
+        out[out_frames * 2 + 1] = (int16_t)(cur_r + ((next_r - cur_r) * phase) / 44100);
+        out_frames++;
+
+        phase += sample_rate;
+        while (phase >= 44100) {
+            phase -= 44100;
+            in_pos++;
+        }
+    }
+
+    return out_frames;
+}
+
+static void maybe_deliver_xa_audio(const uint8_t* raw_data) {
+    if (!(mode_reg & 0x40u) || !raw_data || cd_muted) return;
+
+    uint8_t file = raw_data[XA_SUBHEADER_OFFSET + 0];
+    uint8_t channel = raw_data[XA_SUBHEADER_OFFSET + 1];
+    uint8_t submode = raw_data[XA_SUBHEADER_OFFSET + 2];
+    uint8_t coding = raw_data[XA_SUBHEADER_OFFSET + 3];
+    if (!(submode & XA_SUBMODE_AUDIO)) return;
+
+    if ((mode_reg & 0x08u) &&
+        (file != filter_file || channel != filter_channel)) {
+        trace_cdrom('a', 0, ((uint32_t)file << 16) | ((uint32_t)channel << 8) | coding, 0);
+        return;
+    }
+
+    int stereo = (coding & 0x01u) != 0;
+    int rate_code = (coding >> 2) & 0x03;
+    int depth_code = (coding >> 4) & 0x03;
+    int sample_rate = (rate_code == 0) ? 37800 : ((rate_code == 1) ? 18900 : 0);
+    if (!stereo || depth_code != 0 || sample_rate == 0) {
+        trace_cdrom('X', 0, ((uint32_t)file << 16) | ((uint32_t)channel << 8) | coding, 0);
+        return;
+    }
+
+    if (!xa_stream_active || xa_stream_file != file || xa_stream_channel != channel) {
+        xa_reset_decode();
+        xa_stream_file = file;
+        xa_stream_channel = channel;
+        xa_stream_active = 1;
+    }
+
+    int16_t native[XA_NATIVE_FRAMES * 2];
+    int16_t pcm_44100[XA_MAX_44100_FRAMES * 2];
+    int native_frames = xa_decode_sector_4bit_stereo(raw_data + XA_DATA_OFFSET, native);
+    int out_frames = xa_resample_to_44100(native, native_frames, sample_rate,
+                                          pcm_44100, XA_MAX_44100_FRAMES);
+    spu_cd_audio_push(pcm_44100, out_frames);
+    trace_cdrom('A', 0,
+                ((uint32_t)file << 24) | ((uint32_t)channel << 16) |
+                ((uint32_t)coding << 8) | ((uint32_t)(out_frames / 32) & 0xFFu),
+                0);
+}
+
 static void read_sector_at(int min, int sec, int sect) {
     int lba = msf_to_lba(min, sec, sect);
     uint8_t user_data[SECTOR_SIZE];
@@ -187,6 +334,7 @@ static void read_sector_at(int min, int sec, int sect) {
     if (iso_handle) {
         have_raw = iso_read_raw_sector(iso_handle, lba, raw_data, RAW_SECTOR_SIZE);
         if (have_raw) {
+            maybe_deliver_xa_audio(raw_data);
             memcpy(user_data, raw_data + RAW_USER_DATA_OFFSET, SECTOR_SIZE);
         } else if (!iso_read_sector(iso_handle, lba, user_data, SECTOR_SIZE)) {
             memset(user_data, 0, sizeof(user_data));
@@ -232,6 +380,10 @@ static void clear_sector_buffer(void) {
 
 static void start_read_stream(uint8_t cmd) {
     clear_sector_buffer();
+    if (mode_reg & 0x40u) {
+        xa_reset_decode();
+        spu_cd_audio_reset();
+    }
     read_min = seek_min;
     read_sec = seek_sec;
     read_sect = seek_sect;
@@ -294,6 +446,8 @@ static void exec_command(uint8_t cmd) {
 
     case 0x09: /* Pause */
         stop_read_stream();
+        xa_reset_decode();
+        spu_cd_audio_reset();
         stat_reg &= ~CDSTAT_READ;
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
@@ -305,6 +459,8 @@ static void exec_command(uint8_t cmd) {
 
     case 0x0A: /* Init */
         stop_read_stream();
+        spu_cd_audio_reset();
+        xa_reset_decode();
         stat_reg = has_disc() ? CDSTAT_MOTOR : CDSTAT_SHELL;
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
@@ -314,7 +470,24 @@ static void exec_command(uint8_t cmd) {
         pending.phase = 1;
         break;
 
+    case 0x0B: /* Mute */
+        cd_muted = 1;
+        response_push(stat_reg);
+        set_irq(CDIRQ_ACK);
+        break;
+
     case 0x0C: /* Demute */
+        cd_muted = 0;
+        response_push(stat_reg);
+        set_irq(CDIRQ_ACK);
+        break;
+
+    case 0x0D: /* SetFilter */
+        if (param_count >= 2) {
+            filter_file = param_fifo[0];
+            filter_channel = param_fifo[1];
+            xa_reset_decode();
+        }
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
         break;
@@ -322,6 +495,10 @@ static void exec_command(uint8_t cmd) {
     case 0x0E: /* SetMode */
         if (param_count >= 1) {
             mode_reg = param_fifo[0];
+            if (!(mode_reg & 0x40u)) {
+                xa_reset_decode();
+                spu_cd_audio_reset();
+            }
         }
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
@@ -333,6 +510,8 @@ static void exec_command(uint8_t cmd) {
             set_irq(CDIRQ_ERROR);
             break;
         }
+        xa_reset_decode();
+        spu_cd_audio_reset();
         stat_reg |= CDSTAT_SEEK;
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
@@ -509,6 +688,11 @@ void cdrom_init(const char* cue_path) {
     sector_available = 0;
     stop_read_stream();
     mode_reg = 0;
+    filter_file = 0;
+    filter_channel = 0;
+    cd_muted = 0;
+    xa_reset_decode();
+    spu_cd_audio_reset();
     pending.pending = 0;
     seek_min = seek_sec = seek_sect = 0;
 
@@ -657,6 +841,9 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->read_sec = read_sec;
     out->read_sect = read_sect;
     out->read_cmd = read_cmd;
+    out->filter_file = filter_file;
+    out->filter_channel = filter_channel;
+    out->muted = cd_muted;
     out->read_delay = read_delay;
     out->pending_pending = pending.pending;
     out->pending_delay = pending.delay;

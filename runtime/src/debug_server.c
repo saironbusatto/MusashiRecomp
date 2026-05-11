@@ -2169,6 +2169,9 @@ static const char *cdrom_trace_kind_name(uint8_t kind)
     case 'F': return "fire_irq";
     case 'f': return "irq_masked";
     case 'S': return "sector";
+    case 'A': return "xa_audio";
+    case 'a': return "xa_skip";
+    case 'X': return "xa_unsupported";
     case 'O': return "overwrite";
     case 'R': return "read";
     case 'W': return "write";
@@ -2191,6 +2194,7 @@ static void handle_cdrom_state(int id, const char *json)
              "\"sector_available\":%d,\"sector_read_pos\":%d,\"sector_size\":%d,"
              "\"reading\":%d,\"read_msf\":[%d,%d,%d],"
              "\"read_cmd\":\"0x%02X\",\"read_delay\":%d,"
+             "\"filter_file\":%u,\"filter_channel\":%u,\"muted\":%u,"
              "\"seek_msf\":[%u,%u,%u],"
              "\"pending\":{\"cmd\":\"0x%02X\",\"active\":%d,\"delay\":%d,\"phase\":%d},"
              "\"i_stat\":\"0x%08X\"}",
@@ -2201,6 +2205,7 @@ static void handle_cdrom_state(int id, const char *json)
              s.sector_available, s.sector_read_pos, s.sector_size,
              s.reading, s.read_min, s.read_sec, s.read_sect,
              s.read_cmd, s.read_delay,
+             s.filter_file, s.filter_channel, s.muted,
              s.seek_min, s.seek_sec, s.seek_sect,
              s.pending_cmd, s.pending_pending, s.pending_delay,
              s.pending_phase, s.i_stat);
@@ -2579,19 +2584,28 @@ static void handle_spu_status(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"ctrl\":\"0x%04X\",\"active_mask\":\"0x%06X\","
              "\"main_l\":%d,\"main_r\":%d,"
+             "\"cd_l\":%d,\"cd_r\":%d,"
              "\"key_on_count\":%u,"
              "\"render_frames\":%llu,\"nonzero_frames\":%llu,"
-             "\"last_peak\":%d,\"peak\":%d}",
+             "\"last_peak\":%d,\"peak\":%d,"
+             "\"cd_frames\":%u,\"cd_push_frames\":%llu,"
+             "\"cd_overflow_frames\":%llu,\"cd_underflow_frames\":%llu}",
              id,
              info.ctrl & 0xFFFFu,
              info.active_mask & 0xFFFFFFu,
              info.main_l,
              info.main_r,
+             info.cd_l,
+             info.cd_r,
              info.key_on_count,
              (unsigned long long)info.render_frames,
              (unsigned long long)info.nonzero_frames,
              info.last_peak,
-             info.peak);
+             info.peak,
+             info.cd_frames,
+             (unsigned long long)info.cd_push_frames,
+             (unsigned long long)info.cd_overflow_frames,
+             (unsigned long long)info.cd_underflow_frames);
 }
 
 /* ---- Per-voice SPU snapshot. Mirrors fields the Beetle oracle exposes

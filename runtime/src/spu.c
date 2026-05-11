@@ -2,9 +2,9 @@
  * spu.c - PS1 Sound Processing Unit register and direct ADPCM voice model.
  *
  * This is intentionally still a compact hardware model: it accepts SPU
- * register reads/writes, DMA4 transfers into 512KB SPU RAM, and mixes the
- * 24 direct ADPCM voices. Reverb, noise, sweep volumes, XA/CD input and IRQ
- * timing are not modeled yet.
+ * register reads/writes, DMA4 transfers into 512KB SPU RAM, mixes the
+ * 24 direct ADPCM voices, and accepts decoded CD/XA audio on the SPU CD
+ * input bus. Reverb, noise, sweep volumes, and IRQ timing are not modeled yet.
  */
 
 #include "spu.h"
@@ -47,6 +47,16 @@ extern uint64_t s_frame_count;
 static SpuEvent  s_events[SPU_EVENT_CAP];
 static uint32_t  s_event_idx = 0;
 static uint64_t  s_event_seq = 0;
+
+/* CD input FIFO, fed by the CD-ROM XA decoder at 44.1 kHz stereo. */
+#define SPU_CD_RING_FRAMES (44100u * 8u)
+static int16_t  cd_ring[SPU_CD_RING_FRAMES * 2u];
+static uint32_t cd_read_pos;
+static uint32_t cd_write_pos;
+static uint32_t cd_frame_count;
+static uint64_t cd_push_frames;
+static uint64_t cd_overflow_frames;
+static uint64_t cd_underflow_frames;
 
 /* ADSR phases — match Beetle's order so cross-process diffs read straight. */
 #define ADSR_ATTACK   0
@@ -232,6 +242,58 @@ static inline int16_t direct_volume(uint16_t raw) {
     return (int16_t)v;
 }
 
+static inline int16_t cd_input_volume(uint16_t raw) {
+    /* CD input volume registers use signed 16-bit linear gain; games commonly
+     * program 0x7FFF for full-scale CD audio. */
+    return (int16_t)raw;
+}
+
+void spu_cd_audio_reset(void) {
+    memset(cd_ring, 0, sizeof(cd_ring));
+    cd_read_pos = 0;
+    cd_write_pos = 0;
+    cd_frame_count = 0;
+    cd_push_frames = 0;
+    cd_overflow_frames = 0;
+    cd_underflow_frames = 0;
+}
+
+void spu_cd_audio_push(const int16_t* stereo, int frames) {
+    if (!stereo || frames <= 0) return;
+
+    uint32_t in_frames = (uint32_t)frames;
+    if (in_frames > SPU_CD_RING_FRAMES) {
+        uint32_t skip = in_frames - SPU_CD_RING_FRAMES;
+        stereo += skip * 2u;
+        cd_overflow_frames += skip;
+        in_frames = SPU_CD_RING_FRAMES;
+    }
+
+    if (cd_frame_count + in_frames > SPU_CD_RING_FRAMES) {
+        uint32_t drop = (cd_frame_count + in_frames) - SPU_CD_RING_FRAMES;
+        cd_read_pos = (cd_read_pos + drop) % SPU_CD_RING_FRAMES;
+        cd_frame_count -= drop;
+        cd_overflow_frames += drop;
+    }
+
+    for (uint32_t i = 0; i < in_frames; i++) {
+        cd_ring[cd_write_pos * 2u + 0u] = stereo[i * 2u + 0u];
+        cd_ring[cd_write_pos * 2u + 1u] = stereo[i * 2u + 1u];
+        cd_write_pos = (cd_write_pos + 1u) % SPU_CD_RING_FRAMES;
+    }
+    cd_frame_count += in_frames;
+    cd_push_frames += in_frames;
+}
+
+static int cd_audio_pop(int16_t* left, int16_t* right) {
+    if (cd_frame_count == 0) return 0;
+    *left = cd_ring[cd_read_pos * 2u + 0u];
+    *right = cd_ring[cd_read_pos * 2u + 1u];
+    cd_read_pos = (cd_read_pos + 1u) % SPU_CD_RING_FRAMES;
+    cd_frame_count--;
+    return 1;
+}
+
 static void decode_block(SpuVoice *v) {
     static const int f0[5] = { 0, 60, 115, 98, 122 };
     static const int f1[5] = { 0, 0, -52, -55, -60 };
@@ -380,6 +442,7 @@ void spu_init(void) {
     koff_latch = 0;
     s_event_idx = 0;
     s_event_seq = 0;
+    spu_cd_audio_reset();
 }
 
 void spu_render(int16_t* out_stereo, int frames) {
@@ -389,6 +452,8 @@ void spu_render(int16_t* out_stereo, int frames) {
     int enabled = (ctrl & 0x8000u) != 0;
     int16_t main_l = direct_volume(spu_regs[reg_index(0x1F801D80u)]);
     int16_t main_r = direct_volume(spu_regs[reg_index(0x1F801D82u)]);
+    int16_t cd_vol_l = cd_input_volume(spu_regs[reg_index(0x1F801DB0u)]);
+    int16_t cd_vol_r = cd_input_volume(spu_regs[reg_index(0x1F801DB2u)]);
 
     int32_t block_peak = 0;
     for (int f = 0; f < frames; f++) {
@@ -403,6 +468,16 @@ void spu_render(int16_t* out_stereo, int frames) {
                 int16_t vr = direct_volume(voice_reg(v, 1));
                 mix_l += ((int32_t)s * vl) >> 14;
                 mix_r += ((int32_t)s * vr) >> 14;
+            }
+            if (ctrl & 0x0001u) {
+                int16_t cd_l = 0;
+                int16_t cd_r = 0;
+                if (cd_audio_pop(&cd_l, &cd_r)) {
+                    mix_l += ((int32_t)cd_l * cd_vol_l) >> 15;
+                    mix_r += ((int32_t)cd_r * cd_vol_r) >> 15;
+                } else if (cd_push_frames != 0) {
+                    cd_underflow_frames++;
+                }
             }
             mix_l = (mix_l * main_l) >> 14;
             mix_r = (mix_r * main_r) >> 14;
@@ -427,6 +502,8 @@ void spu_debug_info(SpuDebugInfo* out) {
     out->ctrl = spu_regs[reg_index(0x1F801DAAu)];
     out->main_l = direct_volume(spu_regs[reg_index(0x1F801D80u)]);
     out->main_r = direct_volume(spu_regs[reg_index(0x1F801D82u)]);
+    out->cd_l = cd_input_volume(spu_regs[reg_index(0x1F801DB0u)]);
+    out->cd_r = cd_input_volume(spu_regs[reg_index(0x1F801DB2u)]);
     for (int i = 0; i < SPU_VOICE_COUNT; i++) {
         if (voices[i].active) out->active_mask |= (1u << i);
     }
@@ -435,6 +512,10 @@ void spu_debug_info(SpuDebugInfo* out) {
     out->nonzero_frames = nonzero_frames;
     out->last_peak = last_peak;
     out->peak = peak;
+    out->cd_frames = cd_frame_count;
+    out->cd_push_frames = cd_push_frames;
+    out->cd_overflow_frames = cd_overflow_frames;
+    out->cd_underflow_frames = cd_underflow_frames;
 }
 
 uint32_t spu_read(uint32_t addr) {
