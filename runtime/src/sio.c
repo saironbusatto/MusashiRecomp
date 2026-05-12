@@ -30,6 +30,13 @@ static uint16_t sio_stat;
 static uint16_t sio_mode;
 static uint16_t sio_ctrl;
 static uint16_t sio_baud;
+static uint32_t sio_debug_poll_counter;
+
+static void sio_debug_poll_maybe(void) {
+    if ((++sio_debug_poll_counter & 0x3FFu) == 0) {
+        debug_server_poll();
+    }
+}
 
 /* Pad state: 0=pressed, 1=released (PS1 convention) */
 static uint16_t pad_buttons = 0xFFFF; /* all released */
@@ -211,8 +218,11 @@ static uint8_t sio_shift_byte       = 0;
 static int     sio_shift_remaining  = 0;
 static int     sio_tx_buffered      = 0;
 static uint8_t sio_tx_buffer        = 0;
+static int     sio_shift_ack_irq_en = 0;
+static int     sio_tx_buffer_ack_irq_en = 0;
 static int     sio_pending_ack      = 0;
 static int     sio_ack_remaining    = 0;
+static int     sio_pending_ack_irq_en = 0;
 typedef enum {
     SIO_OWNER_NONE = 0, SIO_OWNER_CARD = 1, SIO_OWNER_PAD = 2, SIO_OWNER_UNKNOWN = 3
 } SioBusOwner;
@@ -447,6 +457,7 @@ uint16_t sio_get_last_ctrl_on_tx(void) { return sio_last_ctrl_on_tx; }
 
 static int sio_irq_pending = 0;
 static int sio_irq_countdown = 0;
+static int sio_ack_visible_reads = 0;
 
 /* SIO status register bits */
 #define SIO_STAT_TX_RDY      (1 << 0)
@@ -490,6 +501,20 @@ void sio_init(void) {
     active_device = DEV_NONE;
     sio_irq_pending = 0;
     sio_irq_countdown = 0;
+    sio_ack_visible_reads = 0;
+#if SIO_MODEL_CYCLE_PACED
+    sio_shift_active = 0;
+    sio_shift_remaining = 0;
+    sio_tx_buffered = 0;
+    sio_shift_ack_irq_en = 0;
+    sio_tx_buffer_ack_irq_en = 0;
+    sio_pending_ack = 0;
+    sio_ack_remaining = 0;
+    sio_pending_ack_irq_en = 0;
+    sio_bus_owner = SIO_OWNER_NONE;
+    sio_bus_byte_index = 0;
+    g_sio_timing_active = 0;
+#endif
     sio_txn_open = 0;
     /* Note: sio_txn_buf, sio_txn_idx, sio_txn_seq deliberately persist
      * across sio_init so post-reset diagnostics can still inspect prior
@@ -961,6 +986,8 @@ static void sio_process_byte(uint8_t tx_byte) {
 }
 
 uint32_t sio_read(uint32_t addr) {
+    sio_debug_poll_maybe();
+
     /* Advance delayed IRQ on every SIO register access.
      * In v4, recompiled functions run as native C without per-instruction
      * stepping. sio_tick() from the dispatch loop won't advance during
@@ -988,11 +1015,15 @@ uint32_t sio_read(uint32_t addr) {
 
     case 0x1F801044: { /* SIO_STAT — record only on value transitions */
         static uint16_t s_last_stat_observed = 0xFFFF;
+        uint16_t observed = sio_stat;
         if (sio_stat != s_last_stat_observed) {
             s_last_stat_observed = sio_stat;
             sr_record(SR_EVT_STAT_READ, 0, 0);
         }
-        return sio_stat;
+        if (sio_ack_visible_reads > 0 && --sio_ack_visible_reads == 0) {
+            sio_stat &= ~SIO_STAT_ACK;
+        }
+        return observed;
     }
 
     case 0x1F801048: /* SIO_MODE */
@@ -1010,6 +1041,8 @@ uint32_t sio_read(uint32_t addr) {
 }
 
 void sio_write(uint32_t addr, uint32_t value) {
+    sio_debug_poll_maybe();
+
     /* Advance delayed IRQ AFTER write processing (not before).
      * Ticking before a CTRL ACK write would fire the pending IRQ
      * right before the CTRL clears it — wrong order. */
@@ -1044,8 +1077,11 @@ void sio_write(uint32_t addr, uint32_t value) {
                 sio_shift_active = 0;
                 sio_shift_remaining = 0;
                 sio_tx_buffered = 0;
+                sio_shift_ack_irq_en = 0;
+                sio_tx_buffer_ack_irq_en = 0;
                 sio_pending_ack = 0;
                 sio_ack_remaining = 0;
+                sio_pending_ack_irq_en = 0;
                 sio_bus_owner = SIO_OWNER_PAD;
                 sio_bus_byte_index++;
                 g_sio_timing_active = 0;
@@ -1084,12 +1120,14 @@ void sio_write(uint32_t addr, uint32_t value) {
                 sio_shift_byte      = b;
                 sio_shift_active    = 1;
                 sio_shift_remaining = SIO_BAUD_CYCLES_DEFAULT;
+                sio_shift_ack_irq_en = (sio_ctrl & SIO_CTRL_ACK_IRQ_EN) ? 1 : 0;
                 sio_stat &= ~(SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY);
                 g_sio_timing_active = 1;
                 sr_record(SR_EVT_SHIFT_START, b, 0);
             } else if (!sio_tx_buffered) {
                 sio_tx_buffer  = b;
                 sio_tx_buffered = 1;
+                sio_tx_buffer_ack_irq_en = (sio_ctrl & SIO_CTRL_ACK_IRQ_EN) ? 1 : 0;
                 sio_stat &= ~SIO_STAT_TX_EMPTY;
                 s_pace_tx_writes_buffered++;
                 sr_record(SR_EVT_BUFFER_LOAD, b, 0);
@@ -1141,6 +1179,7 @@ void sio_write(uint32_t addr, uint32_t value) {
         if (value & SIO_CTRL_ACK) {
             sio_stat &= ~SIO_STAT_IRQ;
             sio_stat &= ~SIO_STAT_ACK;
+            sio_ack_visible_reads = 0;
         }
         if (value & SIO_CTRL_RESET) {
             if (mc_state != MC_IDLE) {
@@ -1163,10 +1202,13 @@ void sio_write(uint32_t addr, uint32_t value) {
             active_device = DEV_NONE;
             sio_irq_pending = 0;
             sio_irq_countdown = 0;
+            sio_ack_visible_reads = 0;
 #if SIO_MODEL_CYCLE_PACED
             sio_shift_active = 0; sio_shift_remaining = 0;
             sio_tx_buffered = 0;
+            sio_shift_ack_irq_en = 0; sio_tx_buffer_ack_irq_en = 0;
             sio_pending_ack = 0; sio_ack_remaining = 0;
+            sio_pending_ack_irq_en = 0;
             sio_bus_owner = SIO_OWNER_NONE; sio_bus_byte_index = 0;
             g_sio_timing_active = 0;
 #endif
@@ -1186,7 +1228,9 @@ void sio_write(uint32_t addr, uint32_t value) {
             if (sio_shift_active || sio_tx_buffered || sio_pending_ack) {
                 sio_shift_active = 0; sio_shift_remaining = 0;
                 sio_tx_buffered = 0;
+                sio_shift_ack_irq_en = 0; sio_tx_buffer_ack_irq_en = 0;
                 sio_pending_ack = 0; sio_ack_remaining = 0;
+                sio_pending_ack_irq_en = 0;
                 if (!(value & SIO_CTRL_SELECT)) {
                     sio_bus_owner = SIO_OWNER_NONE;
                     sio_bus_byte_index = 0;
@@ -1249,7 +1293,9 @@ void sio_write(uint32_t addr, uint32_t value) {
 #if SIO_MODEL_CYCLE_PACED
             sio_shift_active = 0; sio_shift_remaining = 0;
             sio_tx_buffered = 0;
+            sio_shift_ack_irq_en = 0; sio_tx_buffer_ack_irq_en = 0;
             sio_pending_ack = 0; sio_ack_remaining = 0;
+            sio_pending_ack_irq_en = 0;
             sio_bus_owner = SIO_OWNER_NONE; sio_bus_byte_index = 0;
             g_sio_timing_active = 0;
             /* Killing an in-flight shifter mid-cycle leaves sio_stat
@@ -1413,8 +1459,12 @@ static int sio_consume_ack_event(void) {
 
 static void sio_fire_ack_irq(void) {
     sio_stat |= SIO_STAT_ACK;
+    sio_ack_visible_reads = 2;
     sr_record(SR_EVT_ACK_FIRE, 0, 0);
-    if (!(sio_ctrl & SIO_CTRL_ACK_IRQ_EN)) return;
+    int irq_enabled = sio_pending_ack_irq_en
+                   || ((sio_ctrl & SIO_CTRL_ACK_IRQ_EN) ? 1 : 0);
+    sio_pending_ack_irq_en = 0;
+    if (!irq_enabled) return;
     sio_stat |= SIO_STAT_IRQ;
 
     uint32_t i_stat_before = i_stat;
@@ -1465,13 +1515,16 @@ static void sio_handle_shift_complete(void) {
     if (acked) {
         sio_pending_ack   = 1;
         sio_ack_remaining = SIO_ACK_CYCLES_DEFAULT;
+        sio_pending_ack_irq_en = sio_shift_ack_irq_en;
     }
 
     if (sio_tx_buffered) {
         sio_shift_byte      = sio_tx_buffer;
         sio_shift_active    = 1;
         sio_shift_remaining = SIO_BAUD_CYCLES_DEFAULT;
+        sio_shift_ack_irq_en = sio_tx_buffer_ack_irq_en;
         sio_tx_buffered     = 0;
+        sio_tx_buffer_ack_irq_en = 0;
         sio_stat |= SIO_STAT_TX_EMPTY;
         sio_bus_byte_index++;
         s_pace_tx_buffer_promoted++;
@@ -1605,6 +1658,7 @@ void sio_tick(int cycles) {
         if (sio_irq_countdown == 0) {
             sio_irq_pending = 0;
             sio_stat |= SIO_STAT_ACK;
+            sio_ack_visible_reads = 2;
             sio_stat |= SIO_STAT_IRQ;
             /* Restore TX_RDY — the byte transfer is complete.
              * This unblocks the BIOS pad polling loop that spins

@@ -761,8 +761,11 @@ bool FullFunctionEmitter::emit_function(
 
                             // Read table entries and map to ROM labels.
                             // Deduplicate by runtime address to avoid duplicate
-                            // case values in the switch.  Only include targets
-                            // that exist as code in this function.
+                            // case values in the switch. Register all targets
+                            // with the cross-function continuation pass before
+                            // filtering local goto labels; BIOS jump tables can
+                            // legally branch into a different discovered
+                            // function's body.
                             std::vector<std::pair<uint32_t,uint32_t>> targets; // {runtime, rom}
                             std::set<uint32_t> seen_runtime;
                             uint32_t rom_off = rom_tb - base_addr;
@@ -771,6 +774,7 @@ bool FullFunctionEmitter::emit_function(
                                 uint32_t rv = read_u32_le(rom, rom_off + i * 4);
                                 if (!seen_runtime.insert(rv).second) continue;
                                 uint32_t rom_target = ram_alias_to_rom(rv);
+                                register_cross_function_target(rom_target);
                                 if (addr_to_raw.count(rom_target) && block_leaders.count(rom_target))
                                     targets.push_back({rv, rom_target});
                             }

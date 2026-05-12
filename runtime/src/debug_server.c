@@ -18,6 +18,7 @@
 #include "mdec.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
+#include "dirty_ram_interp.h"
 #include "card_read_summary.h"
 #include "card_data_writes.h"
 
@@ -270,6 +271,9 @@ typedef struct {
     uint32_t a1;
     uint32_t a2;
     uint32_t a3;
+    uint32_t s0;
+    uint32_t s1;
+    uint32_t s2;
     uint32_t s3;
     uint32_t sr;
     uint32_t epc;
@@ -277,11 +281,18 @@ typedef struct {
     uint32_t saved_a1;
     uint32_t saved_a2;
     uint32_t saved_a3;
+    uint32_t saved_s0;
+    uint32_t saved_s1;
+    uint32_t saved_s2;
     uint32_t saved_s3;
     uint32_t saved_sp;
     uint32_t saved_ra;
     uint32_t saved_pc;
     uint32_t saved_sr;
+    uint32_t task_ptr;
+    uint32_t task_state;
+    uint32_t task_mode;
+    uint32_t task_submode;
     uint32_t istat;
     uint32_t imask;
     uint32_t frame;
@@ -376,8 +387,21 @@ void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t 
 static uint32_t trace_read_word(CPUState *cpu, uint32_t addr)
 {
     uint32_t phys = addr & 0x1FFFFFFFu;
-    if (phys > 0x001FFFFCu) return 0;
+    if (phys > 0x001FFFFCu &&
+        (phys < 0x1F800000u || phys > 0x1F8003FCu)) {
+        return 0;
+    }
     return cpu ? cpu->read_word(addr) : 0;
+}
+
+static uint32_t trace_read_half(CPUState *cpu, uint32_t addr)
+{
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys > 0x001FFFFEu &&
+        (phys < 0x1F800000u || phys > 0x1F8003FEu)) {
+        return 0;
+    }
+    return cpu ? cpu->read_half(addr) : 0;
 }
 
 void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
@@ -406,6 +430,9 @@ void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
     e->a1              = cpu->gpr[5];
     e->a2              = cpu->gpr[6];
     e->a3              = cpu->gpr[7];
+    e->s0              = cpu->gpr[16];
+    e->s1              = cpu->gpr[17];
+    e->s2              = cpu->gpr[18];
     e->s3              = cpu->gpr[19];
     e->sr              = cpu->cop0[12];
     e->epc             = cpu->cop0[14];
@@ -413,11 +440,18 @@ void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
     e->saved_a1        = target_tcb ? trace_read_word(cpu, save + 20u) : 0;
     e->saved_a2        = target_tcb ? trace_read_word(cpu, save + 24u) : 0;
     e->saved_a3        = target_tcb ? trace_read_word(cpu, save + 28u) : 0;
+    e->saved_s0        = target_tcb ? trace_read_word(cpu, save + 64u) : 0;
+    e->saved_s1        = target_tcb ? trace_read_word(cpu, save + 68u) : 0;
+    e->saved_s2        = target_tcb ? trace_read_word(cpu, save + 72u) : 0;
     e->saved_s3        = target_tcb ? trace_read_word(cpu, save + 76u) : 0;
     e->saved_sp        = target_tcb ? trace_read_word(cpu, save + 116u) : 0;
     e->saved_ra        = target_tcb ? trace_read_word(cpu, save + 124u) : 0;
     e->saved_pc        = target_tcb ? trace_read_word(cpu, save + 128u) : 0;
     e->saved_sr        = target_tcb ? trace_read_word(cpu, save + 140u) : 0;
+    e->task_ptr        = trace_read_word(cpu, 0x1F8001D4u);
+    e->task_state      = e->task_ptr ? trace_read_word(cpu, e->task_ptr) : 0;
+    e->task_mode       = e->task_ptr ? trace_read_half(cpu, e->task_ptr + 72u) : 0;
+    e->task_submode    = e->task_ptr ? trace_read_half(cpu, e->task_ptr + 74u) : 0;
     e->istat           = i_stat;
     e->imask           = i_mask;
     e->frame           = (uint32_t)s_frame_count;
@@ -620,7 +654,7 @@ static uint32_t s_chain_state_active = 0;  /* 0 if not in a state, else state ad
  * ≈ 7 GB.  Lazily resident — only pages actually written use RAM, so the
  * footprint grows from 0 toward the cap as the ring fills.
  * Exit ring stays modest (1<<22, ~192 MB) — exits are auxiliary.  */
-#define FN_TRACE_CAP        (1 << 27)
+#define FN_TRACE_CAP        (1 << 20)
 #define FN_EXIT_TRACE_CAP   (1 << 22)
 #define FN_STACK_DEPTH 4096
 
@@ -650,6 +684,49 @@ static FnExitEntry  *s_fn_exit       = NULL;
 static uint64_t      s_fn_entry_seq  = 0;
 static uint64_t      s_fn_exit_seq   = 0;
 
+/* Narrow card-manager trace. The generic function-entry ring is too hot
+ * during Tomba title/menu polling, so it rotates away the card-read setup
+ * before we can inspect a later hang. This ring records only the BIOS public
+ * card state machine and the low-level RAM card service boundary. */
+#define CARD_MGR_TRACE_CAP 8192
+typedef struct {
+    uint64_t seq;
+    uint32_t func_addr;
+    uint32_t ra;
+    uint32_t pc;
+    uint32_t a0, a1, a2, a3;
+    uint32_t v0, t0, t1;
+    uint32_t frame;
+    uint32_t state_9f20;
+    uint32_t state_9f24;
+    uint32_t state_9f28;
+    uint32_t state_9f2c;
+    uint32_t state_9f30;
+    uint32_t state_9f34;
+    uint32_t state_7258;
+    uint32_t state_725c;
+    uint32_t state_7264;
+    uint32_t state_74bc;
+    uint32_t state_7500;
+    uint32_t state_7504;
+    uint32_t state_7508;
+    uint32_t state_750c;
+    uint32_t state_7510;
+    uint32_t state_7514;
+    uint32_t state_7518;
+    uint32_t state_751c;
+    uint32_t state_7520;
+    uint32_t state_7528;
+    uint32_t state_752c;
+    uint32_t state_7558;
+    uint32_t state_7568;
+    uint32_t state_756c;
+    uint8_t  source; /* 0 = direct entry hook, 1 = dispatch hook */
+    uint8_t  pad[3];
+} CardMgrTraceEntry;
+static CardMgrTraceEntry s_card_mgr_trace[CARD_MGR_TRACE_CAP];
+static uint64_t s_card_mgr_trace_seq = 0;
+
 /* Shadow call stack: tracks open call frames. */
 typedef struct {
     uint32_t func_addr;
@@ -667,7 +744,7 @@ static uint64_t     s_fn_tail_calls        = 0;
 /* ---- EvCB walk ring ----
  *
  * Captures the full kernel EvCB table on every entry to and exit from
- * DeliverEvent (RAM 0x1C5C). EvCB base ptr lives at RAM 0x124, total
+ * DeliverEvent (RAM 0x1B44). EvCB base ptr lives at RAM 0x124, total
  * bytes at RAM 0x120 (per disasm InitEvents at BFC04678).
  *
  * Per-entry tag identifies whether the snapshot was taken at DeliverEvent
@@ -675,7 +752,7 @@ static uint64_t     s_fn_tail_calls        = 0;
  * changed status (FIRED) during one DeliverEvent call.
  *
  * Memory: 256 snapshots × ~960B = ~240 KB. */
-#define EVCB_DELIVER_EVENT_ADDR 0x00001C5Cu  /* func_00001C5C, RAM */
+#define EVCB_DELIVER_EVENT_ADDR 0x00001B44u  /* func_00001B44, RAM */
 /* 4096 snapshots × 32 entries × ~28 B ≈ 3.7 MB — holds many minutes. */
 #define EVCB_RING_CAP           4096
 #define EVCB_MAX_ENTRIES        32
@@ -794,6 +871,59 @@ static uint32_t s_fn_trace_filter_hi = 0xFFFFFFFFu;
 
 static int fn_trace_in_filter(uint32_t phys) {
     return phys >= s_fn_trace_filter_lo && phys < s_fn_trace_filter_hi;
+}
+
+static int card_mgr_trace_target(uint32_t phys) {
+    phys &= 0x1FFFFFFFu;
+    if (phys >= 0x1FC0B600u && phys < 0x1FC0C240u) return 1;
+    if (phys >= 0x00004900u && phys < 0x00006C80u) return 1;
+    if (phys == 0x00001B44u) return 1;
+    return 0;
+}
+
+static void card_mgr_trace_record(uint32_t func_addr, uint8_t source) {
+    if (!debug_cpu_ptr) return;
+    uint32_t phys = func_addr & 0x1FFFFFFFu;
+    if (!card_mgr_trace_target(phys)) return;
+
+    CardMgrTraceEntry *e = &s_card_mgr_trace[s_card_mgr_trace_seq % CARD_MGR_TRACE_CAP];
+    e->seq       = s_card_mgr_trace_seq++;
+    e->func_addr = phys;
+    e->ra        = debug_cpu_ptr->gpr[31];
+    e->pc        = debug_cpu_ptr->pc;
+    e->a0        = debug_cpu_ptr->gpr[4];
+    e->a1        = debug_cpu_ptr->gpr[5];
+    e->a2        = debug_cpu_ptr->gpr[6];
+    e->a3        = debug_cpu_ptr->gpr[7];
+    e->v0        = debug_cpu_ptr->gpr[2];
+    e->t0        = debug_cpu_ptr->gpr[8];
+    e->t1        = debug_cpu_ptr->gpr[9];
+    e->frame     = (uint32_t)s_frame_count;
+    e->state_9f20 = psx_read_word(0x00009F20u);
+    e->state_9f24 = psx_read_word(0x00009F24u);
+    e->state_9f28 = psx_read_word(0x00009F28u);
+    e->state_9f2c = psx_read_word(0x00009F2Cu);
+    e->state_9f30 = psx_read_word(0x00009F30u);
+    e->state_9f34 = psx_read_word(0x00009F34u);
+    e->state_7258 = psx_read_word(0x00007258u);
+    e->state_725c = psx_read_word(0x0000725Cu);
+    e->state_7264 = psx_read_word(0x00007264u);
+    e->state_74bc = psx_read_word(0x000074BCu);
+    e->state_7500 = psx_read_word(0x00007500u);
+    e->state_7504 = psx_read_word(0x00007504u);
+    e->state_7508 = psx_read_word(0x00007508u);
+    e->state_750c = psx_read_word(0x0000750Cu);
+    e->state_7510 = psx_read_word(0x00007510u);
+    e->state_7514 = psx_read_word(0x00007514u);
+    e->state_7518 = psx_read_word(0x00007518u);
+    e->state_751c = psx_read_word(0x0000751Cu);
+    e->state_7520 = psx_read_word(0x00007520u);
+    e->state_7528 = psx_read_word(0x00007528u);
+    e->state_752c = psx_read_word(0x0000752Cu);
+    e->state_7558 = psx_read_word(0x00007558u);
+    e->state_7568 = psx_read_word(0x00007568u);
+    e->state_756c = psx_read_word(0x0000756Cu);
+    e->source    = source;
 }
 
 /* Helper: record an exit event for a popped frame. */
@@ -954,7 +1084,9 @@ static int is_chain_epilogue(uint32_t phys) {
  * stack is owned by function_trace_record and is only meaningful for
  * indirect dispatches; direct calls return through the native C stack. */
 void debug_server_log_call_entry(uint32_t func_addr) {
-    if (!s_fn_entry || !debug_cpu_ptr) return;
+    if (!debug_cpu_ptr) return;
+    card_mgr_trace_record(func_addr, 0);
+    if (!s_fn_entry) return;
     if (!fn_trace_in_filter(func_addr)) return;
     FnEntryEntry *e = &s_fn_entry[s_fn_entry_seq % FN_TRACE_CAP];
     e->seq             = s_fn_entry_seq;
@@ -972,6 +1104,8 @@ void debug_server_log_call_entry(uint32_t func_addr) {
 }
 
 void debug_server_trace_dispatch(uint32_t func_addr) {
+    card_mgr_trace_record(func_addr, 1);
+
     /* Function entry/exit rings (always-on, hooked here so every dispatch
      * is recorded with args and a return value when the call unwinds). */
     function_trace_record(func_addr);
@@ -1060,6 +1194,7 @@ static void handle_dirty_ram_stats(int id, const char *json)
     extern uint64_t g_dirty_ram_blocks_run;
     extern uint64_t g_dirty_ram_insns_run;
     extern uint64_t g_dirty_ram_aborts;
+    extern uint64_t g_dirty_ram_guard_yields;
     extern uint32_t dirty_ram_get_bitmap(void);
     extern uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
     extern uint32_t dirty_ram_get_bitmap_word_count(void);
@@ -1069,11 +1204,13 @@ static void handle_dirty_ram_stats(int id, const char *json)
     int n = snprintf(buf, sizeof(buf),
              "{\"id\":%d,\"ok\":true,\"blocks_run\":%llu,"
              "\"insns_run\":%llu,\"aborts\":%llu,"
+             "\"guard_yields\":%llu,"
              "\"dirty_bitmap\":\"0x%08X\",\"per_pc\":[",
              id,
              (unsigned long long)g_dirty_ram_blocks_run,
              (unsigned long long)g_dirty_ram_insns_run,
              (unsigned long long)g_dirty_ram_aborts,
+             (unsigned long long)g_dirty_ram_guard_yields,
              (unsigned)dirty_ram_get_bitmap());
 
     int first = 1;
@@ -1108,11 +1245,17 @@ static void handle_dirty_ram_unsupported(int id, const char *json)
     const char *reason = g_dirty_ram_last_unsupported_reason;
     if (!reason) reason = "";
     send_fmt("{\"id\":%d,\"ok\":true,\"aborts\":%llu,"
-             "\"midblock\":%llu,\"last_pc\":\"0x%08X\","
+             "\"midblock\":%llu,\"entry\":\"0x%08X\","
+             "\"entry_ra\":\"0x%08X\",\"entry_sp\":\"0x%08X\","
+             "\"entry_insns\":%u,\"last_pc\":\"0x%08X\","
              "\"last_insn\":\"0x%08X\",\"reason\":\"%s\"}\n",
              id,
              (unsigned long long)g_dirty_ram_aborts,
              (unsigned long long)g_dirty_ram_unsupported_midblock,
+             (unsigned)g_dirty_ram_last_unsupported_entry,
+             (unsigned)g_dirty_ram_last_unsupported_entry_ra,
+             (unsigned)g_dirty_ram_last_unsupported_entry_sp,
+             (unsigned)g_dirty_ram_last_unsupported_insns,
              (unsigned)g_dirty_ram_last_unsupported_pc,
              (unsigned)g_dirty_ram_last_unsupported_insn,
              reason);
@@ -1162,11 +1305,120 @@ static void handle_dirty_block_log(int id, const char *json)
                         "%s{\"seq\":%llu,\"target\":\"0x%08X\","
                         "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
                         "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\",\"sp\":\"0x%08X\","
+                        "\"t0\":\"0x%08X\",\"t1\":\"0x%08X\",\"t2\":\"0x%08X\","
                         "\"frame\":%u}",
                         emitted == 0 ? "" : ",",
                         (unsigned long long)e->seq,
                         e->target, e->ra, e->a0, e->a1, e->a2, e->a3,
-                        e->sp, e->frame);
+                        e->sp, e->t0, e->t1, e->t2, e->frame);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%d}\n", emitted);
+    debug_server_send_line(out);
+    free(out);
+}
+
+static void handle_dirty_flow_log(int id, const char *json)
+{
+    char buf[32];
+    uint32_t target_lo = 0, target_hi = 0xFFFFFFFFu;
+    if (json_get_str(json, "target_lo", buf, sizeof(buf))) target_lo = hex_to_u32(buf);
+    if (json_get_str(json, "target_hi", buf, sizeof(buf))) target_hi = hex_to_u32(buf);
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > (int)DIRTY_RAM_FLOW_LOG_CAP) count = DIRTY_RAM_FLOW_LOG_CAP;
+
+    uint64_t total = g_dirty_ram_flow_log_seq;
+    uint64_t avail = (total < DIRTY_RAM_FLOW_LOG_CAP) ? total : DIRTY_RAM_FLOW_LOG_CAP;
+    const size_t BUF_SZ = 2 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) {
+        send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"oom\"}\n", id);
+        return;
+    }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+                    "\"target_lo\":\"0x%08X\",\"target_hi\":\"0x%08X\",\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)avail,
+                    target_lo, target_hi);
+    int emitted = 0;
+    for (uint64_t i = 0; i < avail && emitted < count; i++) {
+        uint64_t seq = total - 1 - i;
+        DirtyRamFlowLogEntry *e =
+            &g_dirty_ram_flow_log[seq & (DIRTY_RAM_FLOW_LOG_CAP - 1u)];
+        if (e->target < target_lo || e->target >= target_hi) continue;
+        if (pos > BUF_SZ - 256) break;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"pc\":\"0x%08X\",\"target\":\"0x%08X\","
+                        "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                        "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\",\"sp\":\"0x%08X\","
+                        "\"frame\":%u}",
+                        emitted == 0 ? "" : ",",
+                        (unsigned long long)e->seq, e->pc, e->target,
+                        e->ra, e->a0, e->a1, e->a2, e->a3, e->sp, e->frame);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%d}\n", emitted);
+    debug_server_send_line(out);
+    free(out);
+}
+
+static void handle_dirty_insn_log(int id, const char *json)
+{
+    char buf[32];
+    uint32_t pc_lo = 0, pc_hi = 0xFFFFFFFFu;
+    if (json_get_str(json, "pc_lo", buf, sizeof(buf))) pc_lo = hex_to_u32(buf);
+    if (json_get_str(json, "pc_hi", buf, sizeof(buf))) pc_hi = hex_to_u32(buf);
+    int changed_only = json_get_int(json, "changed_only", 0);
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > (int)DIRTY_RAM_INSN_LOG_CAP) count = DIRTY_RAM_INSN_LOG_CAP;
+
+    uint64_t total = g_dirty_ram_insn_log_seq;
+    uint64_t avail = (total < DIRTY_RAM_INSN_LOG_CAP) ? total : DIRTY_RAM_INSN_LOG_CAP;
+    const size_t BUF_SZ = 16 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) {
+        send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"oom\"}\n", id);
+        return;
+    }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+                    "\"pc_lo\":\"0x%08X\",\"pc_hi\":\"0x%08X\",\"changed_only\":%d,"
+                    "\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)avail,
+                    pc_lo, pc_hi, changed_only ? 1 : 0);
+    int emitted = 0;
+    for (uint64_t i = 0; i < avail && emitted < count; i++) {
+        uint64_t seq = total - 1 - i;
+        DirtyRamInsnLogEntry *e =
+            &g_dirty_ram_insn_log[seq & (DIRTY_RAM_INSN_LOG_CAP - 1u)];
+        if (e->pc < pc_lo || e->pc >= pc_hi) continue;
+        if (changed_only && e->before_s0 == e->after_s0) continue;
+        if (pos > BUF_SZ - 768) break;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"pc\":\"0x%08X\",\"insn\":\"0x%08X\","
+                        "\"next_pc\":\"0x%08X\",\"target\":\"0x%08X\","
+                        "\"before_s0\":\"0x%08X\",\"after_s0\":\"0x%08X\","
+                        "\"sp\":\"0x%08X\",\"ra\":\"0x%08X\","
+                        "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
+                        "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                        "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+                        "\"t0\":\"0x%08X\",\"t1\":\"0x%08X\","
+                        "\"t2\":\"0x%08X\","
+                        "\"current_tcb\":\"0x%08X\",\"task_ptr\":\"0x%08X\","
+                        "\"task_mode\":\"0x%08X\",\"task_submode\":\"0x%08X\","
+                        "\"frame\":%u,\"transferred\":%u}",
+                        emitted == 0 ? "" : ",",
+                        (unsigned long long)e->seq,
+                        e->pc, e->insn, e->next_pc, e->target,
+                        e->before_s0, e->after_s0, e->sp, e->ra,
+                        e->v0, e->v1, e->a0, e->a1, e->a2, e->a3,
+                        e->t0, e->t1, e->t2,
+                        e->current_tcb, e->task_ptr, e->task_mode,
+                        e->task_submode, e->frame, (unsigned)e->transferred);
         emitted++;
     }
     pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%d}\n", emitted);
@@ -1725,21 +1977,31 @@ static size_t append_thread_entry(char *buf, size_t pos, size_t cap,
                     "\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
                     "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
                     "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
-                    "\"s3\":\"0x%08X\",\"sr\":\"0x%08X\",\"epc\":\"0x%08X\","
+                    "\"s0\":\"0x%08X\",\"s1\":\"0x%08X\","
+                    "\"s2\":\"0x%08X\",\"s3\":\"0x%08X\","
+                    "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\","
                     "\"saved_a0\":\"0x%08X\",\"saved_a1\":\"0x%08X\","
                     "\"saved_a2\":\"0x%08X\",\"saved_a3\":\"0x%08X\","
-                    "\"saved_s3\":\"0x%08X\",\"saved_sp\":\"0x%08X\","
+                    "\"saved_s0\":\"0x%08X\",\"saved_s1\":\"0x%08X\","
+                    "\"saved_s2\":\"0x%08X\",\"saved_s3\":\"0x%08X\","
+                    "\"saved_sp\":\"0x%08X\","
                     "\"saved_ra\":\"0x%08X\",\"saved_pc\":\"0x%08X\","
-                    "\"saved_sr\":\"0x%08X\",\"istat\":\"0x%08X\","
+                    "\"saved_sr\":\"0x%08X\","
+                    "\"task_ptr\":\"0x%08X\",\"task_state\":\"0x%08X\","
+                    "\"task_mode\":\"0x%08X\",\"task_submode\":\"0x%08X\","
+                    "\"istat\":\"0x%08X\","
                     "\"imask\":\"0x%08X\",\"frame\":%u,\"in_exc\":%u}",
                     first ? "" : ",",
                     (unsigned long long)e->seq, e->kind, thread_kind_name(e->kind),
                     e->current_tcb, e->target_tcb, e->current_state, e->target_state,
                     e->current_tcb_ptr, e->target_pc, e->func, e->last_store_pc,
-                    e->ra, e->sp, e->a0, e->a1, e->a2, e->a3, e->s3,
-                    e->sr, e->epc, e->saved_a0, e->saved_a1, e->saved_a2,
-                    e->saved_a3, e->saved_s3, e->saved_sp, e->saved_ra,
-                    e->saved_pc, e->saved_sr, e->istat, e->imask, e->frame,
+                    e->ra, e->sp, e->a0, e->a1, e->a2, e->a3,
+                    e->s0, e->s1, e->s2, e->s3, e->sr, e->epc,
+                    e->saved_a0, e->saved_a1, e->saved_a2, e->saved_a3,
+                    e->saved_s0, e->saved_s1, e->saved_s2, e->saved_s3,
+                    e->saved_sp, e->saved_ra, e->saved_pc, e->saved_sr,
+                    e->task_ptr, e->task_state, e->task_mode, e->task_submode,
+                    e->istat, e->imask, e->frame,
                     (unsigned)e->in_exception);
     return pos;
 }
@@ -1755,7 +2017,7 @@ static void handle_thread_trace(int id, const char *json)
     if ((uint64_t)count > avail) count = (int)avail;
     uint64_t start = total - (uint64_t)count;
 
-    const size_t BUF_SZ = 256u + (size_t)count * 768u;
+    const size_t BUF_SZ = 256u + (size_t)count * 1152u;
     char *buf = (char *)malloc(BUF_SZ);
     if (!buf) { send_err(id, "oom"); return; }
     size_t pos = 0;
@@ -1766,7 +2028,7 @@ static void handle_thread_trace(int id, const char *json)
     for (int i = 0; i < count; i++) {
         uint64_t s = start + (uint64_t)i;
         const ThreadTraceEntry *e = &s_thread_trace[s % THREAD_TRACE_CAP];
-        if (pos > BUF_SZ - 768) break;
+        if (pos > BUF_SZ - 1152) break;
         pos = append_thread_entry(buf, pos, BUF_SZ, e, i == 0);
     }
     pos += snprintf(buf + pos, BUF_SZ - pos, "]}");
@@ -2140,6 +2402,38 @@ static void handle_gpu_state(int id, const char *json)
              (unsigned long long)copy,
              da.left, da.top, da.right, da.bottom,
              da.offset_x, da.offset_y);
+}
+
+static void handle_mem_words(int id, const char *json)
+{
+    char addr_str[32];
+    if (!json_get_str(json, "addr", addr_str, sizeof(addr_str))) {
+        send_err(id, "missing addr");
+        return;
+    }
+
+    uint32_t addr = hex_to_u32(addr_str);
+    int count = json_get_int(json, "count", 16);
+    if (count < 1) count = 1;
+    if (count > 256) count = 256;
+
+    size_t bufsz = 256u + (size_t)count * 32u;
+    char *buf = (char *)malloc(bufsz);
+    if (!buf) { send_err(id, "oom"); return; }
+
+    size_t pos = 0;
+    pos += snprintf(buf + pos, bufsz - pos,
+                    "{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"words\":[",
+                    id, addr);
+    for (int i = 0; i < count && pos < bufsz - 32; i++) {
+        uint32_t a = addr + (uint32_t)i * 4u;
+        uint32_t v = psx_read_word(a);
+        pos += snprintf(buf + pos, bufsz - pos, "%s\"0x%08X\"",
+                        i ? "," : "", v);
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
 }
 
 static void handle_irq_state(int id, const char *json)
@@ -4197,6 +4491,7 @@ static void handle_freeze_check(int id, const char *json)
                     "\"dirty_ram_blocks\":%llu,"
                     "\"dirty_ram_insns\":%llu,"
                     "\"dirty_ram_aborts\":%llu,"
+                    "\"dirty_ram_guard_yields\":%llu,"
                     "\"fn_entry_total\":%llu,"
                     "\"sio_irq_total\":%u,"
                     "\"sio_byte_seq\":%u,"
@@ -4228,6 +4523,7 @@ static void handle_freeze_check(int id, const char *json)
                     (unsigned long long)g_dirty_ram_blocks_run,
                     (unsigned long long)g_dirty_ram_insns_run,
                     (unsigned long long)g_dirty_ram_aborts,
+                    (unsigned long long)g_dirty_ram_guard_yields,
                     (unsigned long long)s_fn_entry_seq,
                     irq_total,
                     sio_get_seq(),
@@ -4546,6 +4842,73 @@ static void handle_dispatch_tail(int id, const char *json) {
     debug_server_send_fmt("]}\n");
 }
 
+static void handle_card_mgr_trace(int id, const char *json) {
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > CARD_MGR_TRACE_CAP) count = CARD_MGR_TRACE_CAP;
+    int newest = json_get_int(json, "newest", 0) != 0;
+
+    uint64_t total = s_card_mgr_trace_seq;
+    uint64_t oldest = (total > CARD_MGR_TRACE_CAP) ? total - CARD_MGR_TRACE_CAP : 0;
+    uint64_t available = total - oldest;
+    if ((uint64_t)count > available) count = (int)available;
+    uint64_t start = total - (uint64_t)count;
+    if (start < oldest) start = oldest;
+
+    size_t buf_sz = 256u + (size_t)count * 640u;
+    char *buf = (char *)malloc(buf_sz);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, buf_sz - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"oldest\":%llu,\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)oldest);
+
+    int first = 1;
+    for (int i = 0; i < count && pos < buf_sz - 640u; i++) {
+        uint64_t seq = newest ? (total - 1ull - (uint64_t)i) : (start + (uint64_t)i);
+        if (seq < oldest || seq >= total) continue;
+        const CardMgrTraceEntry *e = &s_card_mgr_trace[seq % CARD_MGR_TRACE_CAP];
+        if (e->seq != seq) continue;
+        pos += snprintf(buf + pos, buf_sz - pos,
+            "%s{\"seq\":%llu,\"src\":%u,\"frame\":%u,\"func\":\"0x%08X\","
+            "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+            "\"v0\":\"0x%08X\",\"t0\":\"0x%08X\",\"t1\":\"0x%08X\","
+            "\"s9f20\":\"0x%08X\",\"s9f24\":\"0x%08X\",\"s9f28\":\"0x%08X\","
+            "\"s9f2c\":\"0x%08X\",\"s9f30\":\"0x%08X\",\"s9f34\":\"0x%08X\","
+            "\"s7258\":\"0x%08X\",\"s725c\":\"0x%08X\",\"s7264\":\"0x%08X\","
+            "\"s74bc\":\"0x%08X\",\"s7500\":\"0x%08X\",\"s7504\":\"0x%08X\","
+            "\"s7508\":\"0x%08X\",\"s750c\":\"0x%08X\",\"s7510\":\"0x%08X\","
+            "\"s7514\":\"0x%08X\",\"s7518\":\"0x%08X\",\"s751c\":\"0x%08X\","
+            "\"s7520\":\"0x%08X\","
+            "\"s7528\":\"0x%08X\",\"s752c\":\"0x%08X\",\"s7558\":\"0x%08X\","
+            "\"s7568\":\"0x%08X\",\"s756c\":\"0x%08X\"}",
+            first ? "" : ",",
+            (unsigned long long)e->seq, e->source, e->frame, e->func_addr,
+            e->pc, e->ra, e->a0, e->a1, e->a2, e->a3, e->v0, e->t0, e->t1,
+            e->state_9f20, e->state_9f24, e->state_9f28,
+            e->state_9f2c, e->state_9f30, e->state_9f34,
+            e->state_7258, e->state_725c, e->state_7264,
+            e->state_74bc, e->state_7500, e->state_7504,
+            e->state_7508, e->state_750c, e->state_7510,
+            e->state_7514, e->state_7518, e->state_751c,
+            e->state_7520,
+            e->state_7528, e->state_752c, e->state_7558,
+            e->state_7568, e->state_756c);
+        first = 0;
+    }
+    pos += snprintf(buf + pos, buf_sz - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_card_mgr_clear(int id, const char *json) {
+    (void)json;
+    s_card_mgr_trace_seq = 0;
+    memset(s_card_mgr_trace, 0, sizeof(s_card_mgr_trace));
+    send_ok(id);
+}
+
 /* ---- Function entry/exit trace handlers ---- */
 
 static void handle_fn_filter(int id, const char *json) {
@@ -4672,6 +5035,44 @@ static void handle_fn_entry_dump(int id, const char *json) {
     free(buf);
 }
 
+static void handle_fn_entry_tail(int id, const char *json) {
+    if (!s_fn_entry) { send_err(id, "not initialized"); return; }
+    int count = json_get_int(json, "count", 64);
+    if (count < 1) count = 1;
+    if (count > 256) count = 256;
+
+    uint64_t total = s_fn_entry_seq;
+    uint64_t oldest = (total > FN_TRACE_CAP) ? total - FN_TRACE_CAP : 0;
+    uint64_t start = (total > (uint64_t)count) ? total - (uint64_t)count : 0;
+    if (start < oldest) start = oldest;
+
+    size_t BUF_SZ = 256u + (size_t)count * 384u;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
+                    id, (unsigned long long)total);
+    int first = 1;
+    int emitted = 0;
+    for (uint64_t s = start; s < total && pos < BUF_SZ - 384; s++) {
+        FnEntryEntry *e = &s_fn_entry[s % FN_TRACE_CAP];
+        if (e->seq != s) continue;
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+            "%s{\"seq\":%llu,\"func\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\","
+            "\"a3\":\"0x%08X\",\"t1\":\"0x%08X\",\"frame\":%u}",
+            first ? "" : ",",
+            (unsigned long long)e->seq, e->func_addr, e->ra,
+            e->a0, e->a1, e->a2, e->a3, e->t1, e->frame);
+        first = 0;
+        emitted++;
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
+}
+
 static void handle_fn_exit_dump(int id, const char *json) {
     if (!s_fn_exit) { send_err(id, "not initialized"); return; }
     uint64_t seq_lo, seq_hi;
@@ -4724,6 +5125,7 @@ static const CmdEntry s_commands[] = {
     { "dump_ram",          handle_dump_ram },
     { "write_ram",         handle_write_ram },
     { "gpu_state",         handle_gpu_state },
+    { "mem_words",         handle_mem_words },
     { "vram_peek",         handle_vram_peek },
     { "irq_state",         handle_irq_state },
     { "cdrom_state",       handle_cdrom_state },
@@ -4759,6 +5161,8 @@ static const CmdEntry s_commands[] = {
     { "dirty_ram_stats",   handle_dirty_ram_stats },
     { "dirty_ram_unsupported", handle_dirty_ram_unsupported },
     { "dirty_block_log",   handle_dirty_block_log },
+    { "dirty_flow_log",    handle_dirty_flow_log },
+    { "dirty_insn_log",    handle_dirty_insn_log },
     { "fntrace_arm",       handle_fntrace_arm },
     { "fntrace_arm_clear", handle_fntrace_arm_clear },
     { "fntrace_armed",     handle_fntrace_armed },
@@ -4821,11 +5225,14 @@ static const CmdEntry s_commands[] = {
     { "quit",              handle_quit },
     { "dispatch_check",    handle_dispatch_check },
     { "dispatch_tail",     handle_dispatch_tail },
+    { "card_mgr_trace",    handle_card_mgr_trace },
+    { "card_mgr_clear",    handle_card_mgr_clear },
     { "fn_filter",         handle_fn_filter },
     { "fn_disable",        handle_fn_disable },
     { "fn_clear",          handle_fn_clear },
     { "fn_stats",          handle_fn_stats },
     { "fn_entry_dump",     handle_fn_entry_dump },
+    { "fn_entry_tail",     handle_fn_entry_tail },
     { "fn_exit_dump",      handle_fn_exit_dump },
     { NULL, NULL }
 };
@@ -5016,7 +5423,12 @@ void debug_server_init(int port)
     s_wtrace_ranges[21].hi = 0x000F0000u;
     s_wtrace_ranges[22].lo = 0x001FE000u;
     s_wtrace_ranges[22].hi = 0x001FE400u;
-    s_wtrace_range_count = 23;
+    /* BIOS card-operation public state arrays. The Tomba Load menu waits on
+     * F4000001 events after _card_read; these cells reveal which BIOS path
+     * leaves the operation armed or clears it and delivers the public event. */
+    s_wtrace_ranges[23].lo = 0x00009F20u;
+    s_wtrace_ranges[23].hi = 0x00009F38u;
+    s_wtrace_range_count = 24;
 #endif
 
     /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */
@@ -5062,7 +5474,6 @@ void debug_server_poll(void)
         } else if (n == 0) {
             sock_close(s_client);
             s_client = SOCK_INVALID;
-            s_paused = 0;
             return;
         } else {
             int err = sock_error();
@@ -5073,7 +5484,6 @@ void debug_server_poll(void)
 #endif
                 sock_close(s_client);
                 s_client = SOCK_INVALID;
-                s_paused = 0;
                 /* Don't reset s_input_override here. A scheduled press
                  * (s_input_frames > 0) must continue to hold across the
                  * client disconnect — Python clients open a fresh socket

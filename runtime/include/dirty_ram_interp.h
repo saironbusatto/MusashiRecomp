@@ -42,7 +42,12 @@ void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
 extern uint64_t g_dirty_ram_blocks_run;     /* basic blocks interpreted */
 extern uint64_t g_dirty_ram_insns_run;      /* instructions interpreted */
 extern uint64_t g_dirty_ram_aborts;         /* unsupported-opcode aborts */
+extern uint64_t g_dirty_ram_guard_yields;   /* long dirty loops yielded */
 extern uint64_t g_dirty_ram_unsupported_midblock;
+extern uint32_t g_dirty_ram_last_unsupported_entry;
+extern uint32_t g_dirty_ram_last_unsupported_entry_ra;
+extern uint32_t g_dirty_ram_last_unsupported_entry_sp;
+extern uint32_t g_dirty_ram_last_unsupported_insns;
 extern uint32_t g_dirty_ram_last_unsupported_pc;
 extern uint32_t g_dirty_ram_last_unsupported_insn;
 extern const char *g_dirty_ram_last_unsupported_reason;
@@ -85,11 +90,61 @@ typedef struct {
     uint32_t a1;        /* cpu->gpr[5] at dispatch */
     uint32_t a2;        /* cpu->gpr[6] at dispatch */
     uint32_t a3;        /* cpu->gpr[7] at dispatch */
+    uint32_t t0;        /* cpu->gpr[8] at dispatch */
+    uint32_t t1;        /* cpu->gpr[9] at dispatch */
+    uint32_t t2;        /* cpu->gpr[10] at dispatch */
     uint32_t sp;        /* cpu->gpr[29] at dispatch */
     uint32_t frame;     /* s_frame_count at the time of dispatch */
 } DirtyRamBlockLogEntry;
 extern DirtyRamBlockLogEntry g_dirty_ram_block_log[DIRTY_RAM_BLOCK_LOG_CAP];
 extern uint64_t              g_dirty_ram_block_log_seq;
+
+#define DIRTY_RAM_FLOW_LOG_CAP (1u << 16)
+typedef struct {
+    uint64_t seq;
+    uint32_t pc;
+    uint32_t target;
+    uint32_t ra;
+    uint32_t a0;
+    uint32_t a1;
+    uint32_t a2;
+    uint32_t a3;
+    uint32_t sp;
+    uint32_t frame;
+} DirtyRamFlowLogEntry;
+extern DirtyRamFlowLogEntry g_dirty_ram_flow_log[DIRTY_RAM_FLOW_LOG_CAP];
+extern uint64_t             g_dirty_ram_flow_log_seq;
+
+#define DIRTY_RAM_INSN_LOG_CAP (1u << 16)
+typedef struct {
+    uint64_t seq;
+    uint32_t pc;
+    uint32_t insn;
+    uint32_t next_pc;
+    uint32_t target;
+    uint32_t before_s0;
+    uint32_t after_s0;
+    uint32_t sp;
+    uint32_t ra;
+    uint32_t v0;
+    uint32_t v1;
+    uint32_t a0;
+    uint32_t a1;
+    uint32_t a2;
+    uint32_t a3;
+    uint32_t t0;
+    uint32_t t1;
+    uint32_t t2;
+    uint32_t current_tcb;
+    uint32_t task_ptr;
+    uint32_t task_mode;
+    uint32_t task_submode;
+    uint32_t frame;
+    uint8_t  transferred;
+    uint8_t  pad[3];
+} DirtyRamInsnLogEntry;
+extern DirtyRamInsnLogEntry g_dirty_ram_insn_log[DIRTY_RAM_INSN_LOG_CAP];
+extern uint64_t             g_dirty_ram_insn_log_seq;
 
 #ifdef __cplusplus
 }

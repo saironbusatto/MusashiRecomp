@@ -27,6 +27,7 @@
 #include "cpu_state.h"
 #include "debug_server.h"
 #include "interrupts.h"
+#include "psx_cycles.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -35,12 +36,17 @@
 uint64_t g_dirty_ram_blocks_run = 0;
 uint64_t g_dirty_ram_insns_run  = 0;
 uint64_t g_dirty_ram_aborts     = 0;
+uint64_t g_dirty_ram_guard_yields = 0;
 
 /* Mid-block unsupported-opcode counters. Bumped instead of fprintf-spamming
  * stderr (CLAUDE.md §3). Read via dirty_ram_get_unsupported(). The "last_*"
  * fields capture the most recent occurrence so a TCP query can see what
  * opcode is missing without needing log scraping. */
 uint64_t g_dirty_ram_unsupported_midblock = 0;
+uint32_t g_dirty_ram_last_unsupported_entry = 0;
+uint32_t g_dirty_ram_last_unsupported_entry_ra = 0;
+uint32_t g_dirty_ram_last_unsupported_entry_sp = 0;
+uint32_t g_dirty_ram_last_unsupported_insns = 0;
 uint32_t g_dirty_ram_last_unsupported_pc  = 0;
 uint32_t g_dirty_ram_last_unsupported_insn = 0;
 const char *g_dirty_ram_last_unsupported_reason = NULL;
@@ -49,6 +55,10 @@ DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE] = {0};
 
 DirtyRamBlockLogEntry g_dirty_ram_block_log[DIRTY_RAM_BLOCK_LOG_CAP] = {0};
 uint64_t              g_dirty_ram_block_log_seq = 0;
+DirtyRamFlowLogEntry  g_dirty_ram_flow_log[DIRTY_RAM_FLOW_LOG_CAP] = {0};
+uint64_t              g_dirty_ram_flow_log_seq = 0;
+DirtyRamInsnLogEntry  g_dirty_ram_insn_log[DIRTY_RAM_INSN_LOG_CAP] = {0};
+uint64_t              g_dirty_ram_insn_log_seq = 0;
 
 /* Current frame counter, defined in debug_server.c. */
 extern uint64_t s_frame_count;
@@ -75,6 +85,7 @@ extern uint32_t g_debug_last_store_pc;
 #ifdef PSX_HAS_GAME_DISPATCH
 extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
 #endif
+extern void psx_dispatch_call(CPUState* cpu, uint32_t addr, uint32_t return_addr);
 
 /* Forward decls from memory.c — used to read instruction bytes. */
 extern uint8_t *memory_get_ram_ptr(void);
@@ -98,6 +109,50 @@ static inline uint32_t fetch_word(uint32_t phys) {
          | ((uint32_t)ram[phys + 1] <<  8)
          | ((uint32_t)ram[phys + 2] << 16)
          | ((uint32_t)ram[phys + 3] << 24);
+}
+
+static void dirty_ram_log_instruction(CPUState *cpu, uint32_t pc, uint32_t insn,
+                                      uint32_t before_s0, uint32_t next_pc,
+                                      uint32_t target, int transferred) {
+    uint32_t phys = pc & 0x1FFFFFFFu;
+    if (!((phys >= 0x000E0000u && phys < 0x000F0000u) ||
+          (phys >= 0x000000A0u && phys < 0x000000C0u) ||
+          (phys >= 0x000005C0u && phys < 0x00000620u) ||
+          (phys >= 0x00001E00u && phys < 0x00002000u))) {
+        return;
+    }
+
+    uint32_t tcb_ptr_addr = cpu->read_word(0x00000108u);
+    uint32_t current_tcb = tcb_ptr_addr ? cpu->read_word(tcb_ptr_addr) : 0;
+    uint32_t task_ptr = cpu->read_word(0x1F8001D4u);
+
+    uint64_t s = g_dirty_ram_insn_log_seq++;
+    DirtyRamInsnLogEntry *e =
+        &g_dirty_ram_insn_log[s & (DIRTY_RAM_INSN_LOG_CAP - 1u)];
+    e->seq          = s;
+    e->pc           = pc;
+    e->insn         = insn;
+    e->next_pc      = next_pc;
+    e->target       = target;
+    e->before_s0    = before_s0;
+    e->after_s0     = cpu->gpr[16];
+    e->sp           = cpu->gpr[29];
+    e->ra           = cpu->gpr[31];
+    e->v0           = cpu->gpr[2];
+    e->v1           = cpu->gpr[3];
+    e->a0           = cpu->gpr[4];
+    e->a1           = cpu->gpr[5];
+    e->a2           = cpu->gpr[6];
+    e->a3           = cpu->gpr[7];
+    e->t0           = cpu->gpr[8];
+    e->t1           = cpu->gpr[9];
+    e->t2           = cpu->gpr[10];
+    e->current_tcb  = current_tcb;
+    e->task_ptr     = task_ptr;
+    e->task_mode    = task_ptr ? cpu->read_half(task_ptr + 72u) : 0;
+    e->task_submode = task_ptr ? cpu->read_half(task_ptr + 74u) : 0;
+    e->frame        = (uint32_t)s_frame_count;
+    e->transferred  = (uint8_t)(transferred ? 1u : 0u);
 }
 
 static inline uint32_t interp_lwl(CPUState *cpu, uint32_t addr, uint32_t rt_value) {
@@ -171,6 +226,21 @@ static int abort_unsupported(uint32_t pc, uint32_t insn, const char *reason) {
     g_unsupported_insn   = insn;
     g_unsupported_reason = reason;
     return 1; /* signal "control transferred" so the caller stops */
+}
+
+static int is_local_dirty_target(uint32_t target) {
+    uint32_t phys = target & 0x1FFFFFFFu;
+    return phys >= 0x00098000u && dirty_ram_is_dirty(phys);
+}
+
+static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
+                                  uint32_t return_pc,
+                                  uint32_t *next_pc_out) {
+    cpu->pc = 0;
+    psx_dispatch_call(cpu, target, return_pc);
+    if (cpu->pc != 0) return 1;
+    *next_pc_out = return_pc;
+    return 0;
 }
 
 /* Execute ONE instruction at *pc on the given CPU state.  Returns:
@@ -270,6 +340,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                 return 0;
             }
 #endif
+            if (!is_local_dirty_target(target)) {
+                return dispatch_nonlocal_call(cpu, target, return_pc, next_pc_out);
+            }
             cpu->pc = target;
             return 1;
         }
@@ -390,6 +463,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             return 0;
         }
 #endif
+        if (!is_local_dirty_target(target)) {
+            return dispatch_nonlocal_call(cpu, target, return_pc, next_pc_out);
+        }
         cpu->pc = target;
         return 1;
     }
@@ -635,6 +711,9 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
         e->a1     = cpu->gpr[5];
         e->a2     = cpu->gpr[6];
         e->a3     = cpu->gpr[7];
+        e->t0     = cpu->gpr[8];
+        e->t1     = cpu->gpr[9];
+        e->t2     = cpu->gpr[10];
         e->sp     = cpu->gpr[29];
         e->frame  = (uint32_t)s_frame_count;
     }
@@ -651,7 +730,15 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
     int insns_executed = 0;
     for (int i = 0; i < MAX_INSNS_PER_DISPATCH; i++) {
         uint32_t next_pc = 0;
+        uint32_t insn = fetch_word(pc & 0x1FFFFFFFu);
+        uint32_t before_s0 = cpu->gpr[16];
         int transferred = exec_one(cpu, pc, &next_pc);
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+        psx_advance_cycles(1u);
+#endif
+        dirty_ram_log_instruction(cpu, pc, insn, before_s0, next_pc,
+                                  transferred ? cpu->pc : next_pc,
+                                  transferred);
         if (g_unsupported_seen) {
             if (insns_executed == 0) {
                 /* Couldn't decode the first instruction.  Most likely
@@ -672,6 +759,10 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
              * (CLAUDE.md §3). Synchronous stderr at the rate this fires
              * starves the dispatch loop and the debug-server poll. */
             g_dirty_ram_unsupported_midblock++;
+            g_dirty_ram_last_unsupported_entry   = addr;
+            g_dirty_ram_last_unsupported_entry_ra = cpu->gpr[31];
+            g_dirty_ram_last_unsupported_entry_sp = cpu->gpr[29];
+            g_dirty_ram_last_unsupported_insns   = (uint32_t)insns_executed;
             g_dirty_ram_last_unsupported_pc     = g_unsupported_pc;
             g_dirty_ram_last_unsupported_insn   = g_unsupported_insn;
             g_dirty_ram_last_unsupported_reason = g_unsupported_reason;
@@ -682,8 +773,30 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
         insns_executed++;
         if (transferred) {
             uint32_t target = cpu->pc;
-            if (allow_local_dirty_flow &&
-                target != 0 && dirty_ram_is_dirty(target & 0x1FFFFFFFu)) {
+#ifdef PSX_HAS_GAME_DISPATCH
+            if (target != 0 && psx_dispatch_game_compiled(cpu, target)) {
+                g_dirty_ram_blocks_run++;
+                if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                return 1;
+            }
+#endif
+            uint32_t target_phys = target & 0x1FFFFFFFu;
+            if (allow_local_dirty_flow && target != 0 &&
+                target_phys >= 0x00098000u &&
+                dirty_ram_is_dirty(target_phys)) {
+                uint64_t s = g_dirty_ram_flow_log_seq++;
+                DirtyRamFlowLogEntry *e =
+                    &g_dirty_ram_flow_log[s & (DIRTY_RAM_FLOW_LOG_CAP - 1u)];
+                e->seq = s;
+                e->pc = pc;
+                e->target = target;
+                e->ra = cpu->gpr[31];
+                e->a0 = cpu->gpr[4];
+                e->a1 = cpu->gpr[5];
+                e->a2 = cpu->gpr[6];
+                e->a3 = cpu->gpr[7];
+                e->sp = cpu->gpr[29];
+                e->frame = (uint32_t)s_frame_count;
                 pc = target;
                 if ((insns_executed & 0xFFF) == 0) {
                     debug_server_poll();
@@ -707,10 +820,13 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
             return 1;
         }
     }
-    g_dirty_ram_aborts++;
     g_dirty_ram_last_unsupported_pc = pc;
     g_dirty_ram_last_unsupported_insn = fetch_word(pc & 0x1FFFFFFFu);
     g_dirty_ram_last_unsupported_reason = "instruction guard";
-    abort();
-    return 0;
+    g_dirty_ram_guard_yields++;
+    g_dirty_ram_blocks_run++;
+    cpu->pc = pc;
+    if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+    psx_check_interrupts(cpu);
+    return 1;
 }

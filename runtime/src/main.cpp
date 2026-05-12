@@ -395,6 +395,7 @@ int main(int argc, char** argv) {
     debug_server_init(DEFAULT_DEBUG_PORT);
 
     /* ---- SDL init ---- */
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -444,6 +445,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
         return 1;
     }
+    SDL_SetTextureScaleMode(sdl_texture, SDL_ScaleModeNearest);
 
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);

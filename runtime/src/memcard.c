@@ -97,8 +97,18 @@ void memcard_init(const char* dir) {
                 if (n == MEMCARD_SIZE) {
                     cards[i].present = 1;
                 }
+            } else {
+                memcard_format(cards[i].data);
+                f = fopen(cards[i].filepath, "wb");
+                if (f) {
+                    size_t n = fwrite(cards[i].data, 1, MEMCARD_SIZE, f);
+                    int flush_ok = (fflush(f) == 0);
+                    int close_ok = (fclose(f) == 0);
+                    if (n == MEMCARD_SIZE && flush_ok && close_ok) {
+                        cards[i].present = 1;
+                    }
+                }
             }
-            /* No card file = no card in slot. */
         }
     }
 }
