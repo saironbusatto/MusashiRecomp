@@ -19,8 +19,13 @@ recompiler/build-checked/
 runtime/build/
 runtime/build-msvc/
 test_msvc/
-generated/*.o
-generated/*.obj
+
+# Recompiler output (derivative of copyrighted Sony BIOS, regenerate locally)
+generated/
+
+# Release packaging artifacts
+release-stage/
+*.zip
 
 # Vendored upstream sources (cloned locally, not checked in)
 beetle-psx/
