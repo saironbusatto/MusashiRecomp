@@ -9,6 +9,7 @@
 
 extern "C" {
 int  beetle_init(const char* bios_path);
+int  beetle_init_with_disc(const char* bios_path, const char* disc_path);
 void beetle_shutdown(void);
 void beetle_run_frame(uint16_t pad1_buttons);
 int  beetle_get_framebuffer(uint32_t **out_pixels, unsigned *out_w, unsigned *out_h);
@@ -59,11 +60,19 @@ int main(int argc, char** argv) {
     std::setvbuf(stderr, nullptr, _IOLBF, 0);
 
     const char* bios_path = "bios/SCPH1001.BIN";
+    const char* disc_path = NULL;
     for (int i = 1; i < argc; i++) {
-        if (argv[i][0] != '-') bios_path = argv[i];
+        if (!std::strcmp(argv[i], "--disc") && i + 1 < argc) {
+            disc_path = argv[++i];
+        } else if (argv[i][0] != '-') {
+            bios_path = argv[i];
+        }
     }
 
     std::fprintf(stdout, "psx-beetle: loading BIOS from %s\n", bios_path);
+    if (disc_path) {
+        std::fprintf(stdout, "psx-beetle: loading disc from %s\n", disc_path);
+    }
 
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -94,7 +103,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (beetle_init(bios_path) != 0) {
+    if (beetle_init_with_disc(bios_path, disc_path) != 0) {
         std::fprintf(stderr, "beetle_init failed\n");
         return 1;
     }

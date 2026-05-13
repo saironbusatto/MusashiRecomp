@@ -242,7 +242,13 @@ bool on_environment(unsigned cmd, void *data) {
 /* ============== Public extern "C" interface =================== */
 /* ============================================================ */
 
+extern "C" int beetle_init_with_disc(const char *bios_path, const char *disc_path);
+
 extern "C" int beetle_init(const char *bios_path) {
+    return beetle_init_with_disc(bios_path, NULL);
+}
+
+extern "C" int beetle_init_with_disc(const char *bios_path, const char *disc_path) {
     if (s_loaded) return 0;
 
     /* Set system directory to the directory containing the BIOS. */
@@ -262,13 +268,21 @@ extern "C" int beetle_init(const char *bios_path) {
     std::fprintf(stderr, "[psx-beetle] retro_init...\n"); std::fflush(stderr);
     retro_init();
 
-    char dummy_cue[4096];
-    snprintf(dummy_cue, sizeof(dummy_cue), "%s/dummy.cue", s_system_dir);
-    std::fprintf(stderr, "[psx-beetle] retro_load_game(%s)...\n", dummy_cue); std::fflush(stderr);
+    /* If disc_path is non-NULL, load that real disc and keep it inserted.
+     * Otherwise fall back to the dummy-cue + eject behavior so the BIOS
+     * shows its shell (memcard editor / CD player). */
+    char load_path[4096];
+    if (disc_path && *disc_path) {
+        strncpy(load_path, disc_path, sizeof(load_path) - 1);
+        load_path[sizeof(load_path) - 1] = '\0';
+    } else {
+        snprintf(load_path, sizeof(load_path), "%s/dummy.cue", s_system_dir);
+    }
+    std::fprintf(stderr, "[psx-beetle] retro_load_game(%s)...\n", load_path); std::fflush(stderr);
 
     struct retro_game_info info;
     memset(&info, 0, sizeof(info));
-    info.path = dummy_cue;
+    info.path = load_path;
     if (!retro_load_game(&info)) {
         std::fprintf(stderr, "[psx-beetle] retro_load_game failed\n");
         retro_deinit();
@@ -278,11 +292,15 @@ extern "C" int beetle_init(const char *bios_path) {
     s_loaded = true;
     s_frame_count = 0;
 
-    /* Eject the fake disc so BIOS shows the shell selector. */
-    if (s_have_disk_cb_ext && s_disk_cb_ext.set_eject_state) {
-        s_disk_cb_ext.set_eject_state(true);
-    } else if (s_have_disk_cb && s_disk_cb.set_eject_state) {
-        s_disk_cb.set_eject_state(true);
+    /* Eject the fake disc so BIOS shows the shell selector — only when no
+     * real disc was provided. With a real disc, keep it inserted so the
+     * BIOS proceeds straight into game boot. */
+    if (!disc_path || !*disc_path) {
+        if (s_have_disk_cb_ext && s_disk_cb_ext.set_eject_state) {
+            s_disk_cb_ext.set_eject_state(true);
+        } else if (s_have_disk_cb && s_disk_cb.set_eject_state) {
+            s_disk_cb.set_eject_state(true);
+        }
     }
 
     /* Memcard sanity-check (warn-only). */
