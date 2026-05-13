@@ -1180,10 +1180,82 @@ static uint32_t gp0_opcode_count[256];
 
 uint32_t gpu_get_opcode_count(uint8_t op) { return gp0_opcode_count[op]; }
 
+/* ---- Per-frame GP0 command ring (always-on, queried via debug server) ---- */
+/* We record every GP0 command (header + up to 6 payload words) with the
+ * frame number it was issued in. Per CLAUDE.md ring-buffer rule: capture
+ * is continuous and observers query a window of interest later, not arm-
+ * then-record. ~34 MB at 1M entries. Polyline / long commands get the
+ * first 6 payload words; that's enough for the header + first vertex pair
+ * + first uv/color word for diagnosing per-primitive state. */
+
+extern uint64_t s_frame_count;  /* defined in debug_server.c */
+
+#define GP0_RING_CAP        (1u << 20)  /* 1 048 576 entries */
+/* GpuGp0RingEntry + GPU_GP0_RING_MAX_WORDS are public types in gpu.h. */
+
+static GpuGp0RingEntry *gp0_ring = NULL;  /* lazy-alloc on first record */
+static uint64_t gp0_ring_seq    = 0;      /* total commands recorded */
+static uint32_t gp0_ring_head   = 0;      /* next write slot */
+
+static void gp0_ring_record(const uint32_t *words, int n) {
+    if (!gp0_ring) {
+        gp0_ring = (GpuGp0RingEntry *)calloc(GP0_RING_CAP, sizeof(*gp0_ring));
+        if (!gp0_ring) return;  /* OOM — capture disabled, no other effect */
+    }
+    GpuGp0RingEntry *e = &gp0_ring[gp0_ring_head];
+    e->frame   = (uint32_t)s_frame_count;
+    e->seq     = (uint32_t)gp0_ring_seq;
+    e->opcode  = (uint8_t)((words[0] >> 24) & 0xFF);
+    e->n_words = (uint8_t)(n > 255 ? 255 : (n < 0 ? 1 : n));
+    e->pad     = 0;
+    int copy_n = e->n_words > GPU_GP0_RING_MAX_WORDS ? GPU_GP0_RING_MAX_WORDS : e->n_words;
+    for (int i = 0; i < copy_n; i++) e->cmd[i] = words[i];
+    for (int i = copy_n; i < GPU_GP0_RING_MAX_WORDS; i++) e->cmd[i] = 0;
+    gp0_ring_head = (gp0_ring_head + 1) % GP0_RING_CAP;
+    gp0_ring_seq++;
+}
+
+/* Public accessors for debug_server.c */
+uint64_t gpu_gp0_ring_total(void)    { return gp0_ring_seq; }
+uint32_t gpu_gp0_ring_capacity(void) { return GP0_RING_CAP; }
+uint32_t gpu_gp0_ring_max_words(void){ return GPU_GP0_RING_MAX_WORDS; }
+
+/* Fill `out[0..max_out-1]` with entries from the requested frame; returns
+ * count. Walks from oldest in-buffer to newest so iteration order matches
+ * draw order within a frame. */
+int gpu_gp0_ring_dump_frame(uint32_t frame, GpuGp0RingEntry *out, int max_out) {
+    if (!gp0_ring || max_out <= 0) return 0;
+    uint32_t avail = (gp0_ring_seq < GP0_RING_CAP)
+                   ? (uint32_t)gp0_ring_seq : GP0_RING_CAP;
+    uint32_t start = (gp0_ring_seq < GP0_RING_CAP) ? 0 : gp0_ring_head;
+    int n_out = 0;
+    for (uint32_t i = 0; i < avail && n_out < max_out; i++) {
+        uint32_t idx = (start + i) % GP0_RING_CAP;
+        if (gp0_ring[idx].frame == frame) {
+            out[n_out++] = gp0_ring[idx];
+        }
+    }
+    return n_out;
+}
+
+/* Report the frame range currently held in the ring (oldest..newest). */
+void gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest) {
+    if (out_oldest) *out_oldest = 0;
+    if (out_newest) *out_newest = 0;
+    if (!gp0_ring || gp0_ring_seq == 0) return;
+    uint32_t avail = (gp0_ring_seq < GP0_RING_CAP)
+                   ? (uint32_t)gp0_ring_seq : GP0_RING_CAP;
+    uint32_t start = (gp0_ring_seq < GP0_RING_CAP) ? 0 : gp0_ring_head;
+    uint32_t newest_idx = (start + avail - 1) % GP0_RING_CAP;
+    if (out_oldest) *out_oldest = gp0_ring[start].frame;
+    if (out_newest) *out_newest = gp0_ring[newest_idx].frame;
+}
+
 /* Execute a fully-collected GP0 command */
 static void gp0_execute_command(void) {
     uint8_t opcode = (gp0_cmd_buf[0] >> 24) & 0xFF;
     gp0_opcode_count[opcode]++;
+    gp0_ring_record(gp0_cmd_buf, gp0_words_needed);
 
     /* Categorize for diagnostics */
     if (opcode <= 0x01) gp0_nop_count++;
@@ -1538,6 +1610,11 @@ void gpu_write_gp0(uint32_t val) {
         sw_set_semi_transparency(polyline_semi_trans, (int)semi_transparency);
         gp0_state = shaded ? GP0_POLYLINE_SHADED : GP0_POLYLINE_MONO;
         gp0_draw_count++;
+        /* Record polyline header (variable-length body not captured;
+         * just enough so per-frame stream shows the polyline existed). */
+        gp0_opcode_count[opcode]++;
+        uint32_t hdr_only[1] = { val };
+        gp0_ring_record(hdr_only, 1);
         return;
     }
 

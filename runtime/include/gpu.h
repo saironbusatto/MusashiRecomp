@@ -48,6 +48,27 @@ typedef struct {
 void gpu_arm_shaded_quad_capture(void);
 int  gpu_get_shaded_quad_capture(const GpuSqCapEntry** out);
 
+/* Per-frame GP0 command ring (always-on; query via debug server).
+ * Each entry records the GP0 command header + up to 6 payload words
+ * (longer commands like 0x3C shaded textured quad are truncated to 6).
+ * Stamped with the s_frame_count value at issue time so a debug
+ * client can pull all commands for any frame in the ring window. */
+#define GPU_GP0_RING_MAX_WORDS 6
+typedef struct {
+    uint32_t frame;
+    uint32_t seq;
+    uint8_t  opcode;
+    uint8_t  n_words;       /* total command length; >MAX means truncated */
+    uint16_t pad;
+    uint32_t cmd[GPU_GP0_RING_MAX_WORDS];
+} GpuGp0RingEntry;
+
+uint64_t gpu_gp0_ring_total(void);
+uint32_t gpu_gp0_ring_capacity(void);
+uint32_t gpu_gp0_ring_max_words(void);
+int      gpu_gp0_ring_dump_frame(uint32_t frame, GpuGp0RingEntry *out, int max_out);
+void     gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest);
+
 /* Vblank presentation callback — called from gpu_vblank_tick(). */
 typedef void (*gpu_vblank_cb)(void);
 void gpu_set_vblank_callback(gpu_vblank_cb cb);

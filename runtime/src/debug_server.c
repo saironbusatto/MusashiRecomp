@@ -2711,6 +2711,62 @@ static void handle_gpu_opcodes(int id, const char *json)
     send_fmt("%s", buf);
 }
 
+static void handle_gpu_ring_stats(int id, const char *json)
+{
+    (void)json;
+    uint32_t oldest = 0, newest = 0;
+    gpu_gp0_ring_frame_span(&oldest, &newest);
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"capacity\":%u,"
+             "\"max_words\":%u,\"oldest_frame\":%u,\"newest_frame\":%u}",
+             id,
+             (unsigned long long)gpu_gp0_ring_total(),
+             gpu_gp0_ring_capacity(),
+             gpu_gp0_ring_max_words(),
+             oldest, newest);
+}
+
+static void handle_gpu_frame_dump(int id, const char *json)
+{
+    int target = json_get_int(json, "frame", -1);
+    if (target < 0) { send_err(id, "missing frame"); return; }
+    int max_entries = json_get_int(json, "count", 8192);
+    if (max_entries < 1)    max_entries = 1;
+    if (max_entries > 65536) max_entries = 65536;
+
+    GpuGp0RingEntry *entries = (GpuGp0RingEntry *)malloc(
+        (size_t)max_entries * sizeof(GpuGp0RingEntry));
+    if (!entries) { send_err(id, "alloc failed"); return; }
+
+    int n = gpu_gp0_ring_dump_frame((uint32_t)target, entries, max_entries);
+
+    /* ~140 bytes per entry in JSON; budget conservatively. */
+    size_t buf_sz = 256 + (size_t)n * 200u;
+    char *buf = (char *)malloc(buf_sz);
+    if (!buf) { free(entries); send_err(id, "alloc failed"); return; }
+
+    size_t pos = (size_t)snprintf(buf, buf_sz,
+        "{\"id\":%d,\"ok\":true,\"frame\":%u,\"count\":%d,\"max_words\":%u,\"entries\":[",
+        id, (uint32_t)target, n, gpu_gp0_ring_max_words());
+
+    for (int i = 0; i < n && pos < buf_sz - 256; i++) {
+        const GpuGp0RingEntry *e = &entries[i];
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos,
+            "%s{\"seq\":%u,\"op\":\"0x%02X\",\"n\":%u,\"w\":[",
+            i ? "," : "", e->seq, e->opcode, e->n_words);
+        int show = e->n_words < GPU_GP0_RING_MAX_WORDS
+                 ? e->n_words : GPU_GP0_RING_MAX_WORDS;
+        for (int k = 0; k < show && pos < buf_sz - 32; k++) {
+            pos += (size_t)snprintf(buf + pos, buf_sz - pos,
+                "%s\"0x%08X\"", k ? "," : "", e->cmd[k]);
+        }
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos, "]}");
+    }
+    snprintf(buf + pos, buf_sz - pos, "]}");
+    debug_server_send_line(buf);
+    free(buf);
+    free(entries);
+}
+
 static void handle_capture_quads(int id, const char *json)
 {
     (void)json;
@@ -5217,6 +5273,8 @@ static const CmdEntry s_commands[] = {
     { "screenshot",        handle_screenshot },
     { "screenshot_file",   handle_screenshot_file },
     { "gpu_opcodes",       handle_gpu_opcodes },
+    { "gpu_ring_stats",    handle_gpu_ring_stats },
+    { "gpu_frame_dump",    handle_gpu_frame_dump },
     { "a0_history",        handle_a0_history },
     { "c0_history",        handle_c0_history },
     { "capture_quads",     handle_capture_quads },
