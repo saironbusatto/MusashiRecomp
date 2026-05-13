@@ -2,6 +2,7 @@
 
 #include "psx_cycles.h"
 #include "cdrom.h"
+#include "interrupts.h"
 #include "sio.h"
 #include "starvation_ring.h"
 #include "timers.h"
@@ -20,6 +21,7 @@ void psx_advance_cycles(uint32_t cycles) {
     sio_advance(cycles);
     cdrom_advance(cycles);
     timers_advance(cycles);
+    interrupts_advance_cycles(cycles);
     s_watchdog_throttle += cycles;
     if (s_watchdog_throttle >= 65536u) {
         s_watchdog_throttle = 0;

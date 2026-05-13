@@ -29,6 +29,13 @@ void interrupts_init(void);
  * pending + COP0 allows, dispatches the exception handler. */
 void psx_check_interrupts(struct CPUState* cpu);
 
+/* Accumulate emitted PSX cycles toward the next VBlank trigger.
+ * Called from psx_advance_cycles() so the VBlank rate is gated on
+ * guest cycles (correct PSX timing) rather than block-dispatch
+ * count (which was 5-6x too fast and squeezed game-time to ~60% of
+ * real). One real-PSX VBlank = 564480 cycles (33.8688 MHz / 60). */
+void interrupts_advance_cycles(uint32_t cycles);
+
 /* Query whether we are currently inside an exception handler dispatch. */
 int psx_get_in_exception(void);
 

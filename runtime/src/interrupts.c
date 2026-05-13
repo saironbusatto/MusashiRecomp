@@ -46,9 +46,15 @@ extern uint32_t i_stat;
 extern uint32_t i_mask;
 
 /* Dispatch counter for vblank scheduling. */
-#define VBLANK_INTERVAL 50000
+#define VBLANK_INTERVAL 50000        /* legacy: dispatch-count fallback (unused for VBlank gating now) */
+#define VBLANK_CYCLES   564480u      /* 33.8688 MHz / 60 Hz — real PSX NTSC VBlank period */
 static uint32_t dispatch_count;
 static uint64_t total_checks;
+static uint32_t cycles_since_vblank;  /* incremented by interrupts_advance_cycles */
+
+void interrupts_advance_cycles(uint32_t cycles) {
+    cycles_since_vblank += cycles;
+}
 
 /* Reentrancy guard: prevent interrupt handler from triggering interrupts. */
 static int in_exception;
@@ -177,7 +183,13 @@ void psx_check_interrupts(CPUState* cpu) {
 #endif
 #endif
         dispatch_count++;
-        if (dispatch_count >= VBLANK_INTERVAL) {
+        /* VBlank pacing is now cycle-based (real PSX has VBlank at
+         * VBLANK_CYCLES = 564480 = 33.8688 MHz / 60 Hz). Previously this
+         * used dispatch_count >= 50000 which fired at ~5-6 cycles per
+         * dispatch = ~300k cycles per VBlank — half of real PSX, so
+         * guest time ran at ~60% real rate. That broke FMV pacing
+         * (TombaRecomp ISSUES.md #4: FMV at 6.7 fps vs 15 fps target). */
+        if (cycles_since_vblank >= VBLANK_CYCLES) {
             /* Defer VBlank while a card SIO transaction is mid-flight.
              * On real hardware a 140-byte sector read finishes (~4.5ms)
              * well before the next VBlank (16.67ms).  Our dispatch-count
@@ -194,6 +206,10 @@ void psx_check_interrupts(CPUState* cpu) {
             uint64_t since_progress = total_checks - total_checks_at_progress;
             int progress_stale = since_progress >= VBLANK_DEFER_STALE;
             if (!card_active || progress_stale) {
+                /* Subtract one VBlank period rather than reset to 0 so
+                 * cycle overshoot carries forward. Prevents long-running
+                 * blocks from rounding multiple VBlanks together. */
+                cycles_since_vblank -= VBLANK_CYCLES;
                 dispatch_count = 0;
                 i_stat |= (1 << IRQ_VBLANK);
                 gpu_vblank_tick();  /* Toggle LCF (GPUSTAT bit 31) */
