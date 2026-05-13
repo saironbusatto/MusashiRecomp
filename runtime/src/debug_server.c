@@ -125,7 +125,12 @@ static Watchpoint s_watchpoints[MAX_WATCHPOINTS];
 /* ---- Write trace (Tier 1 reverse debugger) ----
  * Records every RAM write matching one of the configurable address ranges.
  * 1M-entry ring buffer, heap-allocated in debug_server_init(). */
-#define WRITE_TRACE_CAP (1 << 22)
+/* Ring caps were sized for hour-long captures; that's ~700 MB if every
+ * ring is touched. Most diagnostic flows need seconds, not hours. Drop
+ * to 256K-entry caps unless an explicit need for more arises — at 60Hz
+ * and ~thousand events/frame that's still ~4 sec of coverage per ring,
+ * and total runtime memory stays under ~100 MB worst-case. */
+#define WRITE_TRACE_CAP (1 << 18)
 typedef struct {
     uint64_t seq;        /* monotonic sequence number */
     uint32_t addr;       /* physical RAM address */
@@ -173,7 +178,7 @@ uint32_t g_debug_last_store_pc = 0;
  * 1<<22 entries x 32 bytes = 128 MiB. This is intentionally much larger
  * than the old 64K ring because BIOS pad/card polling can burn through
  * tens of thousands of MMIO writes before a useful post-failure query. */
-#define SIO_PC_TRACE_CAP (1 << 22)
+#define SIO_PC_TRACE_CAP (1 << 18)
 typedef struct {
     uint64_t seq;
     uint32_t pc;            /* g_debug_last_store_pc at the moment of write */
@@ -654,8 +659,8 @@ static uint32_t s_chain_state_active = 0;  /* 0 if not in a state, else state ad
  * ≈ 7 GB.  Lazily resident — only pages actually written use RAM, so the
  * footprint grows from 0 toward the cap as the ring fills.
  * Exit ring stays modest (1<<22, ~192 MB) — exits are auxiliary.  */
-#define FN_TRACE_CAP        (1 << 20)
-#define FN_EXIT_TRACE_CAP   (1 << 22)
+#define FN_TRACE_CAP        (1 << 18)
+#define FN_EXIT_TRACE_CAP   (1 << 18)
 #define FN_STACK_DEPTH 4096
 
 typedef struct {
@@ -2098,7 +2103,7 @@ static void handle_probe_clear(int id, const char *json)
  * 1<<22 entries, heap-allocated in debug_server_init().
  * Kept in step with the SIO PC trace so generic MMIO history has enough
  * retention for post-failure queries. */
-#define MMIO_TRACE_CAP (1 << 22)
+#define MMIO_TRACE_CAP (1 << 18)
 typedef struct {
     uint64_t seq;
     uint32_t addr;       /* 0x1F801xxx */
@@ -4556,6 +4561,11 @@ static void handle_freeze_check(int id, const char *json)
                     "\"mc_read_done\":%d,"
                     "\"tx_writes\":%d,"
                     "\"psx_cycle_count\":%llu,"
+                    "\"frame_count\":%llu,"
+                    "\"paused\":%d,"
+                    "\"step_count\":%d,"
+                    "\"run_to\":%u,"
+                    "\"client_connected\":%d,"
                     "\"window\":%d,"
                     "\"recent_func_min\":\"0x%08X\","
                     "\"recent_func_max\":\"0x%08X\","
@@ -4588,6 +4598,11 @@ static void handle_freeze_check(int id, const char *json)
                     sio_get_mc_read_done(),
                     sio_get_tx_writes(),
                     (unsigned long long)psx_get_cycle_count(),
+                    (unsigned long long)s_frame_count,
+                    s_paused,
+                    s_step_count,
+                    s_run_to,
+                    (s_client != SOCK_INVALID),
                     window,
                     (recent_total ? recent_min_func : 0),
                     recent_max_func,
@@ -5542,6 +5557,19 @@ void debug_server_poll(void)
         } else if (n == 0) {
             sock_close(s_client);
             s_client = SOCK_INVALID;
+            /* Auto-clear pause state on client disconnect. Otherwise a
+             * leftover `pause`/`step` from a Python client that exited
+             * without sending `continue` (the common case — each
+             * tools/_dbg.py invocation is one connection) leaves the
+             * runtime spinning in debug_server_wait_if_paused forever,
+             * SDL window freezing, frame counter stuck. The user reads
+             * "frozen" but it's really "paused with nobody to unpause."
+             *
+             * Doesn't break legitimate pause workflows — those keep the
+             * connection open across the pause-investigate-continue cycle. */
+            s_paused = 0;
+            s_step_count = 0;
+            s_run_to = 0;
             return;
         } else {
             int err = sock_error();
@@ -5552,6 +5580,9 @@ void debug_server_poll(void)
 #endif
                 sock_close(s_client);
                 s_client = SOCK_INVALID;
+                s_paused = 0;
+                s_step_count = 0;
+                s_run_to = 0;
                 /* Don't reset s_input_override here. A scheduled press
                  * (s_input_frames > 0) must continue to hold across the
                  * client disconnect — Python clients open a fresh socket
