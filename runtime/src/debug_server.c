@@ -2236,6 +2236,11 @@ int debug_server_dirty_break_maybe_pause(uint32_t target, CPUState *cpu)
     if (!s_dirty_break_active) return 0;
     if (target < s_dirty_break_lo || target >= s_dirty_break_hi) return 0;
 
+    /* Record the hit so dirty_break_state can be queried, but do NOT
+     * pause the runtime. The hit recording is its own ring (effectively
+     * size 1 — latest hit only). For broader history, use wtrace or
+     * fn_entry over the same address window instead of relying on a
+     * "stop and inspect" workflow. */
     s_dirty_break_active = 0;
     s_dirty_break_hits++;
     s_dirty_break_target = target;
@@ -2246,7 +2251,6 @@ int debug_server_dirty_break_maybe_pause(uint32_t target, CPUState *cpu)
     s_dirty_break_a3 = cpu ? cpu->gpr[7] : 0;
     s_dirty_break_sp = cpu ? cpu->gpr[29] : 0;
     s_dirty_break_frame = (uint32_t)s_frame_count;
-    s_paused = 1;
     return 1;
 }
 
@@ -3821,41 +3825,46 @@ static void handle_clear_input(int id, const char *json)
     send_ok(id);
 }
 
-static void handle_pause(int id, const char *json)
-{
+/* pause / continue / step / run_to_frame: REMOVED.
+ *
+ * Per CLAUDE.md global rule #2 ("Never time/attach for observability —
+ * always consume ring buffers"), pause/step is the wrong primitive for
+ * observation. It produces synthesized snapshots ("what's state right
+ * NOW") rather than reading the system's own continuously-recorded
+ * history. Worse, it tempts the observer to think pause-step-read is
+ * cheap; in this codebase it forced the runtime into a wait loop where
+ * a dropped client connection looked like a freeze.
+ *
+ * Replacements (already in the runtime):
+ *   - fn_entry_dump / fn_entry_tail   for what code ran
+ *   - wtrace_dump                     for what memory was written
+ *   - gpu_frame_dump frame=N          for what GP0 commands were issued
+ *   - mdec_trace                      for MDEC events
+ *   - sio_trace / sio_pc_trace        for SIO history
+ *   - frame_range / get_frame         for per-frame state snapshots
+ *
+ * Handlers below return an error explaining the migration. The state
+ * variables (s_paused, s_step_count, s_run_to) are kept as zero so
+ * freeze_check still reports them and any stale callsite that reads
+ * them gets a benign value. */
+static void handle_pause(int id, const char *json) {
     (void)json;
-    s_paused = 1;
-    send_fmt("{\"id\":%d,\"ok\":true,\"paused\":true,\"frame\":%llu}",
-             id, (unsigned long long)s_frame_count);
+    send_err(id, "pause is removed; query a ring buffer (fn_entry_tail, wtrace_dump, gpu_frame_dump, etc.) instead of synthesizing a snapshot");
 }
 
-static void handle_continue(int id, const char *json)
-{
+static void handle_continue(int id, const char *json) {
     (void)json;
-    s_paused = 0;
-    s_step_count = 0;
-    s_run_to = 0;
-    send_fmt("{\"id\":%d,\"ok\":true,\"paused\":false}", id);
+    send_err(id, "continue is removed (pause is removed; nothing to resume)");
 }
 
-static void handle_step(int id, const char *json)
-{
-    int n = json_get_int(json, "count", 1);
-    if (n < 1) n = 1;
-    s_step_count = n;
-    s_paused = 0;
-    send_fmt("{\"id\":%d,\"ok\":true,\"stepping\":%d}", id, n);
+static void handle_step(int id, const char *json) {
+    (void)json;
+    send_err(id, "step is removed; query a ring buffer over the window of interest instead of advancing N frames synchronously");
 }
 
-static void handle_run_to_frame(int id, const char *json)
-{
-    int target = json_get_int(json, "frame", 0);
-    if (target <= (int)s_frame_count) {
-        send_err(id, "target frame already passed"); return;
-    }
-    s_run_to = (uint32_t)target;
-    s_paused = 0;
-    send_fmt("{\"id\":%d,\"ok\":true,\"running_to\":%d}", id, target);
+static void handle_run_to_frame(int id, const char *json) {
+    (void)json;
+    send_err(id, "run_to_frame is removed; use frame_range / read_frame_ram against the live frame ring buffer instead");
 }
 
 static void handle_dirty_break_range(int id, const char *json)
@@ -3916,7 +3925,7 @@ static void handle_dirty_break_state(int id, const char *json)
              s_dirty_break_a0, s_dirty_break_a1,
              s_dirty_break_a2, s_dirty_break_a3,
              s_dirty_break_sp, s_dirty_break_frame,
-             s_paused ? "true" : "false");
+             "false"  /* paused field kept for protocol stability; pause was removed */);
 }
 
 /* ---- Ring buffer queries ---- */
@@ -5557,19 +5566,6 @@ void debug_server_poll(void)
         } else if (n == 0) {
             sock_close(s_client);
             s_client = SOCK_INVALID;
-            /* Auto-clear pause state on client disconnect. Otherwise a
-             * leftover `pause`/`step` from a Python client that exited
-             * without sending `continue` (the common case — each
-             * tools/_dbg.py invocation is one connection) leaves the
-             * runtime spinning in debug_server_wait_if_paused forever,
-             * SDL window freezing, frame counter stuck. The user reads
-             * "frozen" but it's really "paused with nobody to unpause."
-             *
-             * Doesn't break legitimate pause workflows — those keep the
-             * connection open across the pause-investigate-continue cycle. */
-            s_paused = 0;
-            s_step_count = 0;
-            s_run_to = 0;
             return;
         } else {
             int err = sock_error();
@@ -5580,9 +5576,6 @@ void debug_server_poll(void)
 #endif
                 sock_close(s_client);
                 s_client = SOCK_INVALID;
-                s_paused = 0;
-                s_step_count = 0;
-                s_run_to = 0;
                 /* Don't reset s_input_override here. A scheduled press
                  * (s_input_frames > 0) must continue to hold across the
                  * client disconnect — Python clients open a fresh socket
@@ -5671,37 +5664,20 @@ void debug_server_record_frame(void)
     s_history_count = s_frame_count + 1;
     s_frame_count++;
 
-    /* Step mode */
-    if (s_step_count > 0) {
-        s_step_count--;
-        if (s_step_count == 0) {
-            s_paused = 1;
-            send_fmt("{\"event\":\"step_done\",\"frame\":%llu}",
-                     (unsigned long long)(s_frame_count - 1));
-        }
-    }
-
-    /* Run-to-frame */
-    if (s_run_to > 0 && s_frame_count - 1 >= s_run_to) {
-        s_paused = 1;
-        s_run_to = 0;
-        send_fmt("{\"event\":\"run_to_done\",\"frame\":%llu}",
+    /* step / run_to_frame post-frame hooks: removed with the rest of
+     * pause/step machinery. s_step_count and s_run_to stay at zero. */
+    if (0) {
+        send_fmt("{\"event\":\"unreachable\",\"frame\":%llu}",
                  (unsigned long long)(s_frame_count - 1));
     }
 }
 
 void debug_server_wait_if_paused(void)
 {
-    while (s_paused) {
-        debug_server_poll();
-
-        SDL_Event ev;
-        while (SDL_PollEvent(&ev)) {
-            if (ev.type == SDL_QUIT) exit(0);
-        }
-
-        SDL_Delay(5);
-    }
+    /* No-op: pause/step removed (see handle_pause). Kept exported so
+     * main.cpp's vblank callback continues to compile without
+     * conditional defines. s_paused is now permanently zero, so the
+     * old `while (s_paused)` loop would have been a no-op anyway. */
 }
 
 void debug_server_check_watchpoints(void)
