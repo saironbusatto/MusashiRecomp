@@ -38,6 +38,7 @@
 #include "fmt/format.h"
 
 #include "bios_slice_walker.h"
+#include "config_loader.h"
 #include "full_function_emitter.h"
 #include "function_discovery.h"
 #include "mips_decoder.h"
@@ -812,9 +813,40 @@ int run_discover(const fs::path& bios_path, const fs::path& out_dir,
 
 int main(int argc, char** argv) {
     try {
+        // ── --config <path.toml> short-form ────────────────────────────
+        // If --config is the first (or only) flag, all paths come from the
+        // TOML. This is the going-forward invocation; the positional form
+        // below stays for backwards compat.
+        for (int i = 1; i < argc; ++i) {
+            const std::string a = argv[i];
+            if (a == "--config" && i + 1 < argc) {
+                const fs::path config_path = argv[i + 1];
+                const auto cfg = PSXRecompV4::load_bios_config(config_path);
+                std::fprintf(stdout,
+                    "psxrecomp-bios: --config %s\n"
+                    "  rom        = %s\n"
+                    "  seeds      = %s\n"
+                    "  out_dir    = %s\n"
+                    "  out_stem   = %s\n",
+                    config_path.string().c_str(),
+                    cfg.rom_path.string().c_str(),
+                    cfg.seeds_path.string().c_str(),
+                    cfg.out_dir.string().c_str(),
+                    cfg.out_stem.c_str());
+                return run_emit_full(cfg.rom_path, cfg.out_dir, cfg.seeds_path);
+            }
+            if (a == "--config=" || a.rfind("--config=", 0) == 0) {
+                const fs::path config_path = a.substr(std::string("--config=").size());
+                const auto cfg = PSXRecompV4::load_bios_config(config_path);
+                return run_emit_full(cfg.rom_path, cfg.out_dir, cfg.seeds_path);
+            }
+        }
+
+        // ── Positional form (legacy) ───────────────────────────────────
         if (argc < 3) {
             std::fprintf(stderr,
-                "usage: psxrecomp-bios <bios.bin> <out_dir> [--cc <c-compiler>]\n"
+                "usage: psxrecomp-bios --config <path.toml>            # going-forward\n"
+                "       psxrecomp-bios <bios.bin> <out_dir> [--cc <c-compiler>]\n"
                 "       psxrecomp-bios <bios.bin> <out_dir> --discover <seeds.json>\n"
                 "       psxrecomp-bios <bios.bin> <out_dir> --emit-full <seeds.json>\n");
             return 2;

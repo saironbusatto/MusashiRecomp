@@ -60,6 +60,7 @@ set(PSXRECOMP_GAME_SOURCES
     src/function_analysis.cpp
     src/code_generator.cpp
     src/annotations.cpp
+    src/config_loader.cpp
     src/main_psx.cpp
 )
 
@@ -105,6 +106,7 @@ add_executable(psxrecomp-bios
     src/bios_slice_walker.cpp
     src/function_discovery.cpp
     src/full_function_emitter.cpp
+    src/config_loader.cpp
     src/main_bios.cpp
 )
 target_include_directories(psxrecomp-bios PRIVATE
@@ -113,6 +115,7 @@ target_include_directories(psxrecomp-bios PRIVATE
     lib/rabbitizer/include
     lib/rabbitizer/cplusplus/include
     lib/fmt/include
+    lib/toml11
 )
 target_link_libraries(psxrecomp-bios PRIVATE fmt rabbitizer)
 if(MINGW OR WIN32)

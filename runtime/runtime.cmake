@@ -58,10 +58,14 @@ set(PSXRECOMP_V4_RUNTIME_SOURCES
     ${PSXRECOMP_V4_ROOT}/runtime/src/starvation_ring.c
     ${PSXRECOMP_V4_ROOT}/runtime/src/card_read_summary.c
     ${PSXRECOMP_V4_ROOT}/runtime/src/card_data_writes.c
+    ${PSXRECOMP_V4_ROOT}/recompiler/src/config_loader.cpp
 )
 
 set(PSXRECOMP_V4_RUNTIME_INCLUDE_DIRS
     ${PSXRECOMP_V4_ROOT}/runtime/include
+    ${PSXRECOMP_V4_ROOT}/recompiler/src
+    ${PSXRECOMP_V4_ROOT}/recompiler/lib/fmt/include
+    ${PSXRECOMP_V4_ROOT}/recompiler/lib/toml11
 )
 
 set(PSXRECOMP_V4_BIOS_GENERATED
@@ -77,30 +81,21 @@ function(psxrecomp_v4_add_runtime_target target)
         DEBUG_PORT
         WINDOW_TITLE
         DEFAULT_BIOS_PATH
-        DEFAULT_GAME_ROOT
-        DEFAULT_MEMCARD_DIR
-        DEFAULT_DISC_PATH
     )
     set(multiValueArgs EXTRAS_SOURCES)
     cmake_parse_arguments(PSXRT "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
+    # DEBUG_PORT and WINDOW_TITLE were previously required cmake-time defaults.
+    # game.toml's [runtime] block is now the source of truth at run time; the
+    # cmake-time values only survive as fallback when --game is not passed.
     if(NOT PSXRT_DEBUG_PORT)
-        message(FATAL_ERROR "psxrecomp_v4_add_runtime_target(${target}) requires DEBUG_PORT")
+        set(PSXRT_DEBUG_PORT 4370)
     endif()
     if(NOT PSXRT_WINDOW_TITLE)
         set(PSXRT_WINDOW_TITLE "${target}")
     endif()
     if(NOT PSXRT_DEFAULT_BIOS_PATH)
         set(PSXRT_DEFAULT_BIOS_PATH "${PSXRECOMP_V4_ROOT}/bios/SCPH1001.BIN")
-    endif()
-    if(NOT PSXRT_DEFAULT_GAME_ROOT)
-        set(PSXRT_DEFAULT_GAME_ROOT "${PSXRECOMP_V4_ROOT}")
-    endif()
-    if(NOT PSXRT_DEFAULT_MEMCARD_DIR)
-        set(PSXRT_DEFAULT_MEMCARD_DIR "${PSXRT_DEFAULT_GAME_ROOT}")
-    endif()
-    if(NOT DEFINED PSXRT_DEFAULT_DISC_PATH)
-        set(PSXRT_DEFAULT_DISC_PATH "")
     endif()
 
     set(generated_sources ${PSXRECOMP_V4_BIOS_GENERATED})
@@ -137,10 +132,8 @@ function(psxrecomp_v4_add_runtime_target target)
     target_compile_definitions(${target} PRIVATE
         DEFAULT_DEBUG_PORT=${PSXRT_DEBUG_PORT}
         PSX_DEFAULT_BIOS_PATH="${PSXRT_DEFAULT_BIOS_PATH}"
-        PSX_DEFAULT_GAME_ROOT="${PSXRT_DEFAULT_GAME_ROOT}"
-        PSX_DEFAULT_MEMCARD_DIR="${PSXRT_DEFAULT_MEMCARD_DIR}"
-        PSX_DEFAULT_DISC_PATH="${PSXRT_DEFAULT_DISC_PATH}"
         PSX_WINDOW_TITLE="${PSXRT_WINDOW_TITLE}"
+        FMT_HEADER_ONLY=1
         $<$<CXX_COMPILER_ID:MSVC>:SDL_MAIN_HANDLED>
     )
 

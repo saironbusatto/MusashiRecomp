@@ -5428,7 +5428,17 @@ void debug_server_init(int port)
      * leaves the operation armed or clears it and delivers the public event. */
     s_wtrace_ranges[23].lo = 0x00009F20u;
     s_wtrace_ranges[23].hi = 0x00009F38u;
-    s_wtrace_range_count = 24;
+    /* Tomba pad-poll buffer (game state +0x30 -> 0x8009EB58, second buffer at
+     * 0x8009EB7A). Display thread state machine gates on (*0x1F8001FC & 0x4008)
+     * which derives from `func_80028D70(0)` reading this buffer. Capture every
+     * write so we can attribute who initialises the layout — BIOS PadInit,
+     * runtime SIO, game-side memcpy, or none of the above. */
+    s_wtrace_ranges[24].lo = 0x0009EB40u;
+    s_wtrace_ranges[24].hi = 0x0009EB80u;
+    /* The gflag word the display thread polls (newly-set bits). */
+    s_wtrace_ranges[25].lo = 0x0009C9D0u;
+    s_wtrace_ranges[25].hi = 0x0009C9E0u;
+    s_wtrace_range_count = 26;
 #endif
 
     /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */

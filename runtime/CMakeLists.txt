@@ -29,8 +29,6 @@ psxrecomp_v4_add_runtime_target(psx-runtime
     DEBUG_PORT 4370
     WINDOW_TITLE "psxrecomp-v4 - BIOS"
     DEFAULT_BIOS_PATH "${PSXRECOMP_V4_ROOT}/bios/SCPH1001.BIN"
-    DEFAULT_GAME_ROOT "${PSXRECOMP_V4_ROOT}"
-    DEFAULT_MEMCARD_DIR "${PSXRECOMP_V4_ROOT}"
 )
 
 if(NOT MSVC)
@@ -39,8 +37,6 @@ if(NOT MSVC)
         DEBUG_PORT 4371
         WINDOW_TITLE "psxrecomp-v4 - Oracle"
         DEFAULT_BIOS_PATH "${PSXRECOMP_V4_ROOT}/bios/SCPH1001.BIN"
-        DEFAULT_GAME_ROOT "${PSXRECOMP_V4_ROOT}"
-        DEFAULT_MEMCARD_DIR "${PSXRECOMP_V4_ROOT}"
     )
 endif()
 

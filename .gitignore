@@ -11,6 +11,9 @@ duckstation/dep/prebuilt/
 # Ghidra project files (large, regenerable)
 ghidra/
 
+# Backup of the working state — see CURRENT_STATE.md for what this contains.
+.happypath/
+
 # Build artifacts
 recompiler/build/
 recompiler/build-asan/
@@ -49,6 +52,10 @@ psx_out.txt
 # All ad-hoc diagnostic dumps land under probes/ so the repo root stays clean.
 # Runtime data (memcards) is intentionally NOT covered: card*.mcd, dummy.*.mcr.
 probes/
+
+# Ad-hoc scratch tools (underscore prefix convention).
+# Real tools have no leading underscore (e.g. tools/codegen_audit.py).
+tools/_*.py
 /*.json
 /*.png
 /*.bmp

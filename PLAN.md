@@ -1496,12 +1496,15 @@ Added Pattern 5 to trampoline resolver (runtime/src/traps.c):
 cd /f/Projects/psxrecomp-v4
 PATH=/c/msys64/mingw64/bin:$PATH
 
-# Regen after seed changes:
-./recompiler/build/psxrecomp-bios.exe bios/SCPH1001.BIN generated/ --emit-full \
-  recompiler/seeds/phase2_ghidra_seeds.json
+# Regen after seed changes (going-forward — config-driven):
+./recompiler/build/psxrecomp-bios.exe --config bios/SCPH1001.toml
 
-# Rebuild (Release):
-cd runtime && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build && cd ..
+# Legacy positional form (still supported for back-compat):
+# ./recompiler/build/psxrecomp-bios.exe bios/SCPH1001.BIN generated/ --emit-full \
+#   recompiler/seeds/phase2_ghidra_seeds.json
+
+# Rebuild (Debug — see memory/debug_vs_release_optimization.md):
+cd runtime && cmake -B build && cmake --build build && cd ..
 
 # Run (one instance at a time):
 taskkill //F //IM psx-runtime.exe 2>/dev/null

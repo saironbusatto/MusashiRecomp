@@ -47,17 +47,25 @@ import json
 import os
 import struct
 import sys
+from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIOS_PATH = os.path.join(ROOT, "bios", "SCPH1001.BIN")
-STARTS_PATH = os.path.join(ROOT, "generated", "ghidra_function_starts.json")
-OUT_PATH = os.path.join(ROOT, "generated", "branch_delay_hazards.json")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import audit_config
 
-IMAGE_BASE = 0xBFC00000
-IMAGE_END  = 0xBFC7FFFF
-ROM_SIZE   = 0x80000
+# These are populated by main() from the config. Module-level globals are
+# preserved to minimize churn against the existing walker/fetch helpers.
+ROOT = None
+BIOS_PATH = None
+STARTS_PATH = None
+OUT_PATH = None
+IMAGE_BASE = None
+IMAGE_END = None
+ROM_SIZE = None
 
-SYNTHETIC_SEEDS = [
+# BIOS-specific synthetic entry seeds (reset vector + BEV=1 exception vector).
+# These don't appear in ghidra_function_starts.json but must be walked to
+# cover boot-time hazards. For non-BIOS configs they don't apply.
+BIOS_SYNTHETIC_SEEDS = [
     (0xBFC00000, 0xBFC00420, "reset_vector"),
     (0xBFC00180, 0xBFC00420, "boot_general_exception_bev1"),
 ]
@@ -293,6 +301,42 @@ def walk(rom, entry, hard_cap):
 
 
 def main():
+    global ROOT, BIOS_PATH, STARTS_PATH, OUT_PATH, IMAGE_BASE, IMAGE_END, ROM_SIZE
+    cfg = audit_config.from_argv(sys.argv)
+    ROOT = str(cfg.project_root)
+    BIOS_PATH = str(cfg.rom)
+    OUT_PATH = str(cfg.out_dir / "branch_delay_hazards.json")
+    IMAGE_BASE = cfg.load_address
+    IMAGE_END = cfg.load_address + cfg.text_size - 1
+    ROM_SIZE = cfg.text_size
+
+    print(f"# branch_delay_hazards: {cfg.name}")
+    print(f"  rom          = {BIOS_PATH}")
+    print(f"  image base   = 0x{IMAGE_BASE:08X}")
+    print(f"  image end    = 0x{IMAGE_END:08X}")
+    print(f"  out          = {OUT_PATH}")
+
+    if not cfg.function_starts:
+        print(f"  function_starts: <not configured for this program>")
+        print()
+        print("Branch-hazard walker requires a function_starts JSON to seed "
+              "the reachable-code walk. This config has none (typical for "
+              "games using dynamic discovery). The walker-based hazard "
+              "scan is skipped. The translator-source check still runs.")
+        translator_check = verify_translator_uses_snapshots()
+        incorrect = sum(1 for v in translator_check.values() if not v["pass"])
+        print(f"\n  translator-source check: "
+              f"{'PASS' if incorrect == 0 else 'FAIL'}")
+        if incorrect:
+            for op_name, info in translator_check.items():
+                if not info["pass"]:
+                    print(f"    FAIL {op_name}: {info['reason']}", file=sys.stderr)
+            return 8
+        # Returning OK because the walker check simply doesn't apply to
+        # this config; the translator-source invariant is still upheld.
+        return 0
+
+    STARTS_PATH = str(cfg.function_starts)
     with open(BIOS_PATH, "rb") as f:
         rom = f.read()
     with open(STARTS_PATH, "r", encoding="utf-8") as f:
@@ -302,9 +346,12 @@ def main():
     # Union all walked addresses across all seeds.
     all_instrs = {}
 
-    for (entry, cap, _label) in SYNTHETIC_SEEDS:
-        for addr, raw in walk(rom, entry, cap).items():
-            all_instrs[addr] = raw
+    # Synthetic seeds: BIOS-specific reset/exception vectors. Only apply
+    # to the BIOS image — recognized by load_address.
+    if cfg.load_address == 0xBFC00000:
+        for (entry, cap, _label) in BIOS_SYNTHETIC_SEEDS:
+            for addr, raw in walk(rom, entry, cap).items():
+                all_instrs[addr] = raw
 
     for i, entry in enumerate(starts):
         cap = starts[i + 1] if i + 1 < len(starts) else (IMAGE_END + 1)
@@ -372,7 +419,7 @@ def main():
 
     out = {
         "schema": "psxrecomp-v4 phase1b branch_delay_hazards v2",
-        "program": "SCPH1001.BIN",
+        "program": cfg.name,
         "totals": {
             "branches_scanned":                  branch_count,
             "delay_slot_writes_branch_operand":  len(hazards),
@@ -425,7 +472,10 @@ def verify_translator_uses_snapshots():
          and never reads cpu->gpr[ in the c_code body.
     Returns a dict { branch_name -> {pass: bool, reason: str} }.
     """
-    src_path = os.path.join(ROOT, "recompiler", "src", "strict_translator.cpp")
+    # strict_translator.cpp lives in psxrecomp-v4 regardless of which
+    # program config is being audited. Resolve relative to this script.
+    psxrecomp_root = Path(__file__).parent.parent
+    src_path = psxrecomp_root / "recompiler" / "src" / "strict_translator.cpp"
     with open(src_path, "r", encoding="utf-8") as f:
         text = f.read()
 

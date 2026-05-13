@@ -77,18 +77,17 @@ static void update_master_irq(void) {
     /* DICR bit 31 (master IRQ flag) is read-only, calculated as:
      * bit31 = bit15 OR (bit23 AND ((bits16-22 AND bits24-30) != 0))
      *
-     * We store bits 0-30 in dicr and compute bit 31 on read. */
-    uint32_t force_irq = (dicr >> 15) & 1;
-    uint32_t master_enable = (dicr >> 23) & 1;
-    uint32_t enable_bits = (dicr >> 16) & 0x7F;
-    uint32_t flag_bits = (dicr >> 24) & 0x7F;
-
-    uint32_t master_flag = force_irq | (master_enable & ((enable_bits & flag_bits) != 0));
-
-    dicr = (dicr & 0x7FFFFFFFu) | (master_flag << 31);
-    if (master_flag) {
-        i_stat |= (1u << 3);
-    }
+     * We store bits 0-30 in dicr and compute bit 31 on read.
+     *
+     * I_STAT bit 3 is set by direct assertion in complete_transfer(),
+     * not here.  The BIOS shell DMA-IRQ handler at 0x80058628 only
+     * clears DICR bit 27 (ch3 flag) — any other channel flag (e.g. ch2
+     * after a GPU DMA) stays high.  If this routine re-asserted
+     * i_stat |= (1<<3) on every DICR read or write, the BIOS handler's
+     * "lw $v0, 0($v1)" of DICR right after writing 0xFFFFFFF7 to I_STAT
+     * would put bit 3 back, and the kernel would loop forever in the
+     * exception handler.  Discless BIOS boot (memcard / CD player
+     * screen) is the case that exhibits this.  */
 }
 
 static int channel_enabled(int ch) {
@@ -124,6 +123,9 @@ static void complete_transfer(int ch) {
     if (channel_irq_enabled(ch)) {
         dicr |= (1u << (24 + ch));
         update_master_irq();
+        /* Edge-trigger I_STAT bit 3 once per completion. See comment in
+         * update_master_irq() for why this is not done there. */
+        i_stat |= (1u << 3);
     }
     trace_dma('C', ch, 0, dicr_before, i_stat_before);
 }

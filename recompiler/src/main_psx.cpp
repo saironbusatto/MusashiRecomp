@@ -12,6 +12,7 @@
 #include "control_flow.h"
 #include "code_generator.h"
 #include "annotations.hpp"
+#include "config_loader.h"
 #include "rabbitizer.hpp"
 #include "fmt/format.h"
 
@@ -19,27 +20,59 @@ int main(int argc, char** argv) {
     fmt::print("PSXRecomp - PlayStation 1 Static Recompiler\n");
     fmt::print("============================================\n\n");
 
-    if (argc < 2) {
-        fmt::print("Usage: {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect]\n", argv[0]);
-        fmt::print("Example: {} SCUS_942.36 --seeds seeds/ghidra_funcs.txt --out-dir generated --strict\n\n", argv[0]);
-        return 0;
+    // ── --config <path> short-form ────────────────────────────────────
+    // If --config is provided, all paths come from the TOML and other
+    // CLI flags are ignored. Positional form below stays for back-compat.
+    std::filesystem::path config_path;
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--config" && i + 1 < argc) {
+            config_path = argv[i + 1];
+            break;
+        }
+        if (a.rfind("--config=", 0) == 0) {
+            config_path = a.substr(std::string("--config=").size());
+            break;
+        }
     }
 
-    std::filesystem::path exe_path = argv[1];
-    const char* extra_funcs_path = nullptr;
-    bool inspect_mode = false;
+    std::filesystem::path exe_path;
+    std::string           extra_funcs_storage;  // lifetime anchor for the .c_str() below
+    const char*           extra_funcs_path = nullptr;
+    bool                  inspect_mode = false;
     std::filesystem::path out_dir = "generated";
-    for (int i = 2; i < argc; i++) {
-        std::string arg = argv[i];
-        if ((arg == "--extra-funcs" || arg == "--seeds") && i + 1 < argc) {
-            extra_funcs_path = argv[++i];
-        } else if (arg == "--out-dir" && i + 1 < argc) {
-            out_dir = argv[++i];
-        } else if (arg == "--strict") {
-            /* The PS-X EXE path is fail-loud by default; accepted for parity
-             * with psxrecomp-bios and project scripts. */
-        } else if (arg == "--inspect") {
-            inspect_mode = true;
+
+    if (!config_path.empty()) {
+        const auto cfg = PSXRecompV4::load_game_config(config_path);
+        exe_path             = cfg.exe_path;
+        extra_funcs_storage  = cfg.seeds_path.string();
+        extra_funcs_path     = extra_funcs_storage.c_str();
+        out_dir              = cfg.out_dir;
+        fmt::print("config:         {}\n", config_path.string());
+        fmt::print("  exe         = {}\n", exe_path.string());
+        fmt::print("  seeds       = {}\n", extra_funcs_storage);
+        fmt::print("  out_dir     = {}\n\n", out_dir.string());
+    } else {
+        if (argc < 2) {
+            fmt::print("Usage: {} --config <game.toml>                  # going-forward\n", argv[0]);
+            fmt::print("       {} <PS1-EXE file> [--seeds <file>] [--out-dir <dir>] [--strict] [--inspect]\n", argv[0]);
+            fmt::print("Example: {} SCUS_942.36 --seeds seeds/ghidra_funcs.txt --out-dir generated --strict\n\n", argv[0]);
+            return 0;
+        }
+
+        exe_path = argv[1];
+        for (int i = 2; i < argc; i++) {
+            std::string arg = argv[i];
+            if ((arg == "--extra-funcs" || arg == "--seeds") && i + 1 < argc) {
+                extra_funcs_path = argv[++i];
+            } else if (arg == "--out-dir" && i + 1 < argc) {
+                out_dir = argv[++i];
+            } else if (arg == "--strict") {
+                /* The PS-X EXE path is fail-loud by default; accepted for parity
+                 * with psxrecomp-bios and project scripts. */
+            } else if (arg == "--inspect") {
+                inspect_mode = true;
+            }
         }
     }
 

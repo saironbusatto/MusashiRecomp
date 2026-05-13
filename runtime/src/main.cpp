@@ -14,10 +14,12 @@
 #include "memcard.h"
 #include "debug_server.h"
 #include "crash_trace.h"
+#include "config_loader.h"
 #include <SDL.h>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -25,17 +27,8 @@
 #ifndef PSX_DEFAULT_BIOS_PATH
 #define PSX_DEFAULT_BIOS_PATH "bios/SCPH1001.BIN"
 #endif
-#ifndef PSX_DEFAULT_GAME_ROOT
-#define PSX_DEFAULT_GAME_ROOT ""
-#endif
-#ifndef PSX_DEFAULT_MEMCARD_DIR
-#define PSX_DEFAULT_MEMCARD_DIR ""
-#endif
-#ifndef PSX_DEFAULT_DISC_PATH
-#define PSX_DEFAULT_DISC_PATH ""
-#endif
 #ifndef PSX_WINDOW_TITLE
-#define PSX_WINDOW_TITLE "psxrecomp-v4 - BIOS"
+#define PSX_WINDOW_TITLE "psxrecomp-v4"
 #endif
 #ifndef DEFAULT_DEBUG_PORT
 #error DEFAULT_DEBUG_PORT must be defined by the runtime target.
@@ -109,34 +102,18 @@ static std::filesystem::path resolve_bios_path(const char* requested, const char
     return p;
 }
 
-static std::filesystem::path resolve_memcard_dir(const char* requested,
-                                                 const char* default_dir,
-                                                 const std::filesystem::path& game_root,
-                                                 const char* argv0) {
+// Fallback memcard directory used when no game config (or its [runtime]
+// block) specifies one. Prefer the executable's directory so saves live
+// next to the binary; fall back to the current working directory.
+static std::filesystem::path default_memcard_dir(const char* argv0) {
     namespace fs = std::filesystem;
     std::error_code ec;
-
-    // 1. Explicit --memcard-dir always wins.
-    if (requested && requested[0]) return fs::path(requested);
-
-    // 2. Runtime targets provide a stable default. BIOS-only dev builds use
-    //    the framework root; game builds use their saves/ directory.
-    if (default_dir && default_dir[0]) return fs::path(default_dir);
-
-    // 3. Sibling game roots prefer saves/ if present, then the root itself.
-    if (!game_root.empty()) {
-        if (fs::exists(game_root / "saves", ec)) return game_root / "saves";
-        return game_root;
-    }
-
-    // 4. Locate exe directory (production layout anchor).
     fs::path exe_dir;
     if (argv0 && argv0[0]) {
         exe_dir = fs::absolute(argv0, ec).parent_path();
         if (ec) exe_dir.clear();
     }
     if (exe_dir.empty()) exe_dir = fs::current_path();
-
     return exe_dir;
 }
 
@@ -347,37 +324,56 @@ int main(int argc, char** argv) {
     psx_crash_trace_install_handlers();
 
     const char* bios_path = PSX_DEFAULT_BIOS_PATH;
-    const char* disc_path = PSX_DEFAULT_DISC_PATH;
-    const char* game_root_arg = PSX_DEFAULT_GAME_ROOT;
-    const char* memcard_dir_arg = nullptr;
-    /* Parse positional. First non-flag arg = bios_path. */
+    const char* game_config_path = nullptr;
+    /* Parse args.
+     *   --bios <path>       override the compile-time BIOS path
+     *   --game <toml>       load a game config (single source of truth for
+     *                       disc / memcard / window title / debug port)
+     *   <positional>        deprecated alias for --bios
+     * No --disc / --memcard-dir / --game-root flags: those are config-driven. */
     for (int i = 1; i < argc; i++) {
-        if (std::strcmp(argv[i], "--memcard-dir") == 0 && i + 1 < argc) {
-            memcard_dir_arg = argv[++i];
-        } else if (std::strcmp(argv[i], "--bios") == 0 && i + 1 < argc) {
+        if (std::strcmp(argv[i], "--bios") == 0 && i + 1 < argc) {
             bios_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--disc") == 0 && i + 1 < argc) {
-            disc_path = argv[++i];
-        } else if (std::strcmp(argv[i], "--game-root") == 0 && i + 1 < argc) {
-            game_root_arg = argv[++i];
+        } else if (std::strcmp(argv[i], "--game") == 0 && i + 1 < argc) {
+            game_config_path = argv[++i];
         } else if (argv[i][0] != '-') {
             bios_path = argv[i];
         }
     }
 
     std::filesystem::path resolved_bios = resolve_bios_path(bios_path, argv[0]);
-    std::filesystem::path game_root =
-        game_root_arg && game_root_arg[0]
-            ? std::filesystem::absolute(std::filesystem::path(game_root_arg))
-            : std::filesystem::path();
-    std::filesystem::path memcard_dir =
-        resolve_memcard_dir(memcard_dir_arg, PSX_DEFAULT_MEMCARD_DIR, game_root, argv[0]);
-    std::filesystem::path resolved_disc =
-        disc_path && disc_path[0] ? resolve_bios_path(disc_path, argv[0])
-                                  : std::filesystem::path();
-    std::string bios_path_str = resolved_bios.string();
-    std::string memcard_dir_str = memcard_dir.string();
-    std::string disc_path_str = resolved_disc.string();
+    std::filesystem::path memcard_dir;
+    std::filesystem::path resolved_disc;
+    std::string window_title = PSX_WINDOW_TITLE;
+    uint16_t   debug_port    = (uint16_t)DEFAULT_DEBUG_PORT;
+    std::string game_name;
+    std::string game_id;
+
+    if (game_config_path) {
+        try {
+            const auto gc = PSXRecompV4::load_game_config(game_config_path);
+            game_name = gc.name;
+            game_id   = gc.id;
+            if (!gc.discs.empty()) resolved_disc = gc.discs.front();
+            if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
+            if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
+            if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
+            std::fprintf(stdout, "psxrecomp-v4: loaded game config %s (%s, %s)\n",
+                         game_config_path, game_name.c_str(), game_id.c_str());
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr, "psxrecomp-v4: failed to load --game %s: %s\n",
+                         game_config_path, ex.what());
+            return 1;
+        }
+    }
+
+    if (memcard_dir.empty()) {
+        memcard_dir = default_memcard_dir(argv[0]);
+    }
+
+    std::string bios_path_str    = resolved_bios.string();
+    std::string memcard_dir_str  = memcard_dir.string();
+    std::string disc_path_str    = resolved_disc.string();
 
     std::fprintf(stdout, "psxrecomp-v4 runtime: loading BIOS from %s\n", bios_path_str.c_str());
     memory_init(bios_path_str.c_str());
@@ -392,7 +388,7 @@ int main(int argc, char** argv) {
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
     memcard_init(memcard_dir_str.c_str());
     std::atexit(memcard_flush_all);
-    debug_server_init(DEFAULT_DEBUG_PORT);
+    debug_server_init(debug_port);
 
     /* ---- SDL init ---- */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
@@ -415,7 +411,7 @@ int main(int argc, char** argv) {
     }
 
     sdl_window = SDL_CreateWindow(
-        PSX_WINDOW_TITLE,
+        window_title.c_str(),
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         640, 480,
         SDL_WINDOW_SHOWN

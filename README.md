@@ -79,7 +79,7 @@ cp /path/to/your/SCPH1001.BIN bios/
 # Recompile the BIOS to C (one-time; regenerate when the BIOS changes):
 cmake -S recompiler -B recompiler/build -G "Unix Makefiles"
 cmake --build recompiler/build
-./recompiler/build/psxrecomp-bios bios/SCPH1001.BIN generated/
+./recompiler/build/psxrecomp-bios --config bios/SCPH1001.toml
 
 # Build the runtime:
 cmake -S runtime -B runtime/build -G "Unix Makefiles"

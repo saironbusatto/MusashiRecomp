@@ -780,6 +780,9 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             case 0x2A: code = translate_swl(instr); break;    // swl
             case 0x2B: code = translate_sw(instr); break;     // sw
             case 0x2E: code = translate_swr(instr); break;    // swr
+            case 0x2F:                                         // CACHE - cache op (no-op for static recomp)
+                code = "/* cache (no-op: static recompilation has no I/D cache) */";
+                break;
             case 0x32:                                         // LWC2 - load word to COP2
                 {
                     uint32_t rs = get_rs(instr);
@@ -1537,16 +1540,27 @@ std::string CodeGenerator::generate_file(
     // ---- Pre-pass: find mid-function branch/jump targets and split ----
     // Scan all CFGs for branch/jump targets that fall within a function's
     // range but are NOT at any function start. Split containing functions
-    // at discovered targets. Iterate up to 3 times since splitting creates
-    // new pieces whose branches may target other mid-piece addresses.
-    // Each subsequent pass only scans CFGs that were rebuilt in the prior pass.
+    // at discovered targets. Iterate until convergence (no new mid-targets
+    // found), since splitting creates new pieces whose branches may target
+    // other mid-piece addresses. Each subsequent pass only scans CFGs that
+    // were rebuilt in the prior pass.
+    //
+    // Previously hard-capped at 3 iterations; Tomba's `func_800905DC` had
+    // 2 mid-func targets (0x800905E4, 0x80090600) that needed a 4th pass.
+    // The unconverged stragglers fell through to the
+    // `call_by_address(cpu, 0xX); return;` emit path (code_generator.cpp
+    // lines 970/981/998), which at runtime missed the dispatch table and
+    // hit `psx_unknown_dispatch`. Surfaced by Phase B2 audit. The 16-pass
+    // cap is a safety limit; in practice each pass strictly reduces the
+    // remaining target set so convergence is fast.
     {
         std::set<uint32_t> cfgs_to_scan;  // Which CFGs to scan (empty = all)
         uint32_t exe_start = exe_.header.load_address;
         uint32_t exe_end = exe_.end_address();
         int total_new = 0;
+        const int MAX_PASSES = 16;
 
-        for (int pass = 0; pass < 3; pass++) {
+        for (int pass = 0; pass < MAX_PASSES; pass++) {
             std::set<uint32_t> mid_targets;
 
             // Scan either all CFGs (pass 0) or only rebuilt CFGs (pass 1+)

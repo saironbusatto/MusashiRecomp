@@ -398,3 +398,117 @@ Take a Beetle screenshot of the same boot screen as oracle, diff the
 VRAM region the logo lives in (Beetle vs recomp at the same frame),
 and walk back from the missing pixels via `wtrace` on the source
 RAM/VRAM coordinates.
+
+---
+
+## Issue #5 — Mid-function split targets not registered in dispatch table
+
+**Status:** open, audit-surfaced
+**Date opened:** 2026-05-12
+**Phase:** platform (recompiler emit, full_function_emitter path)
+**Bug class:** same shape as 2026-05-12 jump-table cross-function fix
+(`full_function_emitter.cpp:777`).
+
+### Symptom
+
+When the recompiler emits a branch/jump whose target is a
+mid-function address (neither a known block in the current CFG nor a
+known function start), it emits `call_by_address(cpu, 0xX); return;`
+to defer dispatch to the runtime — but does NOT register `0xX` in the
+dispatch table. At runtime, the dispatch binary-search misses, the
+target page isn't dirty, so `psx_unknown_dispatch` fires.
+
+### Affected emit sites in `recompiler/src/code_generator.cpp`
+
+| Line | Pattern                                                |
+|------|--------------------------------------------------------|
+| 970  | conditional-branch taken-arm to mid-func target        |
+| 981  | conditional-branch fall-through to mid-func target     |
+| 998  | unconditional jump to mid-func target                  |
+
+All three should call `register_cross_function_target(branch_target)`
+the same way the jump-table emitter does (line 777 of
+`full_function_emitter.cpp`).
+
+### Evidence — Tomba audit, 2 manifestations
+
+From `codegen_audit_game.py --config game.toml`:
+
+```
+[2] literal call_by_address targets: 333 unique, 459 sites
+    dispatch table size: 1921 entries
+    targets in declared code regions: 2
+    targets in RAM (dirty-RAM interpreter domain): 331
+    in-code targets MISSING from dispatch: 2
+      0x800905E4  (1 site)
+      0x80090600  (1 site)
+```
+
+Both addresses appear in `generated/SCUS_942.36_full.c` with comments
+`/* taken: split (mid-func) */` and `/* not taken: split (mid-func) */`
+— the recompiler EXPLICITLY knows these are mid-function splits but
+fails to register them.
+
+The 331 RAM-domain targets are not bugs — they're runtime-loaded
+overlays correctly handled by `dirty_ram_dispatch`.
+
+### Concrete next step
+
+1. Add `register_cross_function_target(branch_target)` at the three
+   call sites in `code_generator.cpp` (lines 970, 981, 998).
+2. Regen Tomba.
+3. Re-run `codegen_audit_game.py` — expect "in-code call_by_address
+   misses: 0".
+4. Re-run on BIOS to confirm no regression.
+
+---
+
+## Issue #4 — 7 unemitted GTE / COP2 instructions in BIOS Shell code
+
+**Status:** open, audit-surfaced
+**Date opened:** 2026-05-12
+**Phase:** 4 (BIOS shell render)
+**Likely related to:** Issue #3 (missing PS logo on disc-detected screen)
+
+### Symptom
+
+The Phase B1 `gte_audit` (now generic, code-region-filtered) reports
+4 missing `gte_execute` emits and 3 missing LWC2/SWC2 emits in the
+BIOS Shell code region. None of the affected PCs appear anywhere in
+`generated/SCPH1001_full.c`.
+
+| PC          | Word         | Class          |
+|-------------|--------------|----------------|
+| 0xBFC34FF8  | 0x4A480012   | GTE MVMVA      |
+| 0xBFC3502C  | 0x4A480012   | GTE MVMVA      |
+| 0xBFC35064  | 0x4A480012   | GTE MVMVA      |
+| 0xBFC350C4  | 0x4A480012   | GTE MVMVA      |
+| (3 sites)   | LWC2 / SWC2  | GTE load/store |
+
+These were previously masked by 73 data-region false positives in the
+old unfiltered tool. The B1 code-region filter surfaced them.
+
+### Likely cause
+
+MVMVA is matrix-vector-multiply-and-add — the BIOS only uses GTE/3D
+math in two narrow places: the boot logo intro and the
+disc-detected/PlayStation-logo screen. We boot past both, but
+**Issue #3's missing PS-logo glyph is consistent with these
+unemitted MVMVA + LWC2/SWC2 sites**: if the recompiler skipped the
+3D math that draws the logo, the logo would render as nothing or
+garbage but the surrounding text would be fine — exactly Issue #3's
+symptom.
+
+Two possible root causes (not yet distinguished):
+- **Discovery gap:** the function containing these PCs was never
+  identified, so nothing got emitted for it.
+- **Emit gap:** the function was discovered but the recompiler
+  skipped these specific instructions when translating.
+
+### Concrete next step
+
+Check whether ANY PC near `0xBFC34FF8` appears in
+`generated/SCPH1001_full.c`. If neighbors are emitted but the GTE
+sites aren't, it's an emit gap (fix in code_generator.cpp). If
+neighbors are absent too, it's a discovery gap (fix in function
+discovery seeds). Either way, then close Issue #3 alongside.
