@@ -5388,7 +5388,12 @@ void debug_server_init(int port)
         return;
     }
 
-    listen(s_listen, 1);
+    /* Backlog 16, not 1: when main thread stalls (the very state we want
+     * to probe during a freeze), backlog=1 means the first pending connect
+     * fills the queue and every subsequent probe gets RST/ConnectionRefused.
+     * 16 leaves room for a few probes to queue while we investigate. This
+     * is observability infrastructure, not a freeze fix. */
+    listen(s_listen, 16);
     set_nonblocking(s_listen);
 
     if (!s_frame_history) {

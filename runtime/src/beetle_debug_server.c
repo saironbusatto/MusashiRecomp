@@ -750,7 +750,9 @@ void beetle_debug_server_init(int port) {
         fprintf(stderr, "[beetle-dbg] bind(%d) failed\n", s_port);
         sock_close(s_listen); s_listen = SOCK_INVALID; return;
     }
-    if (listen(s_listen, 4) < 0) {
+    /* Backlog 16 (was 4): matches runtime's debug_server.c. Lets probes
+     * queue when the main thread is stalled, instead of returning RST. */
+    if (listen(s_listen, 16) < 0) {
         fprintf(stderr, "[beetle-dbg] listen() failed\n");
         sock_close(s_listen); s_listen = SOCK_INVALID; return;
     }
