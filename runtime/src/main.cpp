@@ -242,7 +242,9 @@ static void sdl_vblank_present(void) {
         pad_buttons_this_frame = sio_get_pad_buttons();
     }
     sio_set_pad_state(pad_buttons_this_frame);
+#ifndef PSX_SDL_NO_AUDIO
     sdl_audio_pump();
+#endif
 
     /* Turbo mode: while TAB is held, skip both VRAM->ARGB conversion and
      * SDL_RenderPresent. The recompiled BIOS still advances simulated
@@ -282,6 +284,7 @@ static void sdl_vblank_present(void) {
      * at 640x512, while games can switch to smaller modes such as 320x224 for
      * FMV; presenting the full texture would leave the active image stuck in
      * the upper-left portion of the window. */
+#ifndef PSX_SDL_NO_RENDER
     SDL_Rect src = { 0, 0, (int)w, (int)h };
     SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf, (int)(w * sizeof(uint32_t)));
 
@@ -289,6 +292,7 @@ static void sdl_vblank_present(void) {
     SDL_RenderClear(sdl_renderer);
     SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
     SDL_RenderPresent(sdl_renderer);
+#endif
 
     /* Wall-clock pacing: hold each simulated vblank to ~16.68 ms so the
      * BIOS runs at PSX-native 59.94 Hz. Uses SDL's high-resolution
@@ -399,10 +403,11 @@ int main(int argc, char** argv) {
     std::atexit(memcard_flush_all);
 #ifndef PSX_NO_DEBUG_TOOLS
     debug_server_init(debug_port);
-    freeze_heartbeat_start("psx-runtime");
 #else
     (void)debug_port;
 #endif
+    /* Heartbeat always on — see freeze_heartbeat.c rationale. */
+    freeze_heartbeat_start("psx-runtime");
 
     /* ---- SDL init ---- */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
@@ -410,6 +415,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
+#ifndef PSX_SDL_NO_AUDIO
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
         SDL_AudioSpec want;
         SDL_AudioSpec have;
@@ -423,6 +429,7 @@ int main(int argc, char** argv) {
             SDL_PauseAudioDevice(sdl_audio_device, 0);
         }
     }
+#endif
 
     sdl_window = SDL_CreateWindow(
         window_title.c_str(),
@@ -435,11 +442,31 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* Software renderer only: the accelerated path lets SDL_RenderPresent
-     * block inside the GPU driver, which has reproducibly hung the main
-     * thread mid-frame after extended uptime (TombaRecomp/ISSUES.md #6).
-     * Software costs a few % more CPU but cannot stall in the GPU stack. */
-    sdl_renderer = SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_SOFTWARE);
+    /* Force OpenGL renderer.
+     *
+     * History (TombaRecomp/ISSUES.md #6):
+     *   1. Originally SDL_RENDERER_ACCELERATED with fallback to software.
+     *      Froze "Not Responding" after extended uptime — was thought to
+     *      be GPU-driver-side hangs.
+     *   2. Switched to SDL_RENDERER_SOFTWARE only. Still froze. Software
+     *      renderer goes through Windows GDI; the GDI path hangs the SDL
+     *      main thread under heavy emulation load.
+     *   3. Bisection: NO_AUDIO+NO_RENDER ran indefinitely (~7+ min, 40k+
+     *      frames) but the game never progressed past BIOS boot because
+     *      it depends on the renderer being present. NO_AUDIO alone with
+     *      software renderer froze at frame 3084 — same as full debug
+     *      build. So audio is innocent; software renderer (GDI path) is
+     *      the culprit.
+     *   4. SDL_HINT_RENDER_DRIVER=opengl + SDL_RENDERER_ACCELERATED.
+     *      Ran indefinitely past every prior freeze point. OpenGL driver
+     *      uses a different presentation path that doesn't hit the GDI
+     *      hang. This is now the default.
+     *
+     * Note: the freeze became prevalent only after the FMV-speed fix
+     * (commit b486c13) raised cycle throughput. Before that, the slower
+     * MDEC/DMA workload was below whatever GDI threshold trips the bug. */
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+    sdl_renderer = SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_ACCELERATED);
     if (!sdl_renderer) {
         std::fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
         return 1;

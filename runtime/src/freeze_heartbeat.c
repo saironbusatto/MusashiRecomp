@@ -48,6 +48,29 @@ static HANDLE s_thread = NULL;
 #define HB_FILE      "psx_freeze_heartbeat.json"
 #define HB_INTERVAL_MS 100u
 
+/* Pre-freeze history ring. Each entry = a snapshot taken at one heartbeat
+ * tick (~100 ms). When the runtime freezes, all the "now" values stop
+ * advancing but the past N entries still show what state it was in for
+ * the seconds leading up to the stall. RING_CAP * 100ms = window length. */
+#define RING_CAP 64
+typedef struct {
+    uint64_t frame_count;
+    uint64_t psx_cycle_count;
+    uint64_t exc_reentry;
+    uint64_t dirty_ram_insns;
+    uint32_t current_func;
+    uint32_t last_store_pc;
+    uint32_t i_stat;
+    uint16_t sio_stat;
+    uint16_t sio_ctrl;
+    uint8_t  in_exception;
+    uint8_t  mc_max_state;
+    long long wall_clock;
+} HbRingEntry;
+static HbRingEntry s_ring[RING_CAP];
+static uint32_t    s_ring_head = 0;
+static uint32_t    s_ring_count = 0;
+
 static void heartbeat_write(void) {
     uint64_t cyc = psx_get_cycle_count();
     uint64_t frame = s_frame_count;
@@ -77,7 +100,28 @@ static void heartbeat_write(void) {
     /* Wall-clock seconds since epoch — coarse but enough to spot stalls. */
     long long wall = (long long)time(NULL);
 
-    char buf[2048];
+    /* Push current state into the ring. The ring captures the seconds
+     * leading up to the freeze; when main thread stalls, "current" values
+     * stop advancing but the ring's older entries still show the recent
+     * trajectory. */
+    HbRingEntry *re = &s_ring[s_ring_head];
+    re->frame_count     = frame;
+    re->psx_cycle_count = cyc;
+    re->exc_reentry     = exc_reentry;
+    re->dirty_ram_insns = g_dirty_ram_insns_run;
+    re->current_func    = cur_fn;
+    re->last_store_pc   = last_store;
+    re->i_stat          = i_stat;
+    re->sio_stat        = sio_stat;
+    re->sio_ctrl        = sio_ctrl;
+    re->in_exception    = (uint8_t)in_exc;
+    re->mc_max_state    = (uint8_t)mc_max;
+    re->wall_clock      = wall;
+    s_ring_head = (s_ring_head + 1) % RING_CAP;
+    if (s_ring_count < RING_CAP) s_ring_count++;
+
+    /* Buffer sized for current-state JSON + ring (~256B per ring entry). */
+    static char buf[64 * 1024];
     int n = snprintf(buf, sizeof(buf),
         "{\n"
         "  \"backend\":\"%s\",\n"
@@ -127,7 +171,44 @@ static void heartbeat_write(void) {
         (unsigned long long)g_dirty_ram_blocks_run,
         (unsigned long long)g_dirty_ram_insns_run);
 
-    if (n <= 0) return;
+    if (n <= 0 || n >= (int)sizeof(buf)) return;
+
+    /* Append pre-freeze history ring. Format: array of compact rows,
+     * oldest first, newest last. Reader can spot the moment all values
+     * stop advancing — that's the stall point. */
+    /* Strip the closing brace of the main object so we can append. */
+    if (n > 0 && buf[n - 1] == '\n') n--;     /* drop trailing newline */
+    if (n > 0 && buf[n - 1] == '}')  n--;     /* drop closing brace */
+    if (n > 0 && buf[n - 1] == '\n') n--;     /* and any preceding newline */
+
+    int m = snprintf(buf + n, sizeof(buf) - (size_t)n, ",\n  \"ring\":[\n");
+    if (m > 0) n += m;
+
+    uint32_t avail = s_ring_count;
+    uint32_t start = (s_ring_count < RING_CAP) ? 0
+                   : (s_ring_head /* head points to next-to-write = oldest */);
+    for (uint32_t i = 0; i < avail; i++) {
+        HbRingEntry *e = &s_ring[(start + i) % RING_CAP];
+        m = snprintf(buf + n, sizeof(buf) - (size_t)n,
+            "    {\"wall\":%lld,\"frame\":%llu,\"cyc\":%llu,"
+            "\"exc_re\":%llu,\"dirty_insns\":%llu,"
+            "\"cur_fn\":\"0x%08X\",\"store_pc\":\"0x%08X\","
+            "\"i_stat\":\"0x%08X\",\"sio_stat\":\"0x%04X\","
+            "\"sio_ctrl\":\"0x%04X\",\"in_exc\":%u,\"mc_max\":%u}%s\n",
+            e->wall_clock,
+            (unsigned long long)e->frame_count,
+            (unsigned long long)e->psx_cycle_count,
+            (unsigned long long)e->exc_reentry,
+            (unsigned long long)e->dirty_ram_insns,
+            e->current_func, e->last_store_pc,
+            e->i_stat, (unsigned)e->sio_stat, (unsigned)e->sio_ctrl,
+            (unsigned)e->in_exception, (unsigned)e->mc_max_state,
+            (i + 1 < avail) ? "," : "");
+        if (m <= 0 || (size_t)(n + m) >= sizeof(buf)) break;
+        n += m;
+    }
+    m = snprintf(buf + n, sizeof(buf) - (size_t)n, "  ]\n}\n");
+    if (m > 0) n += m;
 
     /* Atomic overwrite via .tmp + rename. Avoids a reader catching a
      * mid-write file and parsing partial JSON. Cheap on Windows
@@ -159,10 +240,12 @@ static DWORD WINAPI heartbeat_thread(LPVOID arg) {
 #endif
 
 void freeze_heartbeat_start(const char *backend_label) {
-#ifdef PSX_NO_DEBUG_TOOLS
-    (void)backend_label;
-    return;
-#endif
+    /* INTENTIONALLY not gated by PSX_NO_DEBUG_TOOLS. The heartbeat thread
+     * is the only observability mechanism that survives a main-thread
+     * stall (TCP server is on main thread; debug log functions are
+     * called from the stalled code). Cost is ~1 KB/sec disk write and
+     * one extra thread — small enough to keep in production builds for
+     * crash forensics. */
     if (s_started) return;
     if (backend_label && backend_label[0]) {
         size_t n = strlen(backend_label);

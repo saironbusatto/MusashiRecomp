@@ -89,9 +89,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* Software renderer only — see main.cpp note. GPU-driver-side hangs in
-     * SDL_RenderPresent reproducibly wedge the SDL main thread mid-frame. */
-    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_SOFTWARE);
+    /* OpenGL renderer — see main.cpp note. Software renderer (GDI) hangs
+     * the SDL main thread under heavy emulation load after the FMV-speed
+     * fix raised cycle throughput. OpenGL avoids the GDI path. */
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+    SDL_Renderer* ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED);
     if (!ren) {
         std::fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
         return 1;
