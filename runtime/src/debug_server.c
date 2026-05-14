@@ -2269,8 +2269,15 @@ static void send_err(int id, const char *msg)
 static void handle_ping(int id, const char *json)
 {
     (void)json;
-    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%llu}",
-             id, (unsigned long long)s_frame_count);
+    /* Surface accumulated dispatch misses on every ping so they can't go
+     * unnoticed across sessions (NES recomp template PRINCIPLES.md §13a:
+     * "A dispatch miss is a SILENT GAME-BREAKING BUG"). 0 = healthy. */
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%llu,"
+             "\"dispatch_miss_total\":%llu,"
+             "\"dispatch_miss_unique\":%d}",
+             id, (unsigned long long)s_frame_count,
+             (unsigned long long)s_unknown_seq,
+             s_unknown_unique_count);
 }
 
 static void handle_frame(int id, const char *json)
