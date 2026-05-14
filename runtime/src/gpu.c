@@ -1705,12 +1705,12 @@ static void gp1_display_mode(uint32_t val) {
 
 static void gp1_get_info(uint32_t val) {
     /* GP1(10h): Get GPU info — writes result to GPUREAD latch.
-     * DuckStation masks subcommand to 3 bits (val & 0x07). */
-    uint32_t which = val & 0x07;
+     * Mednafen-psx masks the subcommand to 4 bits (val & 0x0F) and
+     * services cases 2..5, 7, 8. Tomba's ResetGraph() uses param 7 to
+     * read the GPU version (must be 2) to pick its video-mode path —
+     * the wrong value here lands the game on a no-draw branch. */
+    uint32_t which = val & 0x0F;
     switch (which) {
-        case 0: case 1: case 6: case 7:
-            /* Leave GPUREAD latch unchanged (per DuckStation) */
-            break;
         case 2: /* texture window */
             gpuread_latch = texture_window_value;
             break;
@@ -1723,6 +1723,15 @@ static void gp1_get_info(uint32_t val) {
         case 5: /* draw offset */
             gpuread_latch = ((uint32_t)draw_offset_x & 0x7FFu) |
                             (((uint32_t)draw_offset_y & 0x7FFu) << 11);
+            break;
+        case 7: /* GPU version (real-hw + mednafen return 2) */
+            gpuread_latch = 2;
+            break;
+        case 8: /* unknown info index, real hw / mednafen return 0 */
+            gpuread_latch = 0;
+            break;
+        default:
+            /* N=0,1,6,9..15: leave latch unchanged */
             break;
     }
 }
