@@ -12,6 +12,7 @@
 #define PSXRECOMP_V4_DEBUG_SERVER_H
 
 #include <stdint.h>
+#include <stdio.h>
 
 #include "cpu_state.h"
 
@@ -177,6 +178,27 @@ extern CPUState *debug_cpu_ptr;
 
 void debug_server_send_line(const char *json);
 void debug_server_send_fmt(const char *fmt, ...);
+
+/* ---- Freeze auto-dump accessors ----
+ *
+ * Called from the freeze_heartbeat thread (NOT from TCP). Each function
+ * writes a JSON array `[entry1,entry2,...]` of the newest `max_count`
+ * entries from its ring directly to the given FILE*. Caller wraps with
+ * the field name (e.g. "wtrace_all":[ ... ]).
+ *
+ * Thread-safety: best-effort. The heartbeat thread fires these only
+ * after detecting a main-thread stall, so concurrent writers are rare,
+ * but a wedged loop that still touches RAM could tear an entry near the
+ * ring head. Forensic value is in the bulk of older entries which are
+ * stable. */
+void debug_server_freeze_dump_wtrace_all_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_wtrace_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_frame_history_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_sio_pc_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_thread_trace_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_restore_trace_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_fn_entry_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_dirty_block_json(FILE *f, uint32_t max_count);
 
 #ifdef __cplusplus
 }

@@ -262,6 +262,18 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     debug_server_log_thread_event(8, cpu, current_tcb, target_tcb, 0);
     SwitchToFiber(target->fiber);
 
+    /* If a non-owner fiber requested an exception longjmp while we were
+     * suspended, it deferred it by SwitchToFiber'ing back to us (the
+     * owner). Honor it now from the correct stack. */
+    extern void* g_exception_owner_fiber;
+    extern int   g_pending_exception_longjmp;
+    extern jmp_buf exception_jmpbuf;
+    if (g_pending_exception_longjmp && GetCurrentFiber() == g_exception_owner_fiber) {
+        int code = g_pending_exception_longjmp;
+        g_pending_exception_longjmp = 0;
+        longjmp(exception_jmpbuf, code);
+    }
+
     debug_server_log_thread_event(9, cpu, target_tcb, current_tcb, 0);
     cpu->pc = 0;
     return 1;

@@ -165,7 +165,7 @@ function(psxrecomp_v4_add_runtime_target target)
     endif()
 
     if(WIN32 OR MINGW)
-        target_link_libraries(${target} PRIVATE ws2_32)
+        target_link_libraries(${target} PRIVATE ws2_32 dbghelp)
     endif()
 
     if(MINGW)

@@ -103,6 +103,12 @@ static uint32_t dma_direction;   /* bits 29-30 in GPUSTAT */
 /* LCF (even/odd line in interlace, toggles per vblank) */
 static uint32_t lcf;             /* bit 31 */
 
+/* I_STAT — defined in memory.c; declared early so gpu_read_gpustat can
+ * raise the VBLANK bit when a synthetic vblank fires from a tight
+ * BIOS-shell GPUSTAT poll loop, without going through the
+ * vblank-callback path (which would call SDL_Delay/Sleep). */
+extern uint32_t i_stat;
+
 /* Display area start (GP1(05h)) */
 static uint32_t display_area_x;
 static uint32_t display_area_y;
@@ -213,11 +219,21 @@ void gpu_init(void) {
 
 uint32_t gpu_read_gpustat(void) {
     /* Advance vblank when polled enough times from within a single function.
-     * This handles BIOS VSYNC wait loops that poll LCF in tight loops. */
+     * This handles BIOS VSYNC wait loops that poll LCF in tight loops.
+     *
+     * IMPORTANT: only update emulation state here (LCF + I_STAT). Do NOT
+     * fire the vblank callback — that calls sdl_vblank_present, which
+     * runs SDL_RenderPresent and SDL_Delay (Sleep). Entering Sleep from
+     * an MMIO-read code path means recompiled MIPS code spends real wall
+     * time inside Sleep — wrong context, hard to reason about, and
+     * accumulates host stack frames inside the recompiled call tree.
+     * The callback fires from the proper VBLANK trigger in
+     * psx_check_interrupts (cycle-paced). */
     gpustat_poll_count++;
     if (gpustat_poll_count >= GPUSTAT_POLL_VBLANK_THRESHOLD) {
         gpustat_poll_count = 0;
-        gpu_vblank_tick();
+        lcf ^= 1;
+        i_stat |= (1u << 0); /* IRQ_VBLANK */
     }
 
     uint32_t stat = 0;
@@ -320,8 +336,7 @@ static uint16_t rgb888_to_rgb555(uint32_t color24) {
     return (uint16_t)((r >> 3) | ((g >> 3) << 5) | ((b >> 3) << 10));
 }
 
-/* I_STAT owned by memory.c — needed to set IRQ_VBLANK from poll-triggered vblank */
-extern uint32_t i_stat;
+/* i_stat extern declared earlier in this file (above gpu_read_gpustat). */
 
 void gpu_vblank_tick(void) {
     lcf ^= 1;

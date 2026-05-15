@@ -79,8 +79,24 @@ static uint64_t exception_reentry_blocks;
  * very next psx_check_interrupts re-enters immediately. */
 static int post_exception_cooldown;
 
-/* setjmp target for ReturnFromException during handler dispatch. */
-static jmp_buf exception_jmpbuf;
+/* setjmp target for ReturnFromException during handler dispatch.
+ *
+ * IMPORTANT: longjmp(exception_jmpbuf, ...) MUST execute on the same
+ * Windows fiber that called setjmp; otherwise RSP is restored to that
+ * fiber's stack while the OS still tracks a different fiber as current,
+ * corrupting fiber state and eventually deadlocking SwitchToFiber.
+ *
+ * s_exception_owner_fiber records which fiber called setjmp. If a
+ * longjmp request originates on a different fiber, the caller must:
+ *   (1) set s_pending_exception_longjmp = code
+ *   (2) SwitchToFiber back to s_exception_owner_fiber
+ * That fiber's wrapped SwitchToFiber call will observe the flag on
+ * return and execute the longjmp on the correct stack. */
+jmp_buf exception_jmpbuf;  /* non-static so traps.c can deferred-longjmp */
+#ifdef _WIN32
+void* g_exception_owner_fiber = NULL;
+int   g_pending_exception_longjmp = 0;
+#endif
 extern int g_psx_dispatch_depth;
 
 int psx_get_in_exception(void) { return in_exception; }
@@ -123,15 +139,39 @@ void interrupts_init(void) {
  * in_exception and return, effectively letting the interrupted
  * code resume at the saved EPC through normal dispatch.
  */
+#ifdef _WIN32
+#include <windows.h>
+/* Defer a longjmp to the fiber that owns the current exception setjmp.
+ * If we're on the owning fiber already, longjmp immediately. Otherwise
+ * record the requested code, SwitchToFiber back to the owner, and the
+ * post-SwitchToFiber check in traps.c psx_change_thread_fiber (or the
+ * fiber entry helper) will execute the longjmp on the correct stack. */
+static void deferred_exception_longjmp(int code) {
+    if (!g_exception_owner_fiber || GetCurrentFiber() == g_exception_owner_fiber) {
+        longjmp(exception_jmpbuf, code);
+    }
+    g_pending_exception_longjmp = code;
+    SwitchToFiber(g_exception_owner_fiber);
+    /* If we end up back here, the owner didn't honor the flag (bug).
+     * Fall through to direct longjmp as a last resort — even though
+     * the stack is wrong, the alternative is hanging silently. */
+    longjmp(exception_jmpbuf, code);
+}
+#else
+static void deferred_exception_longjmp(int code) {
+    longjmp(exception_jmpbuf, code);
+}
+#endif
+
 void psx_exception_longjmp(void) {
     debug_server_log_restore_event(2, debug_cpu_ptr ? debug_cpu_ptr->pc : 0, 1);
-    longjmp(exception_jmpbuf, 1);
+    deferred_exception_longjmp(1);
 }
 
 void psx_restore_state_escape(void) {
     if (in_exception) {
         debug_server_log_restore_event(1, debug_cpu_ptr ? debug_cpu_ptr->pc : 0, 2);
-        longjmp(exception_jmpbuf, 2);
+        deferred_exception_longjmp(2);
     }
     /* Not in exception context — return normally, let caller's `return;` handle it. */
 }
@@ -305,6 +345,15 @@ void psx_check_interrupts(CPUState* cpu) {
         target_pc = hi_val + (uint32_t)(int32_t)lo_val;
     }
 
+#ifdef _WIN32
+    /* Record which fiber owns this setjmp. Any subsequent longjmp must
+     * happen on this same fiber; if a non-owner fiber needs to longjmp
+     * it must SwitchToFiber back here first (see deferred_exception_longjmp). */
+    void *prev_owner_fiber = g_exception_owner_fiber;
+    int   prev_pending = g_pending_exception_longjmp;
+    g_exception_owner_fiber = GetCurrentFiber();
+    g_pending_exception_longjmp = 0;
+#endif
     for (;;) {
         int jmp_val = setjmp(exception_jmpbuf);
         if (jmp_val == 2) {
@@ -327,6 +376,12 @@ void psx_check_interrupts(CPUState* cpu) {
         /* jmp_val 0 (normal return) or 1 (ReturnFromException): done. */
         break;
     }
+#ifdef _WIN32
+    /* Restore previous exception-owner state. Supports nested exceptions
+     * if they ever arise (uncommon but harmless). */
+    g_exception_owner_fiber = prev_owner_fiber;
+    g_pending_exception_longjmp = prev_pending;
+#endif
 
     /* Restore the interrupted code's registers.
      *

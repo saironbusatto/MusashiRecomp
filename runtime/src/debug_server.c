@@ -163,6 +163,27 @@ static uint32_t s_wtrace_head = 0;
 static struct { uint32_t lo, hi; } s_wtrace_ranges[WTRACE_MAX_RANGES];
 static int s_wtrace_range_count = 0;
 
+/* ---- wtrace_all ring (ALWAYS-ON; no filter; lean fields) ----
+ * Parity with psx-beetle's s_wtrace_all. Every recompiled-code write
+ * to RAM lands here unconditionally, so a probe that connects AFTER
+ * an event still has ~1 second of context to query without needing
+ * to have pre-armed a range. Lean record (no register window) keeps
+ * 262144 * 32 B = 8 MB per backend. */
+#define WRITE_TRACE_ALL_CAP (1 << 18)
+typedef struct {
+    uint64_t seq;
+    uint32_t addr;
+    uint32_t new_val;
+    uint32_t pc;
+    uint32_t ra;
+    uint32_t frame;
+    uint8_t  w;
+    uint8_t  pad[3];
+} WriteTraceAllEntry;
+static WriteTraceAllEntry *s_wtrace_all = NULL;
+static uint64_t s_wtrace_all_seq  = 0;
+static uint32_t s_wtrace_all_head = 0;
+
 /* Function attribution global — set by psx_dispatch() before each call. */
 uint32_t g_debug_current_func_addr = 0;
 
@@ -4368,8 +4389,25 @@ static void wtrace_record(uint32_t phys, uint32_t old_val, uint32_t new_val, uin
     s_wtrace_head = (s_wtrace_head + 1) % WRITE_TRACE_CAP;
 }
 
+/* Always-on catch-all recorder.  Lean record (no register window). */
+static void wtrace_all_record(uint32_t phys, uint32_t new_val, uint8_t width)
+{
+    if (!s_wtrace_all) return;
+    WriteTraceAllEntry *e = &s_wtrace_all[s_wtrace_all_head];
+    e->seq     = s_wtrace_all_seq++;
+    e->addr    = phys;
+    e->new_val = new_val;
+    e->pc      = g_debug_last_store_pc;
+    e->ra      = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
+    e->frame   = (uint32_t)s_frame_count;
+    e->w       = width;
+    s_wtrace_all_head = (s_wtrace_all_head + 1) % WRITE_TRACE_ALL_CAP;
+}
+
 /* Multi-range check called from memory.c write paths.
- * Iterates up to 8 ranges; records if any match. */
+ * Iterates up to 8 ranges; records if any match.
+ * The always-on catch-all ring is recorded UNCONDITIONALLY first so
+ * late-connecting probes can still see recent writes without arming. */
 void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                     uint32_t new_val, uint8_t width)
 {
@@ -4377,6 +4415,7 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     (void)phys; (void)old_val; (void)new_val; (void)width;
     return;
 #endif
+    wtrace_all_record(phys, new_val, width);
     if (s_wtrace_range_count == 0) return;
     for (int i = 0; i < s_wtrace_range_count; i++) {
         if (phys >= s_wtrace_ranges[i].lo && phys < s_wtrace_ranges[i].hi) {
@@ -4456,6 +4495,15 @@ static void handle_wtrace_del(int id, const char *json)
     for (int i = slot; i < s_wtrace_range_count - 1; i++)
         s_wtrace_ranges[i] = s_wtrace_ranges[i + 1];
     s_wtrace_range_count--;
+    send_ok(id);
+}
+
+/* Normalized verb: disarm every range in one shot. Parity with
+ * psx-beetle's wtrace_disarm_all. */
+static void handle_wtrace_disarm_all(int id, const char *json)
+{
+    (void)json;
+    s_wtrace_range_count = 0;
     send_ok(id);
 }
 
@@ -4687,6 +4735,90 @@ static void handle_wtrace_clear(int id, const char *json)
     s_wtrace_head = 0;
     if (s_wtrace) memset(s_wtrace, 0, (size_t)WRITE_TRACE_CAP * sizeof(WriteTraceEntry));
     send_ok(id);
+}
+
+/* ---- Always-on catch-all wtrace handlers (parity with psx-beetle) ---- */
+
+static void handle_wtrace_all_stats(int id, const char *json)
+{
+    (void)json;
+    uint64_t total = s_wtrace_all_seq;
+    uint64_t oldest = (total <= WRITE_TRACE_ALL_CAP) ? 0 : total - WRITE_TRACE_ALL_CAP;
+    uint64_t newest = (total > 0) ? total - 1 : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"capacity\":%d,"
+             "\"oldest_seq\":%llu,\"newest_seq\":%llu}",
+             id, (unsigned long long)total, WRITE_TRACE_ALL_CAP,
+             (unsigned long long)oldest, (unsigned long long)newest);
+}
+
+static void handle_wtrace_all_reset(int id, const char *json)
+{
+    (void)json;
+    s_wtrace_all_seq = 0;
+    s_wtrace_all_head = 0;
+    if (s_wtrace_all)
+        memset(s_wtrace_all, 0,
+               (size_t)WRITE_TRACE_ALL_CAP * sizeof(WriteTraceAllEntry));
+    send_ok(id);
+}
+
+static void handle_wtrace_all_dump(int id, const char *json)
+{
+    if (!s_wtrace_all) { send_err(id, "wtrace_all not initialized"); return; }
+
+    /* Optional post-hoc address filter (matches wtrace_dump shape). */
+    char lo_str[32], hi_str[32];
+    uint32_t flo = 0, fhi = 0xFFFFFFFFu;
+    if (json_get_str(json, "addr_lo", lo_str, sizeof(lo_str)))
+        flo = hex_to_u32(lo_str) & 0x1FFFFFFFu;
+    if (json_get_str(json, "addr_hi", hi_str, sizeof(hi_str)))
+        fhi = hex_to_u32(hi_str) & 0x1FFFFFFFu;
+
+    uint64_t total = s_wtrace_all_seq;
+    uint32_t avail = (total < WRITE_TRACE_ALL_CAP)
+                     ? (uint32_t)total : WRITE_TRACE_ALL_CAP;
+    uint32_t start = (total < WRITE_TRACE_ALL_CAP) ? 0 : s_wtrace_all_head;
+
+    int max_out = json_get_int(json, "count", 65536);
+    if (max_out < 1) max_out = 1;
+    if (max_out > WRITE_TRACE_ALL_CAP) max_out = WRITE_TRACE_ALL_CAP;
+    int newest_first = json_get_int(json, "newest", 0) != 0;
+
+    const uint32_t MAX_OUT = (uint32_t)max_out;
+    size_t BUF_SZ = 256u + (size_t)MAX_OUT * 200u;
+    if (BUF_SZ > (size_t)64 * 1024 * 1024) BUF_SZ = (size_t)64 * 1024 * 1024;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    uint32_t emitted = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
+                    id, (unsigned long long)total, avail);
+    for (uint32_t i = 0; i < avail && emitted < MAX_OUT && pos < BUF_SZ - 256; i++) {
+        uint32_t idx;
+        if (newest_first) {
+            uint32_t newest = (s_wtrace_all_head + WRITE_TRACE_ALL_CAP - 1u)
+                              % WRITE_TRACE_ALL_CAP;
+            idx = (newest + WRITE_TRACE_ALL_CAP - (i % WRITE_TRACE_ALL_CAP))
+                  % WRITE_TRACE_ALL_CAP;
+        } else {
+            idx = (start + i) % WRITE_TRACE_ALL_CAP;
+        }
+        WriteTraceAllEntry *e = &s_wtrace_all[idx];
+        if (e->addr < flo || e->addr >= fhi) continue;
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"addr\":\"0x%08X\","
+                        "\"new\":\"0x%08X\",\"pc\":\"0x%08X\","
+                        "\"ra\":\"0x%08X\",\"frame\":%u,\"w\":%u}",
+                        (emitted == 0) ? "" : ",",
+                        (unsigned long long)e->seq,
+                        e->addr, e->new_val, e->pc, e->ra,
+                        e->frame, (unsigned)e->w);
+        emitted++;
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%u}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
 }
 
 static void handle_wtrace_dump(int id, const char *json)
@@ -5237,6 +5369,278 @@ static void handle_fn_exit_dump(int id, const char *json) {
     free(buf);
 }
 
+/* ====================================================================
+ * Freeze auto-dump accessors. Called from the freeze_heartbeat thread
+ * after it detects a main-thread stall. Each function writes a JSON
+ * array `[entry1,entry2,...]` of the newest entries directly to FILE*.
+ *
+ * Snapshot the ring's seq/head ONCE on entry so a concurrent writer
+ * (very rare at dump time) cannot make us walk off the end.
+ * ==================================================================== */
+
+void debug_server_freeze_dump_wtrace_all_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+    if (!s_wtrace_all) { fputs("[]", f); return; }
+
+    uint64_t total = s_wtrace_all_seq;
+    uint32_t head  = s_wtrace_all_head;
+    uint32_t avail = (total < WRITE_TRACE_ALL_CAP)
+                     ? (uint32_t)total : WRITE_TRACE_ALL_CAP;
+    if (max_count > avail) max_count = avail;
+    if (max_count == 0) { fputs("[]", f); return; }
+
+    /* Walk oldest-first within the newest `max_count` window. */
+    uint32_t start = (total < WRITE_TRACE_ALL_CAP)
+                     ? (avail - max_count)
+                     : (head + (WRITE_TRACE_ALL_CAP - max_count)) % WRITE_TRACE_ALL_CAP;
+
+    fputc('[', f);
+    for (uint32_t i = 0; i < max_count; i++) {
+        uint32_t idx = (start + i) % WRITE_TRACE_ALL_CAP;
+        const WriteTraceAllEntry *e = &s_wtrace_all[idx];
+        fprintf(f,
+            "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"new\":\"0x%08X\","
+            "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"frame\":%u,\"w\":%u}",
+            i ? "," : "",
+            (unsigned long long)e->seq, e->addr, e->new_val,
+            e->pc, e->ra, e->frame, (unsigned)e->w);
+    }
+    fputc(']', f);
+}
+
+void debug_server_freeze_dump_wtrace_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+    if (!s_wtrace) { fputs("[]", f); return; }
+
+    uint64_t total = s_wtrace_seq;
+    uint32_t head  = s_wtrace_head;
+    uint32_t avail = (total < WRITE_TRACE_CAP) ? (uint32_t)total : WRITE_TRACE_CAP;
+    if (max_count > avail) max_count = avail;
+    if (max_count == 0) { fputs("[]", f); return; }
+
+    uint32_t start = (total < WRITE_TRACE_CAP)
+                     ? (avail - max_count)
+                     : (head + (WRITE_TRACE_CAP - max_count)) % WRITE_TRACE_CAP;
+
+    fputc('[', f);
+    for (uint32_t i = 0; i < max_count; i++) {
+        uint32_t idx = (start + i) % WRITE_TRACE_CAP;
+        const WriteTraceEntry *e = &s_wtrace[idx];
+        fprintf(f,
+            "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"old\":\"0x%08X\","
+            "\"new\":\"0x%08X\",\"ra\":\"0x%08X\",\"func\":\"0x%08X\","
+            "\"pc\":\"0x%08X\",\"cpu_pc\":\"0x%08X\",\"sp\":\"0x%08X\","
+            "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+            "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+            "\"t0\":\"0x%08X\",\"t1\":\"0x%08X\","
+            "\"frame\":%u,\"w\":%u}",
+            i ? "," : "",
+            (unsigned long long)e->seq, e->addr, e->old_val, e->new_val,
+            e->ra, e->func_addr, e->pc, e->cpu_pc, e->sp,
+            e->v0, e->v1, e->a0, e->a1, e->a2, e->a3, e->t0, e->t1,
+            e->frame, (unsigned)e->width);
+    }
+    fputc(']', f);
+}
+
+void debug_server_freeze_dump_frame_history_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+    if (!s_frame_history) { fputs("[]", f); return; }
+
+    uint64_t total = s_history_count;
+    if (total == 0 || max_count == 0) { fputs("[]", f); return; }
+    uint64_t oldest = (total > FRAME_HISTORY_CAP) ? total - FRAME_HISTORY_CAP : 0;
+    uint64_t start  = (total > (uint64_t)max_count)
+                      ? total - (uint64_t)max_count : 0;
+    if (start < oldest) start = oldest;
+
+    fputc('[', f);
+    int first = 1;
+    for (uint64_t fr = start; fr < total; fr++) {
+        uint32_t idx = (uint32_t)(fr % FRAME_HISTORY_CAP);
+        const PSXFrameRecord *r = &s_frame_history[idx];
+        if (r->frame_number != (uint32_t)fr) continue;
+        fprintf(f,
+            "%s{\"frame\":%u,\"verify\":%d,"
+            "\"sr\":\"0x%08X\",\"cause\":\"0x%08X\",\"epc\":\"0x%08X\","
+            "\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
+            "\"pad\":\"0x%04X\",\"sio_stat\":\"0x%04X\",\"sio_ctrl\":\"0x%04X\","
+            "\"dispatch_count\":%u,\"total_dispatches\":%llu,"
+            "\"disp\":{\"x\":%u,\"y\":%u,\"w\":%u,\"h\":%u,\"off\":%u},"
+            "\"last_func\":\"%s\"}",
+            first ? "" : ",",
+            r->frame_number, r->verify_pass,
+            r->cop0_sr, r->cop0_cause, r->cop0_epc,
+            r->i_stat, r->i_mask,
+            (unsigned)r->pad_buttons,
+            (unsigned)r->sio_stat, (unsigned)r->sio_ctrl,
+            r->dispatch_count,
+            (unsigned long long)r->total_dispatches,
+            (unsigned)r->display_area_x, (unsigned)r->display_area_y,
+            (unsigned)r->display_w, (unsigned)r->display_h,
+            (unsigned)r->display_disabled,
+            r->last_func);
+        first = 0;
+    }
+    fputc(']', f);
+}
+
+void debug_server_freeze_dump_sio_pc_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+    uint64_t total = s_sio_pc_trace_seq;
+    uint32_t avail = (total < SIO_PC_TRACE_CAP) ? (uint32_t)total : SIO_PC_TRACE_CAP;
+    if (max_count > avail) max_count = avail;
+    if (max_count == 0) { fputs("[]", f); return; }
+
+    uint64_t start = total - (uint64_t)max_count;
+
+    fputc('[', f);
+    for (uint32_t i = 0; i < max_count; i++) {
+        uint64_t s = start + i;
+        const SioPcTraceEntry *e = &s_sio_pc_trace[s % SIO_PC_TRACE_CAP];
+        fprintf(f,
+            "%s{\"seq\":%llu,\"pc\":\"0x%08X\",\"func\":\"0x%08X\","
+            "\"addr\":\"0x%08X\",\"value\":\"0x%08X\","
+            "\"byte_seq\":%u,\"width\":%u}",
+            i ? "," : "",
+            (unsigned long long)e->seq, e->pc, e->func,
+            e->addr, e->value, e->byte_seq, (unsigned)e->width);
+    }
+    fputc(']', f);
+}
+
+void debug_server_freeze_dump_thread_trace_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+    uint64_t total = s_thread_trace_seq;
+    uint64_t avail = (total < THREAD_TRACE_CAP) ? total : THREAD_TRACE_CAP;
+    if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
+    if (max_count == 0) { fputs("[]", f); return; }
+
+    uint64_t start = total - (uint64_t)max_count;
+
+    fputc('[', f);
+    for (uint32_t i = 0; i < max_count; i++) {
+        uint64_t s = start + i;
+        const ThreadTraceEntry *e = &s_thread_trace[s % THREAD_TRACE_CAP];
+        fprintf(f,
+            "%s{\"seq\":%llu,\"kind\":%u,\"name\":\"%s\","
+            "\"current_tcb\":\"0x%08X\",\"target_tcb\":\"0x%08X\","
+            "\"current_state\":\"0x%08X\",\"target_state\":\"0x%08X\","
+            "\"target_pc\":\"0x%08X\",\"func\":\"0x%08X\","
+            "\"store_pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+            "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\","
+            "\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
+            "\"frame\":%u,\"in_exc\":%u}",
+            i ? "," : "",
+            (unsigned long long)e->seq, e->kind, thread_kind_name(e->kind),
+            e->current_tcb, e->target_tcb,
+            e->current_state, e->target_state,
+            e->target_pc, e->func,
+            e->last_store_pc, e->ra, e->sp,
+            e->a0, e->a1,
+            e->sr, e->epc, e->istat, e->imask,
+            e->frame, (unsigned)e->in_exception);
+    }
+    fputc(']', f);
+}
+
+void debug_server_freeze_dump_restore_trace_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+    uint64_t total = s_restore_trace_seq;
+    uint64_t avail = (total < RESTORE_TRACE_CAP) ? total : RESTORE_TRACE_CAP;
+    if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
+    if (max_count == 0) { fputs("[]", f); return; }
+
+    uint64_t start = total - (uint64_t)max_count;
+
+    fputc('[', f);
+    for (uint32_t i = 0; i < max_count; i++) {
+        uint64_t s = start + i;
+        const RestoreTraceEntry *e = &s_restore_trace[s % RESTORE_TRACE_CAP];
+        fprintf(f,
+            "%s{\"seq\":%llu,\"kind\":%u,\"name\":\"%s\",\"jmp\":%u,"
+            "\"target\":\"0x%08X\",\"cpu_pc\":\"0x%08X\","
+            "\"func\":\"0x%08X\",\"store_pc\":\"0x%08X\","
+            "\"byte_seq\":%u,\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+            "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\","
+            "\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
+            "\"frame\":%u,\"in_exc\":%u}",
+            i ? "," : "",
+            (unsigned long long)e->seq, e->kind, restore_kind_name(e->kind),
+            e->jmp_val, e->target_pc, e->cpu_pc,
+            e->func, e->last_store_pc, e->byte_seq, e->ra, e->sp,
+            e->sr, e->epc, e->istat, e->imask,
+            e->frame, (unsigned)e->in_exception);
+    }
+    fputc(']', f);
+}
+
+void debug_server_freeze_dump_fn_entry_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+    if (!s_fn_entry) { fputs("[]", f); return; }
+
+    uint64_t total  = s_fn_entry_seq;
+    uint64_t oldest = (total > FN_TRACE_CAP) ? total - FN_TRACE_CAP : 0;
+    uint64_t start  = (total > (uint64_t)max_count)
+                      ? total - (uint64_t)max_count : 0;
+    if (start < oldest) start = oldest;
+    if (start >= total) { fputs("[]", f); return; }
+
+    fputc('[', f);
+    int first = 1;
+    for (uint64_t s = start; s < total; s++) {
+        const FnEntryEntry *e = &s_fn_entry[s % FN_TRACE_CAP];
+        if (e->seq != s) continue;
+        fprintf(f,
+            "%s{\"seq\":%llu,\"func\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\","
+            "\"a3\":\"0x%08X\",\"t1\":\"0x%08X\",\"frame\":%u}",
+            first ? "" : ",",
+            (unsigned long long)e->seq, e->func_addr, e->ra,
+            e->a0, e->a1, e->a2, e->a3, e->t1, e->frame);
+        first = 0;
+    }
+    fputc(']', f);
+}
+
+void debug_server_freeze_dump_dirty_block_json(FILE *f, uint32_t max_count)
+{
+    if (!f) { return; }
+
+    uint64_t total = g_dirty_ram_block_log_seq;
+    uint64_t avail = (total < (uint64_t)DIRTY_RAM_BLOCK_LOG_CAP)
+                     ? total : (uint64_t)DIRTY_RAM_BLOCK_LOG_CAP;
+    uint64_t want  = ((uint64_t)max_count < avail) ? (uint64_t)max_count : avail;
+    uint64_t start = total - want;
+
+    fputc('[', f);
+    int first = 1;
+    for (uint64_t s = start; s < total; s++) {
+        const DirtyRamBlockLogEntry *e =
+            &g_dirty_ram_block_log[s & (DIRTY_RAM_BLOCK_LOG_CAP - 1u)];
+        if (e->seq != s) { continue; }
+        fprintf(f,
+            "%s{\"seq\":%llu,\"target\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\","
+            "\"a3\":\"0x%08X\",\"t0\":\"0x%08X\",\"t1\":\"0x%08X\","
+            "\"sp\":\"0x%08X\",\"frame\":%u}",
+            first ? "" : ",",
+            (unsigned long long)e->seq, e->target, e->ra,
+            e->a0, e->a1, e->a2, e->a3, e->t0, e->t1, e->sp, e->frame);
+        first = 0;
+    }
+    fputc(']', f);
+}
+
 typedef void (*CmdHandler)(int id, const char *json);
 typedef struct { const char *name; CmdHandler handler; } CmdEntry;
 
@@ -5305,13 +5709,27 @@ static const CmdEntry s_commands[] = {
     { "imask_trace",       handle_imask_trace },
     { "watch",             handle_watch },
     { "unwatch",           handle_unwatch },
-    { "wtrace_range",      handle_wtrace_range },
-    { "wtrace_add",        handle_wtrace_add },
-    { "wtrace_del",        handle_wtrace_del },
-    { "wtrace_ranges",     handle_wtrace_ranges },
-    { "wtrace_dump",       handle_wtrace_dump },
-    { "wtrace_clear",      handle_wtrace_clear },
-    { "wtrace_stats",      handle_wtrace_stats },
+    /* wtrace — normalized verb set (parity contract with psx-beetle).
+     * One slot per "lo,hi" pair. arm/disarm/disarm_all/reset/ranges/
+     * dump/stats. Both backends accept identical JSON shape. */
+    { "wtrace_arm",          handle_wtrace_add },
+    { "wtrace_disarm",       handle_wtrace_del },
+    { "wtrace_disarm_all",   handle_wtrace_disarm_all },
+    { "wtrace_reset",        handle_wtrace_clear },
+    { "wtrace_ranges",       handle_wtrace_ranges },
+    { "wtrace_dump",         handle_wtrace_dump },
+    { "wtrace_stats",        handle_wtrace_stats },
+    /* Always-on catch-all wtrace ring (parity with psx-beetle). */
+    { "wtrace_all_dump",     handle_wtrace_all_dump },
+    { "wtrace_all_stats",    handle_wtrace_all_stats },
+    { "wtrace_all_reset",    handle_wtrace_all_reset },
+    /* Legacy verbs retained for existing tools/ scripts that haven't
+     * been updated; they dispatch to the same handlers as the
+     * normalized verbs.  Will retire once consumers are migrated. */
+    { "wtrace_range",        handle_wtrace_range },
+    { "wtrace_add",          handle_wtrace_add },
+    { "wtrace_del",          handle_wtrace_del },
+    { "wtrace_clear",        handle_wtrace_clear },
     { "freeze_check",      handle_freeze_check },
     { "mmio_dump",         handle_mmio_dump },
     { "mmio_clear",        handle_mmio_clear },
@@ -5443,6 +5861,16 @@ void debug_server_init(int port)
     }
     s_wtrace_seq = 0;
     s_wtrace_head = 0;
+
+    /* Always-on catch-all wtrace ring (8 MB). Records EVERY RAM write
+     * with lean fields (no register window). Sized for ~1 second of
+     * coverage at typical Tomba write rates. */
+    if (!s_wtrace_all) {
+        s_wtrace_all = (WriteTraceAllEntry *)calloc(WRITE_TRACE_ALL_CAP,
+                                                    sizeof(WriteTraceAllEntry));
+    }
+    s_wtrace_all_seq  = 0;
+    s_wtrace_all_head = 0;
 
     /* Function entry/exit ring buffers (32 MB each, 64 MB total). */
     if (!s_fn_entry) s_fn_entry = (FnEntryEntry *)calloc(FN_TRACE_CAP, sizeof(FnEntryEntry));
