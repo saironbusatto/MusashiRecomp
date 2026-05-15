@@ -70,3 +70,6 @@ Thumbs.db
 
 # Python caches
 __pycache__/
+
+# DuckStation oracle (local-only; private fork at git@github.com:mstan/duckstation.git)
+/duckstation/
