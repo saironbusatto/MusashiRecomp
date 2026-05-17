@@ -48,14 +48,15 @@ static uint8_t pad_connected = 0;
 typedef enum {
     PAD_IDLE,
     PAD_WAIT_ACCESS,    /* received 0x01 (pad access) */
-    PAD_SEND_ID_LO,    /* sending pad ID low byte (0x41 = digital) */
-    PAD_SEND_ID_HI,    /* sending pad ID high byte (0x5A) */
-    PAD_SEND_BTN_LO,   /* sending button low byte */
-    PAD_SEND_BTN_HI,   /* sending button high byte */
+    PAD_SEND_RESPONSE,  /* sending command response bytes */
 } PadState;
 
 static PadState pad_state = PAD_IDLE;
 static int selected_slot = 0;
+static uint8_t pad_response[8];
+static uint8_t pad_response_len = 0;
+static uint8_t pad_response_idx = 0;
+static uint8_t pad_current_cmd = 0;
 
 /* Memory card SIO state machine */
 typedef enum {
@@ -484,6 +485,9 @@ void sio_init(void) {
     sio_ctrl = 0;
     sio_baud = 0;
     pad_state = PAD_IDLE;
+    pad_response_len = 0;
+    pad_response_idx = 0;
+    pad_current_cmd = 0;
     pad_buttons = 0xFFFF;
     pad_connected = 0;
     mc_state = MC_IDLE;
@@ -537,7 +541,7 @@ uint16_t sio_get_pad_buttons(void) {
 static void pad_process_byte(uint8_t tx_byte) {
     switch (pad_state) {
     case PAD_IDLE:
-        if (pad_connected & (1 << selected_slot)) {
+        if (tx_byte == 0x01 && (pad_connected & (1 << selected_slot))) {
             pad_state = PAD_WAIT_ACCESS;
             sio_rx_data = 0xFF;
             sio_stat |= SIO_STAT_ACK;
@@ -547,36 +551,105 @@ static void pad_process_byte(uint8_t tx_byte) {
         break;
 
     case PAD_WAIT_ACCESS:
-        if (tx_byte == 0x42 || tx_byte == 0x43 || tx_byte == 0x45) {
-            pad_state = PAD_SEND_ID_LO;
-            sio_rx_data = 0x41; /* Digital pad type */
+        pad_current_cmd = tx_byte;
+        pad_response_idx = 1;
+        if (tx_byte == 0x42) {
+            pad_response[0] = 0x41; /* Digital pad poll */
+            pad_response[1] = 0x5A;
+            pad_response[2] = (uint8_t)(pad_buttons & 0xFF);
+            pad_response[3] = (uint8_t)(pad_buttons >> 8);
+            pad_response_len = 4;
+            pad_state = PAD_SEND_RESPONSE;
+            sio_rx_data = pad_response[0];
+            sio_stat |= SIO_STAT_ACK;
+        } else if (tx_byte == 0x43) {
+            static const uint8_t resp_43[8] = {
+                0xF3, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            };
+            memcpy(pad_response, resp_43, sizeof(resp_43));
+            pad_response_len = (uint8_t)sizeof(resp_43);
+            pad_state = PAD_SEND_RESPONSE;
+            sio_rx_data = pad_response[0];
+            sio_stat |= SIO_STAT_ACK;
+        } else if (tx_byte == 0x45) {
+            static const uint8_t resp_45[8] = {
+                0xF3, 0x5A, 0x03, 0x02, 0x01, 0x02, 0x01, 0x00
+            };
+            memcpy(pad_response, resp_45, sizeof(resp_45));
+            pad_response_len = (uint8_t)sizeof(resp_45);
+            pad_state = PAD_SEND_RESPONSE;
+            sio_rx_data = pad_response[0];
+            sio_stat |= SIO_STAT_ACK;
+        } else if (tx_byte == 0x46) {
+            static const uint8_t resp_46[8] = {
+                0xF3, 0x5A, 0x00, 0x00, 0x01, 0x02, 0x00, 0x0A
+            };
+            memcpy(pad_response, resp_46, sizeof(resp_46));
+            pad_response_len = (uint8_t)sizeof(resp_46);
+            pad_state = PAD_SEND_RESPONSE;
+            sio_rx_data = pad_response[0];
+            sio_stat |= SIO_STAT_ACK;
+        } else if (tx_byte == 0x47) {
+            static const uint8_t resp_47[8] = {
+                0xF3, 0x5A, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00
+            };
+            memcpy(pad_response, resp_47, sizeof(resp_47));
+            pad_response_len = (uint8_t)sizeof(resp_47);
+            pad_state = PAD_SEND_RESPONSE;
+            sio_rx_data = pad_response[0];
+            sio_stat |= SIO_STAT_ACK;
+        } else if (tx_byte == 0x4C) {
+            static const uint8_t resp_4c[8] = {
+                0xF3, 0x5A, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00
+            };
+            memcpy(pad_response, resp_4c, sizeof(resp_4c));
+            pad_response_len = (uint8_t)sizeof(resp_4c);
+            pad_state = PAD_SEND_RESPONSE;
+            sio_rx_data = pad_response[0];
+            sio_stat |= SIO_STAT_ACK;
+        } else if (tx_byte == 0x4D) {
+            static const uint8_t resp_4d[8] = {
+                0xF3, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+            };
+            memcpy(pad_response, resp_4d, sizeof(resp_4d));
+            pad_response_len = (uint8_t)sizeof(resp_4d);
+            pad_state = PAD_SEND_RESPONSE;
+            sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;
         } else {
             pad_state = PAD_IDLE;
+            pad_response_len = 0;
+            pad_response_idx = 0;
+            pad_current_cmd = 0;
             sio_rx_data = 0xFF;
         }
         break;
 
-    case PAD_SEND_ID_LO:
-        pad_state = PAD_SEND_ID_HI;
-        sio_rx_data = 0x5A;
-        sio_stat |= SIO_STAT_ACK;
-        break;
-
-    case PAD_SEND_ID_HI:
-        pad_state = PAD_SEND_BTN_LO;
-        sio_rx_data = (uint8_t)(pad_buttons & 0xFF);
-        sio_stat |= SIO_STAT_ACK;
-        break;
-
-    case PAD_SEND_BTN_LO:
-        pad_state = PAD_IDLE;
-        sio_rx_data = (uint8_t)(pad_buttons >> 8);
-        /* No ACK after last byte */
+    case PAD_SEND_RESPONSE:
+        if (pad_response_idx < pad_response_len) {
+            sio_rx_data = pad_response[pad_response_idx++];
+            if (pad_response_idx < pad_response_len) {
+                sio_stat |= SIO_STAT_ACK;
+            } else {
+                pad_state = PAD_IDLE;
+                pad_response_len = 0;
+                pad_response_idx = 0;
+                pad_current_cmd = 0;
+            }
+        } else {
+            pad_state = PAD_IDLE;
+            pad_response_len = 0;
+            pad_response_idx = 0;
+            pad_current_cmd = 0;
+            sio_rx_data = 0xFF;
+        }
         break;
 
     default:
         pad_state = PAD_IDLE;
+        pad_response_len = 0;
+        pad_response_idx = 0;
+        pad_current_cmd = 0;
         sio_rx_data = 0xFF;
         break;
     }
@@ -1196,6 +1269,9 @@ void sio_write(uint32_t addr, uint32_t value) {
             sio_ctrl = 0;
             sio_baud = 0;
             pad_state = PAD_IDLE;
+            pad_response_len = 0;
+            pad_response_idx = 0;
+            pad_current_cmd = 0;
             mc_state = MC_IDLE;
             mc_slots[0].state = MC_IDLE;
             mc_slots[1].state = MC_IDLE;
@@ -1289,6 +1365,9 @@ void sio_write(uint32_t addr, uint32_t value) {
                 /* keep mc_slots[i].flag, mc_slots[i].data */
             }
             pad_state = PAD_IDLE;
+            pad_response_len = 0;
+            pad_response_idx = 0;
+            pad_current_cmd = 0;
             active_device = DEV_NONE;
 #if SIO_MODEL_CYCLE_PACED
             sio_shift_active = 0; sio_shift_remaining = 0;
