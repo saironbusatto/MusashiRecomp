@@ -1,20 +1,20 @@
 # CURRENT_STATE — read this before doing anything
 
-Last updated: 2026-05-12 (post-confusion-session)
+Last updated: 2026-05-17 (Tomba OPTIONS / NEW GAME / save-load milestone)
 
 ---
 
 ## TL;DR
 
-- **The working binary is `F:\Projects\TombaRecomp\build\tomba-runtime.exe`** (built
-  2026-05-12 11:55). It boots BIOS → Tomba → main menu.
-- A copy is preserved at `.happypath/tomba-runtime.exe` so a future rebuild
-  cannot erase it.
-- `psx-runtime.exe` (the BIOS-only runtime in this repo) is **not** the test
-  target. Past handoff references to "main menu reachable" mean Tomba's main
-  menu, not the BIOS shell.
-- We are about to start the **unification work** described in
-  `UNIFICATION_PLAN.md`. Do not start that work without re-reading both files.
+- **The active test binary is `F:\Projects\TombaRecomp\build\psx-runtime.exe
+  --game game.toml`** on debug port 4470.
+- Tomba now boots through BIOS, Whoopee Camp FMV, intro FMV, and title.
+- User-confirmed working on 2026-05-17: OPTIONS, NEW GAME, SAVE, and LOAD.
+- NEW GAME reaches the first in-game area.
+- Remaining near-term work is visual correctness: fuzzy title menu glyphs,
+  missing BIOS PS-logo glyph, and upcoming in-game rendering fixes.
+- The historical Windows "Not Responding" hang is mitigated but should stay
+  under observation during longer gameplay soak tests.
 
 ---
 
@@ -38,11 +38,11 @@ F:\Projects\psxrecomp-v4\          ← THIS repo
 
 F:\Projects\TombaRecomp\           ← sibling repo
   generated\SCUS_942.36_*.c        ← Tomba EXE recomp output (separate from BIOS)
-  build\tomba-runtime.exe          ← THE BINARY THE USER ACTUALLY TESTS
+  build\psx-runtime.exe            ← THE BINARY THE USER ACTUALLY TESTS
   game.toml                        ← Tomba config
 ```
 
-`tomba-runtime.exe` is built from this repo's `runtime/` plus
+`psx-runtime.exe --game game.toml` in TombaRecomp is built from this repo's `runtime/` plus
 `TombaRecomp/generated/`. It also links this repo's
 `generated/SCPH1001_*.c` for the BIOS half. The cmake macro that does this
 is `psxrecomp_v4_add_runtime_target` in this repo's `runtime/CMakeLists.txt`.

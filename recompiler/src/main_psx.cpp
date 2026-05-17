@@ -438,6 +438,14 @@ int main(int argc, char** argv) {
         ds << "\n";
 
         // Dispatch function
+        uint32_t game_text_start = exe->load_address() & 0x1FFFFFFFu;
+        uint32_t game_text_end = game_text_start + exe->code_size();
+        ds << "int psx_game_address_in_text(uint32_t addr) {\n";
+        ds << "    uint32_t phys = addr & 0x1FFFFFFFu;\n";
+        ds << fmt::format("    return phys >= 0x{:08X}u && phys < 0x{:08X}u;\n",
+                          game_text_start, game_text_end);
+        ds << "}\n\n";
+
         ds << "/* Maps PS1 address to compiled game code. Returns 1 if dispatched, 0 if unknown. */\n";
         ds << "int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr) {\n";
         ds << "    switch (addr) {\n";

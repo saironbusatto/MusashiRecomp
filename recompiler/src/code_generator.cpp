@@ -8,20 +8,34 @@
 namespace PSXRecomp {
 
 /*
- * Translate a runtime RAM address to the ROM kseg1 address that
- * exe_.read_word() can resolve.
+ * Translate a runtime RAM address to an address that exe_.read_word() can
+ * resolve.
  *
- * The BIOS shell code lives at ROM 0xBFC18000-0xBFC427FF and gets copied
- * to RAM at 0x80030000-0x8005A7FF during BIOS init.  Jump tables within
- * shell functions store RAM-space target addresses (0x80058xxx), but at
- * recompile time we can only read the ROM.  This helper maps:
+ * Game EXEs are read directly at their load address.  The BIOS shell code
+ * lives at ROM 0xBFC18000-0xBFC427FF and gets copied to RAM at
+ * 0x80030000-0x8005A7FF during BIOS init.  Jump tables within shell
+ * functions store RAM-space target addresses (0x80058xxx), but at recompile
+ * time we can only read the ROM.  This helper maps:
  *
+ *   active EXE load range              ->  active EXE load range
  *   RAM phys 0x00030000-0x0005AFFF  →  ROM kseg1 0xBFC18000+
  *
  * Non-shell addresses pass through unchanged.
  */
-static uint32_t ram_to_rom(uint32_t addr) {
+static uint32_t ram_to_rom(uint32_t addr, const PS1Executable& exe) {
     uint32_t phys = addr & 0x1FFFFFFFu;
+
+    /*
+     * Game EXEs can legitimately occupy physical 0x30000-0x5AFFF.  That
+     * overlaps the BIOS shell copy window below, so prefer the active EXE's
+     * load range before applying any BIOS-specific remap.
+     */
+    uint32_t exe_phys = exe.load_address() & 0x1FFFFFFFu;
+    uint32_t exe_size = exe.code_size();
+    if (exe_size != 0 && phys >= exe_phys && phys < exe_phys + exe_size) {
+        return exe.load_address() + (phys - exe_phys);
+    }
+
     if (phys >= 0x00030000u && phys <= 0x0005AFFFu) {
         return 0xBFC18000u + (phys - 0x00030000u);
     }
@@ -1135,14 +1149,14 @@ std::string CodeGenerator::translate_basic_block(
                     // entry so it matches cfg.blocks / extra_labels_ (ROM space).
                     bool emitted_switch = false;
                     if (table_base != 0 && table_count > 0) {
-                        uint32_t rom_table_base = ram_to_rom(table_base);
+                        uint32_t rom_table_base = ram_to_rom(table_base, exe_);
                         std::set<uint32_t>    seen;
                         std::vector<std::pair<uint32_t,uint32_t>> targets; // {runtime_addr, rom_addr}
                         for (uint32_t i = 0; i < table_count; i++) {
                             auto eopt = exe_.read_word(rom_table_base + i * 4);
                             if (!eopt) continue;
                             uint32_t runtime_addr = *eopt;
-                            uint32_t rom_addr = ram_to_rom(runtime_addr);
+                            uint32_t rom_addr = ram_to_rom(runtime_addr, exe_);
                             if (seen.insert(rom_addr).second &&
                                 (cfg.blocks.count(rom_addr) || extra_labels_.count(rom_addr))) {
                                 targets.push_back({runtime_addr, rom_addr});
@@ -1295,11 +1309,11 @@ GeneratedFunction CodeGenerator::generate_function(
             if (fl && tc>0 && tc<512) tb = (lui_v+(fa[0]?(uint32_t)(int32_t)av[0]:0u)) + (uint32_t)lw_off;
         }
         if (tb==0 || tc==0) continue;
-        uint32_t rom_tb = ram_to_rom(tb);
+        uint32_t rom_tb = ram_to_rom(tb, exe_);
         for (uint32_t i = 0; i < tc; i++) {
             auto eopt = exe_.read_word(rom_tb + i*4);
             if (!eopt) continue;
-            uint32_t t = ram_to_rom(*eopt);
+            uint32_t t = ram_to_rom(*eopt, exe_);
             if (t >= cfg.function_start && t < cfg.function_end && !cfg.blocks.count(t))
                 extra_labels_.insert(t);
         }

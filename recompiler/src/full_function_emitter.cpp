@@ -926,6 +926,9 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
     out += "extern uint32_t g_debug_current_func_addr;\n";
     out += "extern void debug_server_trace_dispatch(uint32_t func_addr);\n\n";
+    out += "#ifdef PSX_HAS_GAME_DISPATCH\n";
+    out += "extern int psx_game_address_in_text(uint32_t addr);\n";
+    out += "#endif\n\n";
 
     // Forward declarations for all emitted functions.
     for (uint32_t norm : emitted_normalized) {
@@ -973,6 +976,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "}\n\n";
 
     out += "extern int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);\n";
+    out += "extern int dirty_ram_is_dirty(uint32_t phys);\n";
     out += "extern void fntrace_record(CPUState* cpu, uint32_t target);\n";
     out += "\n";
     out += "int g_psx_dispatch_depth = 0;\n\n";
@@ -989,9 +993,20 @@ void FullFunctionEmitter::emit_dispatch(
     out += "         * reflect the args being passed for THIS iteration. */\n";
     out += "        fntrace_record(cpu, addr);\n";
     out += "        cpu->pc = 0;\n";
-    out += "        uint32_t phys = normalize(addr);\n";
     out += fmt::format("        int lo = 0, hi = {} - 1;\n", emitted_normalized.size());
     out += "        int found = 0;\n";
+    out += "#ifdef PSX_HAS_GAME_DISPATCH\n";
+    out += "        /* Game EXEs can overlap the BIOS shell copy window at\n";
+    out += "         * physical 0x30000-0x5AFFF. If the target belongs to the\n";
+    out += "         * active game text range, route it through the game/dirty-RAM\n";
+    out += "         * path before normalizing it to shell ROM. */\n";
+    out += "        uint32_t game_phys = addr & 0x1FFFFFFFu;\n";
+    out += "        if (psx_game_address_in_text(addr) && dirty_ram_is_dirty(game_phys)) {\n";
+    out += "            found = dirty_ram_dispatch(cpu, addr);\n";
+    out += "        }\n";
+    out += "#endif\n";
+    out += "        uint32_t phys = normalize(addr);\n";
+    out += "        if (!found) {\n";
     out += "        while (lo <= hi) {\n";
     out += "            int mid = (lo + hi) / 2;\n";
     out += "            if (dispatch_table[mid].addr == phys) {\n";
@@ -1005,6 +1020,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "            } else {\n";
     out += "                hi = mid - 1;\n";
     out += "            }\n";
+    out += "        }\n";
     out += "        }\n";
     out += "        /* Static dispatch miss.  Self-modifying / install-at-runtime RAM\n";
     out += "         * (CLAUDE.md Rule 18): the BIOS writes dispatch stubs into kernel\n";

@@ -1,158 +1,113 @@
 # PSXRecomp
 
-**Generic static recompiler framework for PlayStation 1 — MIPS R3000A → C → native x64.**
+Generic static recompiler framework for PlayStation 1: MIPS R3000A to C to
+native x64.
 
-*Background on the original prototype: [I Built a PS1 Static Recompiler With No Prior Experience (and Claude Code)](https://1379.tech/i-built-a-ps1-static-recompiler-with-no-prior-experience-and-claude-code/)*
+Background on the original prototype:
+[I Built a PS1 Static Recompiler With No Prior Experience (and Claude Code)](https://1379.tech/i-built-a-ps1-static-recompiler-with-no-prior-experience-and-claude-code/)
 
 [![PSXRecomp demo](https://img.youtube.com/vi/CID9oVhgCyY/maxresdefault.jpg)](https://www.youtube.com/watch?v=CID9oVhgCyY)
 
----
+## What It Is
 
-## What it is
+PSXRecomp translates PS1 MIPS binaries into C, then compiles that C as a
+native executable linked against a PS1 hardware runtime. The v4 architecture
+recompiles the real SCPH1001 BIOS and runs it as the kernel. There is no HLE
+BIOS layer, no stubs, and no general-purpose interpreter fallback for static
+code.
 
-PSXRecomp translates a PS1 program's MIPS binary into C once, then compiles that C as a native x64 binary linked against a thin runtime. The result runs on PC without an emulator loop.
-
-This is the **v2** revision of PSXRecomp. It is a ground-up rewrite of the original public project (preserved here on the `legacy-2026-05-11` branch).
-
-The defining v2 rule: **no HLE BIOS, no stubs, no interpreter for static code.** v1 implemented PSX kernel calls as C "shims" that emulated what the BIOS *would have done*. v2 recompiles the real SCPH1001 BIOS to C and runs the recompiled BIOS as the kernel. The only interpreted code is the handful of 4-instruction dispatch stubs the BIOS installs into kernel RAM at runtime; everything else is statically recompiled native code.
-
-PSXRecomp is a **framework**, not a single program. Game projects live in their own repositories and pull this one in to build a game-specific binary. The applied example is [TombaRecomp](https://github.com/mstan/TombaRecomp).
-
----
+PSXRecomp is a framework. Game-specific projects live in their own
+repositories and pull this one in to build a game binary. The active end-to-end
+target is [TombaRecomp](https://github.com/mstan/TombaRecomp).
 
 ## Status
 
-This is **heavy WIP**. The repository compiles and produces a working `psx-runtime` that boots the SCPH1001 BIOS through to the memory card management UI. Game-loading is partially implemented and is not part of the recommended use yet.
-
-### What works
+Current milestone as of 2026-05-17:
 
 | Subsystem | State |
 |---|---|
-| BIOS recompilation (`SCPH1001.BIN`) | Boots to memory card management screen |
-| GPU (basic 2D, BIOS shell UI) | Renders the BIOS shell correctly |
-| Memory cards (read/write, files persist on disk) | Working |
-| SIO0 (pad input via keyboard) | Working |
-| Interrupts, COP0, timers | Working |
-| Dirty-RAM interpreter for kernel-installed stubs | Working |
+| BIOS recompilation (`SCPH1001.BIN`) | Boots and hands off to Tomba |
+| Game EXE recompilation | Tomba title, OPTIONS, NEW GAME, save/load, and gameplay reached |
+| CD-ROM / MDEC / XA | Tomba FMVs stream and play at the game's 15 fps cadence |
+| Memory cards | Tomba save and load verified |
+| SIO0 controllers | Digital pad polling plus DualShock config replies used by Tomba |
+| GPU | Functional for BIOS boot, FMVs, menus, and first gameplay area |
+| Interrupts, COP0, timers | Working for current Tomba path |
+| Dirty-RAM support | BIOS/game RAM-installed dispatch paths handled |
 
-### What does NOT work / is untested
+Known follow-up work:
 
-- **CD-ROM / disc-based game loading is untested and almost certainly does not work** in `psx-runtime`. The CDROM controller emulation is partial and the game-EXE-load path has not been validated end-to-end in the framework binary. Loading a disc via `--disc` may stall or panic.
-- **MDEC FMV playback** is partial. Audio decode works (XA-ADPCM); video decode is incomplete and runs slowly.
-- **SPU** mixes 24 direct ADPCM voices but does not yet model reverb, noise, sweep, or accurate IRQ timing.
-- **GPU** does not implement the full PSX command set — many primitives are not yet supported.
-- **GTE** (geometry coprocessor) coverage is partial.
+- Tomba title-menu glyphs for `NEW GAME / LOAD / OPTIONS` are still fuzzy.
+- The BIOS disc-detected screen is still missing the PS logo glyph.
+- In-game rendering needs more visual correctness work.
+- SPU coverage is partial; reverb, noise, sweep, and accurate SPU IRQ behavior
+  are not complete.
+- The historical Windows "Not Responding" hang is mitigated but should stay on
+  the watch list until longer in-game soak tests are clean.
+- Tomba is the only current game target validated end to end.
 
-Game projects that pull in PSXRecomp will hit these limits long before reaching gameplay. The [TombaRecomp](https://github.com/mstan/TombaRecomp) prototype reaches the main menu with FMVs that play slowly; in-game state is not reachable.
+For the current game milestone, build and run the sibling TombaRecomp project:
 
-If you want to *use* this repository today, the supported path is the **BIOS-only memory card editor** described under "How to use" below.
+```sh
+cd F:/Projects/TombaRecomp
+cmake --build build -j16
+./build/psx-runtime.exe --game game.toml
+```
 
----
+Running this repository's runtime without `--game` is still useful for
+BIOS-only memory card management.
 
 ## Setup
 
-### Requirements
+Requirements:
 
-- **Windows 10/11 x64** (Linux/macOS are not currently supported by the runtime build).
-- **Sony SCPH1001 BIOS ROM** (`SCPH1001.BIN`, 512 KB) — **you must provide your own legally-obtained dump.** Not included.
-- Tools (for building from source): MSYS2 with the `mingw-w64-x86_64` toolchain, CMake ≥ 3.20, SDL2.
+- Windows 10/11 x64.
+- MSYS2 with the `mingw-w64-x86_64` toolchain, CMake 3.20+, and SDL2.
+- A legally obtained `SCPH1001.BIN` BIOS dump. Not included.
+- For game projects, a legally obtained game disc/EXE dump. Not included.
 
-### Option A — use the release binary
-
-1. Download the latest `psxrecomp-v2-windows-x64.zip` from [Releases](https://github.com/mstan/psxrecomp/releases).
-2. Extract anywhere.
-3. Place your `SCPH1001.BIN` in the extracted `bios/` folder. The path must be exactly `bios/SCPH1001.BIN`.
-4. Run `psx-runtime.exe`.
-5. A blank `card1.mcd` / `card2.mcd` is created in `saves/` on first launch.
-
-### Option B — build from source
+Build the framework runtime:
 
 ```sh
-# MSYS2 mingw64 shell:
-pacman -S mingw-w64-x86_64-cmake mingw-w64-x86_64-gcc mingw-w64-x86_64-SDL2
-
-git clone https://github.com/mstan/psxrecomp.git psxrecomp-v4
-cd psxrecomp-v4
-mkdir -p bios
-cp /path/to/your/SCPH1001.BIN bios/
-
-# Recompile the BIOS to C (one-time; regenerate when the BIOS changes):
+cd F:/Projects/psxrecomp-v4
 cmake -S recompiler -B recompiler/build -G "Unix Makefiles"
 cmake --build recompiler/build
-./recompiler/build/psxrecomp-bios --config bios/SCPH1001.toml
-
-# Build the runtime:
 cmake -S runtime -B runtime/build -G "Unix Makefiles"
 cmake --build runtime/build --target psx-runtime
-
-# Run:
-./runtime/build/psx-runtime.exe
 ```
 
----
+Game projects generate their own `generated/<serial>_*.c` files and link this
+runtime source tree through CMake.
 
-## How to use
-
-### BIOS shell + memory card management
-
-Launch `psx-runtime.exe` with no arguments (or with `--disc ""`). With no disc inserted, the BIOS goes to its built-in shell — the same shell you get on a real PS1 with no disc in the tray. From there you can:
-
-- View memory card contents on cards 1 and 2.
-- Copy save blocks between cards.
-- Delete save blocks.
-- Format a card.
-
-Memory card files live in `saves/card1.mcd` and `saves/card2.mcd`. They are standard 128 KB raw PS1 memory card images and are interchangeable with the equivalent files from `pcsx-redux`, `duckstation`, `epsxe`, `mednafen`, etc. — drop them into `saves/` to bring saves with you, or copy them out to share.
-
-### Keyboard map (default)
+## Keyboard Map
 
 | PSX button | Keyboard |
 |---|---|
 | D-Pad Up / Down / Left / Right | Arrow keys |
-| Cross (✕) | X |
-| Square (□) | Z |
-| Circle (○) | S |
-| Triangle (△) | A |
+| Cross | X |
+| Square | Z |
+| Circle | S |
+| Triangle | A |
 | L1 / R1 | Q / W |
 | L2 / R2 | E / R |
 | Start | Enter |
 | Select | Right Shift |
-| Turbo (fast-forward, no render) | Tab (hold) |
+| Turbo | Tab (hold) |
 
-### Command-line options
+## Architecture
 
-```
-psx-runtime.exe [--bios <path>] [--disc <path>] [--memcard-dir <path>] [--game-root <path>]
-```
+The recompiler emits C functions and dispatch tables for BIOS and game code.
+The runtime loads the BIOS/game assets into emulated PS1 memory, links the
+generated C as native code, and simulates hardware through MMIO handlers for
+GPU, DMA, timers, CD-ROM, MDEC, SIO0, memory cards, SPU, GTE, and interrupt
+delivery. BIOS A0/B0/C0 vectors go through the recompiled BIOS, not HLE shims.
 
-- `--bios` — override default `bios/SCPH1001.BIN`.
-- `--disc` — point at a `.cue`/`.bin` PS1 disc image. **See the warnings above; this path is not reliable yet.**
-- `--memcard-dir` — directory holding `card1.mcd` / `card2.mcd`. Default `saves/`.
-
----
-
-## Architecture (one paragraph)
-
-The recompiler reads the BIOS as a flat ROM at `0xBFC00000` and walks function boundaries from explicit seed addresses, emitting `generated/SCPH1001_full.c` (one C function per recompiled MIPS function) and `generated/SCPH1001_dispatch.c` (function-pointer dispatch table). The runtime loads `SCPH1001.BIN` into emulated PSX memory, links the recompiled BIOS as native C, simulates the hardware (GPU, SPU, CD-ROM, DMA, timers, COP0, SIO0, MDEC, memcards) via per-MMIO C, and routes BIOS calls (`A0` / `B0` / `C0` vectors) through the recompiled functions. The only interpreted code is the handful of 4-instruction dispatch stubs the BIOS writes into RAM at boot. See `CLAUDE.md` for the full architecture rules.
-
----
-
-## Difference from v1
-
-The original public version of PSXRecomp (preserved on the `legacy-2026-05-11` branch) used:
-
-- **HLE BIOS shims** — handwritten C reimplementations of `OpenEvent`, `StartCard`, `alloc_kernel_memory`, etc., living in `runner/src/bios.c`.
-- **A MIPS interpreter** for unknown code paths (`runner/src/interpreter.c`, ~900 LOC).
-- **Tomba bundled in the framework repo** as the example game.
-
-v2 (this branch) replaces all of that with real BIOS recompilation and breaks Tomba out into its own repository ([TombaRecomp](https://github.com/mstan/TombaRecomp)). The interpreter is gone except for an ~300-LOC dirty-RAM interpreter dedicated to BIOS-installed runtime stubs, which is a fundamentally different concept from v1's general-purpose fallback interpreter.
-
-The `legacy-2026-05-11` branch is preserved unchanged for anyone who needs the v1 codebase as a reference.
-
----
+See `CLAUDE.md`, `PLAN.md`, and `CURRENT_STATE.md` for the development rules
+and current project context.
 
 ## License
 
-PolyForm Noncommercial 1.0.0 — see [`LICENSE`](LICENSE). Non-commercial use (personal, educational, research, hobbyist) is welcome. Commercial use requires a separate license — contact via [1379.tech](https://1379.tech).
+PolyForm Noncommercial 1.0.0. See `LICENSE`.
 
-The PSX BIOS and any game disc images you supply remain copyrighted by their respective owners. This project distributes neither.
+The PSX BIOS and game disc images remain copyrighted by their respective
+owners. This project distributes neither.

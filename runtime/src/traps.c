@@ -285,10 +285,17 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     }
 
     HostThreadFiber* current = psx_bind_current_host_thread(cpu, current_tcb);
+    int saved_current_context = 0;
     if (psx_tcb_state(cpu, current_tcb) == 0x4000u) {
         psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
+        saved_current_context = 1;
     } else {
-        current->closed = 1;
+        /* 0x1000 is the BIOS closed/free state and must retire the host fiber.
+         * Other non-runnable states can still have a suspended generated C
+         * stack that must be resumed later. */
+        if (psx_tcb_state(cpu, current_tcb) == 0x1000u) {
+            current->closed = 1;
+        }
         debug_server_log_thread_event(6, cpu, current_tcb, target_tcb, 0);
     }
 
@@ -305,6 +312,14 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     (void)psx_restore_context_from_tcb(cpu, target_tcb);
     debug_server_log_thread_event(8, cpu, current_tcb, target_tcb, 0);
     SwitchToFiber(target->fiber);
+
+    /* SwitchToFiber returns on the original native stack, but CPUState is
+     * shared globally and still contains the fiber that just yielded back.
+     * Restore the TCB we saved above before continuing on this stack. */
+    if (saved_current_context && psx_is_valid_tcb(cpu, current_tcb)) {
+        psx_set_current_tcb(cpu, current_tcb);
+        (void)psx_restore_context_from_tcb(cpu, current_tcb);
+    }
 
     /* If a non-owner fiber requested an exception longjmp while we were
      * suspended, it deferred it by SwitchToFiber'ing back to us (the
