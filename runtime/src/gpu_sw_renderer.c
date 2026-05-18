@@ -759,6 +759,31 @@ void sw_draw_textured_rect(int x, int y, int w, int h,
     }
 }
 
+void sw_draw_textured_rect_scaled(int x, int y, int w, int h,
+                                  int u0, int v0, int u1, int v1,
+                                  uint16_t clut_x, uint16_t clut_y,
+                                  uint16_t texpage) {
+    if (w <= 0 || h <= 0) return;
+
+    int du = u1 - u0;
+    int dv = v1 - v0;
+
+    for (int row = 0; row < h; row++) {
+        int py = y + row;
+        if (py < g_clip_y1 || py > g_clip_y2) continue;
+
+        int tv = (int)(v0 + ((int64_t)dv * row) / h) & 0xFF;
+        for (int col = 0; col < w; col++) {
+            int px = x + col;
+            if (px < g_clip_x1 || px > g_clip_x2) continue;
+
+            int tu = (int)(u0 + ((int64_t)du * col) / w) & 0xFF;
+            uint16_t texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
+            draw_pixel_textured(px, py, texel);
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Line (Bresenham)                                                   */
 /* ------------------------------------------------------------------ */
