@@ -16,6 +16,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
 
 #define MAX_CARDS 2
 
@@ -79,8 +84,18 @@ static void memcard_format(uint8_t *data) {
     memcpy(&data[63 * 128], &data[0], 128);
 }
 
+static void memcard_ensure_dir(const char* dir) {
+    if (!dir || !dir[0]) return;
+#ifdef _WIN32
+    (void)_mkdir(dir);
+#else
+    (void)mkdir(dir, 0755);
+#endif
+}
+
 void memcard_init(const char* dir) {
     memset(cards, 0, sizeof(cards));
+    memcard_ensure_dir(dir);
 
     for (int i = 0; i < MAX_CARDS; i++) {
         cards[i].present = 0;

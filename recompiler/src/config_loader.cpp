@@ -59,6 +59,7 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
 
 fs::path find_project_root(const fs::path& config_path) {
     fs::path cur = fs::absolute(config_path).parent_path();
+    const fs::path fallback = cur;
     for (int i = 0; i < 8; ++i) {
         for (const char* marker : { ".gitignore", ".git", "CMakeLists.txt" }) {
             if (fs::exists(cur / marker)) {
@@ -69,9 +70,7 @@ fs::path find_project_root(const fs::path& config_path) {
         if (parent == cur) break;
         cur = parent;
     }
-    throw std::runtime_error(
-        fmt::format("could not locate project root (no .gitignore/.git/CMakeLists.txt) "
-                    "walking up from {}", config_path.string()));
+    return fallback;
 }
 
 // Derive the output filename stem from a rom basename. Mirrors the Python

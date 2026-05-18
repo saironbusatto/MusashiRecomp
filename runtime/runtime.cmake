@@ -90,6 +90,7 @@ function(psxrecomp_v4_add_runtime_target target)
         DEBUG_PORT
         WINDOW_TITLE
         DEFAULT_BIOS_PATH
+        DEFAULT_GAME_CONFIG_PATH
     )
     set(multiValueArgs EXTRAS_SOURCES)
     cmake_parse_arguments(PSXRT "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
@@ -105,6 +106,9 @@ function(psxrecomp_v4_add_runtime_target target)
     endif()
     if(NOT PSXRT_DEFAULT_BIOS_PATH)
         set(PSXRT_DEFAULT_BIOS_PATH "${PSXRECOMP_V4_ROOT}/bios/SCPH1001.BIN")
+    endif()
+    if(NOT DEFINED PSXRT_DEFAULT_GAME_CONFIG_PATH)
+        set(PSXRT_DEFAULT_GAME_CONFIG_PATH "")
     endif()
 
     set(generated_sources ${PSXRECOMP_V4_BIOS_GENERATED})
@@ -141,6 +145,7 @@ function(psxrecomp_v4_add_runtime_target target)
     target_compile_definitions(${target} PRIVATE
         DEFAULT_DEBUG_PORT=${PSXRT_DEBUG_PORT}
         PSX_DEFAULT_BIOS_PATH="${PSXRT_DEFAULT_BIOS_PATH}"
+        PSX_DEFAULT_GAME_CONFIG_PATH="${PSXRT_DEFAULT_GAME_CONFIG_PATH}"
         PSX_WINDOW_TITLE="${PSXRT_WINDOW_TITLE}"
         FMT_HEADER_ONLY=1
         $<$<CXX_COMPILER_ID:MSVC>:SDL_MAIN_HANDLED>
@@ -165,7 +170,7 @@ function(psxrecomp_v4_add_runtime_target target)
     endif()
 
     if(WIN32 OR MINGW)
-        target_link_libraries(${target} PRIVATE ws2_32 dbghelp)
+        target_link_libraries(${target} PRIVATE ws2_32 dbghelp comdlg32)
     endif()
 
     if(MINGW)

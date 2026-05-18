@@ -90,10 +90,14 @@ bool ISOReader::Open(const std::string& filename) {
 
     is_open_ = true;
 
-    // Parse the volume descriptor to extract filesystem metadata
+    // Parse the volume descriptor to extract filesystem metadata when
+    // present. Runtime CD-ROM access only needs sector reads, so keep the
+    // image mounted even if an ISO9660 header is missing or nonstandard.
     if (!ParseVolumeDescriptor()) {
-        Close();
-        return false;
+        file_.clear();
+        volume_id_.clear();
+        root_dir_.lba = 0;
+        root_dir_.size = 0;
     }
 
     return true;

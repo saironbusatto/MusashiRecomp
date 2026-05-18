@@ -16,17 +16,33 @@
 #include "crash_trace.h"
 #include "freeze_heartbeat.h"
 #include "config_loader.h"
+#include "crc32.h"
 #include <SDL.h>
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <commdlg.h>
+#endif
+
 #ifndef PSX_DEFAULT_BIOS_PATH
 #define PSX_DEFAULT_BIOS_PATH "bios/SCPH1001.BIN"
+#endif
+#ifndef PSX_DEFAULT_GAME_CONFIG_PATH
+#define PSX_DEFAULT_GAME_CONFIG_PATH ""
 #endif
 #ifndef PSX_WINDOW_TITLE
 #define PSX_WINDOW_TITLE "psxrecomp-v4"
@@ -80,6 +96,329 @@ static std::filesystem::path find_upward(std::filesystem::path start,
         start = start.parent_path();
     }
     return {};
+}
+
+static std::filesystem::path exe_dir_from_argv(const char* argv0) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::path exe_dir;
+    if (argv0 && argv0[0]) {
+        exe_dir = fs::absolute(argv0, ec).parent_path();
+        if (ec) exe_dir.clear();
+    }
+    if (exe_dir.empty()) exe_dir = fs::current_path();
+    return exe_dir;
+}
+
+static std::filesystem::path resolve_existing_runtime_path(const char* requested,
+                                                           const char* argv0) {
+    namespace fs = std::filesystem;
+    if (!requested || !requested[0]) return {};
+
+    std::error_code ec;
+    fs::path p(requested);
+    if (fs::exists(p, ec)) return fs::absolute(p, ec);
+    if (p.is_absolute()) return {};
+
+    std::vector<fs::path> roots;
+    roots.push_back(fs::current_path());
+    roots.push_back(exe_dir_from_argv(argv0));
+    for (const fs::path& root : roots) {
+        fs::path direct = root / p;
+        if (fs::exists(direct, ec)) return fs::absolute(direct, ec);
+
+        fs::path found = find_upward(root, p);
+        if (!found.empty()) return fs::absolute(found / p, ec);
+    }
+    return {};
+}
+
+static std::filesystem::path sidecar_cfg_path(const char* argv0, const char* filename) {
+    return exe_dir_from_argv(argv0) / filename;
+}
+
+static std::filesystem::path read_cached_path(const char* argv0, const char* filename) {
+    std::ifstream f(sidecar_cfg_path(argv0, filename));
+    if (!f.is_open()) return {};
+    std::string line;
+    std::getline(f, line);
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
+        line.pop_back();
+    }
+    return line.empty() ? std::filesystem::path{} : std::filesystem::path(line);
+}
+
+static void write_cached_path(const char* argv0, const char* filename,
+                              const std::filesystem::path& path) {
+    std::ofstream f(sidecar_cfg_path(argv0, filename), std::ios::trunc);
+    if (f.is_open()) f << path.string() << "\n";
+}
+
+static void launcher_warning(const char* title, const std::string& msg) {
+    std::fprintf(stderr, "%s: %s\n", title, msg.c_str());
+#ifdef _WIN32
+    MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONWARNING);
+#endif
+}
+
+static bool pick_runtime_file(const char* title, const char* filter,
+                              std::filesystem::path& out) {
+#ifdef _WIN32
+    char path_buf[4096];
+    std::memset(path_buf, 0, sizeof(path_buf));
+
+    OPENFILENAMEA ofn;
+    std::memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = NULL;
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile = path_buf;
+    ofn.nMaxFile = (DWORD)sizeof(path_buf);
+    ofn.lpstrTitle = title;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+
+    if (!GetOpenFileNameA(&ofn)) return false;
+    out = path_buf;
+    return true;
+#else
+    (void)filter;
+    (void)out;
+    std::fprintf(stderr, "psxrecomp-v4: %s requires a command-line path on this platform.\n", title);
+    return false;
+#endif
+}
+
+static std::string uppercase_ascii(std::string s) {
+    for (char& c : s) {
+        c = (char)std::toupper((unsigned char)c);
+    }
+    return s;
+}
+
+static bool ends_with_ci(const std::string& s, const std::string& suffix) {
+    if (s.size() < suffix.size()) return false;
+    for (size_t i = 0; i < suffix.size(); i++) {
+        char a = (char)std::toupper((unsigned char)s[s.size() - suffix.size() + i]);
+        char b = (char)std::toupper((unsigned char)suffix[i]);
+        if (a != b) return false;
+    }
+    return true;
+}
+
+static std::filesystem::path cue_data_path(const std::filesystem::path& path) {
+    if (!ends_with_ci(path.string(), ".cue")) return path;
+
+    std::ifstream cue(path);
+    if (!cue.is_open()) return path;
+
+    std::string line;
+    while (std::getline(cue, line)) {
+        const std::string upper = uppercase_ascii(line);
+        const size_t file_pos = upper.find("FILE");
+        const size_t binary_pos = upper.find("BINARY");
+        if (file_pos == std::string::npos || binary_pos == std::string::npos) continue;
+
+        size_t q1 = line.find('"', file_pos);
+        size_t q2 = (q1 == std::string::npos) ? std::string::npos : line.find('"', q1 + 1);
+        std::string bin_name;
+        if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1 + 1) {
+            bin_name = line.substr(q1 + 1, q2 - q1 - 1);
+        } else {
+            std::istringstream iss(line.substr(file_pos + 4));
+            iss >> bin_name;
+        }
+        if (bin_name.empty()) break;
+
+        std::filesystem::path bin_path(bin_name);
+        if (bin_path.is_relative()) return path.parent_path() / bin_path;
+        return bin_path;
+    }
+    return path;
+}
+
+static bool read_at(std::ifstream& f, uint64_t offset, uint8_t* out, size_t len) {
+    f.clear();
+    f.seekg((std::streamoff)offset, std::ios::beg);
+    if (!f.good()) return false;
+    f.read(reinterpret_cast<char*>(out), (std::streamsize)len);
+    return f.gcount() == (std::streamsize)len;
+}
+
+static bool is_iso_pvd(const uint8_t* sector) {
+    return sector[0] == 0x01 && std::memcmp(&sector[1], "CD001", 5) == 0 && sector[6] == 0x01;
+}
+
+static std::string psx_exe_id_from_game_id(const std::string& game_id) {
+    if (game_id.size() == 10 && game_id[4] == '-') {
+        return game_id.substr(0, 4) + "_" + game_id.substr(5, 3) + "." + game_id.substr(8, 2);
+    }
+    return game_id;
+}
+
+struct DiscValidation {
+    bool opened = false;
+    bool has_header = false;
+    bool id_matches = false;
+    std::string detail;
+};
+
+static DiscValidation validate_disc_image(const std::filesystem::path& selected_path,
+                                          const std::string& game_id) {
+    DiscValidation v;
+    const std::filesystem::path data_path = cue_data_path(selected_path);
+    std::ifstream f(data_path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) {
+        v.detail = "Could not open the selected disc image or its CUE-referenced BIN file.";
+        return v;
+    }
+    v.opened = true;
+
+    const uint64_t size = (uint64_t)f.tellg();
+    uint8_t sector[2048];
+    if ((size >= (16ull * 2352ull + 24ull + sizeof(sector))) &&
+        read_at(f, 16ull * 2352ull + 24ull, sector, sizeof(sector)) &&
+        is_iso_pvd(sector)) {
+        v.has_header = true;
+    } else if ((size >= (16ull * 2048ull + sizeof(sector))) &&
+               read_at(f, 16ull * 2048ull, sector, sizeof(sector)) &&
+               is_iso_pvd(sector)) {
+        v.has_header = true;
+    }
+
+    if (!v.has_header) {
+        v.detail = "No ISO9660 CD001 header was found at the standard PS1 disc locations.";
+        return v;
+    }
+
+    if (game_id.empty()) {
+        v.id_matches = true;
+        return v;
+    }
+
+    const std::string exe_id = uppercase_ascii(psx_exe_id_from_game_id(game_id));
+    const std::string serial_id = uppercase_ascii(game_id);
+    const uint64_t scan_len_u64 = std::min<uint64_t>(size, 16ull * 1024ull * 1024ull);
+    const size_t scan_len = (size_t)scan_len_u64;
+    std::vector<uint8_t> scan(scan_len);
+    if (!read_at(f, 0, scan.data(), scan.size())) {
+        v.detail = "The ISO header is present, but the image could not be scanned for the game ID.";
+        return v;
+    }
+
+    auto contains_ascii = [&](const std::string& needle) {
+        if (needle.empty() || needle.size() > scan.size()) return false;
+        return std::search(scan.begin(), scan.end(), needle.begin(), needle.end()) != scan.end();
+    };
+
+    if (contains_ascii(exe_id) || contains_ascii(serial_id)) {
+        v.id_matches = true;
+    } else {
+        v.detail = "The disc header is readable, but it does not contain the expected game ID " +
+                   exe_id + " / " + serial_id + " in the early disc metadata.";
+    }
+    return v;
+}
+
+static bool validate_disc_for_launch(const std::filesystem::path& path,
+                                     const std::string& game_id) {
+    const DiscValidation v = validate_disc_image(path, game_id);
+    if (!v.opened) {
+        launcher_warning("Disc Image Not Found", v.detail + "\n\nSelected path:\n" + path.string());
+        return false;
+    }
+    if (!v.has_header || !v.id_matches) {
+        launcher_warning("Disc Image Warning",
+            v.detail + "\n\nThis may be the wrong game or a corrupt image. The runtime will try to run it anyway.");
+    }
+    return true;
+}
+
+static bool validate_bios_for_launch(const std::filesystem::path& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) return false;
+    const std::streamoff size = f.tellg();
+    if (size != 512 * 1024) {
+        launcher_warning("BIOS Warning",
+            "The selected BIOS is not 512 KiB. Please select SCPH1001.BIN.");
+        return false;
+    }
+    std::vector<uint8_t> data((size_t)size);
+    if (!read_at(f, 0, data.data(), data.size())) return false;
+    const uint32_t crc = crc32_compute(data.data(), data.size());
+    if (crc != 0x37157331u) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "The selected BIOS CRC32 is %08X, but this build was validated with SCPH1001.BIN CRC32 37157331.\n\n"
+            "The runtime will try it anyway, but boot may fail.", crc);
+        launcher_warning("BIOS Warning", buf);
+    }
+    return true;
+}
+
+static std::filesystem::path resolve_bios_path(const char* requested, const char* argv0);
+
+static std::filesystem::path resolve_bios_for_runtime(const char* requested,
+                                                      const char* argv0) {
+    std::filesystem::path resolved = resolve_bios_path(requested, argv0);
+    if (!resolved.empty() && std::filesystem::exists(resolved) &&
+        validate_bios_for_launch(resolved)) {
+        return resolved;
+    }
+
+    std::filesystem::path cached = read_cached_path(argv0, "bios.cfg");
+    if (!cached.empty() && std::filesystem::exists(cached) &&
+        validate_bios_for_launch(cached)) {
+        return cached;
+    }
+
+    for (;;) {
+        std::filesystem::path picked;
+        if (!pick_runtime_file(
+                "Select SCPH1001.BIN BIOS",
+                "PlayStation BIOS (*.bin)\0*.bin\0All Files (*.*)\0*.*\0",
+                picked)) {
+            return {};
+        }
+        if (validate_bios_for_launch(picked)) {
+            write_cached_path(argv0, "bios.cfg", picked);
+            return picked;
+        }
+    }
+}
+
+static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::path& config_disc,
+                                                      const char* disc_override,
+                                                      const std::string& game_id,
+                                                      const char* argv0) {
+    if (disc_override && disc_override[0]) {
+        std::filesystem::path p = std::filesystem::absolute(disc_override);
+        return validate_disc_for_launch(p, game_id) ? p : std::filesystem::path{};
+    }
+
+    if (!config_disc.empty() && std::filesystem::exists(config_disc) &&
+        validate_disc_for_launch(config_disc, game_id)) {
+        return config_disc;
+    }
+
+    std::filesystem::path cached = read_cached_path(argv0, "disc.cfg");
+    if (!cached.empty() && std::filesystem::exists(cached) &&
+        validate_disc_for_launch(cached, game_id)) {
+        return cached;
+    }
+
+    for (;;) {
+        std::filesystem::path picked;
+        if (!pick_runtime_file(
+                "Select PlayStation Disc Image",
+                "PS1 Disc Images (*.cue;*.bin;*.iso)\0*.cue;*.bin;*.iso\0All Files (*.*)\0*.*\0",
+                picked)) {
+            return {};
+        }
+        if (validate_disc_for_launch(picked, game_id)) {
+            write_cached_path(argv0, "disc.cfg", picked);
+            return picked;
+        }
+    }
 }
 
 static std::filesystem::path resolve_bios_path(const char* requested, const char* argv0) {
@@ -338,23 +677,36 @@ int main(int argc, char** argv) {
 
     const char* bios_path = PSX_DEFAULT_BIOS_PATH;
     const char* game_config_path = nullptr;
+    const char* disc_override_path = nullptr;
     /* Parse args.
      *   --bios <path>       override the compile-time BIOS path
      *   --game <toml>       load a game config (single source of truth for
      *                       disc / memcard / window title / debug port)
+     *   --disc <path>       override the game config disc path
      *   <positional>        deprecated alias for --bios
-     * No --disc / --memcard-dir / --game-root flags: those are config-driven. */
+     * No --memcard-dir / --game-root flags: those are config-driven. */
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--bios") == 0 && i + 1 < argc) {
             bios_path = argv[++i];
         } else if (std::strcmp(argv[i], "--game") == 0 && i + 1 < argc) {
             game_config_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--disc") == 0 && i + 1 < argc) {
+            disc_override_path = argv[++i];
         } else if (argv[i][0] != '-') {
             bios_path = argv[i];
         }
     }
 
-    std::filesystem::path resolved_bios = resolve_bios_path(bios_path, argv[0]);
+    std::string default_game_config_storage;
+    if (!game_config_path) {
+        std::filesystem::path default_game_config =
+            resolve_existing_runtime_path(PSX_DEFAULT_GAME_CONFIG_PATH, argv[0]);
+        if (!default_game_config.empty()) {
+            default_game_config_storage = default_game_config.string();
+            game_config_path = default_game_config_storage.c_str();
+        }
+    }
+
     std::filesystem::path memcard_dir;
     std::filesystem::path resolved_disc;
     std::string window_title = PSX_WINDOW_TITLE;
@@ -376,6 +728,19 @@ int main(int argc, char** argv) {
         } catch (const std::exception& ex) {
             std::fprintf(stderr, "psxrecomp-v4: failed to load --game %s: %s\n",
                          game_config_path, ex.what());
+            return 1;
+        }
+    }
+
+    std::filesystem::path resolved_bios = resolve_bios_for_runtime(bios_path, argv[0]);
+    if (resolved_bios.empty()) {
+        std::fprintf(stderr, "psxrecomp-v4: no BIOS selected; exiting.\n");
+        return 1;
+    }
+    if (game_config_path || disc_override_path || !resolved_disc.empty()) {
+        resolved_disc = resolve_disc_for_runtime(resolved_disc, disc_override_path, game_id, argv[0]);
+        if (game_config_path && resolved_disc.empty()) {
+            std::fprintf(stderr, "psxrecomp-v4: no disc image selected; exiting.\n");
             return 1;
         }
     }
