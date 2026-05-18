@@ -659,15 +659,23 @@ static void gp0_exec_textured_quad(void) {
         vx[0] == vx[2] && vx[1] == vx[3] &&
         u[0] == u[2] && u[1] == u[3] &&
         v[0] == v[1] && v[2] == v[3]) {
-        int w = vx[1] - vx[0];
-        int h = vy[2] - vy[0];
-        if (w > 0 && h > 0 &&
-            u[1] - u[0] == w && v[2] - v[0] == h) {
-            sw_draw_textured_rect(vx[0], vy[0], w, h, u[0], v[0],
-                                  clut_x, clut_y, tpage);
-            return;
-        }
-        if (w <= 0 || h <= 0) {
+        int x = vx[0] < vx[1] ? vx[0] : vx[1];
+        int y = vy[0] < vy[2] ? vy[0] : vy[2];
+        int w = vx[0] < vx[1] ? vx[1] - vx[0] : vx[0] - vx[1];
+        int h = vy[0] < vy[2] ? vy[2] - vy[0] : vy[0] - vy[2];
+        int left_u  = vx[0] < vx[1] ? u[0] : u[1];
+        int right_u = vx[0] < vx[1] ? u[1] : u[0];
+        int top_v   = vy[0] < vy[2] ? v[0] : v[2];
+        int bot_v   = vy[0] < vy[2] ? v[2] : v[0];
+        if (w > 0 && h > 0) {
+            if (right_u - left_u == w && bot_v - top_v == h) {
+                sw_draw_textured_rect(x, y, w, h, left_u, top_v,
+                                      clut_x, clut_y, tpage);
+                return;
+            }
+            sw_draw_textured_rect_scaled(x, y, w, h, left_u, top_v,
+                                         right_u, bot_v,
+                                         clut_x, clut_y, tpage);
             return;
         }
     }
