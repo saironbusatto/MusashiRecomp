@@ -22,7 +22,7 @@ target is [TombaRecomp](https://github.com/mstan/TombaRecomp).
 
 ## Status
 
-Current milestone as of 2026-05-17:
+Current milestone as of 2026-05-18:
 
 | Subsystem | State |
 |---|---|
@@ -34,12 +34,13 @@ Current milestone as of 2026-05-17:
 | GPU | Functional for BIOS boot, FMVs, menus, and first gameplay area |
 | Interrupts, COP0, timers | Working for current Tomba path |
 | Dirty-RAM support | BIOS/game RAM-installed dispatch paths handled |
+| Controller input | Keyboard plus SDL/XInput-style controller mapping via `input.ini` |
 
 Known follow-up work:
 
-- Tomba title-menu glyphs for `NEW GAME / LOAD / OPTIONS` are still fuzzy.
-- The BIOS disc-detected screen is still missing the PS logo glyph.
-- In-game rendering needs more visual correctness work.
+- The recent Tomba visual burn-down fixed the BIOS PS logo, title/menu glyph
+  seams, dialog/pause panel seams, terrain shading, and shaded textured branch
+  rendering observed in the first area.
 - SPU coverage is partial; reverb, noise, sweep, and accurate SPU IRQ behavior
   are not complete.
 - The historical Windows "Not Responding" hang is mitigated but should stay on
@@ -56,6 +57,21 @@ cmake --build build -j16
 
 Running this repository's runtime without `--game` is still useful for
 BIOS-only memory card management.
+
+## Release Package
+
+The framework release package is BIOS-only:
+
+1. Download `PSXRecomp-v*-windows-x64.zip` from Releases.
+2. Extract it and run `PSXRecomp.exe`.
+3. Select your legally obtained `SCPH1001.BIN` BIOS when prompted.
+
+The package does not include a PS1 BIOS, game disc image, generated game code,
+or save data. The selected BIOS path is saved next to the executable as
+`bios.cfg`; delete that file to pick a different BIOS later.
+
+Game-specific recomp projects, including TombaRecomp, use the same runtime
+picker contract but also prompt for a legally obtained game disc image.
 
 ## Setup
 
@@ -93,6 +109,25 @@ runtime source tree through CMake.
 | Start | Enter |
 | Select | Right Shift |
 | Turbo | Tab (hold) |
+
+## Controller Map
+
+Xbox-style controller defaults are enabled when a controller is connected:
+
+| PSX button | Xbox controller |
+|---|---|
+| D-Pad Up / Down / Left / Right | D-pad or left stick |
+| Cross | A |
+| Circle | B |
+| Square | X |
+| Triangle | Y |
+| L1 / R1 | LB / RB |
+| L2 / R2 | LT / RT |
+| Start | Menu |
+| Select | View / Back |
+
+Release builds create/use `input.ini` next to the executable. Edit that file to
+change controller device index, deadzone, or button mapping.
 
 ## Architecture
 

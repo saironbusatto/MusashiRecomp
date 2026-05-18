@@ -24,6 +24,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <exception>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -79,6 +80,8 @@ extern "C" void     psx_write_byte(uint32_t addr, uint8_t val);
 static SDL_Window*   sdl_window;
 static SDL_Renderer* sdl_renderer;
 static SDL_Texture*  sdl_texture;
+static SDL_GameController* sdl_controller;
+static SDL_JoystickID      sdl_controller_instance = -1;
 static uint32_t      sdl_pixel_buf[640 * 512]; /* ARGB8888 staging buffer */
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
@@ -457,6 +460,8 @@ static std::filesystem::path default_memcard_dir(const char* argv0) {
     return exe_dir;
 }
 
+static void close_controller(void);
+
 static void shutdown_runtime(void) {
     memcard_flush_all();
     if (sdl_audio_device) {
@@ -464,6 +469,7 @@ static void shutdown_runtime(void) {
         SDL_CloseAudioDevice(sdl_audio_device);
         sdl_audio_device = 0;
     }
+    close_controller();
     debug_server_shutdown();
 }
 
@@ -514,7 +520,319 @@ static inline uint32_t psx16_to_argb(uint16_t c) {
 #define PAD_CROSS    (1 << 14)
 #define PAD_SQUARE   (1 << 15)
 
-static void update_pad_from_keyboard(void) {
+struct ControllerSource {
+    enum class Kind {
+        None,
+        Button,
+        AxisPositive,
+        AxisNegative,
+    };
+
+    Kind kind = Kind::None;
+    int id = -1;
+};
+
+struct PsxButtonMap {
+    uint16_t bit;
+    const char* ini_name;
+    std::vector<ControllerSource> sources;
+};
+
+static int controller_device_index = 0;
+static int controller_deadzone = 12000;
+static std::array<PsxButtonMap, 14> controller_map = {{
+    { PAD_UP,       "up",       {} },
+    { PAD_DOWN,     "down",     {} },
+    { PAD_LEFT,     "left",     {} },
+    { PAD_RIGHT,    "right",    {} },
+    { PAD_CROSS,    "cross",    {} },
+    { PAD_CIRCLE,   "circle",   {} },
+    { PAD_SQUARE,   "square",   {} },
+    { PAD_TRIANGLE, "triangle", {} },
+    { PAD_L1,       "l1",       {} },
+    { PAD_R1,       "r1",       {} },
+    { PAD_L2,       "l2",       {} },
+    { PAD_R2,       "r2",       {} },
+    { PAD_START,    "start",    {} },
+    { PAD_SELECT,   "select",   {} },
+}};
+
+static std::string trim_copy(const std::string& s) {
+    size_t first = 0;
+    while (first < s.size() && std::isspace((unsigned char)s[first])) first++;
+    size_t last = s.size();
+    while (last > first && std::isspace((unsigned char)s[last - 1])) last--;
+    return s.substr(first, last - first);
+}
+
+static std::string lower_copy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return s;
+}
+
+static bool parse_bool_value(const std::string& value, bool fallback) {
+    std::string v = lower_copy(trim_copy(value));
+    if (v == "1" || v == "true" || v == "yes" || v == "on") return true;
+    if (v == "0" || v == "false" || v == "no" || v == "off") return false;
+    return fallback;
+}
+
+static ControllerSource parse_controller_source(const std::string& raw) {
+    std::string s = lower_copy(trim_copy(raw));
+    ControllerSource out;
+    if (s.empty() || s == "none" || s == "disabled") return out;
+
+    if (s == "a")              { out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_A; return out; }
+    if (s == "b")              { out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_B; return out; }
+    if (s == "x")              { out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_X; return out; }
+    if (s == "y")              { out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_Y; return out; }
+    if (s == "back" || s == "view" || s == "select") {
+        out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_BACK; return out;
+    }
+    if (s == "start" || s == "menu") {
+        out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_START; return out;
+    }
+    if (s == "guide")          { out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_GUIDE; return out; }
+    if (s == "leftstick")      { out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_LEFTSTICK; return out; }
+    if (s == "rightstick")     { out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_RIGHTSTICK; return out; }
+    if (s == "leftshoulder" || s == "lb" || s == "l1") {
+        out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_LEFTSHOULDER; return out;
+    }
+    if (s == "rightshoulder" || s == "rb" || s == "r1") {
+        out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_RIGHTSHOULDER; return out;
+    }
+    if (s == "dpup" || s == "dpadup") {
+        out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_DPAD_UP; return out;
+    }
+    if (s == "dpdown" || s == "dpaddown") {
+        out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_DPAD_DOWN; return out;
+    }
+    if (s == "dpleft" || s == "dpadleft") {
+        out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_DPAD_LEFT; return out;
+    }
+    if (s == "dpright" || s == "dpadright") {
+        out.kind = ControllerSource::Kind::Button; out.id = SDL_CONTROLLER_BUTTON_DPAD_RIGHT; return out;
+    }
+    if (s == "lefttrigger" || s == "lt" || s == "l2") {
+        out.kind = ControllerSource::Kind::AxisPositive; out.id = SDL_CONTROLLER_AXIS_TRIGGERLEFT; return out;
+    }
+    if (s == "righttrigger" || s == "rt" || s == "r2") {
+        out.kind = ControllerSource::Kind::AxisPositive; out.id = SDL_CONTROLLER_AXIS_TRIGGERRIGHT; return out;
+    }
+    if (s == "leftx+" || s == "lsright") {
+        out.kind = ControllerSource::Kind::AxisPositive; out.id = SDL_CONTROLLER_AXIS_LEFTX; return out;
+    }
+    if (s == "leftx-" || s == "lsleft") {
+        out.kind = ControllerSource::Kind::AxisNegative; out.id = SDL_CONTROLLER_AXIS_LEFTX; return out;
+    }
+    if (s == "lefty+" || s == "lsdown") {
+        out.kind = ControllerSource::Kind::AxisPositive; out.id = SDL_CONTROLLER_AXIS_LEFTY; return out;
+    }
+    if (s == "lefty-" || s == "lsup") {
+        out.kind = ControllerSource::Kind::AxisNegative; out.id = SDL_CONTROLLER_AXIS_LEFTY; return out;
+    }
+    if (s == "rightx+" || s == "rsright") {
+        out.kind = ControllerSource::Kind::AxisPositive; out.id = SDL_CONTROLLER_AXIS_RIGHTX; return out;
+    }
+    if (s == "rightx-" || s == "rsleft") {
+        out.kind = ControllerSource::Kind::AxisNegative; out.id = SDL_CONTROLLER_AXIS_RIGHTX; return out;
+    }
+    if (s == "righty+" || s == "rsdown") {
+        out.kind = ControllerSource::Kind::AxisPositive; out.id = SDL_CONTROLLER_AXIS_RIGHTY; return out;
+    }
+    if (s == "righty-" || s == "rsup") {
+        out.kind = ControllerSource::Kind::AxisNegative; out.id = SDL_CONTROLLER_AXIS_RIGHTY; return out;
+    }
+
+    SDL_GameControllerButton button = SDL_GameControllerGetButtonFromString(s.c_str());
+    if (button != SDL_CONTROLLER_BUTTON_INVALID) {
+        out.kind = ControllerSource::Kind::Button;
+        out.id = button;
+        return out;
+    }
+    SDL_GameControllerAxis axis = SDL_GameControllerGetAxisFromString(s.c_str());
+    if (axis != SDL_CONTROLLER_AXIS_INVALID) {
+        out.kind = ControllerSource::Kind::AxisPositive;
+        out.id = axis;
+        return out;
+    }
+    return out;
+}
+
+static std::vector<ControllerSource> parse_source_list(const std::string& value) {
+    std::vector<ControllerSource> sources;
+    std::stringstream ss(value);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        ControllerSource source = parse_controller_source(item);
+        if (source.kind != ControllerSource::Kind::None) {
+            sources.push_back(source);
+        }
+    }
+    return sources;
+}
+
+static void set_default_controller_mapping(void) {
+    for (auto& entry : controller_map) entry.sources.clear();
+
+    auto set_sources = [](const char* name, const char* sources) {
+        for (auto& entry : controller_map) {
+            if (std::strcmp(entry.ini_name, name) == 0) {
+                entry.sources = parse_source_list(sources);
+                return;
+            }
+        }
+    };
+
+    set_sources("up",       "dpup,lefty-");
+    set_sources("down",     "dpdown,lefty+");
+    set_sources("left",     "dpleft,leftx-");
+    set_sources("right",    "dpright,leftx+");
+    set_sources("cross",    "a");
+    set_sources("circle",   "b");
+    set_sources("square",   "x");
+    set_sources("triangle", "y");
+    set_sources("l1",       "leftshoulder");
+    set_sources("r1",       "rightshoulder");
+    set_sources("l2",       "lefttrigger");
+    set_sources("r2",       "righttrigger");
+    set_sources("start",    "start");
+    set_sources("select",   "back");
+}
+
+static std::string default_input_ini_text(void) {
+    return
+        "; PSXRecomp input mapping. PSX buttons are active when any listed source is pressed.\n"
+        "; Sources use SDL/Xbox names: a,b,x,y,back,start,leftshoulder,rightshoulder,\n"
+        "; lefttrigger,righttrigger,dpup,dpdown,dpleft,dpright,leftx-/leftx+/lefty-/lefty+.\n"
+        "\n"
+        "[controller]\n"
+        "enabled = true\n"
+        "device = 0\n"
+        "deadzone = 12000\n"
+        "\n"
+        "[mapping]\n"
+        "up = dpup,lefty-\n"
+        "down = dpdown,lefty+\n"
+        "left = dpleft,leftx-\n"
+        "right = dpright,leftx+\n"
+        "cross = a\n"
+        "circle = b\n"
+        "square = x\n"
+        "triangle = y\n"
+        "l1 = leftshoulder\n"
+        "r1 = rightshoulder\n"
+        "l2 = lefttrigger\n"
+        "r2 = righttrigger\n"
+        "start = start\n"
+        "select = back\n";
+}
+
+static void load_input_config(const char* argv0) {
+    set_default_controller_mapping();
+
+    namespace fs = std::filesystem;
+    fs::path config_path = exe_dir_from_argv(argv0) / "input.ini";
+    std::error_code ec;
+    if (!fs::exists(config_path, ec)) {
+        std::ofstream out(config_path, std::ios::binary);
+        if (out) out << default_input_ini_text();
+        return;
+    }
+
+    std::ifstream in(config_path);
+    if (!in) return;
+
+    bool controller_enabled = true;
+    std::string section;
+    std::string line;
+    while (std::getline(in, line)) {
+        size_t comment = line.find_first_of(";#");
+        if (comment != std::string::npos) line.resize(comment);
+        line = trim_copy(line);
+        if (line.empty()) continue;
+        if (line.front() == '[' && line.back() == ']') {
+            section = lower_copy(trim_copy(line.substr(1, line.size() - 2)));
+            continue;
+        }
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+
+        std::string key = lower_copy(trim_copy(line.substr(0, eq)));
+        std::string value = trim_copy(line.substr(eq + 1));
+        if (section == "controller") {
+            if (key == "enabled") {
+                controller_enabled = parse_bool_value(value, controller_enabled);
+            } else if (key == "device") {
+                controller_device_index = std::max(0, std::atoi(value.c_str()));
+            } else if (key == "deadzone") {
+                controller_deadzone = std::max(0, std::min(32767, std::atoi(value.c_str())));
+            }
+        } else if (section == "mapping") {
+            for (auto& entry : controller_map) {
+                if (key == entry.ini_name) {
+                    entry.sources = parse_source_list(value);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!controller_enabled) {
+        for (auto& entry : controller_map) entry.sources.clear();
+    }
+}
+
+static void close_controller(void) {
+    if (sdl_controller) {
+        SDL_GameControllerClose(sdl_controller);
+        sdl_controller = nullptr;
+        sdl_controller_instance = -1;
+    }
+}
+
+static void open_configured_controller(void) {
+    if (sdl_controller) return;
+
+    int seen = 0;
+    int joysticks = SDL_NumJoysticks();
+    for (int i = 0; i < joysticks; i++) {
+        if (!SDL_IsGameController(i)) continue;
+        if (seen++ != controller_device_index) continue;
+
+        sdl_controller = SDL_GameControllerOpen(i);
+        if (sdl_controller) {
+            SDL_Joystick* joy = SDL_GameControllerGetJoystick(sdl_controller);
+            sdl_controller_instance = joy ? SDL_JoystickInstanceID(joy) : -1;
+            const char* name = SDL_GameControllerName(sdl_controller);
+            std::fprintf(stdout, "psxrecomp-v4 runtime: controller %d: %s\n",
+                         controller_device_index, name ? name : "(unnamed)");
+        }
+        break;
+    }
+}
+
+static bool controller_source_pressed(const ControllerSource& source) {
+    if (!sdl_controller) return false;
+
+    switch (source.kind) {
+    case ControllerSource::Kind::Button:
+        return SDL_GameControllerGetButton(
+            sdl_controller, (SDL_GameControllerButton)source.id) != 0;
+    case ControllerSource::Kind::AxisPositive:
+        return SDL_GameControllerGetAxis(
+            sdl_controller, (SDL_GameControllerAxis)source.id) > controller_deadzone;
+    case ControllerSource::Kind::AxisNegative:
+        return SDL_GameControllerGetAxis(
+            sdl_controller, (SDL_GameControllerAxis)source.id) < -controller_deadzone;
+    case ControllerSource::Kind::None:
+    default:
+        return false;
+    }
+}
+
+static uint16_t pad_from_keyboard(void) {
     const Uint8* keys = SDL_GetKeyboardState(NULL);
     uint16_t buttons = 0xFFFF; /* all released */
 
@@ -533,7 +851,21 @@ static void update_pad_from_keyboard(void) {
     if (keys[SDL_SCANCODE_E])       buttons &= ~PAD_L2;
     if (keys[SDL_SCANCODE_R])       buttons &= ~PAD_R2;
 
-    sio_set_pad_state(buttons);
+    return buttons;
+}
+
+static uint16_t merge_controller_pad(uint16_t buttons) {
+    if (!sdl_controller) return buttons;
+
+    for (const auto& entry : controller_map) {
+        for (const auto& source : entry.sources) {
+            if (controller_source_pressed(source)) {
+                buttons &= (uint16_t)~entry.bit;
+                break;
+            }
+        }
+    }
+    return buttons;
 }
 
 /* PSX native vblank cadence: NTSC ≈ 59.94 Hz. Wall-clock target keeps
@@ -568,6 +900,13 @@ static void sdl_vblank_present(void) {
         if (ev.type == SDL_QUIT) {
             shutdown_runtime();
             std::exit(0);
+        } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
+            open_configured_controller();
+        } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+            if (ev.cdevice.which == sdl_controller_instance) {
+                close_controller();
+                open_configured_controller();
+            }
         }
     }
 
@@ -577,8 +916,7 @@ static void sdl_vblank_present(void) {
     if (override >= 0) {
         pad_buttons_this_frame = (uint16_t)override;
     } else {
-        update_pad_from_keyboard();
-        pad_buttons_this_frame = sio_get_pad_buttons();
+        pad_buttons_this_frame = merge_controller_pad(pad_from_keyboard());
     }
     sio_set_pad_state(pad_buttons_this_frame);
 #ifndef PSX_SDL_NO_AUDIO
@@ -776,10 +1114,13 @@ int main(int argc, char** argv) {
 
     /* ---- SDL init ---- */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
-    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
+    load_input_config(argv[0]);
+    open_configured_controller();
 #ifndef PSX_SDL_NO_AUDIO
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
         SDL_AudioSpec want;
