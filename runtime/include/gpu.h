@@ -18,6 +18,7 @@ uint32_t gpu_read_gpustat(void);   /* 0x1F801814 read */
 uint32_t gpu_read_gpuread(void);   /* 0x1F801810 read */
 void     gpu_write_gp0(uint32_t val);  /* 0x1F801810 write */
 void     gpu_write_gp1(uint32_t val);  /* 0x1F801814 write */
+void     gpu_set_gp0_source(uint32_t addr); /* diagnostic source for next GP0 word */
 void     gpu_vblank_tick(void);        /* Toggle LCF, called at each simulated vblank */
 
 /* Display presentation accessors (Phase 3). */
@@ -53,10 +54,12 @@ int  gpu_get_shaded_quad_capture(const GpuSqCapEntry** out);
  * (longer commands like 0x3C shaded textured quad are truncated to 6).
  * Stamped with the s_frame_count value at issue time so a debug
  * client can pull all commands for any frame in the ring window. */
-#define GPU_GP0_RING_MAX_WORDS 6
+#define GPU_GP0_RING_MAX_WORDS 12
 typedef struct {
     uint32_t frame;
     uint32_t seq;
+    uint32_t src_addr;      /* RAM/MMIO source address of command header, if known */
+    uint32_t pc;            /* g_debug_last_store_pc when command completes */
     uint8_t  opcode;
     uint8_t  n_words;       /* total command length; >MAX means truncated */
     uint16_t pad;

@@ -68,9 +68,9 @@ static void light_color(GTEState* gte) {
 
 // Multiply IR by RGBC color and push to RGB FIFO (step 3 of color output)
 static void color_output(GTEState* gte) {
-    uint8_t r0 = (gte->RGB[0] >> 0)  & 0xFF;
-    uint8_t g0 = (gte->RGB[0] >> 8)  & 0xFF;
-    uint8_t b0 = (gte->RGB[0] >> 16) & 0xFF;
+    uint8_t r0 = (gte->RGBC >> 0)  & 0xFF;
+    uint8_t g0 = (gte->RGBC >> 8)  & 0xFF;
+    uint8_t b0 = (gte->RGBC >> 16) & 0xFF;
     int64_t mac1 = ((int64_t)r0 * gte->IR1) << 4;
     int64_t mac2 = ((int64_t)g0 * gte->IR2) << 4;
     int64_t mac3 = ((int64_t)b0 * gte->IR3) << 4;
@@ -301,9 +301,9 @@ void gte_nct(GTEState* gte, uint32_t instr) {
 // ---------------------------------------------------------------------------
 void gte_dpcs(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
-    uint8_t r = (gte->RGB[0] >> 0)  & 0xFF;
-    uint8_t g = (gte->RGB[0] >> 8)  & 0xFF;
-    uint8_t b = (gte->RGB[0] >> 16) & 0xFF;
+    uint8_t r = (gte->RGBC >> 0)  & 0xFF;
+    uint8_t g = (gte->RGBC >> 8)  & 0xFF;
+    uint8_t b = (gte->RGBC >> 16) & 0xFF;
     // MAC = RGBC << 4
     gte->IR1 = gte->saturate_ir(r << 4, 1, false);
     gte->IR2 = gte->saturate_ir(g << 4, 2, false);
@@ -345,9 +345,9 @@ void gte_dpct(GTEState* gte, uint32_t instr) {
 void gte_dpcl(GTEState* gte, uint32_t instr) {
     gte->FLAG = 0;
     // IR already contains lighting result, multiply by RGBC
-    uint8_t r = (gte->RGB[0] >> 0)  & 0xFF;
-    uint8_t g = (gte->RGB[0] >> 8)  & 0xFF;
-    uint8_t b = (gte->RGB[0] >> 16) & 0xFF;
+    uint8_t r = (gte->RGBC >> 0)  & 0xFF;
+    uint8_t g = (gte->RGBC >> 8)  & 0xFF;
+    uint8_t b = (gte->RGBC >> 16) & 0xFF;
     gte->MAC1 = (r * gte->IR1) >> 8;
     gte->MAC2 = (g * gte->IR2) >> 8;
     gte->MAC3 = (b * gte->IR3) >> 8;
@@ -586,7 +586,7 @@ void gte_mtc2(GTEState* gte, uint8_t reg, uint32_t value) {
         case 3:  gte->V1[2] = value & 0xFFFF; break;
         case 4:  gte->V2[0] = value & 0xFFFF; gte->V2[1] = value >> 16; break;
         case 5:  gte->V2[2] = value & 0xFFFF; break;
-        case 6:  gte->RGB[0] = value; break;
+        case 6:  gte->RGBC = value; break;
         case 7:  gte->OTZ = value & 0xFFFF; break;
         case 8:  gte->IR0 = static_cast<int16_t>(value & 0xFFFF); break;
         case 9:  gte->IR1 = static_cast<int16_t>(value & 0xFFFF); break;
@@ -643,7 +643,7 @@ uint32_t gte_mfc2(GTEState* gte, uint8_t reg) {
         case 3:  return static_cast<uint16_t>(gte->V1[2]);
         case 4:  return (static_cast<uint16_t>(gte->V2[1]) << 16) | static_cast<uint16_t>(gte->V2[0]);
         case 5:  return static_cast<uint16_t>(gte->V2[2]);
-        case 6:  return gte->RGB[0];
+        case 6:  return gte->RGBC;
         case 7:  return gte->OTZ;
         case 8:  return static_cast<int32_t>(gte->IR0);  // sign-extend
         case 9:  return static_cast<int32_t>(gte->IR1);

@@ -38,6 +38,8 @@ static uint64_t gp0_nop_count, gp0_fill_count, gp0_draw_count, gp0_env_count, gp
 static uint32_t gp0_cmd_buf[16];   /* max fixed-length command is 12 words */
 static int      gp0_words_collected;
 static int      gp0_words_needed;
+static uint32_t gp0_next_source_addr = 0xFFFFFFFFu;
+static uint32_t gp0_cmd_source_addr  = 0xFFFFFFFFu;
 
 /* Polyline state */
 static uint16_t polyline_color;       /* mono polyline: current color */
@@ -652,6 +654,24 @@ static void gp0_exec_textured_quad(void) {
     }
 
     setup_textured_draw(color24, semi_trans, raw_texture);
+
+    if (vy[0] == vy[1] && vy[2] == vy[3] &&
+        vx[0] == vx[2] && vx[1] == vx[3] &&
+        u[0] == u[2] && u[1] == u[3] &&
+        v[0] == v[1] && v[2] == v[3]) {
+        int w = vx[1] - vx[0];
+        int h = vy[2] - vy[0];
+        if (w > 0 && h > 0 &&
+            u[1] - u[0] == w && v[2] - v[0] == h) {
+            sw_draw_textured_rect(vx[0], vy[0], w, h, u[0], v[0],
+                                  clut_x, clut_y, tpage);
+            return;
+        }
+        if (w <= 0 || h <= 0) {
+            return;
+        }
+    }
+
     sw_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
                               vx[1], vy[1], u[1], v[1],
                               vx[2], vy[2], u[2], v[2],
@@ -664,12 +684,15 @@ static void gp0_exec_textured_quad(void) {
 
 /* Execute shaded textured triangle (GP0 0x34-0x37) */
 static void gp0_exec_shaded_textured_tri(void) {
-    uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t vx[3], vy[3];
     int u[3], v[3];
+    uint32_t c[3];
     /* Layout: C0, V0, TC0+clut, C1, V1, TC1+tpage, C2, V2, TC2 */
+    c[0] = gp0_cmd_buf[0] & 0xFFFFFFu;
+    c[1] = gp0_cmd_buf[3] & 0xFFFFFFu;
+    c[2] = gp0_cmd_buf[6] & 0xFFFFFFu;
     parse_vertex(gp0_cmd_buf[1], &vx[0], &vy[0]);
     parse_vertex(gp0_cmd_buf[4], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[7], &vx[2], &vy[2]);
@@ -686,21 +709,25 @@ static void gp0_exec_shaded_textured_tri(void) {
         vy[i] += draw_offset_y;
     }
 
-    setup_textured_draw(color24, semi_trans, raw_texture);
-    sw_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
-                              vx[1], vy[1], u[1], v[1],
-                              vx[2], vy[2], u[2], v[2],
-                              clut_x, clut_y, tpage);
+    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+    sw_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
+                                     vx[1], vy[1], u[1], v[1], c[1],
+                                     vx[2], vy[2], u[2], v[2], c[2],
+                                     clut_x, clut_y, tpage, raw_texture);
 }
 
 /* Execute shaded textured quad (GP0 0x3C-0x3F) */
 static void gp0_exec_shaded_textured_quad(void) {
-    uint32_t color24 = gp0_cmd_buf[0] & 0xFFFFFFu;
     int semi_trans = (gp0_cmd_buf[0] >> 25) & 1;
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t vx[4], vy[4];
     int u[4], v[4];
+    uint32_t c[4];
     /* Layout: C0, V0, TC0+clut, C1, V1, TC1+tpage, C2, V2, TC2, C3, V3, TC3 */
+    c[0] = gp0_cmd_buf[0] & 0xFFFFFFu;
+    c[1] = gp0_cmd_buf[3] & 0xFFFFFFu;
+    c[2] = gp0_cmd_buf[6] & 0xFFFFFFu;
+    c[3] = gp0_cmd_buf[9] & 0xFFFFFFu;
     parse_vertex(gp0_cmd_buf[1], &vx[0], &vy[0]);
     parse_vertex(gp0_cmd_buf[4], &vx[1], &vy[1]);
     parse_vertex(gp0_cmd_buf[7], &vx[2], &vy[2]);
@@ -719,15 +746,15 @@ static void gp0_exec_shaded_textured_quad(void) {
         vy[i] += draw_offset_y;
     }
 
-    setup_textured_draw(color24, semi_trans, raw_texture);
-    sw_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
-                              vx[1], vy[1], u[1], v[1],
-                              vx[2], vy[2], u[2], v[2],
-                              clut_x, clut_y, tpage);
-    sw_draw_textured_triangle(vx[2], vy[2], u[2], v[2],
-                              vx[1], vy[1], u[1], v[1],
-                              vx[3], vy[3], u[3], v[3],
-                              clut_x, clut_y, tpage);
+    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+    sw_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
+                                     vx[1], vy[1], u[1], v[1], c[1],
+                                     vx[2], vy[2], u[2], v[2], c[2],
+                                     clut_x, clut_y, tpage, raw_texture);
+    sw_draw_shaded_textured_triangle(vx[2], vy[2], u[2], v[2], c[2],
+                                     vx[1], vy[1], u[1], v[1], c[1],
+                                     vx[3], vy[3], u[3], v[3], c[3],
+                                     clut_x, clut_y, tpage, raw_texture);
 }
 
 /* Execute mono line (GP0 0x40-0x47) — Bresenham */
@@ -1204,6 +1231,7 @@ uint32_t gpu_get_opcode_count(uint8_t op) { return gp0_opcode_count[op]; }
  * + first uv/color word for diagnosing per-primitive state. */
 
 extern uint64_t s_frame_count;  /* defined in debug_server.c */
+extern uint32_t g_debug_last_store_pc;  /* defined in debug_server.c */
 
 #define GP0_RING_CAP        (1u << 20)  /* 1 048 576 entries */
 /* GpuGp0RingEntry + GPU_GP0_RING_MAX_WORDS are public types in gpu.h. */
@@ -1220,6 +1248,8 @@ static void gp0_ring_record(const uint32_t *words, int n) {
     GpuGp0RingEntry *e = &gp0_ring[gp0_ring_head];
     e->frame   = (uint32_t)s_frame_count;
     e->seq     = (uint32_t)gp0_ring_seq;
+    e->src_addr = gp0_cmd_source_addr;
+    e->pc      = g_debug_last_store_pc;
     e->opcode  = (uint8_t)((words[0] >> 24) & 0xFF);
     e->n_words = (uint8_t)(n > 255 ? 255 : (n < 0 ? 1 : n));
     e->pad     = 0;
@@ -1234,6 +1264,10 @@ static void gp0_ring_record(const uint32_t *words, int n) {
 uint64_t gpu_gp0_ring_total(void)    { return gp0_ring_seq; }
 uint32_t gpu_gp0_ring_capacity(void) { return GP0_RING_CAP; }
 uint32_t gpu_gp0_ring_max_words(void){ return GPU_GP0_RING_MAX_WORDS; }
+
+void gpu_set_gp0_source(uint32_t addr) {
+    gp0_next_source_addr = addr;
+}
 
 /* Fill `out[0..max_out-1]` with entries from the requested frame; returns
  * count. Walks from oldest in-buffer to newest so iteration order matches
@@ -1634,6 +1668,7 @@ void gpu_write_gp0(uint32_t val) {
     }
 
     gp0_cmd_buf[0] = val;
+    gp0_cmd_source_addr = gp0_next_source_addr;
 
     if (word_count == 1) {
         gp0_words_collected = 1;

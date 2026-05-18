@@ -1,7 +1,7 @@
 {
   "schema": "psxrecomp-v4 phase2 seeds",
   "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
-  "seed_count": 1070,
+  "seed_count": 1071,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -4676,6 +4676,11 @@
       "address": "0xBFC34EC4",
       "label": "gte_lib_BFC34EC4",
       "rationale": "GTE math library function. Batch-discovered from BFC33000-BFC36000."
+    },
+    {
+      "address": "0xBFC34FA0",
+      "label": "gte_lib_BFC34FA0",
+      "rationale": "GTE math library function missed by adjacent batch discovery; contains the BFC34FF8-BFC350C4 MVMVA/SWC2 helper used by the BIOS disc logo screen."
     },
     {
       "address": "0xBFC35128",

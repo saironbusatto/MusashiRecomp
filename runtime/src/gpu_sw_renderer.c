@@ -139,7 +139,9 @@ static inline void draw_pixel_opaque(int x, int y, uint16_t color) {
 }
 
 /* Write a textured pixel — semi-trans only if texel bit 15 is set */
-static inline void draw_pixel_textured(int x, int y, uint16_t texel) {
+static inline void draw_pixel_textured_modulated(int x, int y, uint16_t texel,
+                                                 int mod_r, int mod_g, int mod_b,
+                                                 int raw_texture) {
     if (x < 0 || x >= VRAM_WIDTH || y < 0 || y >= VRAM_HEIGHT) return;
     if (!inside_draw_area(x, y)) return;
 
@@ -153,15 +155,15 @@ static inline void draw_pixel_textured(int x, int y, uint16_t texel) {
 
     /* Color modulation: multiply texel by vertex color unless raw texture */
     uint16_t color;
-    if (!g_raw_texture) {
+    if (!raw_texture) {
         int tr = (texel >>  0) & 0x1F;
         int tg = (texel >>  5) & 0x1F;
         int tb = (texel >> 10) & 0x1F;
         /* PS1 formula: (texel * color * 2) / 256, with 5-bit texel scaled to 8-bit.
          * Simplified: (tr * mod_r) >> 4, clamped to 31 */
-        int r = (tr * g_mod_r) >> 4; if (r > 31) r = 31;
-        int g = (tg * g_mod_g) >> 4; if (g > 31) g = 31;
-        int b = (tb * g_mod_b) >> 4; if (b > 31) b = 31;
+        int r = (tr * mod_r) >> 4; if (r > 31) r = 31;
+        int g = (tg * mod_g) >> 4; if (g > 31) g = 31;
+        int b = (tb * mod_b) >> 4; if (b > 31) b = 31;
         color = (uint16_t)(r | (g << 5) | (b << 10));
     } else {
         color = texel & 0x7FFF;
@@ -176,6 +178,12 @@ static inline void draw_pixel_textured(int x, int y, uint16_t texel) {
     if (g_mask_set_bit) color |= 0x8000;
 
     g_vram[idx] = color;
+}
+
+static inline void draw_pixel_textured(int x, int y, uint16_t texel) {
+    draw_pixel_textured_modulated(x, y, texel,
+                                  g_mod_r, g_mod_g, g_mod_b,
+                                  g_raw_texture);
 }
 
 /* ------------------------------------------------------------------ */
@@ -506,6 +514,10 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
                                int x2, int y2, int u2, int v2,
                                uint16_t clut_x, uint16_t clut_y,
                                uint16_t texpage) {
+    int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
+                  - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
+    if (area2 == 0) return;
+
     /* Sort by Y, keeping UV in sync */
     if (y0 > y1) {
         int t;
@@ -578,6 +590,129 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
 
             uint16_t texel = texel_fetch(u, v_coord, texpage, clut_x, clut_y);
             draw_pixel_textured(x, y, texel);
+        }
+    }
+}
+
+static inline void color24_to_mod(uint32_t color, int *r, int *g, int *b) {
+    *r = (int)((color >> 0) & 0xFF) >> 3;
+    *g = (int)((color >> 8) & 0xFF) >> 3;
+    *b = (int)((color >> 16) & 0xFF) >> 3;
+}
+
+void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
+                                      uint32_t color0,
+                                      int x1, int y1, int u1, int v1,
+                                      uint32_t color1,
+                                      int x2, int y2, int u2, int v2,
+                                      uint32_t color2,
+                                      uint16_t clut_x, uint16_t clut_y,
+                                      uint16_t texpage, int raw_texture) {
+    int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
+                  - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
+    if (area2 == 0) return;
+
+    int r0, g0, b0;
+    int r1, g1, b1;
+    int r2, g2, b2;
+    color24_to_mod(color0, &r0, &g0, &b0);
+    color24_to_mod(color1, &r1, &g1, &b1);
+    color24_to_mod(color2, &r2, &g2, &b2);
+
+    /* Sort by Y, keeping UV and color modulation in sync */
+    if (y0 > y1) {
+        int t;
+        t=x0; x0=x1; x1=t; t=y0; y0=y1; y1=t;
+        t=u0; u0=u1; u1=t; t=v0; v0=v1; v1=t;
+        t=r0; r0=r1; r1=t; t=g0; g0=g1; g1=t; t=b0; b0=b1; b1=t;
+    }
+    if (y0 > y2) {
+        int t;
+        t=x0; x0=x2; x2=t; t=y0; y0=y2; y2=t;
+        t=u0; u0=u2; u2=t; t=v0; v0=v2; v2=t;
+        t=r0; r0=r2; r2=t; t=g0; g0=g2; g2=t; t=b0; b0=b2; b2=t;
+    }
+    if (y1 > y2) {
+        int t;
+        t=x1; x1=x2; x2=t; t=y1; y1=y2; y2=t;
+        t=u1; u1=u2; u2=t; t=v1; v1=v2; v2=t;
+        t=r1; r1=r2; r2=t; t=g1; g1=g2; g2=t; t=b1; b1=b2; b2=t;
+    }
+
+    int dy_total = y2 - y0;
+    if (dy_total == 0) return;
+
+    for (int y = y0; y <= y2; y++) {
+        if (y < g_clip_y1 || y > g_clip_y2) continue;
+
+        int second_half = (y >= y1);
+        int seg_height = second_half ? (y2 - y1) : (y1 - y0);
+        if (seg_height == 0) seg_height = 1;
+
+        float alpha = (float)(y - y0) / (float)dy_total;
+        float beta;
+        if (second_half)
+            beta = (float)(y - y1) / (float)seg_height;
+        else
+            beta = (float)(y - y0) / (float)seg_height;
+
+        int xa = x0 + (int)((float)(x2 - x0) * alpha);
+        int xb;
+        if (second_half)
+            xb = x1 + (int)((float)(x2 - x1) * beta);
+        else
+            xb = x0 + (int)((float)(x1 - x0) * beta);
+
+        float ua = u0 + (float)(u2 - u0) * alpha;
+        float va = v0 + (float)(v2 - v0) * alpha;
+        float ra = r0 + (float)(r2 - r0) * alpha;
+        float ga = g0 + (float)(g2 - g0) * alpha;
+        float ba = b0 + (float)(b2 - b0) * alpha;
+
+        float ub, vb, rb, gb, bb;
+        if (second_half) {
+            ub = u1 + (float)(u2 - u1) * beta;
+            vb = v1 + (float)(v2 - v1) * beta;
+            rb = r1 + (float)(r2 - r1) * beta;
+            gb = g1 + (float)(g2 - g1) * beta;
+            bb = b1 + (float)(b2 - b1) * beta;
+        } else {
+            ub = u0 + (float)(u1 - u0) * beta;
+            vb = v0 + (float)(v1 - v0) * beta;
+            rb = r0 + (float)(r1 - r0) * beta;
+            gb = g0 + (float)(g1 - g0) * beta;
+            bb = b0 + (float)(b1 - b0) * beta;
+        }
+
+        if (xa > xb) {
+            int t = xa; xa = xb; xb = t;
+            float tf;
+            tf = ua; ua = ub; ub = tf;
+            tf = va; va = vb; vb = tf;
+            tf = ra; ra = rb; rb = tf;
+            tf = ga; ga = gb; gb = tf;
+            tf = ba; ba = bb; bb = tf;
+        }
+
+        int span = xb - xa;
+        if (span == 0) span = 1;
+
+        int sx = max_i(xa, g_clip_x1);
+        int ex = min_i(xb, g_clip_x2);
+
+        for (int x = sx; x <= ex; x++) {
+            float t_val = (float)(x - xa) / (float)span;
+            int u = (int)(ua + (ub - ua) * t_val) & 0xFF;
+            int v_coord = (int)(va + (vb - va) * t_val) & 0xFF;
+            int mr = (int)(ra + (rb - ra) * t_val);
+            int mg = (int)(ga + (gb - ga) * t_val);
+            int mb = (int)(ba + (bb - ba) * t_val);
+            if (mr < 0) mr = 0; if (mr > 31) mr = 31;
+            if (mg < 0) mg = 0; if (mg > 31) mg = 31;
+            if (mb < 0) mb = 0; if (mb > 31) mb = 31;
+
+            uint16_t texel = texel_fetch(u, v_coord, texpage, clut_x, clut_y);
+            draw_pixel_textured_modulated(x, y, texel, mr, mg, mb, raw_texture);
         }
     }
 }

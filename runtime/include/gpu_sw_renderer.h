@@ -29,6 +29,14 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
                                int x2, int y2, int u2, int v2,
                                uint16_t clut_x, uint16_t clut_y,
                                uint16_t texpage);
+void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
+                                      uint32_t color0,
+                                      int x1, int y1, int u1, int v1,
+                                      uint32_t color1,
+                                      int x2, int y2, int u2, int v2,
+                                      uint32_t color2,
+                                      uint16_t clut_x, uint16_t clut_y,
+                                      uint16_t texpage, int raw_texture);
 void sw_draw_flat_rect(int x, int y, int w, int h, uint16_t color);
 void sw_draw_textured_rect(int x, int y, int w, int h,
                            int u, int v,

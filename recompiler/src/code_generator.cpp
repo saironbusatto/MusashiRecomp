@@ -766,11 +766,19 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     uint32_t rt = get_rt(instr);
                     uint32_t rd = get_rd(instr);
                     if (cop_op == 0x00) { // MFC2 - move from COP2 data
-                        code = fmt::format("{} = cpu->gte_data[{}];  /* mfc2 */", reg_name(rt), rd);
+                        if ((rd >= 8 && rd <= 11) || rd == 15 || rd == 28 || rd == 29 || rd == 31) {
+                            code = fmt::format("{} = gte_read_data(cpu, {});  /* mfc2 */", reg_name(rt), rd);
+                        } else {
+                            code = fmt::format("{} = cpu->gte_data[{}];  /* mfc2 */", reg_name(rt), rd);
+                        }
                     } else if (cop_op == 0x02) { // CFC2 - move from COP2 control
                         code = fmt::format("{} = cpu->gte_ctrl[{}];  /* cfc2 */", reg_name(rt), rd);
                     } else if (cop_op == 0x04) { // MTC2 - move to COP2 data
-                        code = fmt::format("cpu->gte_data[{}] = {};  /* mtc2 */", rd, reg_name(rt));
+                        if (rd == 7 || (rd >= 8 && rd <= 11) || rd == 14 || rd == 15 || rd == 28 || rd == 30) {
+                            code = fmt::format("gte_write_data(cpu, {}, {});  /* mtc2 */", rd, reg_name(rt));
+                        } else {
+                            code = fmt::format("cpu->gte_data[{}] = {};  /* mtc2 */", rd, reg_name(rt));
+                        }
                     } else if (cop_op == 0x06) { // CTC2 - move to COP2 control
                         code = fmt::format("cpu->gte_ctrl[{}] = {};  /* ctc2 */", rd, reg_name(rt));
                     } else if ((cop_op & 0x10) != 0) { // GTE command (bit 25 set)
@@ -802,7 +810,14 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     uint32_t rs = get_rs(instr);
                     uint32_t rt = get_rt(instr);
                     int16_t offset = get_imm16(instr);
-                    if (offset == 0) {
+                    bool special = (rt == 7 || (rt >= 8 && rt <= 11) || rt == 14 || rt == 15 || rt == 28 || rt == 30);
+                    if (special) {
+                        std::string addr = (offset == 0)
+                            ? reg_name(rs)
+                            : fmt::format("{} + {}", reg_name(rs), offset);
+                        code = fmt::format("gte_write_data(cpu, {}, cpu->read_word({}));  /* lwc2 gte[{}] */",
+                                           rt, addr, rt);
+                    } else if (offset == 0) {
                         code = fmt::format("cpu->gte_data[{}] = cpu->read_word({});  /* lwc2 gte[{}], ({}) */",
                                           rt, reg_name(rs), rt, reg_name(rs));
                     } else {
@@ -816,12 +831,15 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     uint32_t rs = get_rs(instr);
                     uint32_t rt = get_rt(instr);
                     int16_t offset = get_imm16(instr);
+                    std::string value = ((rt >= 8 && rt <= 11) || rt == 15 || rt == 28 || rt == 29 || rt == 31)
+                        ? fmt::format("gte_read_data(cpu, {})", rt)
+                        : fmt::format("cpu->gte_data[{}]", rt);
                     if (offset == 0) {
-                        code = fmt::format("cpu->write_word({}, cpu->gte_data[{}]);  /* swc2 gte[{}], ({}) */",
-                                          reg_name(rs), rt, rt, reg_name(rs));
+                        code = fmt::format("cpu->write_word({}, {});  /* swc2 gte[{}], ({}) */",
+                                          reg_name(rs), value, rt, reg_name(rs));
                     } else {
-                        code = fmt::format("cpu->write_word({} + {}, cpu->gte_data[{}]);  /* swc2 gte[{}], {}({}) */",
-                                          reg_name(rs), offset, rt, rt, offset, reg_name(rs));
+                        code = fmt::format("cpu->write_word({} + {}, {});  /* swc2 gte[{}], {}({}) */",
+                                          reg_name(rs), offset, value, rt, offset, reg_name(rs));
                     }
                 }
                 break;

@@ -210,6 +210,7 @@ static void execute_ch2_gpu(void) {
 
         for (uint32_t i = 0; i < total_words; i++) {
             uint32_t word = psx_read_word(addr);
+            gpu_set_gp0_source(addr);
             gpu_write_gp0(word);
             addr = (addr + addr_step) & 0x1FFFFCu;
         }
@@ -236,6 +237,7 @@ static void execute_ch2_gpu(void) {
 
             for (uint32_t i = 0; i < num_words; i++) {
                 uint32_t word = psx_read_word(word_addr);
+                gpu_set_gp0_source(word_addr);
                 gpu_write_gp0(word);
                 word_addr = (word_addr + 4) & 0x1FFFFCu;
             }
@@ -254,6 +256,7 @@ static void execute_ch2_gpu(void) {
 
         for (uint32_t i = 0; i < word_count; i++) {
             uint32_t word = psx_read_word(addr);
+            gpu_set_gp0_source(addr);
             gpu_write_gp0(word);
             addr = (addr + addr_step) & 0x1FFFFCu;
         }

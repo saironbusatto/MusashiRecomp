@@ -167,6 +167,8 @@ const ImaskTraceEntry *memory_get_imask_trace(int *idx_out, int *count_out) {
 extern void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                            uint32_t new_val, uint8_t width);
 extern void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
+extern CPUState *debug_cpu_ptr;
+extern uint32_t g_debug_last_store_pc;
 
 /* Card-byte destination capture (Phase 3 audit). Always-on. */
 extern int card_data_writes_check(uint32_t phys, uint32_t value, uint8_t width);
@@ -315,7 +317,15 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
         return;
     }
     /* GPU GP0: 0x1F801810, GP1: 0x1F801814 */
-    if (addr == 0x1F801810u) { gpu_write_gp0(val); return; }
+    if (addr == 0x1F801810u) {
+        uint32_t src = addr;
+        if (g_debug_last_store_pc == 0xBFC38B1Cu && debug_cpu_ptr) {
+            src = (debug_cpu_ptr->gpr[4] - 4u) & 0x1FFFFCu;
+        }
+        gpu_set_gp0_source(src);
+        gpu_write_gp0(val);
+        return;
+    }
     if (addr == 0x1F801814u) { gpu_write_gp1(val); return; }
     /* MDEC: 0x1F801820, 0x1F801824 */
     if (addr == 0x1F801820u || addr == 0x1F801824u) { mdec_write(addr, val); return; }

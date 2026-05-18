@@ -3642,8 +3642,8 @@ static void handle_gpu_frame_dump(int id, const char *json)
 
     int n = gpu_gp0_ring_dump_frame((uint32_t)target, entries, max_entries);
 
-    /* ~140 bytes per entry in JSON; budget conservatively. */
-    size_t buf_sz = 256 + (size_t)n * 200u;
+    /* ~190 bytes per entry in JSON; budget conservatively. */
+    size_t buf_sz = 256 + (size_t)n * 280u;
     char *buf = (char *)malloc(buf_sz);
     if (!buf) { free(entries); send_err(id, "alloc failed"); return; }
 
@@ -3654,8 +3654,10 @@ static void handle_gpu_frame_dump(int id, const char *json)
     for (int i = 0; i < n && pos < buf_sz - 256; i++) {
         const GpuGp0RingEntry *e = &entries[i];
         pos += (size_t)snprintf(buf + pos, buf_sz - pos,
-            "%s{\"seq\":%u,\"op\":\"0x%02X\",\"n\":%u,\"w\":[",
-            i ? "," : "", e->seq, e->opcode, e->n_words);
+            "%s{\"seq\":%u,\"op\":\"0x%02X\",\"n\":%u,"
+            "\"src\":\"0x%08X\",\"pc\":\"0x%08X\",\"w\":[",
+            i ? "," : "", e->seq, e->opcode, e->n_words,
+            e->src_addr, e->pc);
         int show = e->n_words < GPU_GP0_RING_MAX_WORDS
                  ? e->n_words : GPU_GP0_RING_MAX_WORDS;
         for (int k = 0; k < show && pos < buf_sz - 32; k++) {
@@ -7467,7 +7469,11 @@ void debug_server_init(int port)
      * copy/enqueue writers so we can identify the caller-supplied env. */
     s_wtrace_ranges[28].lo = 0x00090C80u;
     s_wtrace_ranges[28].hi = 0x00090DE0u;
-    s_wtrace_range_count = 29;
+    s_wtrace_ranges[29].lo = 0x000B3200u; /* title/load GPU packet buffer */
+    s_wtrace_ranges[29].hi = 0x000B3800u;
+    s_wtrace_ranges[30].lo = 0x000EA000u; /* BIOS licensed-screen GPU packet buffer */
+    s_wtrace_ranges[30].hi = 0x000ED000u;
+    s_wtrace_range_count = 31;
 
     s_wtrace_boot_ranges[0].lo = 0x0009B3B0u; /* slot0 callbacks */
     s_wtrace_boot_ranges[0].hi = 0x0009B3C4u;
@@ -7487,7 +7493,11 @@ void debug_server_init(int port)
     s_wtrace_boot_ranges[7].hi = 0x0000E400u;
     s_wtrace_boot_ranges[8].lo = 0x0009C970u; /* title/menu state variables */
     s_wtrace_boot_ranges[8].hi = 0x0009C9A0u;
-    s_wtrace_boot_range_count = 9;
+    s_wtrace_boot_ranges[9].lo = 0x000B3200u; /* title/load GPU packet buffer */
+    s_wtrace_boot_ranges[9].hi = 0x000B3800u;
+    s_wtrace_boot_ranges[10].lo = 0x000EA000u; /* BIOS licensed-screen GPU packet buffer */
+    s_wtrace_boot_ranges[10].hi = 0x000ED000u;
+    s_wtrace_boot_range_count = 11;
 
     s_wtrace_trans_ranges[0].lo = 0x0000E1F4u; /* BIOS TCB save areas */
     s_wtrace_trans_ranges[0].hi = 0x0000E400u;

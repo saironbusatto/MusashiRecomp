@@ -44,7 +44,8 @@ with open(GEN_PATH, "r") as f:
 emitted.sort()
 emitted_set = set(emitted)
 
-# Find all gte_execute ROM addresses
+# Find all generated ROM addresses that emit GTE behavior. Data-register
+# transfers may route through helpers so register side effects stay centralized.
 gen_gte = set()
 with open(GEN_PATH, "r") as f:
     prev_addr = None
@@ -52,7 +53,13 @@ with open(GEN_PATH, "r") as f:
         m = re.search(r'/\* 0x(BFC[0-9A-Fa-f]{5}):', line)
         if m:
             prev_addr = int(m.group(1), 16)
-        if ('gte_execute' in line or 'gte_data' in line or 'gte_ctrl' in line) and prev_addr:
+        if (
+            'gte_execute' in line
+            or 'gte_read_data' in line
+            or 'gte_write_data' in line
+            or 'gte_data' in line
+            or 'gte_ctrl' in line
+        ) and prev_addr:
             gen_gte.add(prev_addr)
 
 # Focus on BFC34F00-BFC36D00 region
