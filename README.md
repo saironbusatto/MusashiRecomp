@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/psxrecomp-logo.png" alt="PSXRecomp" width="640">
+</p>
+
 # PSXRecomp
 
 Generic static recompiler framework for PlayStation 1: MIPS R3000A to C to
