@@ -51,6 +51,7 @@ void fntrace_record(CPUState* cpu, uint32_t target);
 /* Register the game's text range for one-shot game-start detection.
  * First dispatch into [lo, hi) calls cdrom_notify_game_started(). */
 void fntrace_set_game_range(uint32_t lo, uint32_t hi);
+int  fntrace_is_game_started(void);
 
 /* Arm a target filter. arm_count == 0 means "record all" (default).
  * When arm_count > 0, only dispatches whose target matches one of the

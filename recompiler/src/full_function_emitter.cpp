@@ -1075,6 +1075,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);\n";
     out += "extern int dirty_ram_is_dirty(uint32_t phys);\n";
     out += "extern void fntrace_record(CPUState* cpu, uint32_t target);\n";
+    out += "extern uint64_t g_dispatch_static_hits;\n";
     out += "\n";
     out += "int g_psx_dispatch_depth = 0;\n\n";
     out += "static void psx_dispatch_impl(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {\n";
@@ -1110,6 +1111,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "                g_debug_current_func_addr = phys;\n";
     out += "                debug_server_trace_dispatch(phys);\n";
     out += "                dispatch_table[mid].func(cpu);\n";
+    out += "                g_dispatch_static_hits++;\n";
     out += "                found = 1;\n";
     out += "                break;\n";
     out += "            } else if (dispatch_table[mid].addr < phys) {\n";

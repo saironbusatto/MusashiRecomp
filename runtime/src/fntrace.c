@@ -20,6 +20,7 @@ static uint32_t s_arm_record_all = 0;  /* opt-in via fntrace_arm(0xFFFFFFFF) */
 static uint32_t s_game_entry_phys = 0;
 static int      s_game_started = 0;
 extern void cdrom_notify_game_started(void);
+extern void boot_state_trigger_capture(const CPUState* cpu);
 
 void fntrace_set_game_range(uint32_t lo, uint32_t hi) {
     /* lo is treated as entry_pc; hi is ignored (kept for API compat). */
@@ -27,6 +28,8 @@ void fntrace_set_game_range(uint32_t lo, uint32_t hi) {
     s_game_entry_phys = lo & 0x1FFFFFFFu;
     s_game_started = 0;
 }
+
+int fntrace_is_game_started(void) { return s_game_started; }
 
 static inline int armed_match(uint32_t target) {
     if (s_arm_record_all) return 1;
@@ -46,6 +49,7 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
         if ((target & 0x1FFFFFFFu) == s_game_entry_phys) {
             s_game_started = 1;
             cdrom_notify_game_started();
+            boot_state_trigger_capture(cpu);
         }
     }
     if (!armed_match(target)) return;

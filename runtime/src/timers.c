@@ -56,6 +56,30 @@ void timers_init(void) {
     memset(timer_frac, 0, sizeof(timer_frac));
 }
 
+void timers_get_snapshot(uint16_t counter[3], uint32_t mode[3],
+                         uint16_t target[3],  int32_t  irq_line[3],
+                         uint32_t frac[3]) {
+    for (int i = 0; i < 3; i++) {
+        counter[i]  = timers[i].counter;
+        mode[i]     = timers[i].mode;
+        target[i]   = timers[i].target;
+        irq_line[i] = timers[i].irq_line;
+        frac[i]     = timer_frac[i];
+    }
+}
+
+void timers_set_snapshot(const uint16_t counter[3], const uint32_t mode[3],
+                         const uint16_t target[3],  const int32_t  irq_line[3],
+                         const uint32_t frac[3]) {
+    for (int i = 0; i < 3; i++) {
+        timers[i].counter  = counter[i];
+        timers[i].mode     = mode[i];
+        timers[i].target   = target[i];
+        timers[i].irq_line = irq_line[i];
+        timer_frac[i]      = frac[i];
+    }
+}
+
 /* Determine whether this timer uses system clock ticks */
 static int timer_uses_sysclk(int t) {
     int src = (timers[t].mode >> 8) & 3;

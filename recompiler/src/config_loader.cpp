@@ -58,6 +58,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         rt.disc_speed     = toml::find<std::string>(runtime, "disc_speed");
         rt.has_disc_speed = true;
     }
+    if (runtime.contains("fast_boot")) {
+        rt.fast_boot = toml::find<bool>(runtime, "fast_boot");
+    }
     return rt;
 }
 

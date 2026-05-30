@@ -42,6 +42,11 @@ struct RuntimeConfig {
     // seek/read delays to 1 cycle — correct INT sequence, no artificial wait.
     bool                  has_disc_speed = false;
     std::string           disc_speed;      // raw string; main.cpp converts to divisor
+
+    // fast_boot: snapshot BIOS state at first game handoff and restore it on
+    // subsequent launches, skipping BIOS execution entirely. Default off;
+    // enable per-game in [runtime]. Snapshot is keyed on BIOS SHA256 + entry_pc.
+    bool                  fast_boot = false;
 };
 
 // One entry from [[recompiler.bios_vectors]].

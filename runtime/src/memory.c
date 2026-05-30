@@ -31,6 +31,7 @@ static uint8_t bios_rom[BIOS_ROM_SIZE];
 
 /* Expose RAM pointer for oracle comparison (find_first_divergence). */
 uint8_t *memory_get_ram_ptr(void) { return ram; }
+uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
 
 /* ---- Dirty-page tracking for install-at-runtime code (CLAUDE.md Rule 18) ----
  *
@@ -97,6 +98,12 @@ uint32_t dirty_ram_get_bitmap_word(uint32_t word_index) {
 
 uint32_t dirty_ram_get_bitmap_word_count(void) {
     return DIRTY_RAM_BITMAP_WORDS;
+}
+
+void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
+    if (count > DIRTY_RAM_BITMAP_WORDS) count = DIRTY_RAM_BITMAP_WORDS;
+    for (uint32_t i = 0; i < count; i++)
+        dirty_ram_bitmap[i] = words[i];
 }
 
 /* Memory control registers: 0x1F801000..0x1F80103F (16 words) + 0x1F801060 (RAM size).
@@ -188,6 +195,9 @@ static inline uint16_t read_ram_half(uint32_t phys) {
 void memory_set_sr_ptr(const uint32_t *p) { sr_ptr = p; }
 uint32_t memory_get_sr(void) { return sr_ptr ? *sr_ptr : 0; }
 
+static uint32_t s_bios_checksum = 0;
+uint32_t memory_get_bios_checksum(void) { return s_bios_checksum; }
+
 void memory_init(const char* bios_path) {
     memset(ram, 0, sizeof(ram));
     memset(scratchpad, 0, sizeof(scratchpad));
@@ -204,6 +214,9 @@ void memory_init(const char* bios_path) {
                 bios_path, n, BIOS_ROM_SIZE);
         exit(1);
     }
+    s_bios_checksum = 0;
+    for (uint32_t i = 0; i < BIOS_ROM_SIZE / 4; i++)
+        s_bios_checksum += ((const uint32_t*)bios_rom)[i];
 }
 
 static void mmio_fatal(uint32_t vaddr, uint32_t phys, const char* op) {
