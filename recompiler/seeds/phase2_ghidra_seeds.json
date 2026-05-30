@@ -1,7 +1,7 @@
 {
-  "schema": "psxrecomp-v4 phase2 seeds",
+  "schema": "psxrecomp phase2 seeds",
   "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
-  "seed_count": 1071,
+  "seed_count": 1072,
   "seeds": [
     {
       "address": "0xBFC00000",
@@ -3492,6 +3492,11 @@
       "address": "0xBFC079F8",
       "label": "dmiss_BFC079F8",
       "rationale": "Tomba boot dispatch miss after game callback coverage fixes. Verified in Ghidra as a tiny BIOS table leaf routine (sw a0,0(sp); jr ra; clear v0) referenced by data at 0xBFC04484 and 0xBFC0E30C."
+    },
+    {
+      "address": "0xBFC15F1C",
+      "label": "dmiss_BFC15F1C",
+      "rationale": "dirty_ram hot: SIO/PAD interrupt handler entry point (RAM 0x641C), called via jalr. 10852+ hits/frame across internal branch targets (0x641C, 0x6430, 0x6444, 0x6458, 0x650C, 0x6514, 0x658C, 0x6594). Seeding entry only; CFG discovers internal labels."
     },
     {
       "address": "0xBFC0193C",
