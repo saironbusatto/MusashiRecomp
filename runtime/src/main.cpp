@@ -10,7 +10,6 @@
 #include "cdrom.h"
 #include "fntrace.h"
 #include "boot_state.h"
-#include "overlay_log.h"
 #include "gpu.h"
 #include "sio.h"
 #include "spu.h"
@@ -1106,11 +1105,6 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
-            {
-                std::string game_dir =
-                    std::filesystem::path(game_config_path).parent_path().string();
-                overlay_log_init(game_id.c_str(), game_dir.c_str());
-            }
             std::fprintf(stdout, "psxrecomp: loaded game config %s (%s, %s)\n",
                          game_config_path, game_name.c_str(), game_id.c_str());
         } catch (const std::exception& ex) {

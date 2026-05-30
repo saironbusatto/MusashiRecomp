@@ -12,7 +12,6 @@
 #include "dma.h"
 #include "cdrom.h"
 #include "dirty_ram_interp.h"
-#include "overlay_log.h"
 #include "gpu.h"
 #include "mdec.h"
 #include "spu.h"
@@ -291,7 +290,6 @@ static void execute_ch3_cdrom(void) {
     }
 
     uint32_t addr = channels[3].madr & 0x1FFFFCu;
-    uint32_t load_start = addr;   /* capture before loop modifies addr */
     int32_t addr_step = step ? -4 : 4;
     for (uint32_t i = 0; i < total_words; i++) {
         uint32_t word = cdrom_dma_read();
@@ -299,11 +297,6 @@ static void execute_ch3_cdrom(void) {
         dirty_ram_mark_executable_range(addr, 4);
         addr = (addr + addr_step) & 0x1FFFFCu;
     }
-
-    /* Log the completed transfer for overlay pre-compilation (Layer B).
-     * Forward transfers only — backward is unusual and not overlay-shaped. */
-    if (!step)
-        overlay_log_record(load_start, total_words * 4);
 
     channels[3].madr = addr;
     complete_transfer(3);

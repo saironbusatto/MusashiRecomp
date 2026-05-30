@@ -6806,6 +6806,104 @@ static void handle_fn_exit_dump(int id, const char *json) {
     free(buf);
 }
 
+/* overlay_dump: extract RAM regions that dirty_ram has marked executable
+ * above a threshold physical address. Writes <crc32>.bin files to a
+ * caller-supplied directory and returns a JSON manifest.
+ *
+ * Parameters (JSON):
+ *   "lo"  — low physical address threshold (default "0x98000")
+ *   "dir" — output directory for .bin files (default "overlays")
+ *
+ * Returns:
+ *   {"ok":true,"regions":[{"addr":"0x...","size":N,"crc32":"0x...","file":"<hex>.bin"},...]}
+ */
+static void handle_overlay_dump(int id, const char *json)
+{
+    extern uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
+    extern uint32_t dirty_ram_get_bitmap_word_count(void);
+    extern uint8_t *memory_get_ram_ptr(void);
+    extern uint32_t crc32_compute(const uint8_t *data, size_t len);
+
+    char lo_buf[32]  = {0};
+    char dir_buf[512] = {0};
+    json_get_str(json, "lo",  lo_buf,  sizeof(lo_buf));
+    json_get_str(json, "dir", dir_buf, sizeof(dir_buf));
+
+    uint32_t lo_phys = lo_buf[0] ? (uint32_t)strtoul(lo_buf, NULL, 0) : 0x00098000u;
+    if (!dir_buf[0]) strncpy(dir_buf, "overlays", sizeof(dir_buf) - 1);
+
+    /* Create output directory (best-effort). */
+#ifdef _WIN32
+    { char cmd[600]; snprintf(cmd, sizeof(cmd), "mkdir \"%s\" 2>nul", dir_buf); system(cmd); }
+#else
+    { char cmd[600]; snprintf(cmd, sizeof(cmd), "mkdir -p \"%s\"", dir_buf); system(cmd); }
+#endif
+
+    uint8_t *ram      = memory_get_ram_ptr();
+    uint32_t bw       = dirty_ram_get_bitmap_word_count();
+    uint32_t page_sz  = 4096u;
+    uint32_t lo_page  = lo_phys / page_sz;
+
+    /* Scan bitmap for contiguous dirty-page runs above lo_phys. */
+    char    out[65536];
+    int     pos      = 0;
+    int     first    = 1;
+    int     in_run   = 0;
+    uint32_t run_start = 0;
+
+    pos += snprintf(out + pos, sizeof(out) - pos,
+                    "{\"id\":%d,\"ok\":true,\"regions\":[", id);
+
+    for (uint32_t page = lo_page; page < bw * 32u; page++) {
+        uint32_t word = dirty_ram_get_bitmap_word(page >> 5);
+        int dirty = (word >> (page & 31u)) & 1u;
+
+        if (dirty && !in_run) {
+            in_run = 1;
+            run_start = page;
+        } else if (!dirty && in_run) {
+            in_run = 0;
+            /* Emit region [run_start, page) */
+            uint32_t phys = run_start * page_sz;
+            uint32_t size = (page - run_start) * page_sz;
+            uint32_t crc  = crc32_compute(ram + phys, size);
+
+            char fname[32];
+            snprintf(fname, sizeof(fname), "%08X.bin", crc);
+            char fpath[600];
+            snprintf(fpath, sizeof(fpath), "%s/%s", dir_buf, fname);
+            FILE *bf = fopen(fpath, "wb");
+            if (bf) { fwrite(ram + phys, 1, size, bf); fclose(bf); }
+
+            pos += snprintf(out + pos, sizeof(out) - pos,
+                            "%s{\"addr\":\"0x%08X\",\"size\":%u,"
+                            "\"crc32\":\"0x%08X\",\"file\":\"%s\"}",
+                            first ? "" : ",", phys, size, crc, fname);
+            first = 0;
+        }
+    }
+    /* Close any open run at end of RAM. */
+    if (in_run) {
+        uint32_t page = bw * 32u;
+        uint32_t phys = run_start * page_sz;
+        uint32_t size = (page - run_start) * page_sz;
+        uint32_t crc  = crc32_compute(ram + phys, size);
+        char fname[32];
+        snprintf(fname, sizeof(fname), "%08X.bin", crc);
+        char fpath[600];
+        snprintf(fpath, sizeof(fpath), "%s/%s", dir_buf, fname);
+        FILE *bf = fopen(fpath, "wb");
+        if (bf) { fwrite(ram + phys, 1, size, bf); fclose(bf); }
+        pos += snprintf(out + pos, sizeof(out) - pos,
+                        "%s{\"addr\":\"0x%08X\",\"size\":%u,"
+                        "\"crc32\":\"0x%08X\",\"file\":\"%s\"}",
+                        first ? "" : ",", phys, size, crc, fname);
+    }
+
+    snprintf(out + pos, sizeof(out) - pos, "]}\n");
+    send_fmt("%s", out);
+}
+
 /* ====================================================================
  * Freeze auto-dump accessors. Called from the freeze_heartbeat thread
  * after it detects a main-thread stall. Each function writes a JSON
@@ -7230,6 +7328,7 @@ static const CmdEntry s_commands[] = {
     { "fn_entry_dump",     handle_fn_entry_dump },
     { "fn_entry_tail",     handle_fn_entry_tail },
     { "fn_exit_dump",      handle_fn_exit_dump },
+    { "overlay_dump",      handle_overlay_dump },
     { NULL, NULL }
 };
 
