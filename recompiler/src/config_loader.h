@@ -38,6 +38,22 @@ struct RuntimeConfig {
     std::filesystem::path memcard_dir;     // absolute path (resolved against project root)
 };
 
+// One entry from [[recompiler.bios_vectors]].
+// Describes a BIOS vector dispatch stub (A0/B0/C0) that the BIOS installs
+// into low RAM at boot. The recompiler reads the function pointer table from
+// the ROM binary at build time and emits a static C switch handler so these
+// addresses are resolved as binary-search hits at runtime rather than falling
+// through to dirty_ram_interp.
+struct BiosVectorTable {
+    uint32_t ram_addr;       // RAM address of the installed stub (e.g. 0xA0)
+    int      index_reg;      // CPU register that holds the function index ($t1 = 9)
+    uint32_t table_rom_addr; // ROM virtual address of the function pointer table
+    uint32_t table_count;    // number of entries to read from the table
+    // Runtime RAM address of the live function table (used as fallback for
+    // Shell-patched entries not present in ROM). 0 = no runtime fallback.
+    uint32_t table_ram_addr;
+};
+
 struct BiosConfig {
     std::filesystem::path config_path;   // the toml file itself
     std::filesystem::path project_root;  // resolved via .gitignore/.git/CMakeLists.txt walk
@@ -55,6 +71,7 @@ struct BiosConfig {
     std::filesystem::path out_dir;       // absolute path to output dir
     bool                  strict;        // currently always true
     std::string           out_stem;      // derived if not explicit
+    std::vector<BiosVectorTable> bios_vectors; // optional vector dispatch tables
 
     // [runtime] block (optional)
     RuntimeConfig         runtime;

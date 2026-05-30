@@ -182,6 +182,28 @@ BiosConfig load_bios_config(const fs::path& config_path_in) {
         out_stem = derive_out_stem(fs::path(rom_field).filename().string());
     }
 
+    // [[recompiler.bios_vectors]] — optional array of vector dispatch tables
+    std::vector<BiosVectorTable> bios_vectors;
+    if (recomp.contains("bios_vectors")) {
+        const auto& arr = recomp.at("bios_vectors").as_array();
+        for (const auto& v : arr) {
+            BiosVectorTable bvt;
+            bvt.ram_addr = parse_hex(
+                toml::find<std::string>(v, "ram_addr"), "bios_vectors.ram_addr");
+            bvt.index_reg = static_cast<int>(
+                toml::find<int64_t>(v, "index_reg"));
+            bvt.table_rom_addr = parse_hex(
+                toml::find<std::string>(v, "table_rom_addr"), "bios_vectors.table_rom_addr");
+            bvt.table_count = static_cast<uint32_t>(
+                toml::find<int64_t>(v, "table_count"));
+            bvt.table_ram_addr = v.contains("table_ram_addr")
+                ? parse_hex(toml::find<std::string>(v, "table_ram_addr"),
+                            "bios_vectors.table_ram_addr")
+                : 0u;
+            bios_vectors.push_back(bvt);
+        }
+    }
+
     return BiosConfig{
         /*config_path*/  config_path,
         /*project_root*/ root,
@@ -195,6 +217,7 @@ BiosConfig load_bios_config(const fs::path& config_path_in) {
         /*out_dir*/      out_dir,
         /*strict*/       strict,
         /*out_stem*/     out_stem,
+        /*bios_vectors*/ std::move(bios_vectors),
         /*runtime*/      parse_runtime_block(cfg, root),
     };
 }

@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "config_loader.h"
 #include "function_discovery.h"
 
 namespace PSXRecompV4 {
@@ -56,12 +57,13 @@ public:
     // dr: discovery result from Phase 1c/2 discovery pass
     // bios_sha256: hex string for provenance header
     static EmitStats emit(
-        const std::vector<uint8_t>& rom,
-        uint32_t                    base_addr,
-        uint32_t                    rom_end,
-        const DiscoveryResult&      dr,
-        const std::string&          bios_sha256,
-        const std::string&          out_dir);
+        const std::vector<uint8_t>&       rom,
+        uint32_t                          base_addr,
+        uint32_t                          rom_end,
+        const DiscoveryResult&            dr,
+        const std::string&                bios_sha256,
+        const std::string&                out_dir,
+        const std::vector<BiosVectorTable>& bios_vectors = {});
 
 private:
     // Emit a single function's C code to the output stream.
@@ -88,11 +90,14 @@ private:
 
     // Emit the dispatch table.
     static void emit_dispatch(
-        std::string&              out,
-        const DiscoveryResult&    dr,
-        const std::set<uint32_t>& emitted_normalized,
+        std::string&                        out,
+        const DiscoveryResult&              dr,
+        const std::set<uint32_t>&           emitted_normalized,
         const std::map<uint32_t, ContinuationLabel>& continuations,
-        const std::string&        bios_sha256);
+        const std::string&                  bios_sha256,
+        const std::vector<uint8_t>&         rom,
+        uint32_t                            base_addr,
+        const std::vector<BiosVectorTable>& bios_vectors);
 
     static uint32_t normalize_address(uint32_t addr);
     static uint32_t read_u32_le(const std::vector<uint8_t>& rom, uint32_t offset);
