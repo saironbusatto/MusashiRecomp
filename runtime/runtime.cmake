@@ -49,6 +49,7 @@ set(PSXRECOMP_V4_RUNTIME_SOURCES
     ${PSXRECOMP_V4_ROOT}/runtime/src/mdec.c
     ${PSXRECOMP_V4_ROOT}/runtime/src/timers.c
     ${PSXRECOMP_V4_ROOT}/runtime/src/interrupts.c
+    ${PSXRECOMP_V4_ROOT}/runtime/src/psx_fiber.c
     ${PSXRECOMP_V4_ROOT}/runtime/src/sio.c
     ${PSXRECOMP_V4_ROOT}/runtime/src/memcard.c
     ${PSXRECOMP_V4_ROOT}/runtime/src/debug_server.c
@@ -140,6 +141,12 @@ function(psxrecomp_v4_add_runtime_target target)
         ${PSXRECOMP_V4_RUNTIME_INCLUDE_DIRS}
         ${SDL2_INCLUDE_DIRS}
     )
+    # pkg-config reports SDL2_LIBRARIES as a bare name (e.g. "SDL2" -> -lSDL2);
+    # add its library dirs so the linker finds it outside default paths
+    # (e.g. Homebrew's /opt/homebrew/lib on macOS). Empty/harmless on MSVC.
+    if(SDL2_LIBRARY_DIRS)
+        target_link_directories(${target} PRIVATE ${SDL2_LIBRARY_DIRS})
+    endif()
     target_link_libraries(${target} PRIVATE ${SDL2_LIBRARIES})
 
     target_compile_definitions(${target} PRIVATE

@@ -907,6 +907,19 @@ static void sdl_vblank_present(void) {
                 close_controller();
                 open_configured_controller();
             }
+        } else if (ev.type == SDL_KEYDOWN) {
+            /* Fullscreen toggle: F11, Alt+Enter, or Cmd/Ctrl+F.
+             * FULLSCREEN_DESKTOP keeps the desktop resolution; the
+             * renderer's logical size letterboxes the 640x480 image. */
+            const Uint16 mod = ev.key.keysym.mod;
+            if (ev.key.keysym.sym == SDLK_F11 ||
+                (ev.key.keysym.sym == SDLK_RETURN && (mod & KMOD_ALT)) ||
+                (ev.key.keysym.sym == SDLK_f && (mod & (KMOD_GUI | KMOD_CTRL)))) {
+                Uint32 is_fs = SDL_GetWindowFlags(sdl_window) &
+                               SDL_WINDOW_FULLSCREEN_DESKTOP;
+                SDL_SetWindowFullscreen(sdl_window,
+                    is_fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+            }
         }
     }
 
@@ -1171,12 +1184,26 @@ int main(int argc, char** argv) {
      * Note: the freeze became prevalent only after the FMV-speed fix
      * (commit b486c13) raised cycle throughput. Before that, the slower
      * MDEC/DMA workload was below whatever GDI threshold trips the bug. */
+    /* The OpenGL force above is a Windows-only workaround for the GDI
+     * presentation hang; macOS/Linux have no GDI path, so let SDL choose its
+     * native backend (Metal on Apple Silicon). PRESENTVSYNC removes tearing;
+     * fall back progressively if a driver can't provide vsync/accel. */
+#ifdef _WIN32
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
-    sdl_renderer = SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_ACCELERATED);
+#endif
+    sdl_renderer = SDL_CreateRenderer(sdl_window, -1,
+        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    if (!sdl_renderer)
+        sdl_renderer = SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_ACCELERATED);
     if (!sdl_renderer) {
         std::fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
         return 1;
     }
+
+    /* Present in a fixed 640x480 logical space; SDL scales (and, in
+     * fullscreen, letterboxes) it to the real output. Identity in the
+     * default 640x480 window, so windowed rendering is unchanged. */
+    SDL_RenderSetLogicalSize(sdl_renderer, 640, 480);
 
     sdl_texture = SDL_CreateTexture(
         sdl_renderer,

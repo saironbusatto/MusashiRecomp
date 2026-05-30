@@ -5,6 +5,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_subdirectory(lib/fmt)
 
+# Vendored fmt 9.1.0 enables its `consteval` format-string check on Apple
+# clang via the `__cpp_consteval` clause in core.h, even though the same
+# block tries to exclude Apple toolchains — and Apple clang 21 then rejects
+# fmt's own literal format strings ("call to consteval function is not a
+# constant expression"). Force FMT_CONSTEVAL empty to take fmt's
+# non-consteval compile-time-check path. Scoped to non-MSVC so Windows is
+# untouched.
+if(NOT MSVC)
+    target_compile_definitions(fmt PUBLIC FMT_CONSTEVAL=)
+endif()
+
 # Rabbitizer MIPS decoder
 add_library(rabbitizer STATIC)
 target_sources(rabbitizer PRIVATE

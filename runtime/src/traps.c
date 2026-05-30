@@ -10,10 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#endif
+#include "psx_fiber.h"   /* cross-platform fibers (Win32 fibers / POSIX ucontext) */
 
 /* Forward declarations from interrupts.c */
 int psx_get_in_exception(void);
@@ -26,14 +23,6 @@ static void trap_crash(const char* msg) {
     extern void psx_crash_trace_dump(const char *reason, void *seh_info);
     psx_crash_trace_dump("trap_crash", NULL);
 }
-
-typedef struct ThreadWaitFrame {
-    uint32_t tcb;
-    jmp_buf jmp;
-} ThreadWaitFrame;
-
-static ThreadWaitFrame s_thread_wait_stack[16];
-static int s_thread_wait_depth;
 
 static int psx_is_valid_tcb(CPUState* cpu, uint32_t tcb)
 {
@@ -135,12 +124,10 @@ static uint32_t psx_restore_context_from_tcb(CPUState* cpu, uint32_t tcb)
     return cpu->gpr[26];
 }
 
-#ifdef _WIN32
-
 typedef struct HostThreadFiber {
     uint32_t tcb;
-    LPVOID fiber;
-    LPVOID return_fiber;
+    psx_fiber_t fiber;
+    psx_fiber_t return_fiber;
     uint32_t return_tcb;
     CPUState* cpu;
     int used;
@@ -149,23 +136,23 @@ typedef struct HostThreadFiber {
 } HostThreadFiber;
 
 static HostThreadFiber s_host_threads[32];
-static LPVOID s_main_fiber;
+static psx_fiber_t s_main_fiber;
 
 static uint32_t psx_tcb_state(CPUState* cpu, uint32_t tcb)
 {
     return psx_is_valid_tcb(cpu, tcb) ? cpu->read_word(tcb) : 0;
 }
 
-static LPVOID psx_current_host_fiber(void)
+static psx_fiber_t psx_current_host_fiber(void)
 {
     if (!s_main_fiber) {
-        s_main_fiber = ConvertThreadToFiber(NULL);
+        s_main_fiber = psx_fiber_convert_thread();
         if (!s_main_fiber) {
-            trap_crash("ConvertThreadToFiber failed");
+            trap_crash("psx_fiber_convert_thread failed");
             exit(1);
         }
     }
-    return GetCurrentFiber();
+    return psx_fiber_current();
 }
 
 static HostThreadFiber* psx_find_host_thread(uint32_t tcb)
@@ -193,7 +180,7 @@ static HostThreadFiber* psx_alloc_host_thread(void)
 
 static HostThreadFiber* psx_bind_current_host_thread(CPUState* cpu, uint32_t tcb)
 {
-    LPVOID fiber = psx_current_host_fiber();
+    psx_fiber_t fiber = psx_current_host_fiber();
     HostThreadFiber* slot = psx_find_host_thread(tcb);
     if (!slot) {
         slot = psx_alloc_host_thread();
@@ -207,7 +194,7 @@ static HostThreadFiber* psx_bind_current_host_thread(CPUState* cpu, uint32_t tcb
     return slot;
 }
 
-static VOID CALLBACK psx_thread_fiber_entry(LPVOID param)
+static void psx_thread_fiber_entry(void* param)
 {
     HostThreadFiber* slot = (HostThreadFiber*)param;
     CPUState* cpu = slot->cpu;
@@ -231,7 +218,7 @@ static VOID CALLBACK psx_thread_fiber_entry(LPVOID param)
             (void)psx_restore_context_from_tcb(cpu, slot->return_tcb);
         }
         debug_server_log_thread_event(12, cpu, slot->tcb, slot->return_tcb, 0);
-        SwitchToFiber(slot->return_fiber);
+        psx_fiber_switch(slot->return_fiber);
     }
 
     trap_crash("BIOS thread fiber returned with no scheduler target");
@@ -251,8 +238,8 @@ static HostThreadFiber* psx_get_or_create_host_thread(CPUState* cpu, uint32_t tc
 
     if (!slot) {
         slot = psx_alloc_host_thread();
-    } else if (slot->fiber && slot->owned && slot->fiber != GetCurrentFiber()) {
-        DeleteFiber(slot->fiber);
+    } else if (slot->fiber && slot->owned && slot->fiber != psx_fiber_current()) {
+        psx_fiber_destroy(slot->fiber);
         slot->fiber = NULL;
     }
 
@@ -262,9 +249,9 @@ static HostThreadFiber* psx_get_or_create_host_thread(CPUState* cpu, uint32_t tc
     slot->return_tcb = 0;
     slot->owned = 1;
     slot->closed = 0;
-    slot->fiber = CreateFiber(1024 * 1024, psx_thread_fiber_entry, slot);
+    slot->fiber = psx_fiber_create(1024 * 1024, psx_thread_fiber_entry, slot);
     if (!slot->fiber) {
-        trap_crash("CreateFiber failed for BIOS thread");
+        trap_crash("psx_fiber_create failed for BIOS thread");
         exit(1);
     }
     return slot;
@@ -311,9 +298,9 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     psx_set_current_tcb(cpu, target_tcb);
     (void)psx_restore_context_from_tcb(cpu, target_tcb);
     debug_server_log_thread_event(8, cpu, current_tcb, target_tcb, 0);
-    SwitchToFiber(target->fiber);
+    psx_fiber_switch(target->fiber);
 
-    /* SwitchToFiber returns on the original native stack, but CPUState is
+    /* The switch returns on the original native stack, but CPUState is
      * shared globally and still contains the fiber that just yielded back.
      * Restore the TCB we saved above before continuing on this stack. */
     if (saved_current_context && psx_is_valid_tcb(cpu, current_tcb)) {
@@ -327,7 +314,7 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     extern void* g_exception_owner_fiber;
     extern int   g_pending_exception_longjmp;
     extern jmp_buf exception_jmpbuf;
-    if (g_pending_exception_longjmp && GetCurrentFiber() == g_exception_owner_fiber) {
+    if (g_pending_exception_longjmp && psx_fiber_current() == g_exception_owner_fiber) {
         int code = g_pending_exception_longjmp;
         g_pending_exception_longjmp = 0;
         longjmp(exception_jmpbuf, code);
@@ -338,70 +325,14 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     return 1;
 }
 
-#endif
-
-static int psx_change_thread_setjmp(CPUState* cpu, uint32_t target_tcb)
-{
-    uint32_t current_tcb = psx_current_tcb_ptr(cpu);
-    if (!psx_is_valid_tcb(cpu, current_tcb) || !psx_is_valid_tcb(cpu, target_tcb)) {
-        return 0;
-    }
-    if (current_tcb == target_tcb) {
-        cpu->pc = 0;
-        return 1;
-    }
-
-    psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
-
-    if (s_thread_wait_depth > 0 &&
-        s_thread_wait_stack[s_thread_wait_depth - 1].tcb == target_tcb) {
-        ThreadWaitFrame *frame = &s_thread_wait_stack[s_thread_wait_depth - 1];
-        s_thread_wait_depth--;
-        psx_set_current_tcb(cpu, target_tcb);
-        (void)psx_restore_context_from_tcb(cpu, target_tcb);
-        cpu->pc = 0;
-        longjmp(frame->jmp, 1);
-    }
-
-    if (s_thread_wait_depth >= (int)(sizeof(s_thread_wait_stack) / sizeof(s_thread_wait_stack[0]))) {
-        trap_crash("ChangeThread wait stack overflow");
-        exit(1);
-    }
-
-    int frame_index = s_thread_wait_depth++;
-    ThreadWaitFrame *frame = &s_thread_wait_stack[frame_index];
-    frame->tcb = current_tcb;
-
-    if (setjmp(frame->jmp) != 0) {
-        cpu->pc = 0;
-        return 1;
-    }
-
-    psx_set_current_tcb(cpu, target_tcb);
-    uint32_t target_pc = psx_restore_context_from_tcb(cpu, target_tcb);
-    if (target_pc != 0) {
-        psx_dispatch(cpu, target_pc);
-    }
-
-    if (s_thread_wait_depth > frame_index &&
-        s_thread_wait_stack[frame_index].tcb == current_tcb) {
-        s_thread_wait_depth = frame_index;
-    }
-    if (psx_current_tcb_ptr(cpu) != current_tcb) {
-        psx_set_current_tcb(cpu, current_tcb);
-        (void)psx_restore_context_from_tcb(cpu, current_tcb);
-    }
-    cpu->pc = 0;
-    return 1;
-}
-
 static int psx_change_thread(CPUState* cpu, uint32_t target_tcb)
 {
-#ifdef _WIN32
+    /* One scheduler on every platform now: host fibers (Win32 Fibers on
+     * Windows, ucontext on POSIX). The earlier setjmp/longjmp fallback was
+     * removed — it ran target threads nested on the caller's stack, which
+     * couldn't resume an arbitrary suspended thread (the BIOS CD-boot
+     * WaitEvent handoff hung on it). */
     return psx_change_thread_fiber(cpu, target_tcb);
-#else
-    return psx_change_thread_setjmp(cpu, target_tcb);
-#endif
 }
 
 void psx_syscall(CPUState* cpu, uint32_t code) {
