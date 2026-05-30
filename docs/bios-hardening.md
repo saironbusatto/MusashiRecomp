@@ -87,6 +87,26 @@ on the `dispatch_stats` TCP command alongside `dispatch_miss_total`.
 
 ---
 
+## #3 — Overlay discovery (B+A) — next after Tomba seeding
+
+Once Tomba seeding is complete, the remaining dirty_ram traffic will be genuinely
+overlay code (addresses > 0x98000, loaded from disc). That's when B+A slots in.
+
+See `docs/overlay-discovery.md` for the full architecture. Short version:
+
+- **Layer B** (ship first): on CD DMA completion, log `(hash, load_addr, size)` to
+  `logs/<SCUS_ID>/overlay_map.jsonl`. At next build, recompile those overlays
+  statically. No runtime linker needed.
+- **Layer A** (after B has real coverage): on DMA completion, check a per-game cache
+  of compiled DLLs. Cache hit → `LoadLibrary` + register. Cache miss → dirty-RAM
+  fallback + background compile → cache populated for next encounter.
+
+B+A starts after Tomba seeding because: (a) seeding eliminates the non-overlay
+dirty_ram noise so you know exactly what's left, and (b) Layer B's first real overlay
+log needs clean data to hash against.
+
+---
+
 ## Tomba game dispatch misses (game-side, seeding)
 
 Captured 16 dirty_ram dispatch misses in the Tomba game text range (0x10000-0x98000).

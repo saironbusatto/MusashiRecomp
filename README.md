@@ -155,6 +155,21 @@ delivery. BIOS A0/B0/C0 vectors go through the recompiled BIOS, not HLE shims.
 See `CLAUDE.md`, `PLAN.md`, and `CURRENT_STATE.md` for the development rules
 and current project context.
 
+## Disc Speed
+
+Per-game `disc_speed` in `game.toml [runtime]` compresses CD-ROM timing:
+
+| Value | Effect |
+|---|---|
+| `"1x"` | Authentic PSX timing. Default for all games. |
+| `"2x"` / `"4x"` | 2× / 4× faster reads and seeks. |
+| `"instant"` | Minimum-floor delays. **Known to hang some games** during early initialization; root cause not yet identified. Use `"4x"` instead until resolved. |
+
+FMV playback is always protected: the CD-ROM layer reverts to 1× whenever XA
+audio streaming is active, regardless of `disc_speed`. The speed switch fires
+only after the BIOS has handed off to the game EXE — boot and the license
+screen always run at authentic 1×.
+
 ## License
 
 PolyForm Noncommercial 1.0.0. See `LICENSE`.
