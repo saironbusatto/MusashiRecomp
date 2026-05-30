@@ -8,13 +8,16 @@ if(NOT DEFINED PSXRECOMP_ROOT)
     get_filename_component(PSXRECOMP_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 endif()
 
-# Production build flag: -DPSX_DEBUG_TOOLS=OFF disables the TCP debug
-# server, the freeze heartbeat thread, and the hot-path log functions
-# (call_entry / sio_write / probe / restore_event / thread_event) that
-# the recompiled C invokes on every block. Use to test whether the
-# debug infrastructure itself contributes to freezes, or to ship a
-# lean production binary. Visible to all targets including psx-beetle.
-option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" ON)
+# PSX_DEBUG_TOOLS: TCP debug server + heartbeat + per-block recording.
+# Defaults ON for Debug/RelWithDebInfo, OFF for Release/MinSizeRel so
+# a plain cmake -DCMAKE_BUILD_TYPE=Release gives a lean production binary
+# with no TCP server and no debug console. Override explicitly with
+# -DPSX_DEBUG_TOOLS=ON/OFF to force either way regardless of build type.
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+    option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" OFF)
+else()
+    option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" ON)
+endif()
 
 if(NOT SDL2_INCLUDE_DIRS OR NOT SDL2_LIBRARIES)
     if(MSVC)
@@ -182,8 +185,15 @@ function(psxrecomp_add_runtime_target target)
 
     if(MINGW)
         target_link_options(${target} PRIVATE -Wl,--stack,67108864)
+        # No console window in Release MinGW builds.
+        target_link_options(${target} PRIVATE $<$<CONFIG:Release>:-mwindows>)
     elseif(MSVC)
         target_compile_options(${target} PRIVATE /GS- /guard:cf-)
         target_link_options(${target} PRIVATE /STACK:67108864,67108864 /GUARD:NO)
+        # No console window in Release MSVC builds. /ENTRY keeps main() as
+        # the entry point (not WinMain) while switching to the Windows subsystem.
+        target_link_options(${target} PRIVATE
+            $<$<CONFIG:Release>:/SUBSYSTEM:WINDOWS>
+            $<$<CONFIG:Release>:/ENTRY:mainCRTStartup>)
     endif()
 endfunction()
