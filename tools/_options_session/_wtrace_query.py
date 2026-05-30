@@ -1,5 +1,5 @@
-import sys, json, time
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+﻿import sys, json, time
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 # wtrace_dump returns ALL captured events for the armed ranges

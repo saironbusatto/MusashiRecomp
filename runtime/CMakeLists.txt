@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+﻿cmake_minimum_required(VERSION 3.20)
 project(psxrecomp-runtime C CXX)
 
 set(CMAKE_C_STANDARD 99)
@@ -22,21 +22,21 @@ endif()
 
 # ---- Native/oracle runtime targets ----
 
-set(PSXRECOMP_V4_ROOT "${CMAKE_SOURCE_DIR}/..")
+set(PSXRECOMP_ROOT "${CMAKE_SOURCE_DIR}/..")
 include("${CMAKE_SOURCE_DIR}/runtime.cmake")
 
-psxrecomp_v4_add_runtime_target(psx-runtime
+psxrecomp_add_runtime_target(psx-runtime
     DEBUG_PORT 4370
-    WINDOW_TITLE "psxrecomp-v4 - BIOS"
-    DEFAULT_BIOS_PATH "${PSXRECOMP_V4_ROOT}/bios/SCPH1001.BIN"
+    WINDOW_TITLE "psxrecomp - BIOS"
+    DEFAULT_BIOS_PATH "${PSXRECOMP_ROOT}/bios/SCPH1001.BIN"
 )
 
 if(NOT MSVC)
-    psxrecomp_v4_add_runtime_target(psx-oracle
+    psxrecomp_add_runtime_target(psx-oracle
         ORACLE
         DEBUG_PORT 4371
-        WINDOW_TITLE "psxrecomp-v4 - Oracle"
-        DEFAULT_BIOS_PATH "${PSXRECOMP_V4_ROOT}/bios/SCPH1001.BIN"
+        WINDOW_TITLE "psxrecomp - Oracle"
+        DEFAULT_BIOS_PATH "${PSXRECOMP_ROOT}/bios/SCPH1001.BIN"
     )
 endif()
 

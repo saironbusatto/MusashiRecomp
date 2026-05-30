@@ -1,4 +1,4 @@
-/*
+﻿/*
  * card_data_writes.h — always-on capture of where the BIOS stores
  * incoming SIO data bytes during memory-card READ_DATA.
  *
@@ -19,8 +19,8 @@
  * read audit, this gives ~32*128=4096 byte writes — enough to see
  * the full destination buffer for several consecutive reads.
  */
-#ifndef PSXRECOMP_V4_CARD_DATA_WRITES_H
-#define PSXRECOMP_V4_CARD_DATA_WRITES_H
+#ifndef PSXRECOMP_CARD_DATA_WRITES_H
+#define PSXRECOMP_CARD_DATA_WRITES_H
 
 #include <stdint.h>
 
@@ -67,4 +67,4 @@ void card_data_writes_reset(void);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_CARD_DATA_WRITES_H */
+#endif /* PSXRECOMP_CARD_DATA_WRITES_H */

@@ -1,5 +1,5 @@
-#ifndef PSXRECOMP_V4_CRASH_TRACE_H
-#define PSXRECOMP_V4_CRASH_TRACE_H
+﻿#ifndef PSXRECOMP_CRASH_TRACE_H
+#define PSXRECOMP_CRASH_TRACE_H
 
 #include <stdint.h>
 
@@ -20,4 +20,4 @@ void psx_crash_trace_dump(const char *reason, void *seh_info);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_CRASH_TRACE_H */
+#endif /* PSXRECOMP_CRASH_TRACE_H */

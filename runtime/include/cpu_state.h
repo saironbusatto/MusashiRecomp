@@ -1,4 +1,4 @@
-/* ============================================================================
+﻿/* ============================================================================
  * cpu_state.h  —  Phase 2 runtime version
  * ----------------------------------------------------------------------------
  * This is the RUNTIME version of the CPUState header. It has the same struct
@@ -9,8 +9,8 @@
  * "cpu_state.h" and the build uses -I runtime/include so they find this file.
  * ========================================================================== */
 
-#ifndef PSXRECOMP_V4_CPU_STATE_H
-#define PSXRECOMP_V4_CPU_STATE_H
+#ifndef PSXRECOMP_CPU_STATE_H
+#define PSXRECOMP_CPU_STATE_H
 
 #include <stdint.h>
 
@@ -59,4 +59,4 @@ extern void     gte_write_ctrl(CPUState* cpu, uint8_t reg, uint32_t val);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_CPU_STATE_H */
+#endif /* PSXRECOMP_CPU_STATE_H */

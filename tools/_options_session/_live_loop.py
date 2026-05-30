@@ -1,6 +1,6 @@
-"""Query live runtime's recent activity rings to see what's looping."""
+﻿"""Query live runtime's recent activity rings to see what's looping."""
 import sys, json, collections
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 # Try fntrace_dump first

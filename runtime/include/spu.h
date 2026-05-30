@@ -1,5 +1,5 @@
-#ifndef PSXRECOMP_V4_SPU_H
-#define PSXRECOMP_V4_SPU_H
+﻿#ifndef PSXRECOMP_SPU_H
+#define PSXRECOMP_SPU_H
 
 #include <stdint.h>
 
@@ -112,4 +112,4 @@ const uint8_t* spu_get_ram(void);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_SPU_H */
+#endif /* PSXRECOMP_SPU_H */

@@ -1,7 +1,7 @@
-"""Diff critical memory addresses between runtime (4470) and beetle (4380)
+﻿"""Diff critical memory addresses between runtime (4470) and beetle (4380)
 to find where Tomba's state machine diverges in OPTIONS-black."""
 import sys, struct
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 def read_word(port, addr):

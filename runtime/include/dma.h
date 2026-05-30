@@ -1,4 +1,4 @@
-/* dma.h — PS1 DMA controller simulation (Phase 3).
+﻿/* dma.h — PS1 DMA controller simulation (Phase 3).
  *
  * 7 DMA channels:
  *   Ch0: MDEC in       0x1F801080
@@ -14,8 +14,8 @@
  *   DICR: 0x1F8010F4   (DMA interrupt control)
  */
 
-#ifndef PSXRECOMP_V4_DMA_H
-#define PSXRECOMP_V4_DMA_H
+#ifndef PSXRECOMP_DMA_H
+#define PSXRECOMP_DMA_H
 
 #include <stdint.h>
 
@@ -57,4 +57,4 @@ void dma_debug_clear_trace(void);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_DMA_H */
+#endif /* PSXRECOMP_DMA_H */

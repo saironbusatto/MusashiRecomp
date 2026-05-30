@@ -1,9 +1,9 @@
-"""Parse psx_last_run_report.json — show: reason, cpu state, last 30
+﻿"""Parse psx_last_run_report.json — show: reason, cpu state, last 30
 dispatch_ring entries, last 5 unknown_dispatch entries, last 30
 dirty_block_log entries. Highlight the relevant ones for the
 0xBFC09790 caller investigation."""
 import json
-with open(r'F:\Projects\psxrecomp-v4\psx_last_run_report.json') as f:
+with open(r'F:\Projects\psxrecomp\psx_last_run_report.json') as f:
     r = json.load(f)
 
 print(f"reason: {r.get('reason')}")

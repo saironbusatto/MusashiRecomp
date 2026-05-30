@@ -1,4 +1,4 @@
-/* main.cpp — Phase 3 runtime entry point.
+﻿/* main.cpp — Phase 3 runtime entry point.
  *
  * Loads BIOS ROM, initializes CPU state + SDL display, calls into
  * the recompiled reset vector. BIOS drives execution; SDL presents
@@ -46,7 +46,7 @@
 #define PSX_DEFAULT_GAME_CONFIG_PATH ""
 #endif
 #ifndef PSX_WINDOW_TITLE
-#define PSX_WINDOW_TITLE "psxrecomp-v4"
+#define PSX_WINDOW_TITLE "psxrecomp"
 #endif
 #ifndef DEFAULT_DEBUG_PORT
 #error DEFAULT_DEBUG_PORT must be defined by the runtime target.
@@ -186,7 +186,7 @@ static bool pick_runtime_file(const char* title, const char* filter,
 #else
     (void)filter;
     (void)out;
-    std::fprintf(stderr, "psxrecomp-v4: %s requires a command-line path on this platform.\n", title);
+    std::fprintf(stderr, "psxrecomp: %s requires a command-line path on this platform.\n", title);
     return false;
 #endif
 }
@@ -806,7 +806,7 @@ static void open_configured_controller(void) {
             SDL_Joystick* joy = SDL_GameControllerGetJoystick(sdl_controller);
             sdl_controller_instance = joy ? SDL_JoystickInstanceID(joy) : -1;
             const char* name = SDL_GameControllerName(sdl_controller);
-            std::fprintf(stdout, "psxrecomp-v4 runtime: controller %d: %s\n",
+            std::fprintf(stdout, "psxrecomp runtime: controller %d: %s\n",
                          controller_device_index, name ? name : "(unnamed)");
         }
         break;
@@ -1019,7 +1019,7 @@ int main(int argc, char** argv) {
     /* Force line-buffered output so messages appear even if killed. */
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::setvbuf(stderr, nullptr, _IOLBF, 0);
-    std::fprintf(stderr, "psxrecomp-v4: main() entered\n");
+    std::fprintf(stderr, "psxrecomp: main() entered\n");
     std::fflush(stderr);
 
     /* Install crash handlers early so they catch issues during init too.
@@ -1074,10 +1074,10 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
-            std::fprintf(stdout, "psxrecomp-v4: loaded game config %s (%s, %s)\n",
+            std::fprintf(stdout, "psxrecomp: loaded game config %s (%s, %s)\n",
                          game_config_path, game_name.c_str(), game_id.c_str());
         } catch (const std::exception& ex) {
-            std::fprintf(stderr, "psxrecomp-v4: failed to load --game %s: %s\n",
+            std::fprintf(stderr, "psxrecomp: failed to load --game %s: %s\n",
                          game_config_path, ex.what());
             return 1;
         }
@@ -1085,13 +1085,13 @@ int main(int argc, char** argv) {
 
     std::filesystem::path resolved_bios = resolve_bios_for_runtime(bios_path, argv[0]);
     if (resolved_bios.empty()) {
-        std::fprintf(stderr, "psxrecomp-v4: no BIOS selected; exiting.\n");
+        std::fprintf(stderr, "psxrecomp: no BIOS selected; exiting.\n");
         return 1;
     }
     if (game_config_path || disc_override_path || !resolved_disc.empty()) {
         resolved_disc = resolve_disc_for_runtime(resolved_disc, disc_override_path, game_id, argv[0]);
         if (game_config_path && resolved_disc.empty()) {
-            std::fprintf(stderr, "psxrecomp-v4: no disc image selected; exiting.\n");
+            std::fprintf(stderr, "psxrecomp: no disc image selected; exiting.\n");
             return 1;
         }
     }
@@ -1104,7 +1104,7 @@ int main(int argc, char** argv) {
     std::string memcard_dir_str  = memcard_dir.string();
     std::string disc_path_str    = resolved_disc.string();
 
-    std::fprintf(stdout, "psxrecomp-v4 runtime: loading BIOS from %s\n", bios_path_str.c_str());
+    std::fprintf(stdout, "psxrecomp runtime: loading BIOS from %s\n", bios_path_str.c_str());
     memory_init(bios_path_str.c_str());
     gpu_init();
     dma_init();
@@ -1243,10 +1243,10 @@ int main(int argc, char** argv) {
     debug_server_set_cpu(&cpu);
 
     /* Execute. */
-    std::fprintf(stdout, "psxrecomp-v4 runtime: executing from PC=0x%08X\n", cpu.pc);
+    std::fprintf(stdout, "psxrecomp runtime: executing from PC=0x%08X\n", cpu.pc);
 
 #if defined(PSX_ORACLE_BUILD)
-    std::fprintf(stdout, "psxrecomp-v4 ORACLE: interpreter mode (port %d)\n", DEFAULT_DEBUG_PORT);
+    std::fprintf(stdout, "psxrecomp ORACLE: interpreter mode (port %d)\n", DEFAULT_DEBUG_PORT);
     interp_init(&cpu);
     interp_trace_enable(1);
 
@@ -1326,7 +1326,7 @@ int main(int argc, char** argv) {
 #endif
 
     /* If we reach here, all execution completed without MMIO abort. */
-    std::fprintf(stdout, "psxrecomp-v4 runtime: execution completed, PC=0x%08X\n", cpu.pc);
+    std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
 
     shutdown_runtime();
     SDL_DestroyTexture(sdl_texture);

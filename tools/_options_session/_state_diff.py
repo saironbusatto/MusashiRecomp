@@ -1,5 +1,5 @@
-import sys
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+﻿import sys
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 print(f"{'thing':>40}  {'runtime':>12}  {'beetle':>12}")

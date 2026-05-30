@@ -1,4 +1,4 @@
-/* psx_interpreter.h — R3000A interpreter for oracle builds.
+﻿/* psx_interpreter.h — R3000A interpreter for oracle builds.
  *
  * Oracle-only: provides a cycle-accurate reference implementation
  * of the PSX CPU. Shares the same CPUState and memory bus as the
@@ -9,8 +9,8 @@
  * source tree, gated by PSX_ORACLE_BUILD.
  */
 
-#ifndef PSXRECOMP_V4_PSX_INTERPRETER_H
-#define PSXRECOMP_V4_PSX_INTERPRETER_H
+#ifndef PSXRECOMP_PSX_INTERPRETER_H
+#define PSXRECOMP_PSX_INTERPRETER_H
 
 #include "cpu_state.h"
 #include <stdint.h>
@@ -56,4 +56,4 @@ const InterpTraceEntry* interp_trace_get(uint32_t ring_idx);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_PSX_INTERPRETER_H */
+#endif /* PSXRECOMP_PSX_INTERPRETER_H */
