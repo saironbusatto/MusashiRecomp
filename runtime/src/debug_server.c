@@ -235,6 +235,10 @@ uint32_t g_debug_current_func_addr = 0;
 /* Last store PC — set by recompiler emitter before every store instruction. */
 uint32_t g_debug_last_store_pc = 0;
 
+/* Static dispatch hit counter — incremented by generated dispatch code on
+ * every binary-search hit (i.e. successfully dispatched to static C). */
+uint64_t g_dispatch_static_hits = 0;
+
 /* ---- SIO write PC tracer ring ----
  * Captures (pc, addr, value, byte_seq, ctr) for every write to a SIO
  * register, attributing the exact writing instruction.  Used to find what
@@ -6481,6 +6485,20 @@ static void handle_quit(int id, const char *json)
 
 /* ---- Command dispatch table ---- */
 
+/* dispatch_stats: static hit vs. miss coverage summary */
+static void handle_dispatch_stats(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"static_hits\":%llu,"
+             "\"miss_total\":%llu,"
+             "\"miss_unique\":%d}",
+             id,
+             (unsigned long long)g_dispatch_static_hits,
+             (unsigned long long)s_unknown_seq,
+             s_unknown_unique_count);
+}
+
 /* dispatch_check: check if a specific address was ever dispatched */
 static void handle_dispatch_check(int id, const char *json) {
     char abuf[32] = {0};
@@ -7200,6 +7218,7 @@ static const CmdEntry s_commands[] = {
     { "get_quads",         handle_get_quads },
     { "gte_state",         handle_gte_state },
     { "quit",              handle_quit },
+    { "dispatch_stats",    handle_dispatch_stats },
     { "dispatch_check",    handle_dispatch_check },
     { "dispatch_tail",     handle_dispatch_tail },
     { "card_mgr_trace",    handle_card_mgr_trace },

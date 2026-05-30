@@ -8,6 +8,9 @@
 #include "cpu_state.h"
 #include "psx_interpreter.h"
 #include "cdrom.h"
+#include "fntrace.h"
+#include "boot_state.h"
+#include "overlay_log.h"
 #include "gpu.h"
 #include "sio.h"
 #include "spu.h"
@@ -55,8 +58,9 @@
 extern "C" uint64_t gte_get_exec_count(void);
 
 /* memory.c */
-extern "C" void memory_init(const char* bios_path);
-extern "C" void memory_set_sr_ptr(const uint32_t *p);
+extern "C" void     memory_init(const char* bios_path);
+extern "C" void     memory_set_sr_ptr(const uint32_t *p);
+extern "C" uint32_t memory_get_bios_checksum(void);
 
 /* dma.c */
 extern "C" void dma_init(void);
@@ -83,6 +87,7 @@ static SDL_Texture*  sdl_texture;
 static SDL_GameController* sdl_controller;
 static SDL_JoystickID      sdl_controller_instance = -1;
 static uint32_t      sdl_pixel_buf[640 * 512]; /* ARGB8888 staging buffer */
+static int           s_fast_boot_active = 0;  /* cleared when game entry PC fires */
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
 
@@ -795,21 +800,29 @@ static void close_controller(void) {
 static void open_configured_controller(void) {
     if (sdl_controller) return;
 
-    int seen = 0;
-    int joysticks = SDL_NumJoysticks();
-    for (int i = 0; i < joysticks; i++) {
-        if (!SDL_IsGameController(i)) continue;
-        if (seen++ != controller_device_index) continue;
+    /* First pass: open the configured device index. Second pass: open the
+     * first available controller — covers Steam Remote Play where the virtual
+     * Xbox controller appears at an unpredictable index, and cases where the
+     * configured index is simply out of range. */
+    for (int pass = 0; pass < 2 && !sdl_controller; pass++) {
+        int seen = 0;
+        int joysticks = SDL_NumJoysticks();
+        for (int i = 0; i < joysticks; i++) {
+            if (!SDL_IsGameController(i)) continue;
+            int match = (pass == 0) ? (seen == controller_device_index) : 1;
+            seen++;
+            if (!match) continue;
 
-        sdl_controller = SDL_GameControllerOpen(i);
-        if (sdl_controller) {
-            SDL_Joystick* joy = SDL_GameControllerGetJoystick(sdl_controller);
-            sdl_controller_instance = joy ? SDL_JoystickInstanceID(joy) : -1;
-            const char* name = SDL_GameControllerName(sdl_controller);
-            std::fprintf(stdout, "psxrecomp runtime: controller %d: %s\n",
-                         controller_device_index, name ? name : "(unnamed)");
+            sdl_controller = SDL_GameControllerOpen(i);
+            if (sdl_controller) {
+                SDL_Joystick* joy = SDL_GameControllerGetJoystick(sdl_controller);
+                sdl_controller_instance = joy ? SDL_JoystickInstanceID(joy) : -1;
+                const char* name = SDL_GameControllerName(sdl_controller);
+                std::fprintf(stdout, "psxrecomp runtime: controller %d (pass %d): %s\n",
+                             seen - 1, pass, name ? name : "(unnamed)");
+            }
+            break;
         }
-        break;
     }
 }
 
@@ -953,42 +966,17 @@ static void sdl_vblank_present(void) {
         }
     }
 
-    /* ---- Display from our VRAM ---- */
-    uint32_t w = 0, h = 0;
-    {
-        GpuDisplayInfo di;
-        gpu_get_display_info(&di);
-        if (di.disabled || di.width == 0 || di.height == 0) return;
-        const uint16_t* vram = gpu_get_vram();
-        w = di.width; h = di.height;
-        for (uint32_t y = 0; y < h; y++) {
-            uint32_t vy = (di.display_y + y) & 511;
-            for (uint32_t x = 0; x < w; x++) {
-                uint32_t vx = (di.display_x + x) & 1023;
-                sdl_pixel_buf[y * w + x] = psx16_to_argb(vram[vy * 1024 + vx]);
-            }
-        }
+    /* Fast boot: run at full speed with no display until game entry PC fires.
+     * Kernel init and disc auth still execute; only logo rendering is skipped. */
+    if (s_fast_boot_active) {
+        extern int fntrace_is_game_started(void);
+        if (!fntrace_is_game_started()) return;
+        s_fast_boot_active = 0;
     }
 
-    /* Update only the active display rectangle. The backing texture is fixed
-     * at 640x512, while games can switch to smaller modes such as 320x224 for
-     * FMV; presenting the full texture would leave the active image stuck in
-     * the upper-left portion of the window. */
-#ifndef PSX_SDL_NO_RENDER
-    SDL_Rect src = { 0, 0, (int)w, (int)h };
-    SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf, (int)(w * sizeof(uint32_t)));
-
-    SDL_Rect dst = { 0, 0, 640, 480 };
-    SDL_RenderClear(sdl_renderer);
-    SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
-    SDL_RenderPresent(sdl_renderer);
-#endif
-
-    /* Wall-clock pacing: hold each simulated vblank to ~16.68 ms so the
-     * BIOS runs at PSX-native 59.94 Hz. Uses SDL's high-resolution
-     * counter — works around MinGW std::thread quirks. If a frame ran
-     * long the deadline resyncs to "now" rather than queueing catch-up
-     * frames. */
+    /* Wall-clock pacing: always runs once fast_boot has ended, even when the
+     * display is still disabled (e.g. game crt0 setup). Skipped only by the
+     * turbo and fast_boot early-returns above. */
     {
         static Uint64 next_deadline = 0;
         Uint64 freq = SDL_GetPerformanceFrequency();
@@ -1013,6 +1001,44 @@ static void sdl_vblank_present(void) {
             next_deadline += period;
         }
     }
+
+    /* ---- Display from our VRAM ---- */
+    uint32_t w = 0, h = 0;
+    {
+        GpuDisplayInfo di;
+        gpu_get_display_info(&di);
+        if (di.disabled || di.width == 0 || di.height == 0) {
+#ifndef PSX_SDL_NO_RENDER
+            SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
+            SDL_RenderClear(sdl_renderer);
+            SDL_RenderPresent(sdl_renderer);
+#endif
+            return;
+        }
+        const uint16_t* vram = gpu_get_vram();
+        w = di.width; h = di.height;
+        for (uint32_t y = 0; y < h; y++) {
+            uint32_t vy = (di.display_y + y) & 511;
+            for (uint32_t x = 0; x < w; x++) {
+                uint32_t vx = (di.display_x + x) & 1023;
+                sdl_pixel_buf[y * w + x] = psx16_to_argb(vram[vy * 1024 + vx]);
+            }
+        }
+    }
+
+    /* Update only the active display rectangle. The backing texture is fixed
+     * at 640x512, while games can switch to smaller modes such as 320x224 for
+     * FMV; presenting the full texture would leave the active image stuck in
+     * the upper-left portion of the window. */
+#ifndef PSX_SDL_NO_RENDER
+    SDL_Rect src = { 0, 0, (int)w, (int)h };
+    SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf, (int)(w * sizeof(uint32_t)));
+
+    SDL_Rect dst = { 0, 0, 640, 480 };
+    SDL_RenderClear(sdl_renderer);
+    SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
+    SDL_RenderPresent(sdl_renderer);
+#endif
 }
 
 int main(int argc, char** argv) {
@@ -1064,6 +1090,9 @@ int main(int argc, char** argv) {
     uint16_t   debug_port    = (uint16_t)DEFAULT_DEBUG_PORT;
     std::string game_name;
     std::string game_id;
+    std::string disc_speed;   /* "1x" | "2x" | "4x" | "instant" */
+    uint32_t   game_entry_pc = 0;
+    bool       fast_boot     = false;
 
     if (game_config_path) {
         try {
@@ -1074,6 +1103,14 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
+            if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
+            game_entry_pc = gc.entry_pc;
+            fast_boot     = gc.runtime.fast_boot;
+            {
+                std::string game_dir =
+                    std::filesystem::path(game_config_path).parent_path().string();
+                overlay_log_init(game_id.c_str(), game_dir.c_str());
+            }
             std::fprintf(stdout, "psxrecomp: loaded game config %s (%s, %s)\n",
                          game_config_path, game_name.c_str(), game_id.c_str());
         } catch (const std::exception& ex) {
@@ -1115,6 +1152,18 @@ int main(int argc, char** argv) {
     sio_connect_pad(0);  /* Controller on port 1 */
     spu_init();
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
+    {
+        int divisor = 1; /* default: authentic 1x timing */
+        if (disc_speed == "instant") divisor = 0;
+        else if (disc_speed == "4x") divisor = 4;
+        else if (disc_speed == "2x") divisor = 2;
+        /* Store for post-BIOS application; boot always runs at 1x so the
+         * BIOS disc-init sequence sees correct timing. */
+        cdrom_set_game_speed(divisor);
+        if (divisor != 1)
+            std::fprintf(stdout, "psxrecomp: disc_speed=%s (applied post-BIOS)\n",
+                         disc_speed.c_str());
+    }
     memcard_init(memcard_dir_str.c_str());
     std::atexit(memcard_flush_all);
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -1124,10 +1173,19 @@ int main(int argc, char** argv) {
 #endif
     /* Heartbeat always on — see freeze_heartbeat.c rationale. */
     freeze_heartbeat_start("psx-runtime");
+    /* Register game entry_pc for post-BIOS disc speed switch. Fires once when
+     * the BIOS hands control to the game EXE — not on the BIOS shell. */
+    if (game_entry_pc != 0)
+        fntrace_set_game_range(game_entry_pc, 0);
 
     /* ---- SDL init ---- */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    /* Prefer SDL's own HIDAPI driver over platform-native so Steam's virtual
+     * Xbox controller (injected by Steam Input / Remote Play) is enumerated
+     * as a game controller rather than a raw HID device. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
@@ -1232,9 +1290,32 @@ int main(int argc, char** argv) {
     cpu.read_byte  = psx_read_byte;
     cpu.write_byte = psx_write_byte;
 
-    /* R3000A reset state. */
-    cpu.pc = 0xBFC00000u;
-    cpu.cop0[12] = 0x00400000u; /* SR: BEV=1 (boot exception vectors) */
+    /* Fast boot: try to restore a previously-captured BIOS handoff snapshot.
+     * First launch runs BIOS normally (logos visible) and captures state at
+     * game handoff. Every subsequent launch restores and skips BIOS entirely. */
+    bool fast_boot_restored = false;
+    if (fast_boot && game_entry_pc != 0) {
+        uint32_t bios_cksum = memory_get_bios_checksum();
+        char snap_name[64];
+        std::snprintf(snap_name, sizeof(snap_name),
+                      "fast_boot_%08X_%08X.bin", bios_cksum, game_entry_pc);
+        std::filesystem::path snap_path =
+            resolved_bios.parent_path() / snap_name;
+        std::string snap_str = snap_path.string();
+        if (boot_state_load(snap_str.c_str(), bios_cksum, game_entry_pc, &cpu)) {
+            fast_boot_restored = true;
+        } else {
+            /* First run: show BIOS logos normally, capture state silently at
+             * game handoff. Subsequent launches use the snapshot. */
+            boot_state_set_capture(snap_str.c_str(), bios_cksum, game_entry_pc);
+        }
+    }
+
+    if (!fast_boot_restored) {
+        /* R3000A reset state. */
+        cpu.pc = 0xBFC00000u;
+        cpu.cop0[12] = 0x00400000u; /* SR: BEV=1 (boot exception vectors) */
+    }
 
     /* Let memory subsystem see SR for cache-isolation checks. */
     memory_set_sr_ptr(&cpu.cop0[12]);

@@ -36,6 +36,42 @@ struct RuntimeConfig {
 
     bool                  has_memcard_dir = false;
     std::filesystem::path memcard_dir;     // absolute path (resolved against project root)
+
+    // disc_speed: "1x" (default) | "2x" | "4x" | "instant"
+    // Controls how quickly CD-ROM timing delays fire. "instant" collapses all
+    // seek/read delays to 1 cycle — correct INT sequence, no artificial wait.
+    bool                  has_disc_speed = false;
+    std::string           disc_speed;      // raw string; main.cpp converts to divisor
+
+    // fast_boot: snapshot BIOS state at first game handoff and restore it on
+    // subsequent launches, skipping BIOS execution entirely. Default off;
+    // enable per-game in [runtime]. Snapshot is keyed on BIOS SHA256 + entry_pc.
+    bool                  fast_boot = false;
+};
+
+// One entry from [[recompiler.bios_vectors]].
+// Describes a BIOS vector dispatch stub (A0/B0/C0) that the BIOS installs
+// into low RAM at boot. The recompiler reads the function pointer table from
+// the ROM binary at build time and emits a static C switch handler so these
+// addresses are resolved as binary-search hits at runtime rather than falling
+// through to dirty_ram_interp.
+struct BiosVectorTable {
+    uint32_t ram_addr;       // RAM address of the installed stub (e.g. 0xA0)
+    int      index_reg;      // CPU register that holds the function index ($t1 = 9)
+    uint32_t table_rom_addr; // ROM virtual address of the function pointer table
+    uint32_t table_count;    // number of entries to read from the table
+    // Runtime RAM address of the live function table (used as fallback for
+    // Shell-patched entries not present in ROM). 0 = no runtime fallback.
+    uint32_t table_ram_addr;
+};
+
+// One entry from [[recompiler.bios_aliases]].
+// A RAM address the BIOS installs a simple fixed-target trampoline at
+// (e.g. the SIO handler at 0x0CF0 which just jalrs to 0x641C). Emitted as
+// a one-liner wrapper in the dispatch table — no table lookup, no switch.
+struct BiosAlias {
+    uint32_t ram_addr;    // the installed stub address (e.g. 0x0CF0)
+    uint32_t target_key;  // normalized dispatch key of the target (e.g. 0x641C)
 };
 
 struct BiosConfig {
@@ -55,6 +91,8 @@ struct BiosConfig {
     std::filesystem::path out_dir;       // absolute path to output dir
     bool                  strict;        // currently always true
     std::string           out_stem;      // derived if not explicit
+    std::vector<BiosVectorTable> bios_vectors; // optional vector dispatch tables
+    std::vector<BiosAlias>       bios_aliases; // optional fixed-target trampolines
 
     // [runtime] block (optional)
     RuntimeConfig         runtime;

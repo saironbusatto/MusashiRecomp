@@ -1,38 +1,131 @@
 {
   "schema": "psxrecomp-v4 dispatch-miss seeds",
-  "source": "runtime dispatch miss log — functions called indirectly (JALR / function pointer tables)",
+  "source": "runtime dispatch miss log \u00e2\u20ac\u201d functions called indirectly (JALR / function pointer tables)",
   "note": "These functions have no static JAL callers and cannot be found by transitive discovery. They are reached at runtime via BIOS API dispatch tables (A0/B0/C0 vectors) or other indirect call mechanisms.",
   "seeds": [
-    {"address": "0xBFC42380", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC42844", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC38AD4", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC42A90", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC42A10", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC27FB0", "rationale": "dispatch miss: Kernel Part 2 function, indirect call"},
-    {"address": "0xBFC36D48", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC38AA4", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC1E3AC", "rationale": "dispatch miss: Shell function, called in vblank loop"},
-    {"address": "0xBFC3045C", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC30470", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC30484", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC30498", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC30554", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC30560", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC3056C", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC30578", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC36DD0", "rationale": "dispatch miss: Shell function, indirect call via table"},
-    {"address": "0xBFC11840", "rationale": "dispatch miss: KP2 function, indirect call"},
-    {"address": "0xBFC36DF8", "rationale": "dispatch miss: Shell function, indirect call"},
-    {"address": "0xBFC11524", "rationale": "dispatch miss: KP2 secondary entry point for exception handler, mid-function split of func_00001A00, called during VBlank"},
-    {"address": "0xBFC11610", "rationale": "dispatch miss: KP2 function, tail-call target from 0xBFC11524 exception handler path"},
-
-    {"address": "0xBFC14A54", "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain BUSY-writer at RAM 0x4F54; alias rule RAM=ROM-0xBFC10000+0x500. Reached via JAL inside FUN_bfc147f4; never emitted as standalone entry."},
-    {"address": "0xBFC158D0", "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain init slot-0 BUSY writer at RAM 0x5DD0; alias RAM=ROM-0xBFC10000+0x500. Inside FUN_bfc158a8 body."},
-    {"address": "0xBFC158D8", "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain init slot-1 BUSY writer at RAM 0x5DD8; alias RAM=ROM-0xBFC10000+0x500. Inside FUN_bfc158a8 body."},
-    {"address": "0xBFC159F4", "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain step handler that writes 0x02 OPEN to [0x7568+slot] at RAM 0x5EF4. Indirect-jr target from RAM 0x6c98 jump table; alias RAM=ROM-0xBFC10000+0x500. KEY entry — without this the gate never clears."},
-    {"address": "0xBFC15AA8", "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain step handler that writes 0x04 OPEN to [0x7568+slot] at RAM 0x5FA8. Indirect-jr target from RAM 0x6c98 jump table; alias RAM=ROM-0xBFC10000+0x500. KEY entry — paired with 0xBFC159F4."},
-    {"address": "0xBFC04910", "rationale": "Tomba boot dispatch miss after licensed PlayStation screen. Verified in Ghidra/runtime disassembly as a standalone BIOS init routine between 0xBFC048D0 and 0xBFC04ABC, with return at 0xBFC04A98 and table data reference from 0xBFC04554."},
-    {"address": "0xBFC04850", "rationale": "Tomba boot dispatch miss after seeding 0xBFC04910. Verified in Ghidra/runtime disassembly as a standalone BIOS callback-list init routine between 0xBFC0472C and 0xBFC048D0, with return at 0xBFC048C8 and table data reference from 0xBFC04588."},
-    {"address": "0xBFC079F8", "rationale": "Tomba boot dispatch miss after game callback coverage fixes. Verified in Ghidra as a tiny BIOS table leaf routine (sw a0,0(sp); jr ra; clear v0) referenced by data at 0xBFC04484 and 0xBFC0E30C."}
+    {
+      "address": "0xBFC42380",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC42844",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC38AD4",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC42A90",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC42A10",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC27FB0",
+      "rationale": "dispatch miss: Kernel Part 2 function, indirect call"
+    },
+    {
+      "address": "0xBFC36D48",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC38AA4",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC1E3AC",
+      "rationale": "dispatch miss: Shell function, called in vblank loop"
+    },
+    {
+      "address": "0xBFC3045C",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC30470",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC30484",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC30498",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC30554",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC30560",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC3056C",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC30578",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC36DD0",
+      "rationale": "dispatch miss: Shell function, indirect call via table"
+    },
+    {
+      "address": "0xBFC11840",
+      "rationale": "dispatch miss: KP2 function, indirect call"
+    },
+    {
+      "address": "0xBFC36DF8",
+      "rationale": "dispatch miss: Shell function, indirect call"
+    },
+    {
+      "address": "0xBFC11524",
+      "rationale": "dispatch miss: KP2 secondary entry point for exception handler, mid-function split of func_00001A00, called during VBlank"
+    },
+    {
+      "address": "0xBFC11610",
+      "rationale": "dispatch miss: KP2 function, tail-call target from 0xBFC11524 exception handler path"
+    },
+    {
+      "address": "0xBFC14A54",
+      "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain BUSY-writer at RAM 0x4F54; alias rule RAM=ROM-0xBFC10000+0x500. Reached via JAL inside FUN_bfc147f4; never emitted as standalone entry."
+    },
+    {
+      "address": "0xBFC158D0",
+      "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain init slot-0 BUSY writer at RAM 0x5DD0; alias RAM=ROM-0xBFC10000+0x500. Inside FUN_bfc158a8 body."
+    },
+    {
+      "address": "0xBFC158D8",
+      "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain init slot-1 BUSY writer at RAM 0x5DD8; alias RAM=ROM-0xBFC10000+0x500. Inside FUN_bfc158a8 body."
+    },
+    {
+      "address": "0xBFC159F4",
+      "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain step handler that writes 0x02 OPEN to [0x7568+slot] at RAM 0x5EF4. Indirect-jr target from RAM 0x6c98 jump table; alias RAM=ROM-0xBFC10000+0x500. KEY entry \u00e2\u20ac\u201d without this the gate never clears."
+    },
+    {
+      "address": "0xBFC15AA8",
+      "rationale": "dispatch miss (Beetle wtrace, docs/CASE_A_AOT_GAP.md): chain step handler that writes 0x04 OPEN to [0x7568+slot] at RAM 0x5FA8. Indirect-jr target from RAM 0x6c98 jump table; alias RAM=ROM-0xBFC10000+0x500. KEY entry \u00e2\u20ac\u201d paired with 0xBFC159F4."
+    },
+    {
+      "address": "0xBFC04910",
+      "rationale": "Tomba boot dispatch miss after licensed PlayStation screen. Verified in Ghidra/runtime disassembly as a standalone BIOS init routine between 0xBFC048D0 and 0xBFC04ABC, with return at 0xBFC04A98 and table data reference from 0xBFC04554."
+    },
+    {
+      "address": "0xBFC04850",
+      "rationale": "Tomba boot dispatch miss after seeding 0xBFC04910. Verified in Ghidra/runtime disassembly as a standalone BIOS callback-list init routine between 0xBFC0472C and 0xBFC048D0, with return at 0xBFC048C8 and table data reference from 0xBFC04588."
+    },
+    {
+      "address": "0xBFC079F8",
+      "rationale": "Tomba boot dispatch miss after game callback coverage fixes. Verified in Ghidra as a tiny BIOS table leaf routine (sw a0,0(sp); jr ra; clear v0) referenced by data at 0xBFC04484 and 0xBFC0E30C."
+    },
+    {
+      "address": "0xBFC15F1C",
+      "rationale": "dirty_ram hot: SIO/PAD interrupt handler entry point (RAM 0x641C), called via jalr. 10852+ hits/frame across internal branch targets (0x641C, 0x6430, 0x6444, 0x6458, 0x650C, 0x6514, 0x658C, 0x6594). Seeding entry only; CFG discovers internal labels."
+    }
   ]
 }

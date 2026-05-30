@@ -9,6 +9,13 @@ extern "C" {
 
 void cdrom_init(const char* cue_path);
 
+/* Set disc speed multiplier immediately. divisor=0 → instant, 1 → 1x, 2 → 2x. */
+void cdrom_set_speed(int divisor);
+/* Store configured game speed (applied post-BIOS via cdrom_notify_game_started). */
+void cdrom_set_game_speed(int divisor);
+/* Called by fntrace on first game-range dispatch; switches to game speed. */
+void cdrom_notify_game_started(void);
+
 /* MMIO read/write (0x1F801800-0x1F801803) */
 uint32_t cdrom_read(uint32_t addr);
 void cdrom_write(uint32_t addr, uint32_t value);

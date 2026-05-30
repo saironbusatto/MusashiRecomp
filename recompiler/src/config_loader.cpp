@@ -54,6 +54,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         rt.memcard_dir = fs::absolute(root / rel);
         rt.has_memcard_dir = true;
     }
+    if (runtime.contains("disc_speed")) {
+        rt.disc_speed     = toml::find<std::string>(runtime, "disc_speed");
+        rt.has_disc_speed = true;
+    }
+    if (runtime.contains("fast_boot")) {
+        rt.fast_boot = toml::find<bool>(runtime, "fast_boot");
+    }
     return rt;
 }
 
@@ -182,6 +189,42 @@ BiosConfig load_bios_config(const fs::path& config_path_in) {
         out_stem = derive_out_stem(fs::path(rom_field).filename().string());
     }
 
+    // [[recompiler.bios_vectors]] — optional array of vector dispatch tables
+    std::vector<BiosVectorTable> bios_vectors;
+    if (recomp.contains("bios_vectors")) {
+        const auto& arr = recomp.at("bios_vectors").as_array();
+        for (const auto& v : arr) {
+            BiosVectorTable bvt;
+            bvt.ram_addr = parse_hex(
+                toml::find<std::string>(v, "ram_addr"), "bios_vectors.ram_addr");
+            bvt.index_reg = static_cast<int>(
+                toml::find<int64_t>(v, "index_reg"));
+            bvt.table_rom_addr = parse_hex(
+                toml::find<std::string>(v, "table_rom_addr"), "bios_vectors.table_rom_addr");
+            bvt.table_count = static_cast<uint32_t>(
+                toml::find<int64_t>(v, "table_count"));
+            bvt.table_ram_addr = v.contains("table_ram_addr")
+                ? parse_hex(toml::find<std::string>(v, "table_ram_addr"),
+                            "bios_vectors.table_ram_addr")
+                : 0u;
+            bios_vectors.push_back(bvt);
+        }
+    }
+
+    // [[recompiler.bios_aliases]] — fixed-target RAM trampolines
+    std::vector<BiosAlias> bios_aliases;
+    if (recomp.contains("bios_aliases")) {
+        const auto& arr = recomp.at("bios_aliases").as_array();
+        for (const auto& v : arr) {
+            BiosAlias ba;
+            ba.ram_addr   = parse_hex(toml::find<std::string>(v, "ram_addr"),
+                                      "bios_aliases.ram_addr");
+            ba.target_key = parse_hex(toml::find<std::string>(v, "target_key"),
+                                      "bios_aliases.target_key");
+            bios_aliases.push_back(ba);
+        }
+    }
+
     return BiosConfig{
         /*config_path*/  config_path,
         /*project_root*/ root,
@@ -195,6 +238,8 @@ BiosConfig load_bios_config(const fs::path& config_path_in) {
         /*out_dir*/      out_dir,
         /*strict*/       strict,
         /*out_stem*/     out_stem,
+        /*bios_vectors*/ std::move(bios_vectors),
+        /*bios_aliases*/ std::move(bios_aliases),
         /*runtime*/      parse_runtime_block(cfg, root),
     };
 }
