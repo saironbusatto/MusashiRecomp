@@ -1,5 +1,5 @@
-#ifndef PSXRECOMP_V4_INTERRUPTS_H
-#define PSXRECOMP_V4_INTERRUPTS_H
+﻿#ifndef PSXRECOMP_INTERRUPTS_H
+#define PSXRECOMP_INTERRUPTS_H
 
 #include <stdint.h>
 
@@ -71,4 +71,4 @@ void psx_restore_state_escape(void);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_INTERRUPTS_H */
+#endif /* PSXRECOMP_INTERRUPTS_H */

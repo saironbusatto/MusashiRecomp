@@ -1,4 +1,4 @@
-// main_bios.cpp
+﻿// main_bios.cpp
 // ----------------------------------------------------------------------------
 // Phase 1a entry point: psxrecomp-bios.
 //
@@ -443,7 +443,7 @@ std::string make_function_manifest_json(const PSXRecompV4::DiscoveryResult& dr,
                                         const std::string& bios_sha256) {
     std::ostringstream os;
     os << "{\n";
-    os << "  \"schema\": \"psxrecomp-v4 phase1c function_manifest v1\",\n";
+    os << "  \"schema\": \"psxrecomp phase1c function_manifest v1\",\n";
     os << fmt::format("  \"bios_sha256\": \"{}\",\n", bios_sha256);
     os << fmt::format("  \"total_functions\": {},\n", dr.total_functions);
     os << fmt::format("  \"total_instructions\": {},\n", dr.total_instructions);
@@ -477,7 +477,7 @@ std::string make_function_manifest_json(const PSXRecompV4::DiscoveryResult& dr,
 std::string make_function_edges_json(const PSXRecompV4::DiscoveryResult& dr) {
     std::ostringstream os;
     os << "{\n";
-    os << "  \"schema\": \"psxrecomp-v4 phase1c function_edges v1\",\n";
+    os << "  \"schema\": \"psxrecomp phase1c function_edges v1\",\n";
     os << fmt::format("  \"total_edges\": {},\n", dr.total_edges);
     os << "  \"edges\": [\n";
 
@@ -500,7 +500,7 @@ std::string make_discovery_log_json(const PSXRecompV4::DiscoveryResult& dr,
                                     const std::vector<PSXRecompV4::Seed>& seeds) {
     std::ostringstream os;
     os << "{\n";
-    os << "  \"schema\": \"psxrecomp-v4 phase1c discovery_run v1\",\n";
+    os << "  \"schema\": \"psxrecomp phase1c discovery_run v1\",\n";
     os << "  \"seeds\": [\n";
     for (size_t i = 0; i < seeds.size(); ++i) {
         os << fmt::format("    {{\"address\": \"0x{:08X}\", \"label\": \"{}\"}}",
@@ -559,7 +559,7 @@ std::string make_discovery_log_json(const PSXRecompV4::DiscoveryResult& dr,
 std::string make_indirect_jumps_json(const PSXRecompV4::DiscoveryResult& dr) {
     std::ostringstream os;
     os << "{\n";
-    os << "  \"schema\": \"psxrecomp-v4 phase1d indirect_jumps v1\",\n";
+    os << "  \"schema\": \"psxrecomp phase1d indirect_jumps v1\",\n";
     os << fmt::format("  \"total_sites\": {},\n", dr.indirect_jumps.size());
     os << "  \"sites\": [\n";
 
@@ -600,7 +600,7 @@ std::string make_indirect_jump_classes_json(const PSXRecompV4::DiscoveryResult& 
 
     std::ostringstream os;
     os << "{\n";
-    os << "  \"schema\": \"psxrecomp-v4 phase1d indirect_jump_classes v1\",\n";
+    os << "  \"schema\": \"psxrecomp phase1d indirect_jump_classes v1\",\n";
     os << fmt::format("  \"total_sites\": {},\n", dr.indirect_jumps.size());
     os << "  \"classes\": {\n";
 

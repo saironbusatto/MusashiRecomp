@@ -1,6 +1,6 @@
-"""Sample Tomba's state machine state every 500ms for 15 sec."""
+﻿"""Sample Tomba's state machine state every 500ms for 15 sec."""
 import time, sys
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 prev = None

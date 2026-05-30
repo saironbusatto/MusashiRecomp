@@ -1,7 +1,7 @@
-"""Find where 'EC' bytes (0x45, 0x43) appear in runtime memory but not beetle.
+﻿"""Find where 'EC' bytes (0x45, 0x43) appear in runtime memory but not beetle.
 That tells us if 0x43450000 at 0x8009B3D4 is from a stale buffer/string."""
 import sys
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 # Scan a wide range of low RAM (0x80010000..0x80100000) for any place where

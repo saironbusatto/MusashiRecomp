@@ -10,14 +10,17 @@
 
 psx_fiber_t psx_fiber_convert_thread(void)
 {
-    /* If already a fiber, GetCurrentFiber returns it; otherwise convert.
-     * On a freshly-converted thread GetCurrentFiber == the new fiber. */
-    void* cur = GetCurrentFiber();
-    /* 0 and 0x1E00000000000000 are the documented "not a fiber" sentinels. */
-    if (cur == NULL || cur == (void*)(uintptr_t)0x1E00000000000000ULL) {
-        cur = ConvertThreadToFiber(NULL);
-    }
-    return (psx_fiber_t)cur;
+    /* Attempt the conversion unconditionally and check the error code on
+     * failure. The 0x1E00000000000000 TEB sentinel for "not yet a fiber"
+     * is MSVC-internal and not guaranteed by MinGW's GetCurrentFiber()
+     * implementation — reading it before ConvertThreadToFiber is called
+     * can return an unspecified TEB value that isn't the sentinel, causing
+     * the sentinel check to silently skip ConvertThreadToFiber, leaving
+     * the thread as a non-fiber, and crashing the first SwitchToFiber. */
+    void* fib = ConvertThreadToFiber(NULL);
+    if (!fib && GetLastError() == ERROR_ALREADY_FIBER)
+        fib = GetCurrentFiber();
+    return (psx_fiber_t)fib;
 }
 
 psx_fiber_t psx_fiber_current(void)      { return (psx_fiber_t)GetCurrentFiber(); }

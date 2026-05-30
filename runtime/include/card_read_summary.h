@@ -1,4 +1,4 @@
-/*
+﻿/*
  * card_read_summary.h — non-evicting evidence ring for the first 32
  * completed memory-card reads.
  *
@@ -12,8 +12,8 @@
  * caller function. The destination RAM pointer is filled in later
  * by the chain-handler trace (Phase 3).
  */
-#ifndef PSXRECOMP_V4_CARD_READ_SUMMARY_H
-#define PSXRECOMP_V4_CARD_READ_SUMMARY_H
+#ifndef PSXRECOMP_CARD_READ_SUMMARY_H
+#define PSXRECOMP_CARD_READ_SUMMARY_H
 
 #include <stdint.h>
 
@@ -58,4 +58,4 @@ void card_read_summary_set_dest(uint32_t dest_addr);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_CARD_READ_SUMMARY_H */
+#endif /* PSXRECOMP_CARD_READ_SUMMARY_H */

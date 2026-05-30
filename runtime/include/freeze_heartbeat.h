@@ -1,4 +1,4 @@
-/* freeze_heartbeat.h — observability infrastructure.
+﻿/* freeze_heartbeat.h — observability infrastructure.
  *
  * Starts a background thread that snapshots runtime state to
  * `psx_freeze_heartbeat.json` every ~100 ms. Survives main-thread
@@ -12,8 +12,8 @@
  * the runtime was in just before it stalled.
  */
 
-#ifndef PSXRECOMP_V4_FREEZE_HEARTBEAT_H
-#define PSXRECOMP_V4_FREEZE_HEARTBEAT_H
+#ifndef PSXRECOMP_FREEZE_HEARTBEAT_H
+#define PSXRECOMP_FREEZE_HEARTBEAT_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -29,4 +29,4 @@ void freeze_heartbeat_start(const char *backend_label);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_FREEZE_HEARTBEAT_H */
+#endif /* PSXRECOMP_FREEZE_HEARTBEAT_H */

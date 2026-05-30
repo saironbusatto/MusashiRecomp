@@ -1,5 +1,5 @@
-#ifndef PSXRECOMP_V4_PSX_CYCLES_H
-#define PSXRECOMP_V4_PSX_CYCLES_H
+﻿#ifndef PSXRECOMP_PSX_CYCLES_H
+#define PSXRECOMP_PSX_CYCLES_H
 
 #include <stdint.h>
 
@@ -26,4 +26,4 @@ uint64_t psx_get_cycle_count(void);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_PSX_CYCLES_H */
+#endif /* PSXRECOMP_PSX_CYCLES_H */

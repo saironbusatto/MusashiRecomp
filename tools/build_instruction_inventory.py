@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 build_instruction_inventory.py
 
@@ -547,7 +547,7 @@ def main():
 
     synth_walks = [w for w in walks if w.get("kind") == "synthetic_seed"]
     out_doc = {
-        "schema": "psxrecomp-v4 phase1b instruction_inventory v2",
+        "schema": "psxrecomp phase1b instruction_inventory v2",
         "program": "SCPH1001.BIN",
         "image_base": "0xbfc00000",
         "image_end": "0xbfc7ffff",

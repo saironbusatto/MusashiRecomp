@@ -1,5 +1,5 @@
-#ifndef PSXRECOMP_V4_TIMERS_H
-#define PSXRECOMP_V4_TIMERS_H
+﻿#ifndef PSXRECOMP_TIMERS_H
+#define PSXRECOMP_TIMERS_H
 
 #include <stdint.h>
 
@@ -26,4 +26,4 @@ void timers_tick(int cycles);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_TIMERS_H */
+#endif /* PSXRECOMP_TIMERS_H */

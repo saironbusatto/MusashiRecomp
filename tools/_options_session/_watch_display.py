@@ -1,6 +1,6 @@
-"""Sample gpu_state every 500ms for 10 sec and see if display origin moves."""
+﻿"""Sample gpu_state every 500ms for 10 sec and see if display origin moves."""
 import time, json, sys
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 prev = None

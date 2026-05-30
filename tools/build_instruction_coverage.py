@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 build_instruction_coverage.py
 
@@ -196,7 +196,7 @@ def main():
             })
 
     summary = {
-        "schema": "psxrecomp-v4 phase1b instruction_coverage v1",
+        "schema": "psxrecomp phase1b instruction_coverage v1",
         "inventory_source": "generated/instruction_inventory.json",
         "translator_source": TRANSLATOR_PATH,
         "totals": {

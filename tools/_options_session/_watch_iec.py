@@ -1,6 +1,6 @@
-"""Sample SR / IRQ state to check if IEc ever goes back to 1."""
+﻿"""Sample SR / IRQ state to check if IEc ever goes back to 1."""
 import time, sys
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 print(f"{'i':>3} {'frame':>6} {'sr':>10} {'IEc':>3} {'IEp':>3} {'IEo':>3} "

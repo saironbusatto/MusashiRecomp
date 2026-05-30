@@ -1,5 +1,5 @@
-#ifndef PSXRECOMP_V4_SIO_H
-#define PSXRECOMP_V4_SIO_H
+﻿#ifndef PSXRECOMP_SIO_H
+#define PSXRECOMP_SIO_H
 
 #include <stdint.h>
 
@@ -189,4 +189,4 @@ uint32_t sio_get_irq_ring(const SioIrqEntry **buf_out, int *write_idx_out);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_SIO_H */
+#endif /* PSXRECOMP_SIO_H */
