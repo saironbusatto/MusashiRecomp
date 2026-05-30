@@ -63,7 +63,8 @@ public:
         const DiscoveryResult&            dr,
         const std::string&                bios_sha256,
         const std::string&                out_dir,
-        const std::vector<BiosVectorTable>& bios_vectors = {});
+        const std::vector<BiosVectorTable>& bios_vectors = {},
+        const std::vector<BiosAlias>&       bios_aliases = {});
 
 private:
     // Emit a single function's C code to the output stream.
@@ -97,7 +98,8 @@ private:
         const std::string&                  bios_sha256,
         const std::vector<uint8_t>&         rom,
         uint32_t                            base_addr,
-        const std::vector<BiosVectorTable>& bios_vectors);
+        const std::vector<BiosVectorTable>& bios_vectors,
+        const std::vector<BiosAlias>&       bios_aliases);
 
     static uint32_t normalize_address(uint32_t addr);
     static uint32_t read_u32_le(const std::vector<uint8_t>& rom, uint32_t offset);

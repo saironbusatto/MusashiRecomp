@@ -1072,6 +1072,7 @@ int main(int argc, char** argv) {
     uint16_t   debug_port    = (uint16_t)DEFAULT_DEBUG_PORT;
     std::string game_name;
     std::string game_id;
+    std::string disc_speed;   /* "1x" | "2x" | "4x" | "instant" */
 
     if (game_config_path) {
         try {
@@ -1082,6 +1083,7 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
+            if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
             std::fprintf(stdout, "psxrecomp: loaded game config %s (%s, %s)\n",
                          game_config_path, game_name.c_str(), game_id.c_str());
         } catch (const std::exception& ex) {
@@ -1123,6 +1125,16 @@ int main(int argc, char** argv) {
     sio_connect_pad(0);  /* Controller on port 1 */
     spu_init();
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
+    {
+        int divisor = 1; /* default: authentic 1x timing */
+        if (disc_speed == "instant") divisor = 0;
+        else if (disc_speed == "4x") divisor = 4;
+        else if (disc_speed == "2x") divisor = 2;
+        if (divisor != 1)
+            std::fprintf(stdout, "psxrecomp: disc_speed=%s (divisor=%d)\n",
+                         disc_speed.c_str(), divisor);
+        cdrom_set_speed(divisor);
+    }
     memcard_init(memcard_dir_str.c_str());
     std::atexit(memcard_flush_all);
 #ifndef PSX_NO_DEBUG_TOOLS

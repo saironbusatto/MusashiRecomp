@@ -36,6 +36,12 @@ struct RuntimeConfig {
 
     bool                  has_memcard_dir = false;
     std::filesystem::path memcard_dir;     // absolute path (resolved against project root)
+
+    // disc_speed: "1x" (default) | "2x" | "4x" | "instant"
+    // Controls how quickly CD-ROM timing delays fire. "instant" collapses all
+    // seek/read delays to 1 cycle — correct INT sequence, no artificial wait.
+    bool                  has_disc_speed = false;
+    std::string           disc_speed;      // raw string; main.cpp converts to divisor
 };
 
 // One entry from [[recompiler.bios_vectors]].
@@ -52,6 +58,15 @@ struct BiosVectorTable {
     // Runtime RAM address of the live function table (used as fallback for
     // Shell-patched entries not present in ROM). 0 = no runtime fallback.
     uint32_t table_ram_addr;
+};
+
+// One entry from [[recompiler.bios_aliases]].
+// A RAM address the BIOS installs a simple fixed-target trampoline at
+// (e.g. the SIO handler at 0x0CF0 which just jalrs to 0x641C). Emitted as
+// a one-liner wrapper in the dispatch table — no table lookup, no switch.
+struct BiosAlias {
+    uint32_t ram_addr;    // the installed stub address (e.g. 0x0CF0)
+    uint32_t target_key;  // normalized dispatch key of the target (e.g. 0x641C)
 };
 
 struct BiosConfig {
@@ -72,6 +87,7 @@ struct BiosConfig {
     bool                  strict;        // currently always true
     std::string           out_stem;      // derived if not explicit
     std::vector<BiosVectorTable> bios_vectors; // optional vector dispatch tables
+    std::vector<BiosAlias>       bios_aliases; // optional fixed-target trampolines
 
     // [runtime] block (optional)
     RuntimeConfig         runtime;

@@ -9,6 +9,11 @@ extern "C" {
 
 void cdrom_init(const char* cue_path);
 
+/* Set disc speed multiplier. divisor=0 → instant (all delays collapse to
+ * 1 cycle, correct INT sequence fires as fast as host can process).
+ * divisor=1 → authentic 1x. divisor=2 → 2x. Call before first cdrom_tick. */
+void cdrom_set_speed(int divisor);
+
 /* MMIO read/write (0x1F801800-0x1F801803) */
 uint32_t cdrom_read(uint32_t addr);
 void cdrom_write(uint32_t addr, uint32_t value);

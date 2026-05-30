@@ -54,6 +54,10 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         rt.memcard_dir = fs::absolute(root / rel);
         rt.has_memcard_dir = true;
     }
+    if (runtime.contains("disc_speed")) {
+        rt.disc_speed     = toml::find<std::string>(runtime, "disc_speed");
+        rt.has_disc_speed = true;
+    }
     return rt;
 }
 
@@ -204,6 +208,20 @@ BiosConfig load_bios_config(const fs::path& config_path_in) {
         }
     }
 
+    // [[recompiler.bios_aliases]] — fixed-target RAM trampolines
+    std::vector<BiosAlias> bios_aliases;
+    if (recomp.contains("bios_aliases")) {
+        const auto& arr = recomp.at("bios_aliases").as_array();
+        for (const auto& v : arr) {
+            BiosAlias ba;
+            ba.ram_addr   = parse_hex(toml::find<std::string>(v, "ram_addr"),
+                                      "bios_aliases.ram_addr");
+            ba.target_key = parse_hex(toml::find<std::string>(v, "target_key"),
+                                      "bios_aliases.target_key");
+            bios_aliases.push_back(ba);
+        }
+    }
+
     return BiosConfig{
         /*config_path*/  config_path,
         /*project_root*/ root,
@@ -218,6 +236,7 @@ BiosConfig load_bios_config(const fs::path& config_path_in) {
         /*strict*/       strict,
         /*out_stem*/     out_stem,
         /*bios_vectors*/ std::move(bios_vectors),
+        /*bios_aliases*/ std::move(bios_aliases),
         /*runtime*/      parse_runtime_block(cfg, root),
     };
 }

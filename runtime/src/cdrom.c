@@ -86,10 +86,25 @@ static uint8_t xa_stream_file;
 static uint8_t xa_stream_channel;
 static int xa_stream_active;
 
+/* 0 = instant (every delay collapses to 1 cycle), >0 = divisor applied to
+ * all timing constants. Set via cdrom_set_speed() from main before first use. */
+static int g_disc_speed_divisor = 1;
+
+void cdrom_set_speed(int divisor) {
+    g_disc_speed_divisor = divisor;
+}
+
+static int apply_speed(int delay) {
+    if (g_disc_speed_divisor == 0) return 1;
+    int d = delay / g_disc_speed_divisor;
+    return d < 1 ? 1 : d;
+}
+
 static int sector_delay_cycles(void) {
     /* PS1 CPU is 33.8688 MHz. CD-ROM sectors arrive at 75 Hz in 1x
      * mode, or twice that rate when SetMode bit 7 enables double speed. */
-    return (mode_reg & 0x80) ? 225792 : 451584;
+    int base = (mode_reg & 0x80) ? 225792 : 451584;
+    return apply_speed(base);
 }
 
 /* Pending command */
@@ -453,7 +468,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x09;
         pending.pending = 1;
-        pending.delay = 10000;
+        pending.delay = apply_speed(10000);
         pending.phase = 1;
         break;
 
@@ -466,7 +481,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x0A;
         pending.pending = 1;
-        pending.delay = 50000;
+        pending.delay = apply_speed(50000);
         pending.phase = 1;
         break;
 
@@ -517,7 +532,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x15;
         pending.pending = 1;
-        pending.delay = 20000;
+        pending.delay = apply_speed(20000);
         pending.phase = 1;
         break;
 
@@ -529,7 +544,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x1A;
         pending.pending = 1;
-        pending.delay = 30000;
+        pending.delay = apply_speed(30000);
         pending.phase = 1;
         break;
 
@@ -549,7 +564,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x1E;
         pending.pending = 1;
-        pending.delay = 100000;
+        pending.delay = apply_speed(100000);
         pending.phase = 1;
         break;
 
