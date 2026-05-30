@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>   /* va_start/va_end — not pulled in transitively off Windows */
 #include <time.h>
 
 #include "cpu_state.h"
