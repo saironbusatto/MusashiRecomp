@@ -795,21 +795,29 @@ static void close_controller(void) {
 static void open_configured_controller(void) {
     if (sdl_controller) return;
 
-    int seen = 0;
-    int joysticks = SDL_NumJoysticks();
-    for (int i = 0; i < joysticks; i++) {
-        if (!SDL_IsGameController(i)) continue;
-        if (seen++ != controller_device_index) continue;
+    /* First pass: open the configured device index. Second pass: open the
+     * first available controller — covers Steam Remote Play where the virtual
+     * Xbox controller appears at an unpredictable index, and cases where the
+     * configured index is simply out of range. */
+    for (int pass = 0; pass < 2 && !sdl_controller; pass++) {
+        int seen = 0;
+        int joysticks = SDL_NumJoysticks();
+        for (int i = 0; i < joysticks; i++) {
+            if (!SDL_IsGameController(i)) continue;
+            int match = (pass == 0) ? (seen == controller_device_index) : 1;
+            seen++;
+            if (!match) continue;
 
-        sdl_controller = SDL_GameControllerOpen(i);
-        if (sdl_controller) {
-            SDL_Joystick* joy = SDL_GameControllerGetJoystick(sdl_controller);
-            sdl_controller_instance = joy ? SDL_JoystickInstanceID(joy) : -1;
-            const char* name = SDL_GameControllerName(sdl_controller);
-            std::fprintf(stdout, "psxrecomp runtime: controller %d: %s\n",
-                         controller_device_index, name ? name : "(unnamed)");
+            sdl_controller = SDL_GameControllerOpen(i);
+            if (sdl_controller) {
+                SDL_Joystick* joy = SDL_GameControllerGetJoystick(sdl_controller);
+                sdl_controller_instance = joy ? SDL_JoystickInstanceID(joy) : -1;
+                const char* name = SDL_GameControllerName(sdl_controller);
+                std::fprintf(stdout, "psxrecomp runtime: controller %d (pass %d): %s\n",
+                             seen - 1, pass, name ? name : "(unnamed)");
+            }
+            break;
         }
-        break;
     }
 }
 
@@ -1128,6 +1136,11 @@ int main(int argc, char** argv) {
     /* ---- SDL init ---- */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    /* Prefer SDL's own HIDAPI driver over platform-native so Steam's virtual
+     * Xbox controller (injected by Steam Input / Remote Play) is enumerated
+     * as a game controller rather than a raw HID device. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
