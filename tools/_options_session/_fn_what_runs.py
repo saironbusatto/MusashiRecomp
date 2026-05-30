@@ -1,6 +1,6 @@
-"""Arm fntrace, sample, find what Tomba functions actually run during black screen."""
+﻿"""Arm fntrace, sample, find what Tomba functions actually run during black screen."""
 import sys, time, collections, json
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 # Make sure fntrace is armed for the entire Tomba RAM range

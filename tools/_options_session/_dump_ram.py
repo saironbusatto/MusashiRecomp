@@ -1,5 +1,5 @@
-import sys
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+﻿import sys
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 addr = int(sys.argv[1], 16)
 size = int(sys.argv[2], 0) if len(sys.argv) > 2 else 0x200

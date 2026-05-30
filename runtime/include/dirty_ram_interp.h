@@ -1,4 +1,4 @@
-/* dirty_ram_interp.h — interpret-on-dispatch for install-at-runtime RAM.
+﻿/* dirty_ram_interp.h — interpret-on-dispatch for install-at-runtime RAM.
  *
  * See CLAUDE.md Rule 18 and docs/dynamic_handler_install.md for the full
  * rationale.  The PS1 BIOS dynamically writes 4-instruction dispatch stubs
@@ -12,8 +12,8 @@
  * RAM.  See docs/dynamic_handler_install.md for the inline note about a
  * potential future migration to runtime JIT (Option B).
  */
-#ifndef PSXRECOMP_V4_DIRTY_RAM_INTERP_H
-#define PSXRECOMP_V4_DIRTY_RAM_INTERP_H
+#ifndef PSXRECOMP_DIRTY_RAM_INTERP_H
+#define PSXRECOMP_DIRTY_RAM_INTERP_H
 
 #include <stdint.h>
 #include "cpu_state.h"
@@ -150,4 +150,4 @@ extern uint64_t             g_dirty_ram_insn_log_seq;
 }
 #endif
 
-#endif /* PSXRECOMP_V4_DIRTY_RAM_INTERP_H */
+#endif /* PSXRECOMP_DIRTY_RAM_INTERP_H */

@@ -1,4 +1,4 @@
-/* fntrace.h — always-on call ring for recomp psx_dispatch.
+﻿/* fntrace.h — always-on call ring for recomp psx_dispatch.
  *
  * Records every entry into psx_dispatch with the caller's argument
  * registers and return address. Mirrors beetle_libretro.cpp's fntrace
@@ -17,8 +17,8 @@
  * dirty_ram_block_log overlaps with the dirty-RAM subset; this ring is
  * the superset.
  */
-#ifndef PSXRECOMP_V4_FNTRACE_H
-#define PSXRECOMP_V4_FNTRACE_H
+#ifndef PSXRECOMP_FNTRACE_H
+#define PSXRECOMP_FNTRACE_H
 
 #include <stdint.h>
 #include "cpu_state.h"
@@ -65,4 +65,4 @@ void fntrace_clear(void);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_FNTRACE_H */
+#endif /* PSXRECOMP_FNTRACE_H */

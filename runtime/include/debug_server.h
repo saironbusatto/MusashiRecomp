@@ -1,4 +1,4 @@
-/*
+﻿/*
  * debug_server.h -- TCP debug server for PSX recomp v4
  *
  * Non-blocking TCP server on localhost (default port 4370).
@@ -8,8 +8,8 @@
  * Same public API names as nesrecomp/snesrecomp debug servers
  * so TCP.md and DEBUG.md documentation is reusable across projects.
  */
-#ifndef PSXRECOMP_V4_DEBUG_SERVER_H
-#define PSXRECOMP_V4_DEBUG_SERVER_H
+#ifndef PSXRECOMP_DEBUG_SERVER_H
+#define PSXRECOMP_DEBUG_SERVER_H
 
 #include <stdint.h>
 #include <stdio.h>
@@ -204,4 +204,4 @@ void debug_server_freeze_dump_dirty_block_json(FILE *f, uint32_t max_count);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_DEBUG_SERVER_H */
+#endif /* PSXRECOMP_DEBUG_SERVER_H */

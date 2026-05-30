@@ -1,24 +1,27 @@
-# Shared psxrecomp-v4 runtime CMake helpers.
+﻿# Shared psxrecomp runtime CMake helpers.
 #
 # Include this from either the framework runtime build or a sibling game
-# project. Call psxrecomp_v4_add_runtime_target() after SDL2 detection has
+# project. Call psxrecomp_add_runtime_target() after SDL2 detection has
 # populated SDL2_INCLUDE_DIRS and SDL2_LIBRARIES.
 
-if(NOT DEFINED PSXRECOMP_V4_ROOT)
-    get_filename_component(PSXRECOMP_V4_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+if(NOT DEFINED PSXRECOMP_ROOT)
+    get_filename_component(PSXRECOMP_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 endif()
 
-# Production build flag: -DPSX_DEBUG_TOOLS=OFF disables the TCP debug
-# server, the freeze heartbeat thread, and the hot-path log functions
-# (call_entry / sio_write / probe / restore_event / thread_event) that
-# the recompiled C invokes on every block. Use to test whether the
-# debug infrastructure itself contributes to freezes, or to ship a
-# lean production binary. Visible to all targets including psx-beetle.
-option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" ON)
+# PSX_DEBUG_TOOLS: TCP debug server + heartbeat + per-block recording.
+# Defaults ON for Debug/RelWithDebInfo, OFF for Release/MinSizeRel so
+# a plain cmake -DCMAKE_BUILD_TYPE=Release gives a lean production binary
+# with no TCP server and no debug console. Override explicitly with
+# -DPSX_DEBUG_TOOLS=ON/OFF to force either way regardless of build type.
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+    option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" OFF)
+else()
+    option(PSX_DEBUG_TOOLS "Build with TCP debug server + heartbeat + per-block recording" ON)
+endif()
 
 if(NOT SDL2_INCLUDE_DIRS OR NOT SDL2_LIBRARIES)
     if(MSVC)
-        file(GLOB SDL2_MSVC_DIR "${PSXRECOMP_V4_ROOT}/../sdl2-msvc/SDL2-*")
+        file(GLOB SDL2_MSVC_DIR "${PSXRECOMP_ROOT}/../sdl2-msvc/SDL2-*")
         if(SDL2_MSVC_DIR)
             set(SDL2_INCLUDE_DIRS "${SDL2_MSVC_DIR}/include")
             set(SDL2_LIBRARIES "${SDL2_MSVC_DIR}/lib/x64/SDL2.lib")
@@ -40,50 +43,50 @@ if(NOT SDL2_INCLUDE_DIRS OR NOT SDL2_LIBRARIES)
     endif()
 endif()
 
-set(PSXRECOMP_V4_RUNTIME_SOURCES
-    ${PSXRECOMP_V4_ROOT}/runtime/src/main.cpp
-    ${PSXRECOMP_V4_ROOT}/runtime/src/memory.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/gpu.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/gpu_sw_renderer.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/dma.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/mdec.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/timers.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/interrupts.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/psx_fiber.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/sio.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/memcard.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/debug_server.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/dirty_ram_interp.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/fntrace.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/traps.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/crash_trace.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/freeze_heartbeat.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/gte.cpp
-    ${PSXRECOMP_V4_ROOT}/runtime/src/crc32.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/cdrom.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/spu.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/iso_reader.cpp
-    ${PSXRECOMP_V4_ROOT}/runtime/src/iso_reader_c.cpp
-    ${PSXRECOMP_V4_ROOT}/runtime/src/psx_cycles.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/starvation_ring.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/card_read_summary.c
-    ${PSXRECOMP_V4_ROOT}/runtime/src/card_data_writes.c
-    ${PSXRECOMP_V4_ROOT}/recompiler/src/config_loader.cpp
+set(PSXRECOMP_RUNTIME_SOURCES
+    ${PSXRECOMP_ROOT}/runtime/src/main.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/memory.c
+    ${PSXRECOMP_ROOT}/runtime/src/gpu.c
+    ${PSXRECOMP_ROOT}/runtime/src/gpu_sw_renderer.c
+    ${PSXRECOMP_ROOT}/runtime/src/dma.c
+    ${PSXRECOMP_ROOT}/runtime/src/mdec.c
+    ${PSXRECOMP_ROOT}/runtime/src/timers.c
+    ${PSXRECOMP_ROOT}/runtime/src/interrupts.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_fiber.c
+    ${PSXRECOMP_ROOT}/runtime/src/sio.c
+    ${PSXRECOMP_ROOT}/runtime/src/memcard.c
+    ${PSXRECOMP_ROOT}/runtime/src/debug_server.c
+    ${PSXRECOMP_ROOT}/runtime/src/dirty_ram_interp.c
+    ${PSXRECOMP_ROOT}/runtime/src/fntrace.c
+    ${PSXRECOMP_ROOT}/runtime/src/traps.c
+    ${PSXRECOMP_ROOT}/runtime/src/crash_trace.c
+    ${PSXRECOMP_ROOT}/runtime/src/freeze_heartbeat.c
+    ${PSXRECOMP_ROOT}/runtime/src/gte.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/crc32.c
+    ${PSXRECOMP_ROOT}/runtime/src/cdrom.c
+    ${PSXRECOMP_ROOT}/runtime/src/spu.c
+    ${PSXRECOMP_ROOT}/runtime/src/iso_reader.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/iso_reader_c.cpp
+    ${PSXRECOMP_ROOT}/runtime/src/psx_cycles.c
+    ${PSXRECOMP_ROOT}/runtime/src/starvation_ring.c
+    ${PSXRECOMP_ROOT}/runtime/src/card_read_summary.c
+    ${PSXRECOMP_ROOT}/runtime/src/card_data_writes.c
+    ${PSXRECOMP_ROOT}/recompiler/src/config_loader.cpp
 )
 
-set(PSXRECOMP_V4_RUNTIME_INCLUDE_DIRS
-    ${PSXRECOMP_V4_ROOT}/runtime/include
-    ${PSXRECOMP_V4_ROOT}/recompiler/src
-    ${PSXRECOMP_V4_ROOT}/recompiler/lib/fmt/include
-    ${PSXRECOMP_V4_ROOT}/recompiler/lib/toml11
+set(PSXRECOMP_RUNTIME_INCLUDE_DIRS
+    ${PSXRECOMP_ROOT}/runtime/include
+    ${PSXRECOMP_ROOT}/recompiler/src
+    ${PSXRECOMP_ROOT}/recompiler/lib/fmt/include
+    ${PSXRECOMP_ROOT}/recompiler/lib/toml11
 )
 
-set(PSXRECOMP_V4_BIOS_GENERATED
-    ${PSXRECOMP_V4_ROOT}/generated/SCPH1001_full.c
-    ${PSXRECOMP_V4_ROOT}/generated/SCPH1001_dispatch.c
+set(PSXRECOMP_BIOS_GENERATED
+    ${PSXRECOMP_ROOT}/generated/SCPH1001_full.c
+    ${PSXRECOMP_ROOT}/generated/SCPH1001_dispatch.c
 )
 
-function(psxrecomp_v4_add_runtime_target target)
+function(psxrecomp_add_runtime_target target)
     set(options ORACLE)
     set(oneValueArgs
         GAME_GENERATED_FULL_C
@@ -106,13 +109,13 @@ function(psxrecomp_v4_add_runtime_target target)
         set(PSXRT_WINDOW_TITLE "${target}")
     endif()
     if(NOT PSXRT_DEFAULT_BIOS_PATH)
-        set(PSXRT_DEFAULT_BIOS_PATH "${PSXRECOMP_V4_ROOT}/bios/SCPH1001.BIN")
+        set(PSXRT_DEFAULT_BIOS_PATH "${PSXRECOMP_ROOT}/bios/SCPH1001.BIN")
     endif()
     if(NOT DEFINED PSXRT_DEFAULT_GAME_CONFIG_PATH)
         set(PSXRT_DEFAULT_GAME_CONFIG_PATH "")
     endif()
 
-    set(generated_sources ${PSXRECOMP_V4_BIOS_GENERATED})
+    set(generated_sources ${PSXRECOMP_BIOS_GENERATED})
     if(PSXRT_GAME_GENERATED_FULL_C)
         set_source_files_properties("${PSXRT_GAME_GENERATED_FULL_C}" PROPERTIES GENERATED TRUE)
         list(APPEND generated_sources "${PSXRT_GAME_GENERATED_FULL_C}")
@@ -125,20 +128,20 @@ function(psxrecomp_v4_add_runtime_target target)
     endif()
 
     if(PSXRT_ORACLE)
-        set(mode_source ${PSXRECOMP_V4_ROOT}/runtime/src/psx_interpreter.c)
+        set(mode_source ${PSXRECOMP_ROOT}/runtime/src/psx_interpreter.c)
     else()
-        set(mode_source ${PSXRECOMP_V4_ROOT}/runtime/src/stub_interpreter.c)
+        set(mode_source ${PSXRECOMP_ROOT}/runtime/src/stub_interpreter.c)
     endif()
 
     add_executable(${target}
-        ${PSXRECOMP_V4_RUNTIME_SOURCES}
+        ${PSXRECOMP_RUNTIME_SOURCES}
         ${mode_source}
         ${generated_sources}
         ${PSXRT_EXTRAS_SOURCES}
     )
 
     target_include_directories(${target} PRIVATE
-        ${PSXRECOMP_V4_RUNTIME_INCLUDE_DIRS}
+        ${PSXRECOMP_RUNTIME_INCLUDE_DIRS}
         ${SDL2_INCLUDE_DIRS}
     )
     # pkg-config reports SDL2_LIBRARIES as a bare name (e.g. "SDL2" -> -lSDL2);
@@ -182,8 +185,15 @@ function(psxrecomp_v4_add_runtime_target target)
 
     if(MINGW)
         target_link_options(${target} PRIVATE -Wl,--stack,67108864)
+        # No console window in Release MinGW builds.
+        target_link_options(${target} PRIVATE $<$<CONFIG:Release>:-mwindows>)
     elseif(MSVC)
         target_compile_options(${target} PRIVATE /GS- /guard:cf-)
         target_link_options(${target} PRIVATE /STACK:67108864,67108864 /GUARD:NO)
+        # No console window in Release MSVC builds. /ENTRY keeps main() as
+        # the entry point (not WinMain) while switching to the Windows subsystem.
+        target_link_options(${target} PRIVATE
+            $<$<CONFIG:Release>:/SUBSYSTEM:WINDOWS>
+            $<$<CONFIG:Release>:/ENTRY:mainCRTStartup>)
     endif()
 endfunction()

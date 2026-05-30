@@ -1,5 +1,5 @@
-#ifndef PSXRECOMP_V4_MDEC_H
-#define PSXRECOMP_V4_MDEC_H
+﻿#ifndef PSXRECOMP_MDEC_H
+#define PSXRECOMP_MDEC_H
 
 #include <stdint.h>
 
@@ -70,4 +70,4 @@ void mdec_debug_dma_out_end(uint32_t addr, uint32_t words);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_MDEC_H */
+#endif /* PSXRECOMP_MDEC_H */

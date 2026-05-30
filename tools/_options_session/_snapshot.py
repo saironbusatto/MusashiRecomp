@@ -1,6 +1,6 @@
-"""Compact one-line snapshot of runtime state for diff'ing across nav events."""
+﻿"""Compact one-line snapshot of runtime state for diff'ing across nav events."""
 import sys, json
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 label = sys.argv[1] if len(sys.argv) > 1 else "snap"

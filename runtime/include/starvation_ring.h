@@ -1,4 +1,4 @@
-/*
+﻿/*
  * starvation_ring.h — Always-on diagnostic ring for capturing SIO/MMIO
  * state immediately before a TCP-starvation hang.
  *
@@ -10,8 +10,8 @@
  *
  * NOT for permanent use. Disabled by setting STARVATION_RING_ENABLED=0.
  */
-#ifndef PSXRECOMP_V4_STARVATION_RING_H
-#define PSXRECOMP_V4_STARVATION_RING_H
+#ifndef PSXRECOMP_STARVATION_RING_H
+#define PSXRECOMP_STARVATION_RING_H
 
 #include <stdint.h>
 
@@ -105,4 +105,4 @@ void starvation_ring_pc_sample(void);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_STARVATION_RING_H */
+#endif /* PSXRECOMP_STARVATION_RING_H */

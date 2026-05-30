@@ -418,7 +418,7 @@ def main():
     )
 
     out = {
-        "schema": "psxrecomp-v4 phase1b branch_delay_hazards v2",
+        "schema": "psxrecomp phase1b branch_delay_hazards v2",
         "program": cfg.name,
         "totals": {
             "branches_scanned":                  branch_count,
@@ -472,7 +472,7 @@ def verify_translator_uses_snapshots():
          and never reads cpu->gpr[ in the c_code body.
     Returns a dict { branch_name -> {pass: bool, reason: str} }.
     """
-    # strict_translator.cpp lives in psxrecomp-v4 regardless of which
+    # strict_translator.cpp lives in psxrecomp regardless of which
     # program config is being audited. Resolve relative to this script.
     psxrecomp_root = Path(__file__).parent.parent
     src_path = psxrecomp_root / "recompiler" / "src" / "strict_translator.cpp"

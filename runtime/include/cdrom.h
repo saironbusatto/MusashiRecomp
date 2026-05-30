@@ -1,5 +1,5 @@
-#ifndef PSXRECOMP_V4_CDROM_H
-#define PSXRECOMP_V4_CDROM_H
+﻿#ifndef PSXRECOMP_CDROM_H
+#define PSXRECOMP_CDROM_H
 
 #include <stdint.h>
 
@@ -96,4 +96,4 @@ void cdrom_debug_clear_trace(void);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_CDROM_H */
+#endif /* PSXRECOMP_CDROM_H */

@@ -1,5 +1,5 @@
-import sys, struct
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+﻿import sys, struct
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 addr = int(sys.argv[1], 16) if len(sys.argv) > 1 else 0x0005B40C

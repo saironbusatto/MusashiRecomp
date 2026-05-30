@@ -3,7 +3,7 @@
 The windows-x64 prebuilt archive ships with CMake-generated Targets files that
 have `_IMPORT_PREFIX` baked in as an absolute path from wherever the archive
 was originally extracted. When the project root moves (e.g. psxrecomp-projects
--> psxrecomp-v4), CMake can't find the referenced .lib/.dll files even though
+-> psxrecomp), CMake can't find the referenced .lib/.dll files even though
 they're there.
 
 This script rewrites `OLD_PREFIX` -> `NEW_PREFIX` in every file under
@@ -12,7 +12,7 @@ This script rewrites `OLD_PREFIX` -> `NEW_PREFIX` in every file under
 import os, sys
 
 OLD = b"psxrecomp-projects"
-NEW = b"psxrecomp-v4"
+NEW = b"psxrecomp"
 ROOT = sys.argv[1] if len(sys.argv) > 1 else "duckstation/dep/prebuilt"
 
 n_files = 0

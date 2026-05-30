@@ -1,5 +1,5 @@
-import sys, struct
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+﻿import sys, struct
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 # Read scratchpad ptr at 0x1F8001D4

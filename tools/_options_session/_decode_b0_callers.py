@@ -1,7 +1,7 @@
-"""Read MIPS at the B0 call sites to identify what BIOS function each calls.
+﻿"""Read MIPS at the B0 call sites to identify what BIOS function each calls.
 The t1 register holds the B0 function index when calling B0 trampoline."""
 import sys, struct
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 call_sites = [0x800171F8, 0x800170BC, 0x8006825C]
