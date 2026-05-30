@@ -1,5 +1,5 @@
-#ifndef PSXRECOMP_V4_MEMCARD_H
-#define PSXRECOMP_V4_MEMCARD_H
+﻿#ifndef PSXRECOMP_MEMCARD_H
+#define PSXRECOMP_MEMCARD_H
 
 #include <stdint.h>
 
@@ -41,4 +41,4 @@ int memcard_debug_read_buffer(int card, uint32_t offset, uint32_t len,
 }
 #endif
 
-#endif /* PSXRECOMP_V4_MEMCARD_H */
+#endif /* PSXRECOMP_MEMCARD_H */

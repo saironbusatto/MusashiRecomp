@@ -1,11 +1,11 @@
-/* gpu.h — PS1 GPU hardware simulation (Phase 3).
+﻿/* gpu.h — PS1 GPU hardware simulation (Phase 3).
  *
  * Implements GPUSTAT, GP0, GP1, and 1024x512 16-bit VRAM.
  * No rendering to screen — just correct hardware state transitions.
  */
 
-#ifndef PSXRECOMP_V4_GPU_H
-#define PSXRECOMP_V4_GPU_H
+#ifndef PSXRECOMP_GPU_H
+#define PSXRECOMP_GPU_H
 
 #include <stdint.h>
 
@@ -80,4 +80,4 @@ void gpu_set_vblank_callback(gpu_vblank_cb cb);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_GPU_H */
+#endif /* PSXRECOMP_GPU_H */

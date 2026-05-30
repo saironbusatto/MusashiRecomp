@@ -1,5 +1,5 @@
-#ifndef PSXRECOMP_V4_PSX_RUNTIME_H
-#define PSXRECOMP_V4_PSX_RUNTIME_H
+﻿#ifndef PSXRECOMP_PSX_RUNTIME_H
+#define PSXRECOMP_PSX_RUNTIME_H
 
 #include "cpu_state.h"
 #include "interrupts.h"
@@ -17,4 +17,4 @@ static inline void call_by_address(CPUState* cpu, uint32_t addr) {
 }
 #endif
 
-#endif /* PSXRECOMP_V4_PSX_RUNTIME_H */
+#endif /* PSXRECOMP_PSX_RUNTIME_H */

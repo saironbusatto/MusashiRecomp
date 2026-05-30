@@ -1,7 +1,7 @@
-"""Shared audit-config loader.
+﻿"""Shared audit-config loader.
 
 Reads a TOML config (BIOS or game) into a normalized object that the
-psxrecomp-v4 audit tools can consume. See `bios/SCPH1001.toml` and
+psxrecomp audit tools can consume. See `bios/SCPH1001.toml` and
 `TombaRecomp/game.toml` for the schema this module accepts.
 
 Project root is auto-detected by walking up from the config file until a
@@ -87,9 +87,9 @@ def _find_project_root(config_path: Path) -> Path:
     """Walk up from config_path until we find a root marker.
 
     Markers (any one is sufficient): `.gitignore`, `.git`, `CMakeLists.txt`.
-    `.gitignore` is the most reliable — both psxrecomp-v4 and TombaRecomp
+    `.gitignore` is the most reliable — both psxrecomp and TombaRecomp
     have one at the repo root, while CMakeLists.txt only lives in subdirs
-    of psxrecomp-v4 (recompiler/, runtime/).
+    of psxrecomp (recompiler/, runtime/).
     """
     cur = config_path.parent.resolve()
     for _ in range(8):  # bounded search

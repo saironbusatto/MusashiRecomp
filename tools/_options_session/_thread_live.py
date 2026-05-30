@@ -1,6 +1,6 @@
-"""Query live thread_trace and see if ChangeTh ping-pong is active now."""
+﻿"""Query live thread_trace and see if ChangeTh ping-pong is active now."""
 import sys, json, collections
-sys.path.insert(0, 'F:/Projects/psxrecomp-v4/tools/_options_session')
+sys.path.insert(0, 'F:/Projects/psxrecomp/psxrecomp/tools/_options_session')
 import _dbg
 
 try:

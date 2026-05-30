@@ -63,7 +63,7 @@ for addr_int, s in sorted(old_seeds.items()):
         preserved += 1
 
 result = {
-    "schema": "psxrecomp-v4 phase2 seeds",
+    "schema": "psxrecomp phase2 seeds",
     "source": "generated/ghidra_function_starts.json + phase1c seeds + dispatch_miss_seeds + preserved manual",
     "seed_count": len(seeds),
     "seeds": seeds,

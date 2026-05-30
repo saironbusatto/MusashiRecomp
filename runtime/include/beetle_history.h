@@ -1,4 +1,4 @@
-/* beetle_history.h — psx-beetle per-frame snapshot ring.
+﻿/* beetle_history.h — psx-beetle per-frame snapshot ring.
  *
  * Mirrors runtime/src/debug_server.c's PSXFrameRecord history so beetle
  * exposes the SAME time-series surface as psx-runtime: history,
@@ -13,8 +13,8 @@
  * psx_dispatch() call gates) are left zero and explicitly documented
  * so consumers see real-vs-stub at a glance.
  */
-#ifndef PSXRECOMP_V4_BEETLE_HISTORY_H
-#define PSXRECOMP_V4_BEETLE_HISTORY_H
+#ifndef PSXRECOMP_BEETLE_HISTORY_H
+#define PSXRECOMP_BEETLE_HISTORY_H
 
 #include <stdint.h>
 
@@ -85,4 +85,4 @@ int beetle_history_get_snapshot(int slot, uint32_t *out_addr, int *out_active);
 }
 #endif
 
-#endif /* PSXRECOMP_V4_BEETLE_HISTORY_H */
+#endif /* PSXRECOMP_BEETLE_HISTORY_H */

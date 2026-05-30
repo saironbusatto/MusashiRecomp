@@ -1,5 +1,5 @@
-import struct, sys
-with open('F:/Projects/psxrecomp-v4/bios/SCPH1001.BIN', 'rb') as f:
+﻿import struct, sys
+with open('F:/Projects/psxrecomp/psxrecomp/bios/SCPH1001.BIN', 'rb') as f:
     data = f.read()
 # Read inputs as pc, length
 start_pc = int(sys.argv[1], 16) if len(sys.argv) > 1 else 0xBFC16060
