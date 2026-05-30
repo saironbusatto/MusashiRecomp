@@ -79,21 +79,31 @@ picker contract but also prompt for a legally obtained game disc image.
 
 ## Setup
 
+Builds natively on **Windows (MSVC/MinGW)**, **macOS (Apple Silicon & Intel)**,
+and **Linux**. The BIOS thread scheduler uses host fibers — Win32 Fibers on
+Windows, `ucontext` on POSIX (`runtime/src/psx_fiber.c`) — so the recompiled
+BIOS's cooperative thread switching (the CD-boot handoff in particular) behaves
+the same on every platform.
+
 Requirements:
 
-- Windows 10/11 x64.
-- MSYS2 with the `mingw-w64-x86_64` toolchain, CMake 3.20+, and SDL2.
+- A C/C++ toolchain: MSVC or MinGW (Windows), Apple Clang (macOS), Clang/GCC (Linux).
+- CMake 3.20+. On macOS/Linux also `ninja` and `pkg-config`.
+- SDL2: the bundled dev pack on Windows; `brew install sdl2 pkg-config ninja`
+  on macOS; `libsdl2-dev` (or distro equivalent) on Linux.
 - A legally obtained `SCPH1001.BIN` BIOS dump. Not included.
 - For game projects, a legally obtained game disc/EXE dump. Not included.
 
 Build the framework runtime:
 
 ```sh
-cd F:/Projects/psxrecomp-v4
-cmake -S recompiler -B recompiler/build -G "Unix Makefiles"
-cmake --build recompiler/build
-cmake -S runtime -B runtime/build -G "Unix Makefiles"
-cmake --build runtime/build --target psx-runtime
+# Windows (MSYS2/MinGW)
+cmake -S recompiler -B recompiler/build -G "Unix Makefiles" && cmake --build recompiler/build
+cmake -S runtime    -B runtime/build    -G "Unix Makefiles" && cmake --build runtime/build --target psx-runtime
+
+# macOS / Linux (Ninja)
+cmake -S recompiler -B recompiler/build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C recompiler/build
+cmake -S runtime    -B runtime/build    -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C runtime/build psx-runtime
 ```
 
 Game projects generate their own `generated/<serial>_*.c` files and link this
@@ -113,6 +123,7 @@ runtime source tree through CMake.
 | Start | Enter |
 | Select | Right Shift |
 | Turbo | Tab (hold) |
+| Fullscreen | F11 / Alt+Enter / Cmd+F |
 
 ## Controller Map
 
