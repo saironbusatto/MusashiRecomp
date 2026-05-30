@@ -8,6 +8,7 @@
 #include "cpu_state.h"
 #include "psx_interpreter.h"
 #include "cdrom.h"
+#include "fntrace.h"
 #include "gpu.h"
 #include "sio.h"
 #include "spu.h"
@@ -1072,6 +1073,8 @@ int main(int argc, char** argv) {
     uint16_t   debug_port    = (uint16_t)DEFAULT_DEBUG_PORT;
     std::string game_name;
     std::string game_id;
+    std::string disc_speed;   /* "1x" | "2x" | "4x" | "instant" */
+    uint32_t   game_entry_pc = 0;
 
     if (game_config_path) {
         try {
@@ -1082,6 +1085,8 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
+            if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
+            game_entry_pc = gc.entry_pc;
             std::fprintf(stdout, "psxrecomp: loaded game config %s (%s, %s)\n",
                          game_config_path, game_name.c_str(), game_id.c_str());
         } catch (const std::exception& ex) {
@@ -1123,6 +1128,18 @@ int main(int argc, char** argv) {
     sio_connect_pad(0);  /* Controller on port 1 */
     spu_init();
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
+    {
+        int divisor = 1; /* default: authentic 1x timing */
+        if (disc_speed == "instant") divisor = 0;
+        else if (disc_speed == "4x") divisor = 4;
+        else if (disc_speed == "2x") divisor = 2;
+        /* Store for post-BIOS application; boot always runs at 1x so the
+         * BIOS disc-init sequence sees correct timing. */
+        cdrom_set_game_speed(divisor);
+        if (divisor != 1)
+            std::fprintf(stdout, "psxrecomp: disc_speed=%s (applied post-BIOS)\n",
+                         disc_speed.c_str());
+    }
     memcard_init(memcard_dir_str.c_str());
     std::atexit(memcard_flush_all);
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -1132,6 +1149,10 @@ int main(int argc, char** argv) {
 #endif
     /* Heartbeat always on — see freeze_heartbeat.c rationale. */
     freeze_heartbeat_start("psx-runtime");
+    /* Register game entry_pc for post-BIOS disc speed switch. Fires once when
+     * the BIOS hands control to the game EXE — not on the BIOS shell. */
+    if (game_entry_pc != 0)
+        fntrace_set_game_range(game_entry_pc, 0);
 
     /* ---- SDL init ---- */
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");

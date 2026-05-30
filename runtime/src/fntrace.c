@@ -13,6 +13,21 @@ static uint32_t s_arm_targets[FNTRACE_ARM_MAX];
 static uint32_t s_arm_count = 0;
 static uint32_t s_arm_record_all = 0;  /* opt-in via fntrace_arm(0xFFFFFFFF) */
 
+/* One-shot game-start detection: fire cdrom_notify_game_started() the first
+ * time the game's entry_pc is dispatched. Using entry_pc (not a range) avoids
+ * false-triggering on the BIOS shell, which runs from RAM 0x30000-0x5B000 —
+ * overlapping the game text range but never at entry_pc. */
+static uint32_t s_game_entry_phys = 0;
+static int      s_game_started = 0;
+extern void cdrom_notify_game_started(void);
+
+void fntrace_set_game_range(uint32_t lo, uint32_t hi) {
+    /* lo is treated as entry_pc; hi is ignored (kept for API compat). */
+    (void)hi;
+    s_game_entry_phys = lo & 0x1FFFFFFFu;
+    s_game_started = 0;
+}
+
 static inline int armed_match(uint32_t target) {
     if (s_arm_record_all) return 1;
     /* Hot path: when nothing is armed, record nothing. Recording every
@@ -27,6 +42,12 @@ static inline int armed_match(uint32_t target) {
 }
 
 void fntrace_record(CPUState* cpu, uint32_t target) {
+    if (!s_game_started && s_game_entry_phys != 0) {
+        if ((target & 0x1FFFFFFFu) == s_game_entry_phys) {
+            s_game_started = 1;
+            cdrom_notify_game_started();
+        }
+    }
     if (!armed_match(target)) return;
     uint64_t idx = g_fntrace_seq++ & (FNTRACE_RING_CAP - 1);
     FntraceEntry* e = &g_fntrace_ring[idx];

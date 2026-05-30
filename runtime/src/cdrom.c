@@ -86,10 +86,47 @@ static uint8_t xa_stream_file;
 static uint8_t xa_stream_channel;
 static int xa_stream_active;
 
+/* Operating divisor: 1x during BIOS boot, switches to g_game_divisor
+ * when the game's entry point first fires (via cdrom_notify_game_started). */
+static int g_disc_speed_divisor = 1;
+/* Configured target speed — applied post-BIOS. */
+static int g_game_divisor = 1;
+
+void cdrom_set_speed(int divisor) {
+    g_disc_speed_divisor = divisor;
+}
+
+/* Store the configured speed for post-BIOS application. Boot stays at 1x. */
+void cdrom_set_game_speed(int divisor) {
+    g_game_divisor = divisor;
+}
+
+/* Called by fntrace_record on first game-range dispatch. */
+void cdrom_notify_game_started(void) {
+    g_disc_speed_divisor = g_game_divisor;
+}
+
+/* Minimum cycles between CD-ROM IRQs in fast modes. Must be enough for the
+ * interrupt handler to save state, check the IRQ flag, process data, and
+ * return. Too low → interrupt fires before the previous one is processed →
+ * game hangs. 500 cycles ≈ 15µs at 33MHz, still ~900x faster than authentic. */
+#define CDROM_MIN_DELAY 500
+
+static int apply_speed(int delay) {
+    /* XA streaming (FMV / CDDA background music): preserve authentic timing.
+     * FMVs interleave XA audio + MDEC video — speeding up sector delivery
+     * would cause both to play faster than the display refresh rate. */
+    if (xa_stream_active) return delay;
+    if (g_disc_speed_divisor == 0) return CDROM_MIN_DELAY;
+    int d = delay / g_disc_speed_divisor;
+    return d < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : d;
+}
+
 static int sector_delay_cycles(void) {
     /* PS1 CPU is 33.8688 MHz. CD-ROM sectors arrive at 75 Hz in 1x
      * mode, or twice that rate when SetMode bit 7 enables double speed. */
-    return (mode_reg & 0x80) ? 225792 : 451584;
+    int base = (mode_reg & 0x80) ? 225792 : 451584;
+    return apply_speed(base);
 }
 
 /* Pending command */
@@ -453,7 +490,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x09;
         pending.pending = 1;
-        pending.delay = 10000;
+        pending.delay = apply_speed(10000);
         pending.phase = 1;
         break;
 
@@ -466,7 +503,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x0A;
         pending.pending = 1;
-        pending.delay = 50000;
+        pending.delay = apply_speed(50000);
         pending.phase = 1;
         break;
 
@@ -517,7 +554,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x15;
         pending.pending = 1;
-        pending.delay = 20000;
+        pending.delay = apply_speed(20000);
         pending.phase = 1;
         break;
 
@@ -529,7 +566,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x1A;
         pending.pending = 1;
-        pending.delay = 30000;
+        pending.delay = apply_speed(30000);
         pending.phase = 1;
         break;
 
@@ -549,7 +586,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x1E;
         pending.pending = 1;
-        pending.delay = 100000;
+        pending.delay = apply_speed(100000);
         pending.phase = 1;
         break;
 

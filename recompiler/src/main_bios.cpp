@@ -708,7 +708,9 @@ int run_boot_slice(const fs::path& bios_path, const fs::path& out_dir,
 // ----- Phase 2: full BIOS emission ------------------------------------------
 
 int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
-                  const fs::path& seed_path) {
+                  const fs::path& seed_path,
+                  const std::vector<PSXRecompV4::BiosVectorTable>& bios_vectors = {},
+                  const std::vector<PSXRecompV4::BiosAlias>& bios_aliases = {}) {
     // 1. Load + validate BIOS file.
     const auto rom = load_file_strict(bios_path, kBiosSize);
     const std::string sha = sha256_hex(rom);
@@ -734,7 +736,7 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
     // 4. Emit full C.
     const auto stats = PSXRecompV4::FullFunctionEmitter::emit(
         rom, kBiosBase, kBiosBase + static_cast<uint32_t>(kBiosSize) - 1,
-        dr, sha, out_dir.string());
+        dr, sha, out_dir.string(), bios_vectors, bios_aliases);
 
     std::fprintf(stdout,
         "psxrecomp-bios: EMIT OK  emitted=%u  skipped=%u  instructions=%u  "
@@ -833,12 +835,14 @@ int main(int argc, char** argv) {
                     cfg.seeds_path.string().c_str(),
                     cfg.out_dir.string().c_str(),
                     cfg.out_stem.c_str());
-                return run_emit_full(cfg.rom_path, cfg.out_dir, cfg.seeds_path);
+                return run_emit_full(cfg.rom_path, cfg.out_dir, cfg.seeds_path,
+                                     cfg.bios_vectors, cfg.bios_aliases);
             }
             if (a == "--config=" || a.rfind("--config=", 0) == 0) {
                 const fs::path config_path = a.substr(std::string("--config=").size());
                 const auto cfg = PSXRecompV4::load_bios_config(config_path);
-                return run_emit_full(cfg.rom_path, cfg.out_dir, cfg.seeds_path);
+                return run_emit_full(cfg.rom_path, cfg.out_dir, cfg.seeds_path,
+                                     cfg.bios_vectors, cfg.bios_aliases);
             }
         }
 
