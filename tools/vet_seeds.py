@@ -95,24 +95,27 @@ def vet(exe_bytes, base_phys, text_size, vaddr):
     if off < 8 or off + 16 > len(exe_bytes):
         return 'REJECT', 'EXE offset out of range'
 
-    # Check 1: boundary
-    prev_jr  = _word(exe_bytes, off - 8)
-    prev_nop = _word(exe_bytes, off - 4)
-    if not (_is_jr_ra(prev_jr) and _is_nop(prev_nop)):
+    # Check 1: boundary — jr $ra followed by any delay slot (nop is common
+    # but some compilers emit a useful instruction in the delay slot).
+    prev_jr   = _word(exe_bytes, off - 8)
+    prev_ds   = _word(exe_bytes, off - 4)
+    has_boundary = _is_jr_ra(prev_jr)
+    if not has_boundary:
         return 'REJECT', (
             f'no jr $ra/nop boundary '
-            f'(saw 0x{prev_jr:08X} / 0x{prev_nop:08X})'
+            f'(saw 0x{prev_jr:08X} / 0x{prev_ds:08X})'
         )
+    # Note non-nop delay slot — still a valid boundary but worth flagging.
+    delay_note = '' if _is_nop(prev_ds) else f' (non-nop delay slot 0x{prev_ds:08X})'
 
     # Check 2: prologue
     for i in range(4):
         if _is_addiu_sp_neg(_word(exe_bytes, off + i * 4)):
-            return 'ACCEPT', f'boundary + prologue at instr {i}'
+            return 'ACCEPT', f'boundary + prologue at instr {i}{delay_note}'
 
     return 'WARN', (
-        'boundary found but no addiu $sp,$sp,-N in first 4 instrs '
-        '— frameless (leaf or frame-borrower); manual Ghidra check required '
-        'before seeding'
+        f'boundary + no addiu $sp,$sp,-N{delay_note}'
+        ' -- frameless (leaf or frame-borrower); manual Ghidra check required'
     )
 
 # ---------------------------------------------------------------------------
@@ -178,8 +181,8 @@ def main():
             accepted.append(vaddr)
         elif verdict == 'WARN':
             warned.append(vaddr)
-        else:
-            rejected.append(vaddr)
+        else:  # REJECT
+            rejected.append((vaddr, reason))
 
     print()
     print(f'Results: {len(accepted)} ACCEPT  {len(warned)} WARN  {len(rejected)} REJECT')
@@ -195,6 +198,14 @@ def main():
         print('WARN — verify in Ghidra before seeding (check callers set up a frame):')
         for a in warned:
             print(f'  0x{a:08X}')
+
+    if rejected:
+        print()
+        print('REJECT — mid-function or out-of-range (high confidence); rare false-rejects')
+        print('  possible when the preceding function ends with jr $t0 / jalr instead of jr $ra.')
+        print('  Investigate in Ghidra if you suspect a false-reject:')
+        for addr, reason in rejected:
+            print(f'  0x{addr:08X}  # {reason}')
 
 if __name__ == '__main__':
     main()
