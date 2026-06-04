@@ -47,8 +47,8 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `cdrom_sector_history_clear` | ✓ |   | — | Reset the CD-ROM sector history ring |
 | `watch` | ✓ | ✓ | `addr` | Set byte-level memory watchpoint (fires per-frame on change) |
 | `unwatch` | ✓ | ✓ | `addr` | Remove memory watchpoint |
-| `set_input` | ✓ | ✓ | `buttons` | Override pad1 buttons (PS1 inverted bitmask, 0 = pressed) |
-| `clear_input` | ✓ | ✓ | — | Remove input override |
+| `set_input` | ✓ | ✓ | `buttons`, optional `lx`, `ly`, `rx`, `ry` | Override pad1 buttons and optional analog axes (PS1 inverted bitmask, 0 = pressed; axes 0-255) |
+| `clear_input` | ✓ | ✓ | — | Remove input and analog axis overrides |
 | `turbo` | ✓ |   | `enabled` | Enable/disable TCP-controlled frontend turbo for fast-forward validation |
 | `turbo_state` | ✓ |   | — | Query TCP-controlled turbo state |
 | `pause` | ✓ | ✓ | — | Pause emulation |

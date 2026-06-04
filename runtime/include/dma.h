@@ -52,6 +52,9 @@ typedef struct DMATraceEntry {
     uint32_t kind;
     uint32_t channel;
     uint32_t total_words;
+    uint32_t addr;
+    uint32_t val;
+    uint32_t mask;
     uint32_t madr;
     uint32_t bcr;
     uint32_t chcr;

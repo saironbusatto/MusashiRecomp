@@ -929,7 +929,8 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     out += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
     out += "extern uint32_t g_debug_current_func_addr;\n";
-    out += "extern void debug_server_trace_dispatch(uint32_t func_addr);\n\n";
+    out += "extern void debug_server_trace_dispatch(uint32_t func_addr);\n";
+    out += "extern void debug_server_trace_dispatch_return(uint32_t func_addr, CPUState* cpu);\n\n";
     out += "#ifdef PSX_HAS_GAME_DISPATCH\n";
     out += "extern int psx_game_address_in_text(uint32_t addr);\n";
     out += "#endif\n\n";
@@ -1111,6 +1112,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "                g_debug_current_func_addr = phys;\n";
     out += "                debug_server_trace_dispatch(phys);\n";
     out += "                dispatch_table[mid].func(cpu);\n";
+    out += "                debug_server_trace_dispatch_return(phys, cpu);\n";
     out += "                g_dispatch_static_hits++;\n";
     out += "                found = 1;\n";
     out += "                break;\n";

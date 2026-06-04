@@ -58,6 +58,18 @@ uint64_t sio_get_advance_with_work(void);
                L2, R2, L1, R1, TRIANGLE, CIRCLE, CROSS, SQUARE */
 void sio_set_pad_state(uint16_t buttons);
 
+typedef enum {
+    SIO_PAD_MODEL_DIGITAL   = 0,
+    SIO_PAD_MODEL_DUALSHOCK = 1,
+} SioPadModel;
+
+void sio_set_pad_model(int slot, SioPadModel model);
+SioPadModel sio_get_pad_model(int slot);
+
+void sio_set_pad_analog(int slot, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
+void sio_get_pad_analog(int slot, uint8_t *lx, uint8_t *ly, uint8_t *rx, uint8_t *ry);
+int sio_get_pad_analog_enabled(int slot);
+
 /* Connect a pad to a slot (0=port1, 1=port2). By default no pads are
  * connected during initial BIOS boot. */
 void sio_connect_pad(int slot);

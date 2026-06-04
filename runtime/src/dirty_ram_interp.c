@@ -26,6 +26,7 @@
 #include "dirty_ram_interp.h"
 #include "cpu_state.h"
 #include "debug_server.h"
+#include "fntrace.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
 
@@ -84,6 +85,7 @@ extern uint32_t g_debug_last_store_pc;
 
 #ifdef PSX_HAS_GAME_DISPATCH
 extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
+extern int psx_game_address_in_text(uint32_t addr);
 #endif
 extern void psx_dispatch_call(CPUState* cpu, uint32_t addr, uint32_t return_addr);
 
@@ -230,7 +232,23 @@ static int abort_unsupported(uint32_t pc, uint32_t insn, const char *reason) {
 
 static int is_local_dirty_target(uint32_t target) {
     uint32_t phys = target & 0x1FFFFFFFu;
-    return phys >= 0x00098000u && dirty_ram_is_dirty(phys);
+    if (!dirty_ram_is_dirty(phys)) return 0;
+    if (phys >= 0x00098000u) return 1;
+#ifdef PSX_HAS_GAME_DISPATCH
+    return fntrace_is_game_started() && psx_game_address_in_text(target);
+#else
+    return 0;
+#endif
+}
+
+static int allow_dirty_local_flow_for_addr(uint32_t addr) {
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys >= 0x00098000u) return 1;
+#ifdef PSX_HAS_GAME_DISPATCH
+    return fntrace_is_game_started() && psx_game_address_in_text(addr);
+#else
+    return 0;
+#endif
 }
 
 static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
@@ -673,6 +691,11 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
  * caller should fall back (e.g. unsupported opcode at the entry, page
  * not dirty). */
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
+    if (addr == 0) {
+        cpu->pc = 0;
+        return 1;
+    }
+
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (addr == 0x80000048u) {
@@ -691,7 +714,7 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
 
     /* Reset soft-fail state at block entry. */
     g_unsupported_seen = 0;
-    int allow_local_dirty_flow = (phys >= 0x00098000u);
+    int allow_local_dirty_flow = allow_dirty_local_flow_for_addr(addr);
 
     /* Per-PC entry counter (visible via dirty_ram_stats). */
     DirtyRamPcEntry *pc_entry = pc_table_get_or_insert(phys);
@@ -723,8 +746,10 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
     }
 
     /* Run dirty code locally until it returns to compiled/non-dirty code.
-     * Runtime-loaded overlays are larger than BIOS install stubs, so stopping
-     * at every local branch burns the dispatch loop. */
+     * This is required for overlays and for any static text page that has
+     * been marked dirty: returning a mid-function continuation to the outer
+     * dispatcher would re-enter it without the live register context built by
+     * the function prologue. */
     enum { MAX_INSNS_PER_DISPATCH = 1000000 };
     uint32_t pc = addr;
     int insns_executed = 0;
@@ -780,10 +805,8 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
                 return 1;
             }
 #endif
-            uint32_t target_phys = target & 0x1FFFFFFFu;
             if (allow_local_dirty_flow && target != 0 &&
-                target_phys >= 0x00098000u &&
-                dirty_ram_is_dirty(target_phys)) {
+                is_local_dirty_target(target)) {
                 uint64_t s = g_dirty_ram_flow_log_seq++;
                 DirtyRamFlowLogEntry *e =
                     &g_dirty_ram_flow_log[s & (DIRTY_RAM_FLOW_LOG_CAP - 1u)];

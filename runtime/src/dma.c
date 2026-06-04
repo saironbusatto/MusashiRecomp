@@ -72,11 +72,13 @@ static DMADelayedComplete delayed_complete[7];
 static uint32_t dpcr;  /* 0x1F8010F0: DMA control (enable bits) */
 static uint32_t dicr;  /* 0x1F8010F4: DMA interrupt control */
 
-#define DICR_WRITE_MASK 0x00FF803Fu
+#define DICR_WRITE_MASK 0x00FF807Fu
 #define DICR_RESET_MASK 0x7F000000u
 
 static DMATraceEntry dma_trace[DMA_TRACE_CAP];
 static uint64_t dma_trace_seq;
+
+static uint32_t dicr_read_value(uint32_t v);
 
 static void trace_dma(uint32_t kind, int ch, uint32_t total_words,
                       uint32_t dicr_before, uint32_t i_stat_before) {
@@ -86,12 +88,39 @@ static void trace_dma(uint32_t kind, int ch, uint32_t total_words,
     e->kind = kind;
     e->channel = (uint32_t)ch;
     e->total_words = total_words;
+    e->addr = 0;
+    e->val = 0;
+    e->mask = 0;
     e->madr = (ch >= 0 && ch < 7) ? channels[ch].madr : 0;
     e->bcr = (ch >= 0 && ch < 7) ? channels[ch].bcr : 0;
     e->chcr = (ch >= 0 && ch < 7) ? channels[ch].chcr : 0;
     e->dpcr = dpcr;
-    e->dicr_before = dicr_before;
-    e->dicr_after = dicr;
+    e->dicr_before = dicr_read_value(dicr_before);
+    e->dicr_after = dicr_read_value(dicr);
+    e->i_stat_before = i_stat_before;
+    e->i_stat_after = i_stat;
+    e->func = g_debug_current_func_addr;
+    e->pc = g_debug_last_store_pc;
+}
+
+static void trace_dma_reg_write(uint32_t addr, uint32_t val, uint32_t mask,
+                                uint32_t dicr_before,
+                                uint32_t i_stat_before) {
+    DMATraceEntry *e = &dma_trace[dma_trace_seq % DMA_TRACE_CAP];
+    e->seq = dma_trace_seq++;
+    e->frame = (uint32_t)s_frame_count;
+    e->kind = 'W';
+    e->channel = 0xFFFFFFFFu;
+    e->total_words = 0;
+    e->addr = addr;
+    e->val = val;
+    e->mask = mask;
+    e->madr = 0;
+    e->bcr = 0;
+    e->chcr = 0;
+    e->dpcr = dpcr;
+    e->dicr_before = dicr_read_value(dicr_before);
+    e->dicr_after = dicr_read_value(dicr);
     e->i_stat_before = i_stat_before;
     e->i_stat_after = i_stat;
     e->func = g_debug_current_func_addr;
@@ -106,15 +135,27 @@ static void update_master_irq(void) {
      *
      * We store bits 0-30 in dicr and compute bit 31 on read.
      *
-     * I_STAT bit 3 is set by direct assertion in complete_transfer(),
-     * not here.  The BIOS shell DMA-IRQ handler at 0x80058628 only
-     * clears DICR bit 27 (ch3 flag) — any other channel flag (e.g. ch2
-     * after a GPU DMA) stays high.  If this routine re-asserted
-     * i_stat |= (1<<3) on every DICR read or write, the BIOS handler's
-     * "lw $v0, 0($v1)" of DICR right after writing 0xFFFFFFF7 to I_STAT
-     * would put bit 3 back, and the kernel would loop forever in the
-     * exception handler.  Discless BIOS boot (memcard / CD player
-     * screen) is the case that exhibits this.  */
+     * I_STAT bit 3 is set on the aggregate DICR bit31 0->1 transition.
+     * Per-channel DICR flags are latched by complete_transfer() only
+     * when both master IRQ and that channel IRQ are enabled. */
+}
+
+static uint32_t dicr_master_flag(uint32_t v) {
+    return ((v & (1u << 15)) ||
+            ((v & (1u << 23)) && (v & DICR_RESET_MASK))) ? (1u << 31) : 0;
+}
+
+static uint32_t dicr_read_value(uint32_t v) {
+    return (v & ~(1u << 31)) | dicr_master_flag(v);
+}
+
+static void raise_dma_irq_on_master_edge(uint32_t before) {
+    /* IRQ3 is latched only when DICR's aggregate master flag transitions
+     * from 0 to 1. Pending channel flags keep bit 31 high, but do not
+     * continuously re-latch I_STAT after software acknowledges IRQ3. */
+    if (!dicr_master_flag(before) && dicr_master_flag(dicr)) {
+        i_stat |= (1u << 3);
+    }
 }
 
 static int channel_enabled(int ch) {
@@ -123,7 +164,12 @@ static int channel_enabled(int ch) {
     return (dpcr >> (ch * 4 + 3)) & 1;
 }
 
-static int channel_irq_enabled(int ch) {
+static int channel_irq_flag_armed(int ch) {
+    /* DICR channel completion flags (24+n) are latched only when both
+     * the per-channel interrupt bit and the master DMA interrupt bit are
+     * enabled at completion time. Old flags still contribute to bit31
+     * until acknowledged, but masked/master-disabled completions do not
+     * create new stale flags. */
     return ((dicr >> (16 + ch)) & 1u) && ((dicr >> 23) & 1u);
 }
 
@@ -132,6 +178,10 @@ static uint32_t transfer_word_count(int ch) {
     uint32_t sync_mode = (chcr >> 9) & 3;
     uint32_t block_size = channels[ch].bcr & 0xFFFFu;
     uint32_t block_count = (channels[ch].bcr >> 16) & 0xFFFFu;
+
+    if (ch == 3 && block_size == 0) {
+        return cdrom_dma_sector_word_count();
+    }
 
     if (sync_mode == 1) {
         if (block_size == 0) block_size = 0x10000u;
@@ -147,12 +197,9 @@ static void complete_transfer(int ch) {
     uint32_t dicr_before = dicr;
     uint32_t i_stat_before = i_stat;
     channels[ch].chcr &= ~((1u << 24) | (1u << 28));
-    if (channel_irq_enabled(ch)) {
+    if (channel_irq_flag_armed(ch)) {
         dicr |= (1u << (24 + ch));
-        update_master_irq();
-        /* Edge-trigger I_STAT bit 3 once per completion. See comment in
-         * update_master_irq() for why this is not done there. */
-        i_stat |= (1u << 3);
+        raise_dma_irq_on_master_edge(dicr_before);
     }
     trace_dma('C', ch, 0, dicr_before, i_stat_before);
 }
@@ -567,7 +614,7 @@ static void try_execute(int ch) {
 
 /* ---- Public interface ---- */
 
-uint32_t dma_get_dicr(void) { update_master_irq(); return dicr; }
+uint32_t dma_get_dicr(void) { return dicr_read_value(dicr); }
 uint32_t dma_get_dpcr(void) { return dpcr; }
 
 void dma_advance(uint32_t cycles) {
@@ -631,8 +678,7 @@ uint32_t dma_read(uint32_t addr) {
     if (addr == 0x1F8010F0u) return dpcr;
     /* DICR */
     if (addr == 0x1F8010F4u) {
-        update_master_irq();
-        return dicr;
+        return dma_get_dicr();
     }
 
     /* Per-channel registers: 0x1F801080 + ch*0x10 + offset */
@@ -673,11 +719,14 @@ void dma_write_masked(uint32_t addr, uint32_t val, uint32_t mask) {
         /* Bit 23: master IRQ enable */
         /* Bits 24-30: IRQ flags, write 1 to clear */
         /* Bit 31: master flag, read-only (computed) */
+        uint32_t dicr_before = dicr;
+        uint32_t i_stat_before = i_stat;
         uint32_t write_mask = DICR_WRITE_MASK & mask;
         uint32_t reset_mask = DICR_RESET_MASK & mask;
         dicr = (dicr & ~write_mask) | (val & write_mask);
         dicr &= ~(val & reset_mask);
-        update_master_irq();
+        raise_dma_irq_on_master_edge(dicr_before);
+        trace_dma_reg_write(addr, val, mask, dicr_before, i_stat_before);
         return;
     }
 

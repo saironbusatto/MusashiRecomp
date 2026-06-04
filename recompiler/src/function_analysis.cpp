@@ -70,6 +70,51 @@ bool FunctionAnalyzer::is_branch_or_jump(uint32_t instr) {
     return false;
 }
 
+static bool is_load_imm_zero_u16(uint32_t instr, uint32_t& rt_out, uint32_t& imm_out) {
+    uint32_t opcode = (instr >> 26) & 0x3F;
+    uint32_t rs = (instr >> 21) & 0x1F;
+    if ((opcode != 0x09 && opcode != 0x0D) || rs != 0) {
+        return false;
+    }
+    rt_out = (instr >> 16) & 0x1F;
+    imm_out = instr & 0xFFFFu;
+    return true;
+}
+
+bool FunctionAnalyzer::is_bios_dispatch_thunk(uint32_t addr, uint32_t& jr_addr_out) const {
+    auto w0 = exe_.read_word(addr);
+    auto w1 = exe_.read_word(addr + 4);
+    auto w2 = exe_.read_word(addr + 8);
+    if (!w0.has_value() || !w1.has_value() || !w2.has_value()) {
+        return false;
+    }
+
+    uint32_t target_reg = 0;
+    uint32_t vector = 0;
+    if (!is_load_imm_zero_u16(*w0, target_reg, vector)) {
+        return false;
+    }
+    if (vector != 0xA0u && vector != 0xB0u && vector != 0xC0u) {
+        return false;
+    }
+
+    uint32_t op1 = (*w1 >> 26) & 0x3F;
+    uint32_t rs1 = (*w1 >> 21) & 0x1F;
+    uint32_t fn1 = *w1 & 0x3F;
+    if (op1 != 0 || fn1 != 0x08u || rs1 != target_reg) {
+        return false;
+    }
+
+    uint32_t index_reg = 0;
+    uint32_t index = 0;
+    if (!is_load_imm_zero_u16(*w2, index_reg, index) || index_reg != 9) {
+        return false;
+    }
+
+    jr_addr_out = addr + 4;
+    return true;
+}
+
 static bool is_sw_reg_base(uint32_t instr, uint32_t base_reg, uint32_t value_reg) {
     uint32_t opcode = (instr >> 26) & 0x3F;
     uint32_t rs = (instr >> 21) & 0x1F;
@@ -224,6 +269,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     result.prologue_count = 0;
     result.call_discovered_count = 0;
     result.strong_prologue_count = 0;
+    result.bios_thunk_count = 0;
     result.state_continuation_count = 0;
 
     fmt::print("\n=== Function Boundary Detection ===\n\n");
@@ -374,6 +420,35 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     result.strong_prologue_count = strong_prologues;
     fmt::print("Identified {} strong prologue entries\n\n",
                result.strong_prologue_count);
+
+    // Pass 2.56: promote packed PSY-Q BIOS dispatch thunks.
+    //
+    // PSY-Q libraries often pack tiny A0/B0/C0 syscall thunks back-to-back:
+    //   addiu rN, $zero, 0xA0/0xB0/0xC0
+    //   jr    rN
+    //   addiu $t1, $zero, index
+    //
+    // They do not contain jr $ra and may sit directly before data tables, so
+    // return/prologue scanning either misses them or lets the following data
+    // make the region look like a data section. Treat each thunk as a real
+    // function and cap it after the JR delay slot.
+    fmt::print("Finding packed BIOS dispatch thunk entries...\n");
+    int bios_thunks = 0;
+    for (uint32_t addr = exe_start; addr + 12u <= exe_end; addr += 4) {
+        uint32_t jr_addr = 0;
+        if (!is_bios_dispatch_thunk(addr, jr_addr)) continue;
+
+        if (function_starts.insert(addr).second) {
+            bios_thunks++;
+        }
+        auto it = function_last_return.find(addr);
+        if (it == function_last_return.end() || jr_addr > it->second) {
+            function_last_return[addr] = jr_addr;
+        }
+    }
+    result.bios_thunk_count = bios_thunks;
+    fmt::print("Identified {} packed BIOS dispatch thunk entries\n\n",
+               result.bios_thunk_count);
 
     // Pass 2.6: discover continuations saved by setjmp/SaveState-style helpers.
     //

@@ -74,12 +74,21 @@ static int    s_sym_initialized = 0;
  * dump fits in ~10-15 MB JSON even when every ring is full. */
 #define DUMP_CAP_WTRACE_ALL    16384u
 #define DUMP_CAP_WTRACE         8192u
+#define DUMP_CAP_MMIO           8192u
 #define DUMP_CAP_FRAME_HISTORY   600u
 #define DUMP_CAP_SIO_PC         8192u
 #define DUMP_CAP_THREAD_TRACE   4096u
 #define DUMP_CAP_RESTORE_TRACE  4096u
+#define DUMP_CAP_ENTRYINT       4096u
+#define DUMP_CAP_CDROM_TRACE    4096u
+#define DUMP_CAP_CDROM_SECTORS   256u
+#define DUMP_CAP_DMA_TRACE      4096u
+#define DUMP_CAP_EXCEPTION_TRACE 8192u
+#define DUMP_CAP_THREAD_CTX      256u
 #define DUMP_CAP_FN_ENTRY       4096u
 #define DUMP_CAP_DIRTY_BLOCK   16384u
+#define DUMP_CAP_DIRTY_INSN     4096u
+#define DUMP_CAP_EVCB            256u
 
 /* Pre-freeze history ring. Each entry = a snapshot taken at one heartbeat
  * tick (~100 ms). When the runtime freezes, all the "now" values stop
@@ -109,6 +118,8 @@ static uint32_t    s_ring_count = 0;
  *                  firing, re-armed when the wedge clears (healthy tick). */
 static int      s_dump_armed = 1;
 static uint32_t s_last_wedge_kind = 0;  /* informational, last detected kind */
+static uint32_t s_last_dump_wedge_kind = 0;
+static uint64_t s_last_dump_frame = 0;
 
 #ifdef _WIN32
 /* Capture the main thread's call stack at the moment of a hard freeze.
@@ -262,9 +273,15 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         "  \"dirty_ram_insns\":%llu,\n"
         "  \"wedge_kind\":%u,\n"
         "  \"wedge_kind_name\":\"%s\",\n"
-        "  \"caps\":{\"wtrace_all\":%u,\"wtrace\":%u,\"frames\":%u,"
-                  "\"sio_pc\":%u,\"thread\":%u,\"restore\":%u,\"fn_entry\":%u,"
-                  "\"dirty_block\":%u},\n",
+        "  \"caps\":{\"wtrace_all\":%u,\"wtrace\":%u,\"mmio\":%u,"
+                  "\"frames\":%u,"
+                  "\"sio_pc\":%u,\"thread\":%u,\"restore\":%u,"
+                  "\"entryint\":%u,"
+                  "\"cdrom_trace\":%u,\"cdrom_sectors\":%u,"
+                  "\"dma_trace\":%u,"
+                  "\"exception_trace\":%u,"
+                  "\"thread_ctx\":%u,\"fn_entry\":%u,"
+                  "\"dirty_block\":%u,\"dirty_insn\":%u,\"evcb\":%u},\n",
         s_backend, wall,
         (unsigned long long)frame, (unsigned long long)cyc,
         cur_fn, last_store,
@@ -283,12 +300,21 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         (s_last_wedge_kind == 2) ? "reentry_storm" : "unknown",
         (unsigned)DUMP_CAP_WTRACE_ALL,
         (unsigned)DUMP_CAP_WTRACE,
+        (unsigned)DUMP_CAP_MMIO,
         (unsigned)DUMP_CAP_FRAME_HISTORY,
         (unsigned)DUMP_CAP_SIO_PC,
         (unsigned)DUMP_CAP_THREAD_TRACE,
         (unsigned)DUMP_CAP_RESTORE_TRACE,
+        (unsigned)DUMP_CAP_ENTRYINT,
+        (unsigned)DUMP_CAP_CDROM_TRACE,
+        (unsigned)DUMP_CAP_CDROM_SECTORS,
+        (unsigned)DUMP_CAP_DMA_TRACE,
+        (unsigned)DUMP_CAP_EXCEPTION_TRACE,
+        (unsigned)DUMP_CAP_THREAD_CTX,
         (unsigned)DUMP_CAP_FN_ENTRY,
-        (unsigned)DUMP_CAP_DIRTY_BLOCK);
+        (unsigned)DUMP_CAP_DIRTY_BLOCK,
+        (unsigned)DUMP_CAP_DIRTY_INSN,
+        (unsigned)DUMP_CAP_EVCB);
 
     fputs("  \"heartbeat_ring\":[\n", f);
     uint32_t avail = s_ring_count;
@@ -321,6 +347,10 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
     debug_server_freeze_dump_wtrace_json(f, DUMP_CAP_WTRACE);
     fputs(",\n", f);
 
+    fputs("  \"mmio_trace\":", f);
+    debug_server_freeze_dump_mmio_json(f, DUMP_CAP_MMIO);
+    fputs(",\n", f);
+
     fputs("  \"frame_history\":", f);
     debug_server_freeze_dump_frame_history_json(f, DUMP_CAP_FRAME_HISTORY);
     fputs(",\n", f);
@@ -337,12 +367,57 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
     debug_server_freeze_dump_restore_trace_json(f, DUMP_CAP_RESTORE_TRACE);
     fputs(",\n", f);
 
+    fputs("  \"first_zero_restore\":", f);
+    debug_server_freeze_dump_first_zero_restore_json(f);
+    fputs(",\n", f);
+
+    fputs("  \"entryint_trace\":", f);
+    debug_server_freeze_dump_entryint_json(f, DUMP_CAP_ENTRYINT);
+    fputs(",\n", f);
+
+    fputs("  \"cdrom_state\":", f);
+    debug_server_freeze_dump_cdrom_state_json(f);
+    fputs(",\n", f);
+
+    fputs("  \"cdrom_trace\":", f);
+    debug_server_freeze_dump_cdrom_trace_json(f, DUMP_CAP_CDROM_TRACE);
+    fputs(",\n", f);
+
+    fputs("  \"cdrom_sector_history\":", f);
+    debug_server_freeze_dump_cdrom_sector_history_json(f,
+                                                       DUMP_CAP_CDROM_SECTORS);
+    fputs(",\n", f);
+
+    fputs("  \"dma_state\":", f);
+    debug_server_freeze_dump_dma_state_json(f);
+    fputs(",\n", f);
+
+    fputs("  \"dma_trace\":", f);
+    debug_server_freeze_dump_dma_trace_json(f, DUMP_CAP_DMA_TRACE);
+    fputs(",\n", f);
+
+    fputs("  \"exception_trace\":", f);
+    debug_server_freeze_dump_exception_trace_json(f, DUMP_CAP_EXCEPTION_TRACE);
+    fputs(",\n", f);
+
+    fputs("  \"thread_ctx\":", f);
+    debug_server_freeze_dump_thread_ctx_json(f, DUMP_CAP_THREAD_CTX);
+    fputs(",\n", f);
+
     fputs("  \"fn_entry\":", f);
     debug_server_freeze_dump_fn_entry_json(f, DUMP_CAP_FN_ENTRY);
     fputs(",\n", f);
 
     fputs("  \"dirty_block\":", f);
     debug_server_freeze_dump_dirty_block_json(f, DUMP_CAP_DIRTY_BLOCK);
+    fputs(",\n", f);
+
+    fputs("  \"dirty_insn\":", f);
+    debug_server_freeze_dump_dirty_insn_json(f, DUMP_CAP_DIRTY_INSN);
+    fputs(",\n", f);
+
+    fputs("  \"evcb\":", f);
+    debug_server_freeze_dump_evcb_json(f, DUMP_CAP_EVCB);
     fputs(",\n", f);
 
 #ifdef _WIN32
@@ -443,9 +518,17 @@ static void heartbeat_write(void) {
     }
 
     if (wedge_kind != 0) {
-        if (s_dump_armed) {
+        int kind_changed = (s_last_dump_wedge_kind != 0
+                            && wedge_kind != s_last_dump_wedge_kind);
+        int long_running_same_kind =
+            (s_last_dump_wedge_kind == wedge_kind
+             && frame != s_last_dump_frame
+             && frame > s_last_dump_frame + 600u);
+        if (s_dump_armed || kind_changed || long_running_same_kind) {
             s_dump_armed = 0;
             s_last_wedge_kind = wedge_kind;
+            s_last_dump_wedge_kind = wedge_kind;
+            s_last_dump_frame = frame;
             freeze_dump_write(wall, frame, cyc, exc_reentry, cur_fn, last_store,
                               i_stat, i_mask, in_exc, total_checks,
                               dispatch_count, exc_entries,
@@ -455,6 +538,7 @@ static void heartbeat_write(void) {
     } else {
         /* Healthy tick: re-arm for the next wedge. */
         s_dump_armed = 1;
+        s_last_dump_wedge_kind = 0;
     }
 
     /* Buffer sized for current-state JSON + ring (~256B per ring entry). */

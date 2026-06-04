@@ -30,6 +30,7 @@ void cdrom_tick(void);
 /* DMA channel 3 interface */
 uint32_t cdrom_dma_read(void);
 int cdrom_dma_ready(void);
+uint32_t cdrom_dma_sector_word_count(void);
 
 typedef struct CDROMDebugState {
     uint64_t seq;
@@ -43,6 +44,9 @@ typedef struct CDROMDebugState {
     uint8_t seek_sec;
     uint8_t seek_sect;
     uint8_t pending_cmd;
+    uint8_t queued_cmd;
+    uint8_t queued_pending;
+    uint8_t queued_param_count;
     int has_disc;
     int param_count;
     int response_read;

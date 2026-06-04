@@ -872,6 +872,38 @@ static uint16_t merge_controller_pad(uint16_t buttons) {
     return buttons;
 }
 
+static uint8_t psx_axis_from_sdl(SDL_GameControllerAxis axis) {
+    if (!sdl_controller) return 0x80;
+    const int v = (int)SDL_GameControllerGetAxis(sdl_controller, axis);
+    int out = ((v + 32768) * 255) / 65535;
+    if (out < 0) out = 0;
+    if (out > 255) out = 255;
+    return (uint8_t)out;
+}
+
+static void analog_from_keyboard(uint8_t *lx, uint8_t *ly) {
+    const Uint8* keys = SDL_GetKeyboardState(NULL);
+    if (keys[SDL_SCANCODE_LEFT] && !keys[SDL_SCANCODE_RIGHT]) {
+        *lx = 0x00;
+    } else if (keys[SDL_SCANCODE_RIGHT] && !keys[SDL_SCANCODE_LEFT]) {
+        *lx = 0xFF;
+    }
+
+    if (keys[SDL_SCANCODE_UP] && !keys[SDL_SCANCODE_DOWN]) {
+        *ly = 0x00;
+    } else if (keys[SDL_SCANCODE_DOWN] && !keys[SDL_SCANCODE_UP]) {
+        *ly = 0xFF;
+    }
+}
+
+static void analog_from_controller(uint8_t *lx, uint8_t *ly, uint8_t *rx, uint8_t *ry) {
+    if (!sdl_controller) return;
+    *lx = psx_axis_from_sdl(SDL_CONTROLLER_AXIS_LEFTX);
+    *ly = psx_axis_from_sdl(SDL_CONTROLLER_AXIS_LEFTY);
+    *rx = psx_axis_from_sdl(SDL_CONTROLLER_AXIS_RIGHTX);
+    *ry = psx_axis_from_sdl(SDL_CONTROLLER_AXIS_RIGHTY);
+}
+
 /* PSX native vblank cadence: NTSC ≈ 59.94 Hz. Wall-clock target keeps
  * audio sample generation (735 samples/vblank * 60 = 44100/sec) matched
  * to the SDL audio device drain rate, eliminating queue overflow drops
@@ -889,12 +921,21 @@ static void sdl_vblank_present(void) {
     debug_server_check_watchpoints();
 
     /* Check debug server input override. */
-    int override = debug_server_get_input_override();
+    uint16_t override_buttons = 0xFFFF;
+    int override_axes = 0;
+    uint8_t override_lx = 0x80, override_ly = 0x80, override_rx = 0x80, override_ry = 0x80;
+    int override = debug_server_get_input_state(&override_buttons,
+                                                &override_axes,
+                                                &override_lx, &override_ly,
+                                                &override_rx, &override_ry);
 #else
     /* Production: skip debug server. Still need to advance frame counter
      * locally so anything else that reads it continues to work. */
     extern uint64_t s_frame_count;
     s_frame_count++;
+    uint16_t override_buttons = 0xFFFF;
+    int override_axes = 0;
+    uint8_t override_lx = 0x80, override_ly = 0x80, override_rx = 0x80, override_ry = 0x80;
     int override = -1;
 #endif
 
@@ -930,12 +971,26 @@ static void sdl_vblank_present(void) {
     /* Sample keyboard state and feed into SIO controller.
      * Debug server input override takes priority if active. */
     uint16_t pad_buttons_this_frame;
+    uint8_t lx = 0x80;
+    uint8_t ly = 0x80;
+    uint8_t rx = 0x80;
+    uint8_t ry = 0x80;
+    analog_from_controller(&lx, &ly, &rx, &ry);
+    analog_from_keyboard(&lx, &ly);
+
     if (override >= 0) {
-        pad_buttons_this_frame = (uint16_t)override;
+        pad_buttons_this_frame = override_buttons;
     } else {
         pad_buttons_this_frame = merge_controller_pad(pad_from_keyboard());
     }
+    if (override_axes) {
+        lx = override_lx;
+        ly = override_ly;
+        rx = override_rx;
+        ry = override_ry;
+    }
     sio_set_pad_state(pad_buttons_this_frame);
+    sio_set_pad_analog(0, lx, ly, rx, ry);
 #ifndef PSX_SDL_NO_AUDIO
     sdl_audio_pump();
 #endif
@@ -1091,6 +1146,7 @@ int main(int argc, char** argv) {
     std::string game_name;
     std::string game_id;
     std::string disc_speed;   /* "1x" | "2x" | "4x" | "instant" */
+    std::string controller_model = "digital";
     uint32_t   game_entry_pc = 0;
     bool       fast_boot     = false;
 
@@ -1104,6 +1160,7 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
             if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
+            if (gc.runtime.has_controller)   controller_model = gc.runtime.controller;
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
             std::fprintf(stdout, "psxrecomp: loaded game config %s (%s, %s)\n",
@@ -1145,6 +1202,11 @@ int main(int argc, char** argv) {
     interrupts_init();
     sio_init();
     sio_connect_pad(0);  /* Controller on port 1 */
+    if (controller_model == "dualshock") {
+        sio_set_pad_model(0, SIO_PAD_MODEL_DUALSHOCK);
+    } else {
+        sio_set_pad_model(0, SIO_PAD_MODEL_DIGITAL);
+    }
     spu_init();
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
     {

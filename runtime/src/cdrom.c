@@ -19,6 +19,7 @@
 extern void* iso_open(const char* path);
 extern int iso_read_sector(void* handle, uint32_t lba, uint8_t* buffer, int size);
 extern int iso_read_raw_sector(void* handle, uint32_t lba, uint8_t* buffer, int size);
+extern uint32_t iso_sector_count(void* handle);
 extern void iso_close(void* handle);
 
 /* I_STAT owned by memory.c — set bit 2 for CDROM IRQ */
@@ -170,6 +171,16 @@ typedef struct {
 } PendingCmd;
 static PendingCmd pending;
 
+typedef struct {
+    uint8_t cmd;
+    uint8_t params[PARAM_FIFO_SIZE];
+    int param_count;
+    int pending;
+} QueuedCmd;
+static QueuedCmd queued_cmd;
+
+static void exec_command(uint8_t cmd);
+
 /* ISO reader */
 static void* iso_handle = NULL;
 
@@ -303,6 +314,12 @@ static void fire_cdrom_irq(void) {
         trace_cdrom('F', 0, irq_flag, 0);
     } else {
         trace_cdrom('f', 0, irq_flag, 0);
+    }
+}
+
+static void refresh_cdrom_irq_line(void) {
+    if (irq_flag && (irq_enable & (1 << (irq_flag - 1)))) {
+        i_stat |= (1u << 2); /* IRQ_CDROM */
     }
 }
 
@@ -639,6 +656,41 @@ static int deliver_read_sector(void) {
     return 1;
 }
 
+static void try_execute_queued_command(void) {
+    if (!queued_cmd.pending || irq_flag != 0) return;
+
+    uint8_t cmd = queued_cmd.cmd;
+    int count = queued_cmd.param_count;
+    if (count < 0) count = 0;
+    if (count > PARAM_FIFO_SIZE) count = PARAM_FIFO_SIZE;
+
+    memcpy(param_fifo, queued_cmd.params, (size_t)count);
+    param_count = count;
+
+    queued_cmd.pending = 0;
+    queued_cmd.cmd = 0;
+    queued_cmd.param_count = 0;
+    memset(queued_cmd.params, 0, sizeof(queued_cmd.params));
+
+    exec_command(cmd);
+}
+
+static void queue_or_exec_command(uint8_t cmd) {
+    if (irq_flag == 0) {
+        exec_command(cmd);
+        return;
+    }
+
+    queued_cmd.cmd = cmd;
+    queued_cmd.param_count = param_count;
+    if (queued_cmd.param_count < 0) queued_cmd.param_count = 0;
+    if (queued_cmd.param_count > PARAM_FIFO_SIZE) queued_cmd.param_count = PARAM_FIFO_SIZE;
+    memcpy(queued_cmd.params, param_fifo, (size_t)queued_cmd.param_count);
+    queued_cmd.pending = 1;
+    param_count = 0;
+    trace_cdrom('Q', 0, cmd, 0);
+}
+
 static void exec_command(uint8_t cmd) {
     trace_cdrom('C', 0, cmd, 0);
     response_clear();
@@ -789,6 +841,33 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         break;
 
+    case 0x14: { /* GetTD */
+        if (!has_disc()) {
+            response_push(stat_reg | CDSTAT_ERROR);
+            response_push(0x80);
+            set_irq(CDIRQ_ERROR);
+            break;
+        }
+
+        int track = (param_count >= 1) ? bcd_to_bin(param_fifo[0]) : 0;
+        int lba = 0;
+        if (track == 0 || track == 0xAA) {
+            uint32_t sectors = iso_sector_count(iso_handle);
+            lba = sectors ? (int)sectors : 0;
+        } else {
+            lba = 0; /* Single data track starts at absolute MSF 00:02:00. */
+        }
+
+        int m, s, f;
+        (void)f;
+        lba_to_msf(lba, 150, &m, &s, &f);
+        response_push(stat_reg);
+        response_push(bin_to_bcd(m));
+        response_push(bin_to_bcd(s));
+        set_irq(CDIRQ_ACK);
+        break;
+    }
+
     case 0x15: /* SeekL */
         if (!has_disc()) {
             response_push(stat_reg | CDSTAT_ERROR | CDSTAT_SEEKERR);
@@ -870,6 +949,7 @@ static void process_pending(uint32_t cycles) {
     if (cycles == 0) return;
     pending.delay -= (int)cycles;
     if (pending.delay > 0) return;
+    if (irq_flag != 0) return;
 
     pending.pending = 0;
     response_clear();
@@ -946,14 +1026,9 @@ static void process_read_stream(uint32_t cycles) {
         read_delay -= (int)cycles;
     }
 
-    if (sector_available && irq_flag != 0) {
-        return;
-    }
+    if (sector_available || irq_flag != 0) return;
 
     if (read_delay <= 0) {
-        if (sector_available) {
-            trace_cdrom('O', 0, (uint32_t)sector_read_pos, 0);
-        }
         deliver_read_sector();
         read_delay += sector_delay_cycles();
     }
@@ -993,6 +1068,7 @@ void cdrom_init(const char* cue_path) {
     xa_reset_decode();
     spu_cd_audio_reset();
     pending.pending = 0;
+    memset(&queued_cmd, 0, sizeof(queued_cmd));
     seek_min = seek_sec = seek_sect = 0;
     cdrom_debug_clear_sector_history();
 
@@ -1062,8 +1138,7 @@ void cdrom_write(uint32_t addr, uint32_t value) {
 
     case 0x1F801801:
         if (index_reg == 0) {
-            exec_command(val);
-            fire_cdrom_irq();
+            queue_or_exec_command(val);
         }
         break;
 
@@ -1088,6 +1163,7 @@ void cdrom_write(uint32_t addr, uint32_t value) {
             if (val & 0x40) {
                 param_count = 0;
             }
+            try_execute_queued_command();
         }
         break;
 
@@ -1097,8 +1173,11 @@ void cdrom_write(uint32_t addr, uint32_t value) {
 }
 
 void cdrom_advance(uint32_t cycles) {
+    refresh_cdrom_irq_line();
+    try_execute_queued_command();
     process_pending(cycles);
     process_read_stream(cycles);
+    refresh_cdrom_irq_line();
 }
 
 void cdrom_tick(void) {
@@ -1125,6 +1204,19 @@ int cdrom_dma_ready(void) {
            (sector_read_pos + 4 <= sector_size);
 }
 
+uint32_t cdrom_dma_sector_word_count(void) {
+    int size = sector_size;
+
+    /* CD DMA BCR low half zero means transfer one sector-sized payload.
+     * If DMA is armed just before the next sector becomes available, fall
+     * back to the active mode's payload size. */
+    if (size <= 0) {
+        size = (mode_reg & 0x20u) ? WHOLE_SECTOR_SIZE : SECTOR_SIZE;
+    }
+
+    return (uint32_t)((size + 3) / 4);
+}
+
 void cdrom_debug_snapshot(CDROMDebugState* out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
@@ -1139,6 +1231,9 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->seek_sec = seek_sec;
     out->seek_sect = seek_sect;
     out->pending_cmd = pending.cmd;
+    out->queued_cmd = queued_cmd.cmd;
+    out->queued_pending = (uint8_t)queued_cmd.pending;
+    out->queued_param_count = (uint8_t)queued_cmd.param_count;
     out->has_disc = has_disc();
     out->param_count = param_count;
     out->response_read = response_read;

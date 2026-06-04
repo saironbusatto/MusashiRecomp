@@ -105,6 +105,11 @@ static uint64_t s_dirty_break_hits = 0;
 /* ---- Input override ---- */
 static int s_input_override = -1;
 static int s_input_frames   = 0;
+static int s_input_axes_override = 0;
+static uint8_t s_input_lx = 0x80;
+static uint8_t s_input_ly = 0x80;
+static uint8_t s_input_rx = 0x80;
+static uint8_t s_input_ry = 0x80;
 
 /* ---- Frontend turbo override ---- */
 static volatile int s_turbo_enabled = 0;
@@ -233,6 +238,44 @@ static uint32_t s_wtrace_trans_head = 0;
 static struct { uint32_t lo, hi; } s_wtrace_trans_ranges[WTRACE_TRANS_MAX_RANGES];
 static int s_wtrace_trans_range_count = 0;
 
+/* EntryInt / jmpbuf tracer. The BIOS exception handler falls back to the
+ * jmpbuf stored at kernel RAM 0x75D0 when no interrupt-chain callback exits
+ * via ReturnFromException. Capturing installs and writes to the active jmpbuf
+ * makes bad exception fallthroughs diagnosable without game-specific probes. */
+#define ENTRYINT_TRACE_CAP 4096
+#define ENTRYINT_JMPBUF_WORDS 12
+typedef struct {
+    uint64_t seq;
+    uint32_t kind;
+    uint32_t addr;
+    uint32_t old_val;
+    uint32_t new_val;
+    uint32_t entryint_ptr;
+    uint32_t watch_base;
+    uint32_t pc;
+    uint32_t func_addr;
+    uint32_t ra;
+    uint32_t sp;
+    uint32_t v0;
+    uint32_t v1;
+    uint32_t a0;
+    uint32_t a1;
+    uint32_t a2;
+    uint32_t a3;
+    uint32_t sr;
+    uint32_t epc;
+    uint32_t istat;
+    uint32_t imask;
+    uint32_t frame;
+    uint32_t words[ENTRYINT_JMPBUF_WORDS];
+    uint8_t  width;
+    uint8_t  in_exception;
+    uint8_t  pad[2];
+} EntryIntTraceEntry;
+static EntryIntTraceEntry s_entryint_trace[ENTRYINT_TRACE_CAP];
+static uint64_t s_entryint_trace_seq = 0;
+static uint32_t s_entryint_watch_base = 0;
+
 /* Function attribution global — set by psx_dispatch() before each call. */
 uint32_t g_debug_current_func_addr = 0;
 
@@ -302,6 +345,8 @@ static uint64_t s_sio_ctrl_reg_trace_seq = 0;
  * ring shows whether exception nonlocal control flow skipped a callback's
  * normal return-value cleanup. */
 #define RESTORE_TRACE_CAP (1 << 16)
+#define RESTORE_TRACE_QUEUE_COUNT 4
+#define RESTORE_TRACE_QUEUE_DEPTH 3
 typedef struct {
     uint64_t seq;
     uint32_t kind;
@@ -321,6 +366,17 @@ typedef struct {
     uint32_t a3;
     uint32_t s0;
     uint32_t s1;
+    uint32_t ctx_base;
+    uint32_t kernel_ctx_ptr;
+    uint32_t ctx_words[12];
+    uint32_t queue_base;
+    uint32_t queue_head[RESTORE_TRACE_QUEUE_COUNT];
+    uint32_t queue_flag[RESTORE_TRACE_QUEUE_COUNT];
+    uint32_t queue_entry[RESTORE_TRACE_QUEUE_COUNT][RESTORE_TRACE_QUEUE_DEPTH][4];
+    uint32_t tcbh_ptr;
+    uint32_t current_tcb;
+    uint32_t current_tcb_state;
+    uint32_t current_tcb_cause;
     uint32_t sr;
     uint32_t epc;
     uint32_t istat;
@@ -331,6 +387,10 @@ typedef struct {
 } RestoreTraceEntry;
 static RestoreTraceEntry s_restore_trace[RESTORE_TRACE_CAP];
 static uint64_t s_restore_trace_seq = 0;
+static RestoreTraceEntry s_first_zero_restore;
+static int s_first_zero_restore_valid = 0;
+
+static uint32_t trace_read_word(CPUState *cpu, uint32_t addr);
 
 #define THREAD_TRACE_CAP (1 << 16)
 typedef struct {
@@ -477,6 +537,7 @@ void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t 
     RestoreTraceEntry *e =
         &s_restore_trace[s_restore_trace_seq % RESTORE_TRACE_CAP];
     CPUState *cpu = s_cpu;
+    memset(e, 0, sizeof(*e));
     e->seq           = s_restore_trace_seq++;
     e->kind          = kind;
     e->jmp_val       = jmp_val;
@@ -495,12 +556,44 @@ void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t 
     e->a3            = cpu ? cpu->gpr[7]  : 0;
     e->s0            = cpu ? cpu->gpr[16] : 0;
     e->s1            = cpu ? cpu->gpr[17] : 0;
+    e->ctx_base      = (kind == 1 || kind == 3) ? e->a0 : 0;
+    e->kernel_ctx_ptr = cpu ? trace_read_word(cpu, 0x000075D0u) : 0;
+    for (size_t i = 0; i < sizeof(e->ctx_words) / sizeof(e->ctx_words[0]); i++) {
+        e->ctx_words[i] = (cpu && e->ctx_base)
+            ? trace_read_word(cpu, e->ctx_base + (uint32_t)(i * 4u))
+            : 0;
+    }
+    e->tcbh_ptr           = cpu ? trace_read_word(cpu, 0x00000108u) : 0;
+    e->current_tcb        = (cpu && e->tcbh_ptr) ? trace_read_word(cpu, e->tcbh_ptr) : 0;
+    e->current_tcb_state  = (cpu && e->current_tcb) ? trace_read_word(cpu, e->current_tcb) : 0;
+    e->current_tcb_cause  = (cpu && e->current_tcb) ? trace_read_word(cpu, e->current_tcb + 152u) : 0;
+    e->queue_base = cpu ? trace_read_word(cpu, 0x00000100u) : 0;
+    for (size_t q = 0; q < RESTORE_TRACE_QUEUE_COUNT; q++) {
+        uint32_t queue_addr = e->queue_base + (uint32_t)(q * 8u);
+        uint32_t node = (cpu && e->queue_base) ? trace_read_word(cpu, queue_addr + 0u) : 0;
+        e->queue_head[q] = node;
+        e->queue_flag[q] = (cpu && e->queue_base) ? trace_read_word(cpu, queue_addr + 4u) : 0;
+        for (size_t d = 0; d < RESTORE_TRACE_QUEUE_DEPTH; d++) {
+            if (!cpu || !node) {
+                continue;
+            }
+            e->queue_entry[q][d][0] = trace_read_word(cpu, node + 0u);
+            e->queue_entry[q][d][1] = trace_read_word(cpu, node + 4u);
+            e->queue_entry[q][d][2] = trace_read_word(cpu, node + 8u);
+            e->queue_entry[q][d][3] = trace_read_word(cpu, node + 12u);
+            node = e->queue_entry[q][d][0];
+        }
+    }
     e->sr            = cpu ? cpu->cop0[12] : 0;
     e->epc           = cpu ? cpu->cop0[14] : 0;
     e->istat         = i_stat;
     e->imask         = i_mask;
     e->frame         = (uint32_t)s_frame_count;
     e->in_exception  = (uint8_t)psx_get_in_exception();
+    if (kind == 1 && target_pc == 0 && !s_first_zero_restore_valid) {
+        s_first_zero_restore = *e;
+        s_first_zero_restore_valid = 1;
+    }
 }
 
 static uint32_t trace_read_word(CPUState *cpu, uint32_t addr)
@@ -865,6 +958,30 @@ typedef struct {
 static ChainTraceEntry s_chain_trace[CHAIN_TRACE_CAP];
 static uint64_t s_chain_trace_seq = 0;
 static uint32_t s_prev_dispatch_target = 0;
+
+/* ---- BIOS exception dispatch ring ----
+ *
+ * Records only while psx_check_interrupts has dispatched the BIOS exception
+ * handler. This stays low-volume during normal execution but captures the
+ * callback chain selected by Cause/IP bits and each callback's return value,
+ * which is the decisive signal for claimed vs. unclaimed IRQ paths. */
+#define EXCEPTION_TRACE_CAP 8192
+typedef struct {
+    uint64_t seq;
+    uint32_t kind;       /* 0=dispatch entry, 1=dispatch return */
+    uint32_t func_addr;
+    uint32_t pc;
+    uint32_t ra;
+    uint32_t sp;
+    uint32_t v0, v1;
+    uint32_t a0, a1, a2, a3;
+    uint32_t s0, s1, s2, s3, s4, s5, s6;
+    uint32_t sr, cause, epc;
+    uint32_t istat, imask;
+    uint32_t frame;
+} ExceptionTraceEntry;
+static ExceptionTraceEntry s_exception_trace[EXCEPTION_TRACE_CAP];
+static uint64_t s_exception_trace_seq = 0;
 
 /* Track whether we're currently INSIDE a chain-state subtree.
  * Set when chain state entry dispatched; cleared when chain epilogue
@@ -1462,10 +1579,28 @@ static void fn_record_exit(FnStackFrame *f) {
  * Distinguishing TAIL CALL from NEW CALL via $ra-change is what keeps the
  * shadow stack bounded under heavy code that uses fall-through dispatch. */
 static void function_trace_record(uint32_t target) {
-    if (!s_fn_trace_active) return;
-    if (!s_fn_entry || !s_fn_exit || !debug_cpu_ptr) return;
-
+    if (!debug_cpu_ptr) return;
     uint32_t cur_ra = debug_cpu_ptr->gpr[31];
+
+    if (!s_fn_trace_active) {
+        if (target == EVCB_DELIVER_EVENT_ADDR) {
+            if (s_evcb_pending_active) {
+                s_evcb_unwound_count++;
+            }
+            s_evcb_pending_exit_ra   = cur_ra & 0x1FFFFFFFu;
+            s_evcb_pending_entry_seq = (uint64_t)-1;
+            s_evcb_pending_active    = 1;
+            evcb_snapshot_capture(EVCB_TAG_ENTRY, (uint64_t)-1);
+        } else if (s_evcb_pending_active
+                   && target == s_evcb_pending_exit_ra) {
+            evcb_snapshot_capture(EVCB_TAG_EXIT, s_evcb_pending_entry_seq);
+            s_evcb_pending_active = 0;
+        }
+        s_fn_prev_ra = cur_ra;
+        return;
+    }
+
+    if (!s_fn_entry || !s_fn_exit) return;
 
     /* RETURN check first: walk stack from top down. Match deepest first, since
      * deeper frames may have stale RAs that coincidentally match. */
@@ -1631,11 +1766,45 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     s_fn_entry_seq++;
 }
 
+static void exception_trace_record(uint32_t kind, uint32_t func_addr, CPUState *cpu)
+{
+    if (!cpu || !psx_get_in_exception()) return;
+
+    ExceptionTraceEntry *e =
+        &s_exception_trace[s_exception_trace_seq % EXCEPTION_TRACE_CAP];
+    e->seq       = s_exception_trace_seq++;
+    e->kind      = kind;
+    e->func_addr = func_addr;
+    e->pc        = cpu->pc;
+    e->ra        = cpu->gpr[31];
+    e->sp        = cpu->gpr[29];
+    e->v0        = cpu->gpr[2];
+    e->v1        = cpu->gpr[3];
+    e->a0        = cpu->gpr[4];
+    e->a1        = cpu->gpr[5];
+    e->a2        = cpu->gpr[6];
+    e->a3        = cpu->gpr[7];
+    e->s0        = cpu->gpr[16];
+    e->s1        = cpu->gpr[17];
+    e->s2        = cpu->gpr[18];
+    e->s3        = cpu->gpr[19];
+    e->s4        = cpu->gpr[20];
+    e->s5        = cpu->gpr[21];
+    e->s6        = cpu->gpr[22];
+    e->sr        = cpu->cop0[12];
+    e->cause     = cpu->cop0[13];
+    e->epc       = cpu->cop0[14];
+    e->istat     = i_stat;
+    e->imask     = i_mask;
+    e->frame     = (uint32_t)s_frame_count;
+}
+
 void debug_server_trace_dispatch(uint32_t func_addr) {
 #ifdef PSX_NO_DEBUG_TOOLS
     (void)func_addr;
     return;
 #endif
+    exception_trace_record(0, func_addr, debug_cpu_ptr);
     card_mgr_trace_record(func_addr, 1);
 
     /* Function entry/exit rings (always-on, hooked here so every dispatch
@@ -1675,6 +1844,16 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
     s_dispatch_ring[s_dispatch_seq % DISPATCH_TRACE_CAP] = func_addr;
     s_dispatch_seq++;
     dispatch_unique_add(func_addr);
+}
+
+void debug_server_trace_dispatch_return(uint32_t func_addr, CPUState *cpu)
+{
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)func_addr;
+    (void)cpu;
+    return;
+#endif
+    exception_trace_record(1, func_addr, cpu);
 }
 
 static int json_get_int(const char *json, const char *key, int def);
@@ -3108,6 +3287,20 @@ static uint32_t hex_to_u32(const char *s)
     return (uint32_t)strtoul(s, NULL, 16);
 }
 
+static int json_get_axis_u8(const char *json, const char *key, uint8_t *out)
+{
+    char buf[64];
+    char *endp = NULL;
+    long v;
+    if (!json_get_str(json, key, buf, sizeof(buf))) return 0;
+    v = strtol(buf, &endp, 0);
+    if (endp == buf) return 0;
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    *out = (uint8_t)v;
+    return 1;
+}
+
 /* ---- Send helpers ---- */
 
 static void send_all_blocking(sock_t sock, const char *data, size_t len)
@@ -3432,6 +3625,7 @@ static const char *cdrom_trace_kind_name(uint8_t kind)
     case 'a': return "xa_skip";
     case 'X': return "xa_unsupported";
     case 'O': return "overwrite";
+    case 'Q': return "cmd_queued";
     case 'R': return "read";
     case 'W': return "write";
     case 'D': return "dma";
@@ -3457,6 +3651,7 @@ static void handle_cdrom_state(int id, const char *json)
              "\"filter_file\":%u,\"filter_channel\":%u,\"muted\":%u,"
              "\"seek_msf\":[%u,%u,%u],"
              "\"pending\":{\"cmd\":\"0x%02X\",\"active\":%d,\"delay\":%d,\"phase\":%d},"
+             "\"queued\":{\"cmd\":\"0x%02X\",\"active\":%u,\"params\":%u},"
              "\"last_sector\":{\"lba\":%d,\"size\":%d,\"frame\":%u,"
              "\"mode\":\"0x%02X\",\"have_raw\":%u},"
              "\"i_stat\":\"0x%08X\"}",
@@ -3471,6 +3666,7 @@ static void handle_cdrom_state(int id, const char *json)
              s.seek_min, s.seek_sec, s.seek_sect,
              s.pending_cmd, s.pending_pending, s.pending_delay,
              s.pending_phase,
+             s.queued_cmd, s.queued_pending, s.queued_param_count,
              s.last_sector_lba, s.last_sector_size, s.last_sector_frame,
              s.last_sector_mode, s.last_sector_have_raw,
              s.i_stat);
@@ -3664,6 +3860,7 @@ static const char *dma_trace_kind_name(uint32_t kind)
     switch (kind) {
     case 'S': return "start";
     case 'C': return "complete";
+    case 'W': return "write";
     default: return "unknown";
     }
 }
@@ -3729,7 +3926,9 @@ static void handle_dma_trace_dump(int id, const char *json)
         if (e->seq != seq) continue;
         pos += snprintf(buf + pos, bufsz - pos,
                         "%s{\"seq\":%llu,\"frame\":%u,\"kind\":\"%s\",\"ch\":%u,"
-                        "\"words\":%u,\"madr\":\"0x%08X\",\"bcr\":\"0x%08X\","
+                        "\"words\":%u,\"addr\":\"0x%08X\","
+                        "\"val\":\"0x%08X\",\"mask\":\"0x%08X\","
+                        "\"madr\":\"0x%08X\",\"bcr\":\"0x%08X\","
                         "\"chcr\":\"0x%08X\",\"dpcr\":\"0x%08X\","
                         "\"dicr_before\":\"0x%08X\",\"dicr_after\":\"0x%08X\","
                         "\"i_stat_before\":\"0x%08X\",\"i_stat_after\":\"0x%08X\","
@@ -3737,7 +3936,8 @@ static void handle_dma_trace_dump(int id, const char *json)
                         emitted ? "," : "",
                         (unsigned long long)e->seq, e->frame,
                         dma_trace_kind_name(e->kind), e->channel,
-                        e->total_words, e->madr, e->bcr, e->chcr, e->dpcr,
+                        e->total_words, e->addr, e->val, e->mask,
+                        e->madr, e->bcr, e->chcr, e->dpcr,
                         e->dicr_before, e->dicr_after,
                         e->i_stat_before, e->i_stat_after,
                         e->func, e->pc);
@@ -4902,10 +5102,16 @@ static void handle_unwatch(int id, const char *json)
 static void handle_set_input(int id, const char *json)
 {
     char val_str[32];
+    int any_axis = 0;
     if (!json_get_str(json, "buttons", val_str, sizeof(val_str))) {
         send_err(id, "missing buttons"); return;
     }
     s_input_override = (int)hex_to_u32(val_str);
+    any_axis |= json_get_axis_u8(json, "lx", &s_input_lx);
+    any_axis |= json_get_axis_u8(json, "ly", &s_input_ly);
+    any_axis |= json_get_axis_u8(json, "rx", &s_input_rx);
+    any_axis |= json_get_axis_u8(json, "ry", &s_input_ry);
+    if (any_axis) s_input_axes_override = 1;
     s_input_frames = 0;
     send_ok(id);
 }
@@ -4914,8 +5120,14 @@ static void handle_press(int id, const char *json)
 {
     int buttons = json_get_int(json, "buttons", -1);
     int frames  = json_get_int(json, "frames", 2);
+    int any_axis = 0;
     if (buttons < 0) { send_err(id, "missing buttons"); return; }
     s_input_override = buttons;
+    any_axis |= json_get_axis_u8(json, "lx", &s_input_lx);
+    any_axis |= json_get_axis_u8(json, "ly", &s_input_ly);
+    any_axis |= json_get_axis_u8(json, "rx", &s_input_rx);
+    any_axis |= json_get_axis_u8(json, "ry", &s_input_ry);
+    if (any_axis) s_input_axes_override = 1;
     s_input_frames   = frames;
     send_ok(id);
 }
@@ -4926,9 +5138,16 @@ static void handle_pad_status(int id, const char *json)
 {
     (void)json;
     uint16_t pad = sio_get_pad_buttons();
+    uint8_t lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80;
+    sio_get_pad_analog(0, &lx, &ly, &rx, &ry);
     send_fmt("{\"id\":%d,\"ok\":true,\"pad\":\"0x%04X\","
-             "\"override\":%d,\"override_frames\":%d}\n",
-             id, pad, s_input_override, s_input_frames);
+             "\"override\":%d,\"override_frames\":%d,"
+             "\"axis_override\":%d,\"lx\":%u,\"ly\":%u,\"rx\":%u,\"ry\":%u,"
+             "\"model\":%d,\"analog_enabled\":%d}\n",
+             id, pad, s_input_override, s_input_frames,
+             s_input_axes_override,
+             (unsigned)lx, (unsigned)ly, (unsigned)rx, (unsigned)ry,
+             (int)sio_get_pad_model(0), sio_get_pad_analog_enabled(0));
 }
 
 static void handle_clear_input(int id, const char *json)
@@ -4936,6 +5155,11 @@ static void handle_clear_input(int id, const char *json)
     (void)json;
     s_input_override = -1;
     s_input_frames   = 0;
+    s_input_axes_override = 0;
+    s_input_lx = 0x80;
+    s_input_ly = 0x80;
+    s_input_rx = 0x80;
+    s_input_ry = 0x80;
     send_ok(id);
 }
 
@@ -5316,7 +5540,6 @@ static void handle_get_snapshots(int id, const char *json)
 
 static void handle_screenshot_file(int id, const char *json)
 {
-    (void)json;
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
     if (di.disabled || di.width == 0 || di.height == 0) {
@@ -5326,7 +5549,11 @@ static void handle_screenshot_file(int id, const char *json)
     uint32_t w = di.width;  if (w > 640) w = 640;
     uint32_t h = di.height; if (h > 512) h = 512;
 
+    char path_buf[512];
     const char *path = "psx_screenshot.bmp";
+    if (json_get_str(json, "path", path_buf, sizeof(path_buf))) {
+        path = path_buf;
+    }
     FILE *f = fopen(path, "wb");
     if (!f) { send_err(id, "cannot open file"); return; }
 
@@ -5544,6 +5771,95 @@ static void wtrace_transition_record(uint32_t phys, uint32_t old_val,
     s_wtrace_trans_head = (s_wtrace_trans_head + 1) % WRITE_TRACE_TRANS_CAP;
 }
 
+static uint32_t entryint_apply_pending_write(uint32_t word_addr,
+                                             uint32_t cur_word,
+                                             uint32_t phys,
+                                             uint32_t new_val,
+                                             uint8_t width)
+{
+    if (phys < word_addr || phys >= word_addr + 4u || width == 0 || width > 4) {
+        return cur_word;
+    }
+
+    uint32_t lane = phys - word_addr;
+    if (lane + (uint32_t)width > 4u) {
+        return cur_word;
+    }
+
+    uint32_t mask = (width == 4)
+        ? 0xFFFFFFFFu
+        : ((1u << (8u * width)) - 1u);
+    mask <<= 8u * lane;
+    return (cur_word & ~mask) | ((new_val << (8u * lane)) & mask);
+}
+
+void debug_server_trace_entryint_write(uint32_t phys, uint32_t old_val,
+                                       uint32_t new_val, uint8_t width)
+{
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)phys; (void)old_val; (void)new_val; (void)width;
+    return;
+#else
+    int entryint_write = (phys >= 0x000075D0u && phys < 0x000075D4u);
+    uint32_t active_base = s_entryint_watch_base;
+    if (entryint_write && width == 4 && phys == 0x000075D0u) {
+        active_base = new_val & 0x1FFFFFFFu;
+    }
+
+    int jmpbuf_write = active_base &&
+        phys >= active_base &&
+        phys < active_base + ENTRYINT_JMPBUF_WORDS * 4u;
+    if (!entryint_write && !jmpbuf_write) {
+        return;
+    }
+
+    CPUState *cpu = debug_cpu_ptr;
+    EntryIntTraceEntry *e =
+        &s_entryint_trace[s_entryint_trace_seq % ENTRYINT_TRACE_CAP];
+    memset(e, 0, sizeof(*e));
+    e->seq          = s_entryint_trace_seq++;
+    e->kind         = (entryint_write && jmpbuf_write) ? 3u :
+                      (entryint_write ? 1u : 2u);
+    e->addr         = phys;
+    e->old_val      = old_val;
+    e->new_val      = new_val;
+    e->entryint_ptr = entryint_write && width == 4 && phys == 0x000075D0u
+        ? new_val
+        : (cpu ? trace_read_word(cpu, 0x000075D0u) : 0);
+    e->watch_base   = active_base;
+    e->pc           = g_debug_last_store_pc;
+    e->func_addr    = g_debug_current_func_addr;
+    e->ra           = cpu ? cpu->gpr[31] : 0;
+    e->sp           = cpu ? cpu->gpr[29] : 0;
+    e->v0           = cpu ? cpu->gpr[2]  : 0;
+    e->v1           = cpu ? cpu->gpr[3]  : 0;
+    e->a0           = cpu ? cpu->gpr[4]  : 0;
+    e->a1           = cpu ? cpu->gpr[5]  : 0;
+    e->a2           = cpu ? cpu->gpr[6]  : 0;
+    e->a3           = cpu ? cpu->gpr[7]  : 0;
+    e->sr           = cpu ? cpu->cop0[12] : 0;
+    e->epc          = cpu ? cpu->cop0[14] : 0;
+    e->istat        = i_stat;
+    e->imask        = i_mask;
+    e->frame        = (uint32_t)s_frame_count;
+    e->width        = width;
+    e->in_exception = (uint8_t)psx_get_in_exception();
+
+    if (active_base) {
+        for (uint32_t i = 0; i < ENTRYINT_JMPBUF_WORDS; i++) {
+            uint32_t word_addr = active_base + i * 4u;
+            uint32_t word = cpu ? trace_read_word(cpu, word_addr) : 0;
+            e->words[i] = entryint_apply_pending_write(word_addr, word,
+                                                       phys, new_val, width);
+        }
+    }
+
+    if (entryint_write && width == 4 && phys == 0x000075D0u) {
+        s_entryint_watch_base = active_base;
+    }
+#endif
+}
+
 /* Multi-range check called from memory.c write paths.
  * Iterates up to 8 ranges; records if any match.
  * The always-on catch-all ring is recorded UNCONDITIONALLY first so
@@ -5558,6 +5874,7 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     wtrace_all_record(phys, new_val, width);
     wtrace_transition_record(phys, old_val, new_val, width);
     wtrace_boot_record(phys, old_val, new_val, width);
+    debug_server_trace_entryint_write(phys, old_val, new_val, width);
     if (s_wtrace_range_count == 0) return;
     for (int i = 0; i < s_wtrace_range_count; i++) {
         if (phys >= s_wtrace_ranges[i].lo && phys < s_wtrace_ranges[i].hi) {
@@ -7223,6 +7540,97 @@ void debug_server_freeze_dump_wtrace_json(FILE *f, uint32_t max_count)
     fputc(']', f);
 }
 
+void debug_server_freeze_dump_mmio_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+    if (!s_mmio_trace) { fputs("[]", f); return; }
+
+    uint64_t total = s_mmio_trace_seq;
+    uint32_t head  = s_mmio_trace_head;
+    uint32_t avail = (total < MMIO_TRACE_CAP) ? (uint32_t)total : MMIO_TRACE_CAP;
+    if (max_count > avail) max_count = avail;
+    if (max_count == 0) { fputs("[]", f); return; }
+
+    uint32_t start = (total < MMIO_TRACE_CAP)
+                     ? (avail - max_count)
+                     : (head + (MMIO_TRACE_CAP - max_count)) % MMIO_TRACE_CAP;
+
+    fputc('[', f);
+    for (uint32_t i = 0; i < max_count; i++) {
+        uint32_t idx = (start + i) % MMIO_TRACE_CAP;
+        const MmioTraceEntry *e = &s_mmio_trace[idx];
+        fprintf(f,
+            "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"val\":\"0x%08X\","
+            "\"func\":\"0x%08X\",\"pc\":\"0x%08X\",\"cpu_pc\":\"0x%08X\","
+            "\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+            "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+            "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\","
+            "\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
+            "\"frame\":%u,\"w\":%u}",
+            i ? "," : "",
+            (unsigned long long)e->seq,
+            e->addr, e->val, e->func_addr, e->pc, e->cpu_pc,
+            e->ra, e->sp, e->a0, e->a1, e->a2, e->a3,
+            e->sr, e->epc, e->istat, e->imask,
+            e->frame, (unsigned)e->width);
+    }
+    fputc(']', f);
+}
+
+static const char *entryint_kind_name(uint32_t kind)
+{
+    switch (kind) {
+    case 1: return "entryint_write";
+    case 2: return "jmpbuf_write";
+    case 3: return "entryint_jmpbuf_write";
+    default: return "unknown";
+    }
+}
+
+void debug_server_freeze_dump_entryint_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+    uint64_t total = s_entryint_trace_seq;
+    uint64_t avail = (total < ENTRYINT_TRACE_CAP) ? total : ENTRYINT_TRACE_CAP;
+    if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
+    if (max_count == 0) { fputs("[]", f); return; }
+
+    uint64_t start = total - (uint64_t)max_count;
+    fputc('[', f);
+    for (uint32_t i = 0; i < max_count; i++) {
+        uint64_t s = start + i;
+        const EntryIntTraceEntry *e =
+            &s_entryint_trace[s % ENTRYINT_TRACE_CAP];
+        fprintf(f,
+            "%s{\"seq\":%llu,\"kind\":%u,\"name\":\"%s\","
+            "\"addr\":\"0x%08X\",\"old\":\"0x%08X\","
+            "\"new\":\"0x%08X\",\"entryint\":\"0x%08X\","
+            "\"watch\":\"0x%08X\",\"pc\":\"0x%08X\","
+            "\"func\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"sp\":\"0x%08X\",\"v0\":\"0x%08X\","
+            "\"v1\":\"0x%08X\",\"a0\":\"0x%08X\","
+            "\"a1\":\"0x%08X\",\"a2\":\"0x%08X\","
+            "\"a3\":\"0x%08X\",\"sr\":\"0x%08X\","
+            "\"epc\":\"0x%08X\",\"istat\":\"0x%08X\","
+            "\"imask\":\"0x%08X\",\"frame\":%u,"
+            "\"width\":%u,\"in_exc\":%u,\"words\":[",
+            i ? "," : "",
+            (unsigned long long)e->seq, e->kind,
+            entryint_kind_name(e->kind),
+            e->addr, e->old_val, e->new_val, e->entryint_ptr,
+            e->watch_base, e->pc, e->func_addr, e->ra, e->sp,
+            e->v0, e->v1, e->a0, e->a1, e->a2, e->a3,
+            e->sr, e->epc, e->istat, e->imask, e->frame,
+            (unsigned)e->width, (unsigned)e->in_exception);
+        for (uint32_t j = 0; j < ENTRYINT_JMPBUF_WORDS; j++) {
+            fprintf(f, "%s\"0x%08X\"", j ? "," : "", e->words[j]);
+        }
+        fputs("]}", f);
+    }
+    fputc(']', f);
+}
+
 void debug_server_freeze_dump_frame_history_json(FILE *f, uint32_t max_count)
 {
     if (!f) return;
@@ -7328,6 +7736,43 @@ void debug_server_freeze_dump_thread_trace_json(FILE *f, uint32_t max_count)
     fputc(']', f);
 }
 
+static void dump_restore_kernel_snapshot_json(FILE *f, const RestoreTraceEntry *e)
+{
+    fprintf(f,
+            ",\"tcbh_ptr\":\"0x%08X\",\"current_tcb\":\"0x%08X\","
+            "\"current_tcb_state\":\"0x%08X\","
+            "\"current_tcb_cause\":\"0x%08X\","
+            "\"queue_base\":\"0x%08X\",\"queues\":[",
+            e->tcbh_ptr, e->current_tcb, e->current_tcb_state,
+            e->current_tcb_cause, e->queue_base);
+
+    for (size_t q = 0; q < RESTORE_TRACE_QUEUE_COUNT; q++) {
+        fprintf(f,
+                "%s{\"index\":%u,\"head\":\"0x%08X\","
+                "\"flag\":\"0x%08X\",\"nodes\":[",
+                q ? "," : "", (unsigned)q, e->queue_head[q],
+                e->queue_flag[q]);
+        uint32_t node_addr = e->queue_head[q];
+        int emitted = 0;
+        for (size_t d = 0; d < RESTORE_TRACE_QUEUE_DEPTH; d++) {
+            if (!node_addr) {
+                break;
+            }
+            const uint32_t *node = e->queue_entry[q][d];
+            fprintf(f,
+                    "%s{\"addr\":\"0x%08X\",\"next\":\"0x%08X\","
+                    "\"func2\":\"0x%08X\",\"func1\":\"0x%08X\","
+                    "\"flag\":\"0x%08X\"}",
+                    emitted ? "," : "", node_addr, node[0], node[1],
+                    node[2], node[3]);
+            node_addr = node[0];
+            emitted = 1;
+        }
+        fputs("]}", f);
+    }
+    fputc(']', f);
+}
+
 void debug_server_freeze_dump_restore_trace_json(FILE *f, uint32_t max_count)
 {
     if (!f) return;
@@ -7347,15 +7792,342 @@ void debug_server_freeze_dump_restore_trace_json(FILE *f, uint32_t max_count)
             "\"target\":\"0x%08X\",\"cpu_pc\":\"0x%08X\","
             "\"func\":\"0x%08X\",\"store_pc\":\"0x%08X\","
             "\"byte_seq\":%u,\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+            "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\",\"a0\":\"0x%08X\","
+            "\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+            "\"s0\":\"0x%08X\",\"s1\":\"0x%08X\","
             "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\","
             "\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
-            "\"frame\":%u,\"in_exc\":%u}",
+            "\"frame\":%u,\"in_exc\":%u,"
+            "\"ctx_base\":\"0x%08X\",\"kernel_ctx_ptr\":\"0x%08X\","
+            "\"ctx\":[",
             i ? "," : "",
             (unsigned long long)e->seq, e->kind, restore_kind_name(e->kind),
             e->jmp_val, e->target_pc, e->cpu_pc,
             e->func, e->last_store_pc, e->byte_seq, e->ra, e->sp,
-            e->sr, e->epc, e->istat, e->imask,
-            e->frame, (unsigned)e->in_exception);
+            e->v0, e->v1, e->a0, e->a1, e->a2, e->a3,
+            e->s0, e->s1, e->sr, e->epc, e->istat, e->imask,
+            e->frame, (unsigned)e->in_exception,
+            e->ctx_base, e->kernel_ctx_ptr);
+        for (size_t j = 0; j < sizeof(e->ctx_words) / sizeof(e->ctx_words[0]); j++) {
+            fprintf(f, "%s\"0x%08X\"", j ? "," : "", e->ctx_words[j]);
+        }
+        fputc(']', f);
+        dump_restore_kernel_snapshot_json(f, e);
+        fputc('}', f);
+    }
+    fputc(']', f);
+}
+
+void debug_server_freeze_dump_first_zero_restore_json(FILE *f)
+{
+    if (!f) return;
+    if (!s_first_zero_restore_valid) {
+        fputs("null", f);
+        return;
+    }
+
+    const RestoreTraceEntry *e = &s_first_zero_restore;
+    fprintf(f,
+        "{\"seq\":%llu,\"kind\":%u,\"name\":\"%s\",\"jmp\":%u,"
+        "\"target\":\"0x%08X\",\"cpu_pc\":\"0x%08X\","
+        "\"func\":\"0x%08X\",\"store_pc\":\"0x%08X\","
+        "\"byte_seq\":%u,\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+        "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\",\"a0\":\"0x%08X\","
+        "\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+        "\"s0\":\"0x%08X\",\"s1\":\"0x%08X\","
+        "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\","
+        "\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
+        "\"frame\":%u,\"in_exc\":%u,"
+        "\"ctx_base\":\"0x%08X\",\"kernel_ctx_ptr\":\"0x%08X\","
+        "\"ctx\":[",
+        (unsigned long long)e->seq, e->kind, restore_kind_name(e->kind),
+        e->jmp_val, e->target_pc, e->cpu_pc,
+        e->func, e->last_store_pc, e->byte_seq, e->ra, e->sp,
+        e->v0, e->v1, e->a0, e->a1, e->a2, e->a3,
+        e->s0, e->s1, e->sr, e->epc, e->istat, e->imask,
+        e->frame, (unsigned)e->in_exception,
+        e->ctx_base, e->kernel_ctx_ptr);
+    for (size_t j = 0; j < sizeof(e->ctx_words) / sizeof(e->ctx_words[0]); j++) {
+        fprintf(f, "%s\"0x%08X\"", j ? "," : "", e->ctx_words[j]);
+    }
+    fputc(']', f);
+    dump_restore_kernel_snapshot_json(f, e);
+    fputc('}', f);
+}
+
+void debug_server_freeze_dump_cdrom_state_json(FILE *f)
+{
+    if (!f) return;
+
+    CDROMDebugState s;
+    cdrom_debug_snapshot(&s);
+    fprintf(f,
+        "{\"seq\":%llu,\"has_disc\":%d,"
+        "\"index\":%u,\"stat\":\"0x%02X\","
+        "\"request\":\"0x%02X\","
+        "\"irq_enable\":\"0x%02X\",\"irq_flag\":\"0x%02X\","
+        "\"mode\":\"0x%02X\","
+        "\"param_count\":%d,\"response_read\":%d,\"response_count\":%d,"
+        "\"sector_available\":%d,\"sector_read_pos\":%d,\"sector_size\":%d,"
+        "\"reading\":%d,\"read_msf\":[%d,%d,%d],"
+        "\"read_cmd\":\"0x%02X\",\"read_delay\":%d,"
+        "\"filter_file\":%u,\"filter_channel\":%u,\"muted\":%u,"
+        "\"seek_msf\":[%u,%u,%u],"
+        "\"pending\":{\"cmd\":\"0x%02X\",\"active\":%d,"
+        "\"delay\":%d,\"phase\":%d},"
+        "\"queued\":{\"cmd\":\"0x%02X\",\"active\":%u,\"params\":%u},"
+        "\"last_sector\":{\"lba\":%d,\"size\":%d,\"frame\":%u,"
+        "\"mode\":\"0x%02X\",\"have_raw\":%u},"
+        "\"i_stat\":\"0x%08X\"}",
+        (unsigned long long)s.seq, s.has_disc,
+        s.index_reg, s.stat_reg, s.request_reg, s.irq_enable, s.irq_flag,
+        s.mode_reg,
+        s.param_count, s.response_read, s.response_count,
+        s.sector_available, s.sector_read_pos, s.sector_size,
+        s.reading, s.read_min, s.read_sec, s.read_sect,
+        s.read_cmd, s.read_delay,
+        s.filter_file, s.filter_channel, s.muted,
+        s.seek_min, s.seek_sec, s.seek_sect,
+        s.pending_cmd, s.pending_pending, s.pending_delay, s.pending_phase,
+        s.queued_cmd, s.queued_pending, s.queued_param_count,
+        s.last_sector_lba, s.last_sector_size, s.last_sector_frame,
+        s.last_sector_mode, s.last_sector_have_raw,
+        s.i_stat);
+}
+
+void debug_server_freeze_dump_cdrom_trace_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+
+    const CDROMTraceEntry *entries = NULL;
+    uint64_t total = cdrom_debug_get_trace(&entries);
+    uint64_t oldest = (total > CDROM_TRACE_CAP) ? total - CDROM_TRACE_CAP : 0;
+    uint64_t avail = total - oldest;
+    if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
+    uint64_t start = total - (uint64_t)max_count;
+
+    fprintf(f,
+        "{\"total\":%llu,\"oldest\":%llu,\"entries\":[",
+        (unsigned long long)total, (unsigned long long)oldest);
+
+    int first = 1;
+    for (uint64_t seq = start; seq < total; seq++) {
+        const CDROMTraceEntry *e = &entries[seq % CDROM_TRACE_CAP];
+        if (e->seq != seq) continue;
+        fprintf(f,
+            "%s{\"seq\":%llu,\"kind\":\"%s\",\"addr\":\"0x%08X\","
+            "\"val\":\"0x%08X\",\"w\":%u,\"func\":\"0x%08X\","
+            "\"pc\":\"0x%08X\",\"frame\":%u,\"i_stat\":\"0x%08X\","
+            "\"index\":%u,\"stat\":\"0x%02X\","
+            "\"request\":\"0x%02X\","
+            "\"irq_enable\":\"0x%02X\",\"irq_flag\":\"0x%02X\","
+            "\"mode\":\"0x%02X\","
+            "\"param\":%u,\"resp_read\":%u,\"resp_count\":%u,"
+            "\"sector_avail\":%u,\"sector_pos\":%d,\"sector_size\":%d,"
+            "\"pending_cmd\":\"0x%02X\",\"pending\":%u,"
+            "\"pending_delay\":%d,\"reading\":%u,"
+            "\"read_cmd\":\"0x%02X\",\"read_delay\":%d}",
+            first ? "" : ",",
+            (unsigned long long)e->seq, cdrom_trace_kind_name(e->kind),
+            e->addr, e->val, (unsigned)e->width,
+            e->func, e->pc, e->frame, e->i_stat,
+            e->index_reg, e->stat_reg, e->request_reg,
+            e->irq_enable, e->irq_flag, e->mode_reg,
+            e->param_count, e->response_read, e->response_count,
+            e->sector_available, e->sector_read_pos, e->sector_size,
+            e->pending_cmd, e->pending_pending,
+            e->pending_delay, e->reading,
+            e->read_cmd, e->read_delay);
+        first = 0;
+    }
+
+    fputs("]}", f);
+}
+
+void debug_server_freeze_dump_cdrom_sector_history_json(FILE *f,
+                                                        uint32_t max_count)
+{
+    if (!f) return;
+
+    const CDROMSectorHistoryEntry *entries = NULL;
+    uint64_t total = cdrom_debug_get_sector_history(&entries);
+    uint64_t oldest = (total > CDROM_SECTOR_HISTORY_CAP)
+        ? total - CDROM_SECTOR_HISTORY_CAP : 0;
+    uint64_t avail = total - oldest;
+    if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
+    uint64_t start = total - (uint64_t)max_count;
+
+    fprintf(f,
+        "{\"total\":%llu,\"oldest\":%llu,\"entries\":[",
+        (unsigned long long)total, (unsigned long long)oldest);
+
+    int first = 1;
+    for (uint64_t seq = start; seq < total; seq++) {
+        const CDROMSectorHistoryEntry *e =
+            &entries[seq % CDROM_SECTOR_HISTORY_CAP];
+        if (e->seq != seq) continue;
+        fprintf(f,
+            "%s{\"seq\":%llu,\"lba\":%d,\"size\":%d,"
+            "\"frame\":%u,\"mode\":\"0x%02X\","
+            "\"have_raw\":%u,\"raw_mode\":\"0x%02X\","
+            "\"xa_file\":%u,\"xa_channel\":%u,"
+            "\"xa_submode\":\"0x%02X\",\"xa_coding\":\"0x%02X\","
+            "\"data_delivered\":%u,\"xa_audio_delivered\":%u,"
+            "\"skip_reason\":%u,\"bytes_len\":%u,\"hex\":\"",
+            first ? "" : ",",
+            (unsigned long long)e->seq, e->lba, e->size,
+            e->frame, e->mode, e->have_raw, e->raw_mode,
+            e->xa_file, e->xa_channel, e->xa_submode, e->xa_coding,
+            e->data_delivered, e->xa_audio_delivered,
+            e->skip_reason, e->bytes_len);
+        for (uint16_t i = 0; i < e->bytes_len; i++) {
+            fprintf(f, "%02x", e->bytes[i]);
+        }
+        fputs("\"}", f);
+        first = 0;
+    }
+
+    fputs("]}", f);
+}
+
+void debug_server_freeze_dump_dma_state_json(FILE *f)
+{
+    if (!f) return;
+
+    DMADebugState s;
+    dma_debug_get_state(&s);
+    fprintf(f, "{\"dpcr\":\"0x%08X\",\"dicr\":\"0x%08X\",\"channels\":[",
+            s.dpcr, s.dicr);
+    for (int i = 0; i < 7; i++) {
+        fprintf(f,
+            "%s{\"ch\":%d,\"madr\":\"0x%08X\","
+            "\"bcr\":\"0x%08X\",\"chcr\":\"0x%08X\","
+            "\"active\":%u,\"remaining_words\":%u,"
+            "\"cycles_accum\":%u}",
+            i ? "," : "",
+            i, s.channels[i].madr, s.channels[i].bcr,
+            s.channels[i].chcr, s.channels[i].active,
+            s.channels[i].remaining_words,
+            s.channels[i].cycles_accum);
+    }
+    fputs("]}", f);
+}
+
+void debug_server_freeze_dump_dma_trace_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+
+    const DMATraceEntry *entries = NULL;
+    uint64_t total = dma_debug_get_trace(&entries);
+    uint64_t oldest = (total > DMA_TRACE_CAP) ? total - DMA_TRACE_CAP : 0;
+    uint64_t avail = total - oldest;
+    if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
+    uint64_t start = total - (uint64_t)max_count;
+
+    fprintf(f,
+        "{\"total\":%llu,\"oldest\":%llu,\"entries\":[",
+        (unsigned long long)total, (unsigned long long)oldest);
+
+    int first = 1;
+    for (uint64_t seq = start; seq < total; seq++) {
+        const DMATraceEntry *e = &entries[seq % DMA_TRACE_CAP];
+        if (e->seq != seq) continue;
+        fprintf(f,
+            "%s{\"seq\":%llu,\"frame\":%u,\"kind\":\"%s\",\"ch\":%u,"
+            "\"words\":%u,\"addr\":\"0x%08X\","
+            "\"val\":\"0x%08X\",\"mask\":\"0x%08X\","
+            "\"madr\":\"0x%08X\",\"bcr\":\"0x%08X\","
+            "\"chcr\":\"0x%08X\",\"dpcr\":\"0x%08X\","
+            "\"dicr_before\":\"0x%08X\",\"dicr_after\":\"0x%08X\","
+            "\"i_stat_before\":\"0x%08X\",\"i_stat_after\":\"0x%08X\","
+            "\"func\":\"0x%08X\",\"pc\":\"0x%08X\"}",
+            first ? "" : ",",
+            (unsigned long long)e->seq, e->frame,
+            dma_trace_kind_name(e->kind), e->channel,
+            e->total_words, e->addr, e->val, e->mask,
+            e->madr, e->bcr, e->chcr, e->dpcr,
+            e->dicr_before, e->dicr_after,
+            e->i_stat_before, e->i_stat_after,
+            e->func, e->pc);
+        first = 0;
+    }
+
+    fputs("]}", f);
+}
+
+void debug_server_freeze_dump_exception_trace_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+
+    uint64_t total = s_exception_trace_seq;
+    uint64_t oldest = (total > EXCEPTION_TRACE_CAP)
+        ? total - EXCEPTION_TRACE_CAP : 0;
+    uint64_t avail = total - oldest;
+    if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
+    uint64_t start = total - (uint64_t)max_count;
+
+    fprintf(f,
+        "{\"total\":%llu,\"oldest\":%llu,\"entries\":[",
+        (unsigned long long)total, (unsigned long long)oldest);
+
+    int first = 1;
+    for (uint64_t seq = start; seq < total; seq++) {
+        const ExceptionTraceEntry *e =
+            &s_exception_trace[seq % EXCEPTION_TRACE_CAP];
+        if (e->seq != seq) continue;
+        fprintf(f,
+            "%s{\"seq\":%llu,\"kind\":\"%s\",\"func\":\"0x%08X\","
+            "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+            "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+            "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+            "\"s0\":\"0x%08X\",\"s1\":\"0x%08X\","
+            "\"s2\":\"0x%08X\",\"s3\":\"0x%08X\","
+            "\"s4\":\"0x%08X\",\"s5\":\"0x%08X\","
+            "\"s6\":\"0x%08X\",\"sr\":\"0x%08X\","
+            "\"cause\":\"0x%08X\",\"epc\":\"0x%08X\","
+            "\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
+            "\"frame\":%u}",
+            first ? "" : ",",
+            (unsigned long long)e->seq,
+            e->kind == 0 ? "entry" : "return",
+            e->func_addr, e->pc, e->ra, e->sp,
+            e->v0, e->v1, e->a0, e->a1, e->a2, e->a3,
+            e->s0, e->s1, e->s2, e->s3, e->s4, e->s5, e->s6,
+            e->sr, e->cause, e->epc, e->istat, e->imask, e->frame);
+        first = 0;
+    }
+
+    fputs("]}", f);
+}
+
+void debug_server_freeze_dump_thread_ctx_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+
+    uint64_t total = g_thread_ctx_ring_seq;
+    uint64_t avail = (total < THREAD_CTX_RING_CAP_DS)
+                     ? total : THREAD_CTX_RING_CAP_DS;
+    if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
+    if (max_count == 0) { fputs("[]", f); return; }
+
+    uint64_t start = total - (uint64_t)max_count;
+
+    fputc('[', f);
+    int first = 1;
+    for (uint64_t s = start; s < total; s++) {
+        const ThreadCtxRingEntry *e =
+            &g_thread_ctx_ring[s & (THREAD_CTX_RING_CAP_DS - 1u)];
+        fprintf(f,
+            "%s{\"seq\":%u,\"frame\":%u,\"op\":\"%s\","
+            "\"tcb\":\"0x%08X\",\"resume_pc\":\"0x%08X\","
+            "\"sp\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\"}",
+            first ? "" : ",",
+            e->seq, e->frame, e->op == 0 ? "save" : "restore",
+            e->tcb, e->resume_pc, e->gpr_29, e->gpr_31,
+            e->cop0_sr, e->cop0_epc);
+        first = 0;
     }
     fputc(']', f);
 }
@@ -7409,11 +8181,102 @@ void debug_server_freeze_dump_dirty_block_json(FILE *f, uint32_t max_count)
             "%s{\"seq\":%llu,\"target\":\"0x%08X\",\"ra\":\"0x%08X\","
             "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\","
             "\"a3\":\"0x%08X\",\"t0\":\"0x%08X\",\"t1\":\"0x%08X\","
-            "\"sp\":\"0x%08X\",\"frame\":%u}",
+            "\"t2\":\"0x%08X\",\"sp\":\"0x%08X\",\"frame\":%u}",
             first ? "" : ",",
             (unsigned long long)e->seq, e->target, e->ra,
-            e->a0, e->a1, e->a2, e->a3, e->t0, e->t1, e->sp, e->frame);
+            e->a0, e->a1, e->a2, e->a3, e->t0, e->t1, e->t2, e->sp, e->frame);
         first = 0;
+    }
+    fputc(']', f);
+}
+
+void debug_server_freeze_dump_dirty_insn_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+
+    uint64_t total = g_dirty_ram_insn_log_seq;
+    uint64_t avail = (total < (uint64_t)DIRTY_RAM_INSN_LOG_CAP)
+                     ? total : (uint64_t)DIRTY_RAM_INSN_LOG_CAP;
+    uint64_t want  = ((uint64_t)max_count < avail) ? (uint64_t)max_count : avail;
+    uint64_t start = total - want;
+
+    fputc('[', f);
+    int first = 1;
+    for (uint64_t s = start; s < total; s++) {
+        const DirtyRamInsnLogEntry *e =
+            &g_dirty_ram_insn_log[s & (DIRTY_RAM_INSN_LOG_CAP - 1u)];
+        if (e->seq != s) continue;
+        fprintf(f,
+            "%s{\"seq\":%llu,\"pc\":\"0x%08X\",\"insn\":\"0x%08X\","
+            "\"next_pc\":\"0x%08X\",\"target\":\"0x%08X\","
+            "\"before_s0\":\"0x%08X\",\"after_s0\":\"0x%08X\","
+            "\"sp\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+            "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+            "\"t0\":\"0x%08X\",\"t1\":\"0x%08X\",\"t2\":\"0x%08X\","
+            "\"current_tcb\":\"0x%08X\",\"task_ptr\":\"0x%08X\","
+            "\"task_mode\":\"0x%08X\",\"task_submode\":\"0x%08X\","
+            "\"frame\":%u,\"transferred\":%u}",
+            first ? "" : ",",
+            (unsigned long long)e->seq, e->pc, e->insn,
+            e->next_pc, e->target,
+            e->before_s0, e->after_s0,
+            e->sp, e->ra,
+            e->v0, e->v1,
+            e->a0, e->a1,
+            e->a2, e->a3,
+            e->t0, e->t1, e->t2,
+            e->current_tcb, e->task_ptr,
+            e->task_mode, e->task_submode,
+            e->frame, (unsigned)e->transferred);
+        first = 0;
+    }
+    fputc(']', f);
+}
+
+void debug_server_freeze_dump_evcb_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+    if (!s_evcb_ring) { fputs("[]", f); return; }
+
+    uint64_t total = s_evcb_ring_seq;
+    uint64_t avail = (total < EVCB_RING_CAP) ? total : EVCB_RING_CAP;
+    uint64_t want  = ((uint64_t)max_count < avail) ? (uint64_t)max_count : avail;
+    uint64_t start = total - want;
+
+    fputc('[', f);
+    int first_snap = 1;
+    for (uint64_t s = start; s < total; s++) {
+        const EvCBSnapshot *e = &s_evcb_ring[s % EVCB_RING_CAP];
+        if (e->seq != s) continue;
+        fprintf(f,
+            "%s{\"seq\":%llu,\"fn_entry_seq\":%llu,\"tag\":\"%s\","
+            "\"evcb_base\":\"0x%08X\",\"evcb_total_bytes\":%u,"
+            "\"entry_count\":%u,\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+            "\"v0\":\"0x%08X\",\"counter_7514\":%u,"
+            "\"flag_755A\":\"0x%08X\",\"flag_75C0\":\"0x%08X\","
+            "\"frame\":%u,\"entries\":[",
+            first_snap ? "" : ",",
+            (unsigned long long)e->seq,
+            (unsigned long long)e->fn_entry_seq,
+            e->tag == EVCB_TAG_ENTRY ? "entry" : "exit",
+            e->evcb_base, e->evcb_total_bytes,
+            e->entry_count, e->a0, e->a1, e->v0,
+            e->counter_7514, e->flag_755A, e->flag_75C0,
+            e->frame);
+        for (uint32_t i = 0; i < e->entry_count; i++) {
+            fprintf(f,
+                "%s{\"i\":%u,\"class\":\"0x%08X\","
+                "\"status\":\"0x%08X\",\"spec\":\"0x%08X\","
+                "\"mode\":\"0x%08X\",\"fhandler\":\"0x%08X\"}",
+                i == 0 ? "" : ",",
+                i, e->entries[i].cls, e->entries[i].status,
+                e->entries[i].spec, e->entries[i].mode,
+                e->entries[i].fhandler);
+        }
+        fputs("]}", f);
+        first_snap = 0;
     }
     fputc(']', f);
 }
@@ -8112,11 +8975,37 @@ int debug_server_is_connected(void)
 
 int debug_server_get_input_override(void)
 {
+    int ret = s_input_override;
     if (s_input_override >= 0 && s_input_frames > 0) {
-        if (--s_input_frames == 0)
+        if (--s_input_frames == 0) {
             s_input_override = -1;
+            s_input_axes_override = 0;
+        }
     }
-    return s_input_override;
+    return ret;
+}
+
+int debug_server_get_input_state(uint16_t *buttons,
+                                 int *axes_override,
+                                 uint8_t *lx, uint8_t *ly,
+                                 uint8_t *rx, uint8_t *ry)
+{
+    int ret = s_input_override;
+    if (buttons && s_input_override >= 0) *buttons = (uint16_t)s_input_override;
+    if (axes_override) *axes_override = s_input_axes_override;
+    if (s_input_axes_override) {
+        if (lx) *lx = s_input_lx;
+        if (ly) *ly = s_input_ly;
+        if (rx) *rx = s_input_rx;
+        if (ry) *ry = s_input_ry;
+    }
+    if ((s_input_override >= 0 || s_input_axes_override) && s_input_frames > 0) {
+        if (--s_input_frames == 0) {
+            s_input_override = -1;
+            s_input_axes_override = 0;
+        }
+    }
+    return ret;
 }
 
 int debug_server_turbo_enabled(void)
