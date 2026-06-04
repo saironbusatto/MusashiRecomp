@@ -43,6 +43,26 @@ if(NOT SDL2_INCLUDE_DIRS OR NOT SDL2_LIBRARIES)
     endif()
 endif()
 
+# PSX_STATIC_RUNTIME: produce a 100% self-contained MinGW exe.
+#
+# A default MinGW build dynamically imports three NON-system DLLs —
+# SDL2.dll, libgcc_s_seh-1.dll, libstdc++-6.dll — which must be shipped
+# next to the exe. On a user's machine that side-by-side scheme breaks
+# when a different-architecture copy of one of those DLLs is found earlier
+# on the DLL search path (System32, another app on PATH), producing the
+# 0xc000007b STATUS_INVALID_IMAGE_FORMAT crash on launch.
+#
+# Linking those runtimes (and SDL2) statically removes every non-system
+# import, so the exe runs from any folder with zero bundled DLLs and the
+# 0xc000007b failure mode becomes structurally impossible. Default ON for
+# MinGW Release/MinSizeRel (the configs used to cut releases); override
+# with -DPSX_STATIC_RUNTIME=OFF to force dynamic linking.
+if(MINGW AND (CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "MinSizeRel"))
+    option(PSX_STATIC_RUNTIME "Statically link SDL2 + libgcc/libstdc++ for a self-contained exe" ON)
+else()
+    option(PSX_STATIC_RUNTIME "Statically link SDL2 + libgcc/libstdc++ for a self-contained exe" OFF)
+endif()
+
 set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/main.cpp
     ${PSXRECOMP_ROOT}/runtime/src/memory.c
@@ -151,7 +171,15 @@ function(psxrecomp_add_runtime_target target)
     if(SDL2_LIBRARY_DIRS)
         target_link_directories(${target} PRIVATE ${SDL2_LIBRARY_DIRS})
     endif()
-    target_link_libraries(${target} PRIVATE ${SDL2_LIBRARIES})
+    # For a self-contained MinGW build, link SDL2 statically via pkg-config's
+    # --static link line (libSDL2.a + the full Windows system-lib chain SDL2
+    # needs: winmm, imm32, ole32, oleaut32, version, setupapi, dinput8, ...).
+    # Otherwise link the SDL2 import lib (needs SDL2.dll at runtime).
+    if(PSX_STATIC_RUNTIME AND SDL2_STATIC_LDFLAGS)
+        target_link_libraries(${target} PRIVATE ${SDL2_STATIC_LDFLAGS})
+    else()
+        target_link_libraries(${target} PRIVATE ${SDL2_LIBRARIES})
+    endif()
 
     target_compile_definitions(${target} PRIVATE
         DEFAULT_DEBUG_PORT=${PSXRT_DEBUG_PORT}
@@ -188,6 +216,13 @@ function(psxrecomp_add_runtime_target target)
         target_link_options(${target} PRIVATE -Wl,--stack,67108864)
         # No console window in Release MinGW builds.
         target_link_options(${target} PRIVATE $<$<CONFIG:Release>:-mwindows>)
+        if(PSX_STATIC_RUNTIME)
+            # Fold the GCC / C++ / winpthread runtimes into the exe so it
+            # imports only Windows system DLLs (no libgcc_s_seh-1.dll /
+            # libstdc++-6.dll dependency). Pairs with the static SDL2 link
+            # above to make the exe fully self-contained.
+            target_link_options(${target} PRIVATE -static -static-libgcc -static-libstdc++)
+        endif()
     elseif(MSVC)
         target_compile_options(${target} PRIVATE /GS- /guard:cf-)
         target_link_options(${target} PRIVATE /STACK:67108864,67108864 /GUARD:NO)

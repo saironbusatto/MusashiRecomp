@@ -30,13 +30,26 @@ if (Test-Path (Join-Path $Root "RELEASE_NOTES.md")) {
     Copy-Item (Join-Path $Root "RELEASE_NOTES.md") $Stage
 }
 
-foreach ($Dll in @("SDL2.dll", "libgcc_s_seh-1.dll", "libstdc++-6.dll")) {
-    $Source = Join-Path $MingwBin $Dll
-    if (!(Test-Path $Source)) {
-        throw "Required runtime DLL not found: $Source"
-    }
-    Copy-Item $Source $Stage
+# The Release build is statically linked (PSX_STATIC_RUNTIME defaults ON for
+# MinGW Release in runtime.cmake), so the exe imports ONLY Windows system DLLs
+# — no SDL2.dll / libgcc_s_seh-1.dll / libstdc++-6.dll to bundle. Shipping
+# those side-by-side was the cause of the 0xc000007b launch crash on user
+# machines that had a mismatched copy earlier on the DLL search path.
+#
+# Assert self-containment rather than trust it: fail packaging if the exe
+# imports any non-system DLL.
+$objdump = Join-Path $MingwBin "objdump.exe"
+$imports = & $objdump -p (Join-Path $Stage "PSXRecomp.exe") |
+    Select-String "DLL Name: (.+)" | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() }
+$systemDlls = @("kernel32.dll","user32.dll","gdi32.dll","shell32.dll","msvcrt.dll",
+                "advapi32.dll","ws2_32.dll","comdlg32.dll","dbghelp.dll","ole32.dll",
+                "oleaut32.dll","winmm.dll","imm32.dll","version.dll","setupapi.dll",
+                "dinput8.dll","rpcrt4.dll","hid.dll","cfgmgr32.dll")
+$nonSystem = $imports | Where-Object { $systemDlls -notcontains $_.ToLower() }
+if ($nonSystem) {
+    throw "Release exe is NOT self-contained — imports non-system DLL(s): $($nonSystem -join ', ')"
 }
+Write-Host "Verified self-contained: imports only system DLLs ($($imports.Count) total)"
 
 @"
 ; PSXRecomp input mapping. PSX buttons are active when any listed source is pressed.
