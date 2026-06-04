@@ -36,16 +36,21 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `dump_ram` | ✓ | ✓ | `addr`, `len` | Chunked RAM read (up to 64 KB) |
 | `read_scratch` |   | ✓ | `addr`, `len` | Read PS1 scratchpad (0x1F800000 region) |
 | `read_vram` / `vram_peek` | ✓¹ | ✓ | `x`, `y`, `w`, `h` | Read 16-bit VRAM pixels (max 128×128) |
-| `gpu_state` | ✓ | ✓ | — | Display area, draw offset, GPUSTAT, clip rect, xfer state |
+| `gpu_state` | ✓ | ✓ | — | Display area, display depth, draw offset, GPUSTAT, clip rect, xfer state |
 | `sio_state` | ✓ | ✓ | — | SIO registers + (native only) pad/memcard protocol + TX/RX history |
 | `irq_state` | ✓ | ✓ | — | `I_STAT`, `I_MASK` (both), plus chain state on native |
-| `dma_state` |   | ✓ | — | DPCR, DICR, all 7 channel states (madr/bcr/chcr) |
+| `dma_state` | ✓ | ✓ | — | DPCR, DICR, all 7 channel states (madr/bcr/chcr) |
 | `event_state` |   | ✓ | — | EvCB table summary (stub on DS — events are BIOS-level) |
 | `overlay_state` |   | ✓ | — | Current overlay info |
+| `cdrom_sector_dump` | ✓ |   | `offset`, `len` | Dump bytes from the last CD-ROM sector observed by the controller, including LBA/mode metadata |
+| `cdrom_sector_history` | ✓ |   | `count`, optional `lba` | Dump newest CD-ROM sector history entries, including raw XA subheader fields, CPU/audio delivery flags, and the first 128 bytes |
+| `cdrom_sector_history_clear` | ✓ |   | — | Reset the CD-ROM sector history ring |
 | `watch` | ✓ | ✓ | `addr` | Set byte-level memory watchpoint (fires per-frame on change) |
 | `unwatch` | ✓ | ✓ | `addr` | Remove memory watchpoint |
 | `set_input` | ✓ | ✓ | `buttons` | Override pad1 buttons (PS1 inverted bitmask, 0 = pressed) |
 | `clear_input` | ✓ | ✓ | — | Remove input override |
+| `turbo` | ✓ |   | `enabled` | Enable/disable TCP-controlled frontend turbo for fast-forward validation |
+| `turbo_state` | ✓ |   | — | Query TCP-controlled turbo state |
 | `pause` | ✓ | ✓ | — | Pause emulation |
 | `continue` (`c`) | ✓ | ✓ | — | Resume emulation |
 | `step` | ✓ | ✓ | `[count]` | Step N frames (default 1) |
@@ -56,7 +61,7 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `frame_timeseries` | ✓ | ✓ | `start`, `end` | Compact timeseries, max 200 frames |
 | `set_snapshot` | ✓ | ✓ | `slot`, `addr`, `size` | Configure per-frame RAM snapshot region (slots 0-3) |
 | `get_snapshots` | ✓ | ✓ | — | Show snapshot config |
-| `screenshot` | ✓ | ✓ | `path` | Save display to PNG |
+| `screenshot` | ✓ | ✓ | `path` | Save display to PNG/file; native row dumps report `rgb555` or `rgb888` to match display depth |
 | `first_failure` | ✓ |   | — | Find first divergence point between runs (native-side tracking) |
 | `read_frame_ram` | ✓ |   | `addr`, `len`, `frame` | Read RAM **as of a specific frame** (from ring buffer) |
 | `wtrace_range` | ✓ |   | `lo`, `hi` | Set RAM-write trace range (ring of 1024 writes with RA) |

@@ -27,10 +27,14 @@ const uint16_t* gpu_get_vram(void);    /* Pointer to 1024x512 16-bit VRAM */
 typedef struct {
     uint32_t display_x, display_y;     /* VRAM start of display area (GP1(05h)) */
     uint32_t width, height;            /* Derived from display mode + ranges */
+    int      depth24;                  /* GP1(08h) display depth flag: RGB888 scanout */
     int      disabled;                 /* GP1(03h) display disable flag */
 } GpuDisplayInfo;
 
 void gpu_get_display_info(GpuDisplayInfo* out);
+void gpu_display_pixel_rgb(const GpuDisplayInfo* di, uint32_t x, uint32_t y,
+                           uint8_t* r, uint8_t* g, uint8_t* b);
+uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y);
 uint64_t gpu_get_gp0_count(void);  /* Total GP0 writes since init */
 void gpu_get_gp0_stats(uint64_t* nop, uint64_t* fill, uint64_t* draw, uint64_t* env, uint64_t* copy);
 

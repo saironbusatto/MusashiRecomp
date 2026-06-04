@@ -5,7 +5,10 @@
  *   - Ch2 (GPU): block mode and linked-list mode
  *   - Ch6 (OTC): ordering table clear
  *
- * Transfer is executed synchronously when CHCR start bit is written.
+ * Most channels execute synchronously when CHCR start bit is written. MDEC
+ * request-mode transfers are advanced from the guest cycle clock so games
+ * which synchronize video decode through DMA busy/request state see realistic
+ * backpressure.
  * Reference: nocash PSX specs, DuckStation src/core/dma.cpp
  */
 
@@ -39,6 +42,30 @@ typedef struct {
 } DMAChannel;
 
 static DMAChannel channels[7];
+
+typedef struct {
+    uint8_t active;
+    uint8_t debug_started;
+    uint32_t total_words;
+    uint32_t remaining_words;
+    uint32_t cycles_accum;
+} DMAAsyncChannel;
+
+static DMAAsyncChannel mdec_async[2];
+static DMAAsyncChannel cdrom_async;
+
+#define DMA_MDEC_IN_CYCLES_PER_WORD   1u
+#define DMA_MDEC_OUT_CYCLES_PER_WORD 14u
+#define DMA_GPU_CYCLES_PER_WORD       1u
+#define DMA_CDROM_CYCLES_PER_WORD     1u
+
+typedef struct {
+    uint8_t active;
+    uint32_t total_words;
+    uint32_t cycles_remaining;
+} DMADelayedComplete;
+
+static DMADelayedComplete delayed_complete[7];
 
 /* ---- Global registers ---- */
 
@@ -132,6 +159,167 @@ static void complete_transfer(int ch) {
 
 /* ---- Transfer execution ---- */
 
+static void cancel_async_transfer(int ch) {
+    if (ch >= 0 && ch < 2) {
+        mdec_async[ch].active = 0;
+        mdec_async[ch].debug_started = 0;
+        mdec_async[ch].total_words = 0;
+        mdec_async[ch].remaining_words = 0;
+        mdec_async[ch].cycles_accum = 0;
+    }
+    if (ch == 3) {
+        cdrom_async.active = 0;
+        cdrom_async.debug_started = 0;
+        cdrom_async.total_words = 0;
+        cdrom_async.remaining_words = 0;
+        cdrom_async.cycles_accum = 0;
+    }
+    if (ch >= 0 && ch < 7) {
+        delayed_complete[ch].active = 0;
+        delayed_complete[ch].total_words = 0;
+        delayed_complete[ch].cycles_remaining = 0;
+    }
+}
+
+static void schedule_delayed_complete(int ch, uint32_t total_words,
+                                      uint32_t cycles_per_word) {
+    if (total_words == 0 || cycles_per_word == 0) {
+        complete_transfer(ch);
+        return;
+    }
+
+    uint64_t cycles = (uint64_t)total_words * (uint64_t)cycles_per_word;
+    if (cycles > UINT32_MAX) cycles = UINT32_MAX;
+
+    delayed_complete[ch].active = 1;
+    delayed_complete[ch].total_words = total_words;
+    delayed_complete[ch].cycles_remaining = (uint32_t)cycles;
+}
+
+static void advance_delayed_complete(int ch, uint32_t cycles) {
+    DMADelayedComplete *d = &delayed_complete[ch];
+    if (!d->active) return;
+    if (cycles < d->cycles_remaining) {
+        d->cycles_remaining -= cycles;
+        return;
+    }
+
+    d->active = 0;
+    d->total_words = 0;
+    d->cycles_remaining = 0;
+    complete_transfer(ch);
+}
+
+static void start_async_mdec_transfer(int ch) {
+    DMAAsyncChannel *a = &mdec_async[ch];
+    if (a->active) return;
+
+    a->active = 1;
+    a->debug_started = 0;
+    a->total_words = transfer_word_count(ch);
+    a->remaining_words = a->total_words;
+    a->cycles_accum = 0;
+
+    if (ch == 0) {
+        mdec_debug_dma_in_start(channels[0].madr & 0x1FFFFCu, a->remaining_words);
+    } else {
+        mdec_debug_dma_out_start(channels[1].madr & 0x1FFFFCu, a->remaining_words);
+    }
+    a->debug_started = 1;
+}
+
+static void finish_async_mdec_transfer(int ch, uint32_t final_addr, uint32_t total_words) {
+    if (ch == 0) {
+        mdec_debug_dma_in_end(final_addr, total_words);
+    } else {
+        mdec_debug_dma_out_end(final_addr, total_words);
+    }
+    cancel_async_transfer(ch);
+    complete_transfer(ch);
+}
+
+static void start_async_cdrom_transfer(void) {
+    DMAAsyncChannel *a = &cdrom_async;
+    if (a->active) return;
+
+    a->active = 1;
+    a->debug_started = 0;
+    a->total_words = transfer_word_count(3);
+    a->remaining_words = a->total_words;
+    a->cycles_accum = 0;
+
+    if (a->total_words == 0) {
+        cancel_async_transfer(3);
+        complete_transfer(3);
+    }
+}
+
+static void finish_async_cdrom_transfer(uint32_t final_addr) {
+    channels[3].madr = final_addr;
+    cancel_async_transfer(3);
+    complete_transfer(3);
+}
+
+static void advance_mdec_channel(int ch, uint32_t cycles) {
+    DMAAsyncChannel *a = &mdec_async[ch];
+    if (!a->active) return;
+    if (!((channels[ch].chcr >> 24) & 1u) || !channel_enabled(ch)) return;
+
+    uint32_t chcr = channels[ch].chcr;
+    uint32_t direction = chcr & 1u;
+    uint32_t step = (chcr >> 1) & 1u;
+    int32_t addr_step = step ? -4 : 4;
+    uint32_t cycles_per_word = (ch == 0) ? DMA_MDEC_IN_CYCLES_PER_WORD : DMA_MDEC_OUT_CYCLES_PER_WORD;
+
+    if ((ch == 0 && direction == 0) || (ch == 1 && direction != 0)) {
+        uint32_t words = a->total_words;
+        uint32_t addr = channels[ch].madr & 0x1FFFFCu;
+        finish_async_mdec_transfer(ch, addr, words);
+        return;
+    }
+
+    if (ch == 0) {
+        if (!mdec_dma_write_ready()) return;
+    } else {
+        if (!mdec_dma_read_ready()) return;
+    }
+
+    if (cycles > UINT32_MAX - a->cycles_accum) {
+        a->cycles_accum = UINT32_MAX;
+    } else {
+        a->cycles_accum += cycles;
+    }
+
+    uint32_t words_budget = a->cycles_accum / cycles_per_word;
+    if (words_budget == 0) return;
+
+    uint32_t addr = channels[ch].madr & 0x1FFFFCu;
+    uint32_t moved = 0;
+    while (a->remaining_words > 0 && words_budget > 0) {
+        if (ch == 0) {
+            if (!mdec_dma_write_ready()) break;
+            mdec_dma_write_word(psx_read_word(addr));
+        } else {
+            if (!mdec_dma_read_ready()) break;
+            psx_write_word(addr, mdec_dma_read_word());
+        }
+
+        addr = (addr + addr_step) & 0x1FFFFCu;
+        a->remaining_words--;
+        words_budget--;
+        moved++;
+    }
+
+    if (moved == 0) return;
+
+    a->cycles_accum -= moved * cycles_per_word;
+    channels[ch].madr = addr;
+
+    if (a->remaining_words == 0) {
+        finish_async_mdec_transfer(ch, addr, a->total_words);
+    }
+}
+
 static void execute_ch0_mdec_in(void) {
     uint32_t chcr = channels[0].chcr;
     uint32_t direction = chcr & 1;           /* 1=from RAM to MDEC */
@@ -174,11 +362,12 @@ static void execute_ch1_mdec_out(void) {
     complete_transfer(1);
 }
 
-static void execute_ch2_gpu(void) {
+static uint32_t execute_ch2_gpu(void) {
     uint32_t chcr = channels[2].chcr;
     uint32_t direction = chcr & 1;           /* 0=to RAM, 1=from RAM (to device) */
     uint32_t step = (chcr >> 1) & 1;         /* 0=forward(+4), 1=backward(-4) */
     uint32_t sync_mode = (chcr >> 9) & 3;    /* 0=burst, 1=block, 2=linked-list */
+    uint32_t actual_words = 0;
 
     if (direction == 0) {
         /* GPU → RAM (VRAM read): read pixel data via GPUREAD.
@@ -194,9 +383,10 @@ static void execute_ch2_gpu(void) {
                 psx_write_word(addr, pixel_data);
                 addr = (addr + addr_step) & 0x1FFFFCu;
             }
+            channels[2].madr = addr;
+            actual_words = total_words;
         }
-        complete_transfer(2);
-        return;
+        return actual_words;
     }
 
     /* direction == 1: RAM → GPU */
@@ -215,6 +405,7 @@ static void execute_ch2_gpu(void) {
             addr = (addr + addr_step) & 0x1FFFFCu;
         }
         channels[2].madr = addr;
+        actual_words = total_words;
     } else if (sync_mode == 2) {
         /* Linked-list mode: follow ordering table in RAM.
          * Each node: bits 24-31 = number of words following header,
@@ -234,6 +425,7 @@ static void execute_ch2_gpu(void) {
             uint32_t header = psx_read_word(addr);
             uint32_t num_words = (header >> 24) & 0xFF;
             uint32_t word_addr = (addr + 4) & 0x1FFFFCu;
+            actual_words += 1u;
 
             for (uint32_t i = 0; i < num_words; i++) {
                 uint32_t word = psx_read_word(word_addr);
@@ -241,11 +433,18 @@ static void execute_ch2_gpu(void) {
                 gpu_write_gp0(word);
                 word_addr = (word_addr + 4) & 0x1FFFFCu;
             }
+            actual_words += num_words;
 
             /* Next node */
             uint32_t next = header & 0xFFFFFFu;
-            if (next == 0xFFFFFFu) break; /* end of list */
+            if (next == 0xFFFFFFu) {
+                channels[2].madr = 0x00FFFFFFu;
+                break; /* end of list */
+            }
             addr = next & 0x1FFFFCu;
+        }
+        if (safety > MAX_NODES) {
+            channels[2].madr = addr;
         }
     } else {
         /* Burst mode (sync_mode == 0) */
@@ -261,45 +460,22 @@ static void execute_ch2_gpu(void) {
             addr = (addr + addr_step) & 0x1FFFFCu;
         }
         channels[2].madr = addr;
+        actual_words = word_count;
     }
 
-    complete_transfer(2);
+    return actual_words;
 }
 
 static void execute_ch3_cdrom(void) {
     uint32_t chcr = channels[3].chcr;
     uint32_t direction = chcr & 1;           /* 0=to RAM, 1=from RAM */
-    uint32_t step = (chcr >> 1) & 1;         /* 0=forward(+4), 1=backward(-4) */
-    uint32_t sync_mode = (chcr >> 9) & 3;
 
     if (direction != 0) {
         channels[3].chcr &= ~((1u << 24) | (1u << 28));
         return;
     }
 
-    uint32_t block_size = channels[3].bcr & 0xFFFF;
-    uint32_t block_count = (channels[3].bcr >> 16) & 0xFFFF;
-    uint32_t total_words;
-    if (sync_mode == 1) {
-        if (block_size == 0) block_size = 0x10000;
-        if (block_count == 0) block_count = 1;
-        total_words = block_size * block_count;
-    } else {
-        total_words = block_size;
-        if (total_words == 0) total_words = 0x10000;
-    }
-
-    uint32_t addr = channels[3].madr & 0x1FFFFCu;
-    int32_t addr_step = step ? -4 : 4;
-    for (uint32_t i = 0; i < total_words; i++) {
-        uint32_t word = cdrom_dma_read();
-        psx_write_word(addr, word);
-        dirty_ram_mark_executable_range(addr, 4);
-        addr = (addr + addr_step) & 0x1FFFFCu;
-    }
-
-    channels[3].madr = addr;
-    complete_transfer(3);
+    start_async_cdrom_transfer();
 }
 
 static void execute_ch4_spu(void) {
@@ -358,17 +534,19 @@ static void try_execute(int ch) {
     if (!((chcr >> 24) & 1)) return;
     if (!channel_enabled(ch)) return;
 
+    channels[ch].chcr &= ~(1u << 28);
     trace_dma('S', ch, transfer_word_count(ch), dicr, i_stat);
 
     switch (ch) {
         case 0:
-            execute_ch0_mdec_in();
+            start_async_mdec_transfer(0);
             break;
         case 1:
-            execute_ch1_mdec_out();
+            start_async_mdec_transfer(1);
             break;
         case 2:
-            execute_ch2_gpu();
+            schedule_delayed_complete(2, execute_ch2_gpu(),
+                                      DMA_GPU_CYCLES_PER_WORD);
             break;
         case 3:
             execute_ch3_cdrom();
@@ -392,8 +570,57 @@ static void try_execute(int ch) {
 uint32_t dma_get_dicr(void) { update_master_irq(); return dicr; }
 uint32_t dma_get_dpcr(void) { return dpcr; }
 
+void dma_advance(uint32_t cycles) {
+    if (cycles == 0) return;
+    advance_mdec_channel(0, cycles);
+    advance_mdec_channel(1, cycles);
+    DMAAsyncChannel *a = &cdrom_async;
+    if (a->active && ((channels[3].chcr >> 24) & 1u) && channel_enabled(3)) {
+        uint32_t chcr = channels[3].chcr;
+        uint32_t direction = chcr & 1u;
+        uint32_t step = (chcr >> 1) & 1u;
+        int32_t addr_step = step ? -4 : 4;
+
+        if (direction != 0) {
+            cancel_async_transfer(3);
+            channels[3].chcr &= ~((1u << 24) | (1u << 28));
+        } else if (cdrom_dma_ready()) {
+            if (cycles > UINT32_MAX - a->cycles_accum) {
+                a->cycles_accum = UINT32_MAX;
+            } else {
+                a->cycles_accum += cycles;
+            }
+
+            uint32_t words_budget = a->cycles_accum / DMA_CDROM_CYCLES_PER_WORD;
+            uint32_t addr = channels[3].madr & 0x1FFFFCu;
+            uint32_t moved = 0;
+            while (a->remaining_words > 0 && words_budget > 0 && cdrom_dma_ready()) {
+                uint32_t word = cdrom_dma_read();
+                psx_write_word(addr, word);
+                dirty_ram_mark_executable_range(addr, 4);
+                addr = (addr + addr_step) & 0x1FFFFCu;
+                a->remaining_words--;
+                words_budget--;
+                moved++;
+            }
+
+            if (moved > 0) {
+                a->cycles_accum -= moved * DMA_CDROM_CYCLES_PER_WORD;
+                channels[3].madr = addr;
+                if (a->remaining_words == 0) {
+                    finish_async_cdrom_transfer(addr);
+                }
+            }
+        }
+    }
+    advance_delayed_complete(2, cycles);
+}
+
 void dma_init(void) {
     memset(channels, 0, sizeof(channels));
+    memset(mdec_async, 0, sizeof(mdec_async));
+    memset(&cdrom_async, 0, sizeof(cdrom_async));
+    memset(delayed_complete, 0, sizeof(delayed_complete));
     dpcr = 0x07654321u; /* default: priorities set, no channels enabled */
     dicr = 0;
     dma_debug_clear_trace();
@@ -419,6 +646,7 @@ uint32_t dma_read(uint32_t addr) {
             case 0x00: return channels[ch].madr;
             case 0x04: return channels[ch].bcr;
             case 0x08: return channels[ch].chcr;
+            case 0x0C: return 0;
             default: goto bad;
         }
     }
@@ -469,10 +697,15 @@ void dma_write_masked(uint32_t addr, uint32_t val, uint32_t mask) {
                 return;
             case 0x08:
                 channels[ch].chcr = (channels[ch].chcr & ~mask) | (val & mask);
+                if ((mask & (1u << 24)) && !((channels[ch].chcr >> 24) & 1u)) {
+                    cancel_async_transfer(ch);
+                }
                 /* Writing CHCR's start bit set triggers transfer. */
                 if ((mask & (1u << 24)) && ((channels[ch].chcr >> 24) & 1)) {
                     try_execute(ch);
                 }
+                return;
+            case 0x0C:
                 return;
             default:
                 goto bad;
@@ -497,4 +730,27 @@ uint64_t dma_debug_get_trace(const DMATraceEntry** out_entries) {
 void dma_debug_clear_trace(void) {
     memset(dma_trace, 0, sizeof(dma_trace));
     dma_trace_seq = 0;
+}
+
+void dma_debug_get_state(DMADebugState* out) {
+    if (!out) return;
+    out->dpcr = dpcr;
+    out->dicr = dma_get_dicr();
+    for (int i = 0; i < 7; i++) {
+        out->channels[i].madr = channels[i].madr;
+        out->channels[i].bcr = channels[i].bcr;
+        out->channels[i].chcr = channels[i].chcr;
+        out->channels[i].active =
+            ((i < 2) ? mdec_async[i].active : 0) ||
+            ((i == 3) ? cdrom_async.active : 0) ||
+            delayed_complete[i].active;
+        out->channels[i].remaining_words =
+            (i < 2 && mdec_async[i].active) ? mdec_async[i].remaining_words :
+            (i == 3 && cdrom_async.active) ? cdrom_async.remaining_words :
+            delayed_complete[i].total_words;
+        out->channels[i].cycles_accum =
+            (i < 2 && mdec_async[i].active) ? mdec_async[i].cycles_accum :
+            (i == 3 && cdrom_async.active) ? cdrom_async.cycles_accum :
+            delayed_complete[i].cycles_remaining;
+    }
 }

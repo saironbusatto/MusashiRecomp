@@ -30,6 +30,7 @@ extern uint64_t s_frame_count;
 /* CD-ROM state */
 static uint8_t index_reg;
 static uint8_t stat_reg;
+static uint8_t request_reg;
 static uint8_t irq_enable;
 static uint8_t irq_flag;
 
@@ -58,6 +59,19 @@ static uint8_t sector_buffer[SECTOR_BUFFER_SIZE];
 static int sector_read_pos;
 static int sector_available;
 static int sector_size;
+static uint8_t last_sector_buffer[SECTOR_BUFFER_SIZE];
+static int last_sector_lba;
+static int last_sector_size;
+static uint32_t last_sector_frame;
+static uint8_t last_sector_mode;
+static uint8_t last_sector_have_raw;
+static uint8_t last_sector_raw_mode;
+static uint8_t last_sector_xa_file;
+static uint8_t last_sector_xa_channel;
+static uint8_t last_sector_xa_submode;
+static uint8_t last_sector_xa_coding;
+static CDROMSectorHistoryEntry sector_history[CDROM_SECTOR_HISTORY_CAP];
+static uint64_t sector_history_seq;
 
 /* Seek target */
 static uint8_t seek_min, seek_sec, seek_sect;
@@ -75,15 +89,33 @@ static uint8_t cd_muted;
 #define XA_SUBHEADER_OFFSET 16
 #define XA_DATA_OFFSET      24
 #define XA_SOUND_GROUPS     18
-#define XA_NATIVE_FRAMES    (XA_SOUND_GROUPS * 4 * 28)
-#define XA_MAX_44100_FRAMES 4704
+#define XA_NATIVE_FRAMES    (XA_SOUND_GROUPS * 8 * 28)
+#define XA_MAX_44100_FRAMES 9408
 
 #define XA_SUBMODE_AUDIO 0x04
+#define XA_SUBMODE_REALTIME 0x40
+#define CDROM_SECTOR_MODE2 0x02
+
+#define CDROM_SKIP_NONE 0
+#define CDROM_SKIP_XA_AUDIO_REALTIME 1
+#define CDROM_REQUEST_BFRD 0x80u
+
+typedef struct CDROMSectorDelivery {
+    uint8_t raw_mode;
+    uint8_t xa_file;
+    uint8_t xa_channel;
+    uint8_t xa_submode;
+    uint8_t xa_coding;
+    uint8_t data_delivered;
+    uint8_t xa_audio_delivered;
+    uint8_t skip_reason;
+} CDROMSectorDelivery;
 
 static int32_t xa_hist_l[2];
 static int32_t xa_hist_r[2];
 static uint8_t xa_stream_file;
 static uint8_t xa_stream_channel;
+static uint8_t xa_stream_coding;
 static int xa_stream_active;
 
 /* Operating divisor: 1x during BIOS boot, switches to g_game_divisor
@@ -157,6 +189,7 @@ static void trace_cdrom(uint8_t kind, uint32_t addr, uint32_t val, uint8_t width
     e->i_stat = i_stat;
     e->index_reg = index_reg;
     e->stat_reg = stat_reg;
+    e->request_reg = request_reg;
     e->irq_enable = irq_enable;
     e->irq_flag = irq_flag;
     e->mode_reg = mode_reg;
@@ -172,6 +205,58 @@ static void trace_cdrom(uint8_t kind, uint32_t addr, uint32_t val, uint8_t width
     e->reading = (uint8_t)reading;
     e->read_cmd = read_cmd;
     e->read_delay = read_delay;
+}
+
+static int xa_is_audio_realtime(const CDROMSectorDelivery *d) {
+    return d &&
+           d->raw_mode == CDROM_SECTOR_MODE2 &&
+           ((d->xa_submode & (XA_SUBMODE_AUDIO | XA_SUBMODE_REALTIME)) ==
+            (XA_SUBMODE_AUDIO | XA_SUBMODE_REALTIME));
+}
+
+static CDROMSectorDelivery classify_raw_sector(const uint8_t *raw_data, int have_raw) {
+    CDROMSectorDelivery d;
+    memset(&d, 0, sizeof(d));
+    if (!have_raw || !raw_data) return d;
+
+    d.raw_mode = raw_data[15];
+    if (d.raw_mode == CDROM_SECTOR_MODE2) {
+        d.xa_file = raw_data[XA_SUBHEADER_OFFSET + 0];
+        d.xa_channel = raw_data[XA_SUBHEADER_OFFSET + 1];
+        d.xa_submode = raw_data[XA_SUBHEADER_OFFSET + 2];
+        d.xa_coding = raw_data[XA_SUBHEADER_OFFSET + 3];
+    }
+    return d;
+}
+
+static void record_sector_history(int lba, int size, uint8_t mode, int have_raw,
+                                  const uint8_t *bytes,
+                                  const CDROMSectorDelivery *delivery) {
+    CDROMSectorHistoryEntry *e =
+        &sector_history[sector_history_seq % CDROM_SECTOR_HISTORY_CAP];
+    e->seq = sector_history_seq++;
+    e->lba = lba;
+    e->size = size;
+    e->frame = (uint32_t)s_frame_count;
+    e->mode = mode;
+    e->have_raw = (uint8_t)(have_raw ? 1 : 0);
+    e->raw_mode = delivery ? delivery->raw_mode : 0;
+    e->xa_file = delivery ? delivery->xa_file : 0;
+    e->xa_channel = delivery ? delivery->xa_channel : 0;
+    e->xa_submode = delivery ? delivery->xa_submode : 0;
+    e->xa_coding = delivery ? delivery->xa_coding : 0;
+    e->data_delivered = delivery ? delivery->data_delivered : 0;
+    e->xa_audio_delivered = delivery ? delivery->xa_audio_delivered : 0;
+    e->skip_reason = delivery ? delivery->skip_reason : CDROM_SKIP_NONE;
+    e->bytes_len = (uint16_t)((size < CDROM_SECTOR_HISTORY_BYTES)
+        ? size : CDROM_SECTOR_HISTORY_BYTES);
+    if (e->bytes_len && bytes) {
+        memcpy(e->bytes, bytes, e->bytes_len);
+    }
+    if (e->bytes_len < CDROM_SECTOR_HISTORY_BYTES) {
+        memset(e->bytes + e->bytes_len, 0,
+               CDROM_SECTOR_HISTORY_BYTES - e->bytes_len);
+    }
 }
 
 static int has_disc(void) {
@@ -233,6 +318,15 @@ static uint8_t bin_to_bcd(int val) {
     return (uint8_t)(((val / 10) << 4) | (val % 10));
 }
 
+static void lba_to_msf(int lba, int pregap, int* m, int* s, int* f) {
+    int frames = lba + pregap;
+    if (frames < 0) frames = 0;
+    *m = frames / (60 * 75);
+    frames %= 60 * 75;
+    *s = frames / 75;
+    *f = frames % 75;
+}
+
 static int16_t clamp16_cd(int32_t v) {
     if (v > 32767) return 32767;
     if (v < -32768) return -32768;
@@ -244,6 +338,7 @@ static void xa_reset_decode(void) {
     xa_hist_r[0] = xa_hist_r[1] = 0;
     xa_stream_file = 0xFF;
     xa_stream_channel = 0xFF;
+    xa_stream_coding = 0xFF;
     xa_stream_active = 0;
 }
 
@@ -292,6 +387,44 @@ static int xa_decode_sector_4bit_stereo(const uint8_t* data, int16_t* out) {
     return pair;
 }
 
+static int xa_decode_sector_4bit_mono(const uint8_t* data, int16_t* out) {
+    static const int k0[5] = { 0, 60, 115, 98, 122 };
+    static const int k1[5] = { 0, 0, -52, -55, -60 };
+    int pair = 0;
+
+    for (int g = 0; g < XA_SOUND_GROUPS; g++) {
+        const uint8_t* grp = data + g * 128;
+        for (int blk = 0; blk < 4; blk++) {
+            for (int nibble = 0; nibble < 2; nibble++) {
+                uint8_t hdr = grp[4 + blk * 2 + nibble];
+                int shift = 12 - (int)(hdr & 0x0F);
+                int filter = (hdr >> 4) & 0x03;
+                if (shift < 0) shift = 0;
+
+                for (int i = 0; i < 28; i++) {
+                    uint8_t b = grp[16 + blk + i * 4];
+                    int32_t sample_nibble = nibble ? ((b >> 4) & 0x0F) : (b & 0x0F);
+                    if (sample_nibble >= 8) sample_nibble -= 16;
+
+                    int32_t sample = (sample_nibble << shift)
+                        + ((k0[filter] * xa_hist_l[0] + k1[filter] * xa_hist_l[1] + 32) >> 6);
+                    sample = clamp16_cd(sample);
+                    xa_hist_l[1] = xa_hist_l[0];
+                    xa_hist_l[0] = sample;
+
+                    out[pair * 2 + 0] = (int16_t)sample;
+                    out[pair * 2 + 1] = (int16_t)sample;
+                    pair++;
+                }
+            }
+        }
+    }
+
+    xa_hist_r[0] = xa_hist_l[0];
+    xa_hist_r[1] = xa_hist_l[1];
+    return pair;
+}
+
 static int xa_resample_to_44100(const int16_t* in, int in_frames,
                                 int sample_rate, int16_t* out, int max_frames) {
     if (!in || !out || in_frames <= 0 || sample_rate <= 0 || max_frames <= 0) return 0;
@@ -319,40 +452,46 @@ static int xa_resample_to_44100(const int16_t* in, int in_frames,
     return out_frames;
 }
 
-static void maybe_deliver_xa_audio(const uint8_t* raw_data) {
-    if (!(mode_reg & 0x40u) || !raw_data || cd_muted) return;
+static int maybe_deliver_xa_audio(const uint8_t* raw_data,
+                                  const CDROMSectorDelivery *delivery) {
+    if (!(mode_reg & 0x40u) || !raw_data || !delivery || cd_muted) return 0;
+    if (!xa_is_audio_realtime(delivery)) return 0;
 
-    uint8_t file = raw_data[XA_SUBHEADER_OFFSET + 0];
-    uint8_t channel = raw_data[XA_SUBHEADER_OFFSET + 1];
-    uint8_t submode = raw_data[XA_SUBHEADER_OFFSET + 2];
-    uint8_t coding = raw_data[XA_SUBHEADER_OFFSET + 3];
-    if (!(submode & XA_SUBMODE_AUDIO)) return;
+    uint8_t file = delivery->xa_file;
+    uint8_t channel = delivery->xa_channel;
+    uint8_t coding = delivery->xa_coding;
 
     if ((mode_reg & 0x08u) &&
         (file != filter_file || channel != filter_channel)) {
         trace_cdrom('a', 0, ((uint32_t)file << 16) | ((uint32_t)channel << 8) | coding, 0);
-        return;
+        return 0;
     }
 
     int stereo = (coding & 0x01u) != 0;
     int rate_code = (coding >> 2) & 0x03;
     int depth_code = (coding >> 4) & 0x03;
     int sample_rate = (rate_code == 0) ? 37800 : ((rate_code == 1) ? 18900 : 0);
-    if (!stereo || depth_code != 0 || sample_rate == 0) {
+    if (depth_code != 0 || sample_rate == 0) {
         trace_cdrom('X', 0, ((uint32_t)file << 16) | ((uint32_t)channel << 8) | coding, 0);
-        return;
+        return 0;
     }
 
-    if (!xa_stream_active || xa_stream_file != file || xa_stream_channel != channel) {
+    if (!xa_stream_active ||
+        xa_stream_file != file ||
+        xa_stream_channel != channel ||
+        xa_stream_coding != coding) {
         xa_reset_decode();
         xa_stream_file = file;
         xa_stream_channel = channel;
+        xa_stream_coding = coding;
         xa_stream_active = 1;
     }
 
     int16_t native[XA_NATIVE_FRAMES * 2];
     int16_t pcm_44100[XA_MAX_44100_FRAMES * 2];
-    int native_frames = xa_decode_sector_4bit_stereo(raw_data + XA_DATA_OFFSET, native);
+    int native_frames = stereo
+        ? xa_decode_sector_4bit_stereo(raw_data + XA_DATA_OFFSET, native)
+        : xa_decode_sector_4bit_mono(raw_data + XA_DATA_OFFSET, native);
     int out_frames = xa_resample_to_44100(native, native_frames, sample_rate,
                                           pcm_44100, XA_MAX_44100_FRAMES);
     spu_cd_audio_push(pcm_44100, out_frames);
@@ -360,18 +499,21 @@ static void maybe_deliver_xa_audio(const uint8_t* raw_data) {
                 ((uint32_t)file << 24) | ((uint32_t)channel << 16) |
                 ((uint32_t)coding << 8) | ((uint32_t)(out_frames / 32) & 0xFFu),
                 0);
+    return 1;
 }
 
-static void read_sector_at(int min, int sec, int sect) {
+static int read_sector_at(int min, int sec, int sect) {
     int lba = msf_to_lba(min, sec, sect);
     uint8_t user_data[SECTOR_SIZE];
     uint8_t raw_data[RAW_SECTOR_SIZE];
     int have_raw = 0;
+    CDROMSectorDelivery delivery;
+    const uint8_t *history_bytes = user_data;
+    int history_size = SECTOR_SIZE;
 
     if (iso_handle) {
         have_raw = iso_read_raw_sector(iso_handle, lba, raw_data, RAW_SECTOR_SIZE);
         if (have_raw) {
-            maybe_deliver_xa_audio(raw_data);
             memcpy(user_data, raw_data + RAW_USER_DATA_OFFSET, SECTOR_SIZE);
         } else if (!iso_read_sector(iso_handle, lba, user_data, SECTOR_SIZE)) {
             memset(user_data, 0, sizeof(user_data));
@@ -380,11 +522,23 @@ static void read_sector_at(int min, int sec, int sect) {
         memset(user_data, 0, sizeof(user_data));
     }
 
+    delivery = classify_raw_sector(raw_data, have_raw);
+    delivery.xa_audio_delivered =
+        (uint8_t)maybe_deliver_xa_audio(raw_data, &delivery);
+    delivery.data_delivered = 1;
+    if (delivery.xa_audio_delivered ||
+        ((mode_reg & 0x08u) && xa_is_audio_realtime(&delivery))) {
+        delivery.data_delivered = 0;
+        delivery.skip_reason = CDROM_SKIP_XA_AUDIO_REALTIME;
+    }
+
     memset(sector_buffer, 0, sizeof(sector_buffer));
-    if (mode_reg & 0x20) {
+    if (delivery.data_delivered && (mode_reg & 0x20)) {
         if (have_raw) {
             memcpy(sector_buffer, raw_data + WHOLE_SECTOR_OFFSET, WHOLE_SECTOR_SIZE);
             sector_size = WHOLE_SECTOR_SIZE;
+            history_bytes = sector_buffer;
+            history_size = sector_size;
         } else {
             sector_buffer[0] = bin_to_bcd(min);
             sector_buffer[1] = bin_to_bcd(sec);
@@ -392,15 +546,52 @@ static void read_sector_at(int min, int sec, int sect) {
             sector_buffer[3] = 0x02; /* Mode 2 sector. */
             memcpy(sector_buffer + FALLBACK_SECTOR_HEADER_SIZE, user_data, SECTOR_SIZE);
             sector_size = FALLBACK_WHOLE_SECTOR_SIZE;
+            history_bytes = sector_buffer;
+            history_size = sector_size;
         }
-    } else {
+    } else if (delivery.data_delivered) {
         memcpy(sector_buffer, user_data, SECTOR_SIZE);
         sector_size = SECTOR_SIZE;
+        history_bytes = sector_buffer;
+        history_size = sector_size;
+    } else {
+        sector_size = 0;
     }
 
     sector_read_pos = 0;
-    sector_available = 1;
+    sector_available = delivery.data_delivered ? 1 : 0;
+    if (delivery.data_delivered) {
+        memcpy(last_sector_buffer, sector_buffer, (size_t)sector_size);
+    } else {
+        uint32_t copy_size = history_size < SECTOR_BUFFER_SIZE ? (uint32_t)history_size
+                                                               : SECTOR_BUFFER_SIZE;
+        memcpy(last_sector_buffer, history_bytes, copy_size);
+        if (copy_size < SECTOR_BUFFER_SIZE) {
+            memset(last_sector_buffer + copy_size, 0, SECTOR_BUFFER_SIZE - copy_size);
+        }
+    }
+    last_sector_lba = lba;
+    last_sector_size = delivery.data_delivered ? sector_size : history_size;
+    last_sector_frame = (uint32_t)s_frame_count;
+    last_sector_mode = mode_reg;
+    last_sector_have_raw = (uint8_t)(have_raw ? 1 : 0);
+    last_sector_raw_mode = delivery.raw_mode;
+    last_sector_xa_file = delivery.xa_file;
+    last_sector_xa_channel = delivery.xa_channel;
+    last_sector_xa_submode = delivery.xa_submode;
+    last_sector_xa_coding = delivery.xa_coding;
+    record_sector_history(lba, history_size, mode_reg, have_raw,
+                          history_bytes, &delivery);
     trace_cdrom('S', 0, (uint32_t)lba, 0);
+    if (!delivery.data_delivered) {
+        trace_cdrom('s', 0,
+                    ((uint32_t)delivery.xa_file << 24) |
+                    ((uint32_t)delivery.xa_channel << 16) |
+                    ((uint32_t)delivery.xa_submode << 8) |
+                    delivery.xa_coding,
+                    0);
+    }
+    return delivery.data_delivered ? 1 : 0;
 }
 
 static void advance_msf(int* m, int* s, int* f) {
@@ -413,6 +604,7 @@ static void clear_sector_buffer(void) {
     sector_read_pos = 0;
     sector_size = 0;
     sector_available = 0;
+    request_reg &= (uint8_t)~CDROM_REQUEST_BFRD;
 }
 
 static void start_read_stream(uint8_t cmd) {
@@ -436,13 +628,15 @@ static void stop_read_stream(void) {
     read_delay = 0;
 }
 
-static void deliver_read_sector(void) {
-    read_sector_at(read_min, read_sec, read_sect);
+static int deliver_read_sector(void) {
+    int delivered = read_sector_at(read_min, read_sec, read_sect);
     advance_msf(&read_min, &read_sec, &read_sect);
+    if (!delivered) return 0;
     response_clear();
     response_push(stat_reg);
     set_irq(CDIRQ_DATA_READY);
     fire_cdrom_irq();
+    return 1;
 }
 
 static void exec_command(uint8_t cmd) {
@@ -541,6 +735,60 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         break;
 
+    case 0x0F: /* Getparam */
+        response_push(stat_reg);
+        response_push(mode_reg);
+        response_push(0x00);
+        response_push(filter_file);
+        response_push(filter_channel);
+        set_irq(CDIRQ_ACK);
+        break;
+
+    case 0x10: { /* GetlocL */
+        int lba = (last_sector_lba >= 0)
+            ? last_sector_lba
+            : msf_to_lba(read_min, read_sec, read_sect);
+        int m, s, f;
+        lba_to_msf(lba, 150, &m, &s, &f);
+        response_push(bin_to_bcd(m));
+        response_push(bin_to_bcd(s));
+        response_push(bin_to_bcd(f));
+        response_push(last_sector_raw_mode ? last_sector_raw_mode : CDROM_SECTOR_MODE2);
+        response_push(last_sector_xa_file);
+        response_push(last_sector_xa_channel);
+        response_push(last_sector_xa_submode);
+        response_push(last_sector_xa_coding);
+        set_irq(CDIRQ_ACK);
+        break;
+    }
+
+    case 0x11: { /* GetlocP */
+        int lba = (last_sector_lba >= 0)
+            ? last_sector_lba
+            : msf_to_lba(read_min, read_sec, read_sect);
+        int rm, rs, rf;
+        int am, as, af;
+        lba_to_msf(lba, 0, &rm, &rs, &rf);
+        lba_to_msf(lba, 150, &am, &as, &af);
+        response_push(0x01); /* single data track */
+        response_push(0x01);
+        response_push(bin_to_bcd(rm));
+        response_push(bin_to_bcd(rs));
+        response_push(bin_to_bcd(rf));
+        response_push(bin_to_bcd(am));
+        response_push(bin_to_bcd(as));
+        response_push(bin_to_bcd(af));
+        set_irq(CDIRQ_ACK);
+        break;
+    }
+
+    case 0x13: /* GetTN */
+        response_push(stat_reg);
+        response_push(0x01);
+        response_push(0x01);
+        set_irq(CDIRQ_ACK);
+        break;
+
     case 0x15: /* SeekL */
         if (!has_disc()) {
             response_push(stat_reg | CDSTAT_ERROR | CDSTAT_SEEKERR);
@@ -630,11 +878,13 @@ static void process_pending(uint32_t cycles) {
     case 0x06: /* ReadN data ready */
     case 0x1B: /* ReadS data ready */
         if (reading) {
-            read_sector_at(read_min, read_sec, read_sect);
+            int delivered = read_sector_at(read_min, read_sec, read_sect);
             advance_msf(&read_min, &read_sec, &read_sect);
-            response_push(stat_reg);
-            set_irq(CDIRQ_DATA_READY);
-            fire_cdrom_irq();
+            if (delivered) {
+                response_push(stat_reg);
+                set_irq(CDIRQ_DATA_READY);
+                fire_cdrom_irq();
+            }
         }
         break;
 
@@ -713,8 +963,10 @@ void cdrom_init(const char* cue_path) {
     memset(param_fifo, 0, sizeof(param_fifo));
     memset(response_fifo, 0, sizeof(response_fifo));
     memset(sector_buffer, 0, sizeof(sector_buffer));
+    memset(last_sector_buffer, 0, sizeof(last_sector_buffer));
 
     index_reg = 0;
+    request_reg = 0;
     irq_enable = 0x1F;
     irq_flag = 0;
     param_count = 0;
@@ -723,6 +975,16 @@ void cdrom_init(const char* cue_path) {
     sector_read_pos = 0;
     sector_size = 0;
     sector_available = 0;
+    last_sector_lba = -1;
+    last_sector_size = 0;
+    last_sector_frame = 0;
+    last_sector_mode = 0;
+    last_sector_have_raw = 0;
+    last_sector_raw_mode = 0;
+    last_sector_xa_file = 0;
+    last_sector_xa_channel = 0;
+    last_sector_xa_submode = 0;
+    last_sector_xa_coding = 0;
     stop_read_stream();
     mode_reg = 0;
     filter_file = 0;
@@ -732,6 +994,7 @@ void cdrom_init(const char* cue_path) {
     spu_cd_audio_reset();
     pending.pending = 0;
     seek_min = seek_sec = seek_sect = 0;
+    cdrom_debug_clear_sector_history();
 
     if (cue_path) {
         iso_handle = iso_open(cue_path);
@@ -751,7 +1014,7 @@ uint32_t cdrom_read(uint32_t addr) {
         if (param_count == 0) s |= (1 << 3);
         if (param_count < PARAM_FIFO_SIZE) s |= (1 << 4);
         if (response_read < response_count) s |= (1 << 5);
-        if (sector_available) s |= (1 << 6);
+        if (request_reg & CDROM_REQUEST_BFRD) s |= (1 << 6);
         ret = s;
         break;
     }
@@ -763,10 +1026,11 @@ uint32_t cdrom_read(uint32_t addr) {
         break;
 
     case 0x1F801802:
-        if (sector_available && sector_read_pos < sector_size) {
+        if ((request_reg & CDROM_REQUEST_BFRD) && sector_available && sector_read_pos < sector_size) {
             ret = sector_buffer[sector_read_pos++];
             if (sector_read_pos >= sector_size) {
                 sector_available = 0;
+                request_reg &= (uint8_t)~CDROM_REQUEST_BFRD;
             }
         }
         break;
@@ -814,7 +1078,12 @@ void cdrom_write(uint32_t addr, uint32_t value) {
         break;
 
     case 0x1F801803:
-        if (index_reg == 1) {
+        if (index_reg == 0) {
+            request_reg = val;
+            if (!(request_reg & CDROM_REQUEST_BFRD)) {
+                sector_read_pos = 0;
+            }
+        } else if (index_reg == 1) {
             irq_flag &= ~(val & 0x1F);
             if (val & 0x40) {
                 param_count = 0;
@@ -838,11 +1107,12 @@ void cdrom_tick(void) {
 
 uint32_t cdrom_dma_read(void) {
     uint32_t val = 0;
-    if (sector_available && sector_read_pos + 4 <= sector_size) {
+    if ((request_reg & CDROM_REQUEST_BFRD) && sector_available && sector_read_pos + 4 <= sector_size) {
         memcpy(&val, sector_buffer + sector_read_pos, 4);
         sector_read_pos += 4;
         if (sector_read_pos >= sector_size) {
             sector_available = 0;
+            request_reg &= (uint8_t)~CDROM_REQUEST_BFRD;
         }
     }
     trace_cdrom('D', 0, val, 4);
@@ -850,7 +1120,9 @@ uint32_t cdrom_dma_read(void) {
 }
 
 int cdrom_dma_ready(void) {
-    return sector_available && (sector_read_pos < sector_size);
+    return (request_reg & CDROM_REQUEST_BFRD) &&
+           sector_available &&
+           (sector_read_pos + 4 <= sector_size);
 }
 
 void cdrom_debug_snapshot(CDROMDebugState* out) {
@@ -859,6 +1131,7 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->seq = cdrom_trace_seq;
     out->index_reg = index_reg;
     out->stat_reg = stat_reg;
+    out->request_reg = request_reg;
     out->irq_enable = irq_enable;
     out->irq_flag = irq_flag;
     out->mode_reg = mode_reg;
@@ -886,6 +1159,11 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->pending_delay = pending.delay;
     out->pending_phase = pending.phase;
     out->i_stat = i_stat;
+    out->last_sector_lba = last_sector_lba;
+    out->last_sector_size = last_sector_size;
+    out->last_sector_frame = last_sector_frame;
+    out->last_sector_mode = last_sector_mode;
+    out->last_sector_have_raw = last_sector_have_raw;
 }
 
 uint64_t cdrom_debug_get_trace(const CDROMTraceEntry** out_entries) {
@@ -896,4 +1174,38 @@ uint64_t cdrom_debug_get_trace(const CDROMTraceEntry** out_entries) {
 void cdrom_debug_clear_trace(void) {
     memset(cdrom_trace, 0, sizeof(cdrom_trace));
     cdrom_trace_seq = 0;
+}
+
+uint64_t cdrom_debug_get_sector_history(const CDROMSectorHistoryEntry** out_entries) {
+    if (out_entries) *out_entries = sector_history;
+    return sector_history_seq;
+}
+
+void cdrom_debug_clear_sector_history(void) {
+    memset(sector_history, 0, sizeof(sector_history));
+    sector_history_seq = 0;
+}
+
+uint32_t cdrom_debug_copy_last_sector(uint32_t offset, uint32_t len,
+                                      uint8_t* out,
+                                      CDROMSectorDebugState* state) {
+    if (state) {
+        memset(state, 0, sizeof(*state));
+        state->current_available = sector_available;
+        state->current_read_pos = sector_read_pos;
+        state->current_size = sector_size;
+        state->last_lba = last_sector_lba;
+        state->last_size = last_sector_size;
+        state->last_frame = last_sector_frame;
+        state->last_mode = last_sector_mode;
+        state->last_have_raw = last_sector_have_raw;
+    }
+
+    if (!out || last_sector_size <= 0 || offset >= (uint32_t)last_sector_size) {
+        return 0;
+    }
+    uint32_t avail = (uint32_t)last_sector_size - offset;
+    if (len > avail) len = avail;
+    memcpy(out, last_sector_buffer + offset, len);
+    return len;
 }

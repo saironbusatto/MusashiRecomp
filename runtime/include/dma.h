@@ -27,8 +27,24 @@ void     dma_init(void);
 uint32_t dma_read(uint32_t addr);
 void     dma_write(uint32_t addr, uint32_t val);
 void     dma_write_masked(uint32_t addr, uint32_t val, uint32_t mask);
+void     dma_advance(uint32_t cycles);
 uint32_t dma_get_dicr(void);
 uint32_t dma_get_dpcr(void);
+
+typedef struct DMAChannelDebugState {
+    uint32_t madr;
+    uint32_t bcr;
+    uint32_t chcr;
+    uint32_t active;
+    uint32_t remaining_words;
+    uint32_t cycles_accum;
+} DMAChannelDebugState;
+
+typedef struct DMADebugState {
+    uint32_t dpcr;
+    uint32_t dicr;
+    DMAChannelDebugState channels[7];
+} DMADebugState;
 
 typedef struct DMATraceEntry {
     uint64_t seq;
@@ -52,6 +68,7 @@ typedef struct DMATraceEntry {
 
 uint64_t dma_debug_get_trace(const DMATraceEntry** out_entries);
 void dma_debug_clear_trace(void);
+void dma_debug_get_state(DMADebugState* out);
 
 #ifdef __cplusplus
 }

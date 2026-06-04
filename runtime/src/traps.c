@@ -208,9 +208,9 @@ static void psx_thread_fiber_entry(void* param)
 
     debug_server_log_thread_event(11, cpu, psx_current_tcb_ptr(cpu), slot->tcb, target_pc);
     slot->closed = 1;
-    if (psx_tcb_state(cpu, slot->tcb) == 0x4000u) {
-        cpu->write_word(slot->tcb, 0x1000u);
-    }
+    /* Guest BIOS code owns the TCB state. A host fiber can finish because a
+     * thread returned through the BIOS scheduler path, but changing the BIOS
+     * TCB here races with games that keep that thread runnable. */
 
     if (slot->return_fiber) {
         if (psx_is_valid_tcb(cpu, slot->return_tcb)) {

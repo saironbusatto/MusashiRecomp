@@ -2,6 +2,7 @@
 
 #include "psx_cycles.h"
 #include "cdrom.h"
+#include "dma.h"
 #include "interrupts.h"
 #include "sio.h"
 #include "starvation_ring.h"
@@ -20,6 +21,7 @@ void psx_advance_cycles(uint32_t cycles) {
     psx_cycle_count += (uint64_t)cycles;
     sio_advance(cycles);
     cdrom_advance(cycles);
+    dma_advance(cycles);
     timers_advance(cycles);
     interrupts_advance_cycles(cycles);
     s_watchdog_throttle += cycles;

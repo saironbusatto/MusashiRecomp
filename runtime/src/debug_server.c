@@ -18,6 +18,7 @@
 #include "mdec.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
+#include "timers.h"
 #include "dirty_ram_interp.h"
 #include "card_read_summary.h"
 #include "card_data_writes.h"
@@ -104,6 +105,9 @@ static uint64_t s_dirty_break_hits = 0;
 /* ---- Input override ---- */
 static int s_input_override = -1;
 static int s_input_frames   = 0;
+
+/* ---- Frontend turbo override ---- */
+static volatile int s_turbo_enabled = 0;
 
 /* ---- Ring buffer (heap-allocated) ---- */
 static PSXFrameRecord *s_frame_history = NULL;
@@ -1158,9 +1162,35 @@ static void evcb_snapshot_capture(EvCBTag tag, uint64_t fn_entry_seq) {
 static int      s_fn_trace_active    = 0;
 static uint32_t s_fn_trace_filter_lo = 0u;
 static uint32_t s_fn_trace_filter_hi = 0xFFFFFFFFu;
+static uint64_t s_fn_direct_seen = 0;
+static uint64_t s_fn_direct_no_cpu = 0;
+static uint64_t s_fn_direct_filtered = 0;
 
 static int fn_trace_in_filter(uint32_t phys) {
+    if (!s_fn_trace_active) return 0;
     return phys >= s_fn_trace_filter_lo && phys < s_fn_trace_filter_hi;
+}
+
+static void fn_trace_filter_from_env(const char *env_name) {
+    const char *spec = getenv(env_name);
+    if (!spec || !*spec) return;
+
+    char *end = NULL;
+    uint32_t lo = (uint32_t)strtoul(spec, &end, 0);
+    if (end == spec) return;
+
+    while (*end == ' ' || *end == '\t') end++;
+    if (*end != ':' && *end != '-' && *end != ',' && *end != ';') return;
+    end++;
+
+    while (*end == ' ' || *end == '\t') end++;
+    char *end2 = NULL;
+    uint32_t hi = (uint32_t)strtoul(end, &end2, 0);
+    if (end2 == end || hi <= lo) return;
+
+    s_fn_trace_filter_lo = lo;
+    s_fn_trace_filter_hi = hi;
+    s_fn_trace_active = 1;
 }
 
 static int card_mgr_trace_target(uint32_t phys) {
@@ -1571,12 +1601,17 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     (void)func_addr;
     return;
 #endif
-    if (!debug_cpu_ptr) return;
+    s_fn_direct_seen++;
+    if (!debug_cpu_ptr) {
+        s_fn_direct_no_cpu++;
+        return;
+    }
     card_mgr_trace_record(func_addr, 0);
     sreg_trace_record(func_addr);
     call_focus_record(func_addr);
     if (!s_fn_entry) return;
     if (!fn_trace_in_filter(func_addr)) return;
+    s_fn_direct_filtered++;
     FnEntryEntry *e = &s_fn_entry[s_fn_entry_seq % FN_TRACE_CAP];
     e->seq             = s_fn_entry_seq;
     e->paired_exit_seq = 0;
@@ -3293,6 +3328,7 @@ static void handle_gpu_state(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"display_x\":%d,\"display_y\":%d,"
              "\"width\":%d,\"height\":%d,"
+             "\"depth\":%d,\"depth24\":%d,"
              "\"disabled\":%d,"
              "\"gpustat\":\"0x%08X\","
              "\"gp0_writes\":%llu,"
@@ -3301,6 +3337,7 @@ static void handle_gpu_state(int id, const char *json)
              "\"draw_offset\":[%d,%d]}",
              id, di.display_x, di.display_y,
              di.width, di.height,
+             di.depth24 ? 24 : 15, di.depth24,
              di.disabled,
              gpustat,
              (unsigned long long)gpu_get_gp0_count(),
@@ -3360,6 +3397,26 @@ static void handle_irq_state(int id, const char *json)
              dma_get_dpcr(), dma_get_dicr());
 }
 
+static void handle_timers_state(int id, const char *json)
+{
+    (void)json;
+    uint16_t counter[3], target[3];
+    uint32_t mode[3], frac[3];
+    int32_t irq_line[3];
+    timers_get_snapshot(counter, mode, target, irq_line, frac);
+    send_fmt("{\"id\":%d,\"ok\":true,\"timers\":["
+             "{\"ch\":0,\"counter\":%u,\"mode\":\"0x%04X\",\"target\":%u,"
+             "\"irq_line\":%d,\"frac\":%u},"
+             "{\"ch\":1,\"counter\":%u,\"mode\":\"0x%04X\",\"target\":%u,"
+             "\"irq_line\":%d,\"frac\":%u},"
+             "{\"ch\":2,\"counter\":%u,\"mode\":\"0x%04X\",\"target\":%u,"
+             "\"irq_line\":%d,\"frac\":%u}]}",
+             id,
+             counter[0], mode[0], target[0], irq_line[0], frac[0],
+             counter[1], mode[1], target[1], irq_line[1], frac[1],
+             counter[2], mode[2], target[2], irq_line[2], frac[2]);
+}
+
 /* GPU opcode counter — defined in gpu.c */
 static const char *cdrom_trace_kind_name(uint8_t kind)
 {
@@ -3370,6 +3427,7 @@ static const char *cdrom_trace_kind_name(uint8_t kind)
     case 'F': return "fire_irq";
     case 'f': return "irq_masked";
     case 'S': return "sector";
+    case 's': return "sector_skip";
     case 'A': return "xa_audio";
     case 'a': return "xa_skip";
     case 'X': return "xa_unsupported";
@@ -3389,6 +3447,7 @@ static void handle_cdrom_state(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"seq\":%llu,\"has_disc\":%d,"
              "\"index\":%u,\"stat\":\"0x%02X\","
+             "\"request\":\"0x%02X\","
              "\"irq_enable\":\"0x%02X\",\"irq_flag\":\"0x%02X\","
              "\"mode\":\"0x%02X\","
              "\"param_count\":%d,\"response_read\":%d,\"response_count\":%d,"
@@ -3398,9 +3457,11 @@ static void handle_cdrom_state(int id, const char *json)
              "\"filter_file\":%u,\"filter_channel\":%u,\"muted\":%u,"
              "\"seek_msf\":[%u,%u,%u],"
              "\"pending\":{\"cmd\":\"0x%02X\",\"active\":%d,\"delay\":%d,\"phase\":%d},"
+             "\"last_sector\":{\"lba\":%d,\"size\":%d,\"frame\":%u,"
+             "\"mode\":\"0x%02X\",\"have_raw\":%u},"
              "\"i_stat\":\"0x%08X\"}",
              id, (unsigned long long)s.seq, s.has_disc,
-             s.index_reg, s.stat_reg, s.irq_enable, s.irq_flag,
+             s.index_reg, s.stat_reg, s.request_reg, s.irq_enable, s.irq_flag,
              s.mode_reg,
              s.param_count, s.response_read, s.response_count,
              s.sector_available, s.sector_read_pos, s.sector_size,
@@ -3409,7 +3470,131 @@ static void handle_cdrom_state(int id, const char *json)
              s.filter_file, s.filter_channel, s.muted,
              s.seek_min, s.seek_sec, s.seek_sect,
              s.pending_cmd, s.pending_pending, s.pending_delay,
-             s.pending_phase, s.i_stat);
+             s.pending_phase,
+             s.last_sector_lba, s.last_sector_size, s.last_sector_frame,
+             s.last_sector_mode, s.last_sector_have_raw,
+             s.i_stat);
+}
+
+static void handle_cdrom_sector_dump(int id, const char *json)
+{
+    int offset = json_get_int(json, "offset", 0);
+    int len = json_get_int(json, "len", 128);
+    if (offset < 0) offset = 0;
+    if (len < 1) len = 1;
+    if (len > 2340) len = 2340;
+
+    uint8_t *bytes = (uint8_t *)malloc((size_t)len);
+    if (!bytes) { send_err(id, "oom"); return; }
+
+    CDROMSectorDebugState s;
+    uint32_t got = cdrom_debug_copy_last_sector((uint32_t)offset,
+                                                (uint32_t)len,
+                                                bytes, &s);
+
+    size_t bufsz = 512u + (size_t)got * 2u;
+    char *buf = (char *)malloc(bufsz);
+    if (!buf) {
+        free(bytes);
+        send_err(id, "oom");
+        return;
+    }
+
+    size_t pos = 0;
+    pos += snprintf(buf + pos, bufsz - pos,
+                    "{\"id\":%d,\"ok\":true,"
+                    "\"current\":{\"available\":%d,\"read_pos\":%d,\"size\":%d},"
+                    "\"last\":{\"lba\":%d,\"size\":%d,\"frame\":%u,"
+                    "\"mode\":\"0x%02X\",\"have_raw\":%u},"
+                    "\"offset\":%d,\"len\":%u,\"hex\":\"",
+                    id,
+                    s.current_available, s.current_read_pos, s.current_size,
+                    s.last_lba, s.last_size, s.last_frame,
+                    s.last_mode, s.last_have_raw,
+                    offset, got);
+    for (uint32_t i = 0; i < got && pos + 3 < bufsz; i++) {
+        pos += snprintf(buf + pos, bufsz - pos, "%02x", bytes[i]);
+    }
+    snprintf(buf + pos, bufsz - pos, "\"}");
+    debug_server_send_line(buf);
+    free(buf);
+    free(bytes);
+}
+
+static void append_hex_bytes(char *buf, size_t bufsz, size_t *pos,
+                             const uint8_t *bytes, uint32_t len)
+{
+    for (uint32_t i = 0; i < len && *pos + 3 < bufsz; i++) {
+        *pos += snprintf(buf + *pos, bufsz - *pos, "%02x", bytes[i]);
+    }
+}
+
+static void handle_cdrom_sector_history(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 64);
+    if (count < 1) count = 1;
+    if (count > CDROM_SECTOR_HISTORY_CAP) count = CDROM_SECTOR_HISTORY_CAP;
+
+    int filter_lba = -1;
+    char lba_str[32];
+    if (json_get_str(json, "lba", lba_str, sizeof(lba_str))) {
+        filter_lba = (int)hex_to_u32(lba_str);
+    }
+
+    const CDROMSectorHistoryEntry *entries = NULL;
+    uint64_t total = cdrom_debug_get_sector_history(&entries);
+    uint64_t oldest = (total > CDROM_SECTOR_HISTORY_CAP)
+        ? total - CDROM_SECTOR_HISTORY_CAP : 0;
+
+    size_t bufsz = 256u + (size_t)count * 760u;
+    char *buf = (char *)malloc(bufsz);
+    if (!buf) { send_err(id, "oom"); return; }
+
+    size_t pos = 0;
+    int emitted = 0;
+    pos += snprintf(buf + pos, bufsz - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,"
+                    "\"oldest\":%llu,\"entries\":[",
+                    id, (unsigned long long)total,
+                    (unsigned long long)oldest);
+
+    uint64_t seq = total;
+    while (seq > oldest && emitted < count && pos < bufsz - 760) {
+        seq--;
+        const CDROMSectorHistoryEntry *e =
+            &entries[seq % CDROM_SECTOR_HISTORY_CAP];
+        if (e->seq != seq) continue;
+        if (filter_lba >= 0 && e->lba != filter_lba) continue;
+
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s{\"seq\":%llu,\"lba\":%d,\"size\":%d,"
+                        "\"frame\":%u,\"mode\":\"0x%02X\","
+                        "\"have_raw\":%u,\"raw_mode\":\"0x%02X\","
+                        "\"xa_file\":%u,\"xa_channel\":%u,"
+                        "\"xa_submode\":\"0x%02X\",\"xa_coding\":\"0x%02X\","
+                        "\"data_delivered\":%u,\"xa_audio_delivered\":%u,"
+                        "\"skip_reason\":%u,\"bytes_len\":%u,\"hex\":\"",
+                        emitted ? "," : "",
+                        (unsigned long long)e->seq, e->lba, e->size,
+                        e->frame, e->mode, e->have_raw, e->raw_mode,
+                        e->xa_file, e->xa_channel, e->xa_submode, e->xa_coding,
+                        e->data_delivered, e->xa_audio_delivered,
+                        e->skip_reason, e->bytes_len);
+        append_hex_bytes(buf, bufsz, &pos, e->bytes, e->bytes_len);
+        pos += snprintf(buf + pos, bufsz - pos, "\"}");
+        emitted++;
+    }
+
+    pos += snprintf(buf + pos, bufsz - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_cdrom_sector_history_clear(int id, const char *json)
+{
+    (void)json;
+    cdrom_debug_clear_sector_history();
+    send_ok(id);
 }
 
 static void handle_cdrom_trace_clear(int id, const char *json)
@@ -3448,6 +3633,7 @@ static void handle_cdrom_trace_dump(int id, const char *json)
                         "\"val\":\"0x%08X\",\"w\":%u,\"func\":\"0x%08X\","
                         "\"pc\":\"0x%08X\",\"frame\":%u,\"i_stat\":\"0x%08X\","
                         "\"index\":%u,\"stat\":\"0x%02X\","
+                        "\"request\":\"0x%02X\","
                         "\"irq_enable\":\"0x%02X\",\"irq_flag\":\"0x%02X\","
                         "\"mode\":\"0x%02X\","
                         "\"param\":%u,\"resp_read\":%u,\"resp_count\":%u,"
@@ -3459,7 +3645,7 @@ static void handle_cdrom_trace_dump(int id, const char *json)
                         (unsigned long long)e->seq, cdrom_trace_kind_name(e->kind),
                         e->addr, e->val, (unsigned)e->width,
                         e->func, e->pc, e->frame, e->i_stat,
-                        e->index_reg, e->stat_reg, e->irq_enable, e->irq_flag,
+                        e->index_reg, e->stat_reg, e->request_reg, e->irq_enable, e->irq_flag,
                         e->mode_reg,
                         e->param_count, e->response_read, e->response_count,
                         e->sector_available, e->sector_read_pos, e->sector_size,
@@ -3480,6 +3666,34 @@ static const char *dma_trace_kind_name(uint32_t kind)
     case 'C': return "complete";
     default: return "unknown";
     }
+}
+
+static void handle_dma_state(int id, const char *json)
+{
+    (void)json;
+    DMADebugState s;
+    dma_debug_get_state(&s);
+
+    char buf[2048];
+    size_t pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "{\"id\":%d,\"ok\":true,\"dpcr\":\"0x%08X\","
+                    "\"dicr\":\"0x%08X\",\"channels\":[",
+                    id, s.dpcr, s.dicr);
+    for (int i = 0; i < 7 && pos < sizeof(buf) - 192; i++) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                        "%s{\"ch\":%d,\"madr\":\"0x%08X\","
+                        "\"bcr\":\"0x%08X\",\"chcr\":\"0x%08X\","
+                        "\"active\":%u,\"remaining_words\":%u,"
+                        "\"cycles_accum\":%u}",
+                        i ? "," : "",
+                        i, s.channels[i].madr, s.channels[i].bcr,
+                        s.channels[i].chcr, s.channels[i].active,
+                        s.channels[i].remaining_words,
+                        s.channels[i].cycles_accum);
+    }
+    snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    debug_server_send_line(buf);
 }
 
 static void handle_dma_trace_clear(int id, const char *json)
@@ -4725,6 +4939,26 @@ static void handle_clear_input(int id, const char *json)
     send_ok(id);
 }
 
+static void handle_turbo(int id, const char *json)
+{
+    int enabled = json_get_int(json, "enabled", -1);
+    if (enabled < 0) {
+        enabled = json_get_int(json, "on", -1);
+    }
+    if (enabled < 0) {
+        send_err(id, "missing enabled");
+        return;
+    }
+    s_turbo_enabled = enabled ? 1 : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d}", id, s_turbo_enabled);
+}
+
+static void handle_turbo_state(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d}", id, s_turbo_enabled);
+}
+
 /* pause / continue / step / run_to_frame: REMOVED.
  *
  * Per CLAUDE.md global rule #2 ("Never time/attach for observability —
@@ -5089,7 +5323,6 @@ static void handle_screenshot_file(int id, const char *json)
         send_err(id, "display disabled"); return;
     }
 
-    const uint16_t *vram = gpu_get_vram();
     uint32_t w = di.width;  if (w > 640) w = 640;
     uint32_t h = di.height; if (h > 512) h = 512;
 
@@ -5125,13 +5358,9 @@ static void handle_screenshot_file(int id, const char *json)
     uint8_t *row = (uint8_t *)malloc(row_stride);
     for (uint32_t y = 0; y < h; y++) {
         memset(row, 0, row_stride);
-        uint32_t vy = (di.display_y + y) & 511;
         for (uint32_t x = 0; x < w; x++) {
-            uint32_t vx = (di.display_x + x) & 1023;
-            uint16_t c = vram[vy * 1024 + vx];
-            uint8_t r = (c & 0x1F) << 3;
-            uint8_t g = ((c >> 5) & 0x1F) << 3;
-            uint8_t b = ((c >> 10) & 0x1F) << 3;
+            uint8_t r, g, b;
+            gpu_display_pixel_rgb(&di, x, y, &r, &g, &b);
             row[x * 3 + 0] = b;
             row[x * 3 + 1] = g;
             row[x * 3 + 2] = r;
@@ -5148,7 +5377,7 @@ static void handle_screenshot_file(int id, const char *json)
 static void handle_screenshot(int id, const char *json)
 {
     (void)json;
-    /* Read display area from GPU and encode as hex RGB555 */
+    /* Read display area from GPU and encode as display-format hex rows. */
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
 
@@ -5156,26 +5385,30 @@ static void handle_screenshot(int id, const char *json)
         send_err(id, "display disabled"); return;
     }
 
-    const uint16_t *vram = gpu_get_vram();
     uint32_t w = di.width;
     uint32_t h = di.height;
     if (w > 640) w = 640;
     if (h > 512) h = 512;
 
     /* Send metadata first */
-    send_fmt("{\"id\":%d,\"ok\":true,\"width\":%u,\"height\":%u,\"format\":\"rgb555\"}",
-             id, w, h);
+    send_fmt("{\"id\":%d,\"ok\":true,\"width\":%u,\"height\":%u,\"format\":\"%s\"}",
+             id, w, h, di.depth24 ? "rgb888" : "rgb555");
 
     /* Send rows as hex lines */
-    char *hex = (char *)malloc(w * 4 + 32);
+    uint32_t chars_per_pixel = di.depth24 ? 6u : 4u;
+    char *hex = (char *)malloc((size_t)w * chars_per_pixel + 32u);
     if (!hex) return;
 
     for (uint32_t y = 0; y < h; y++) {
-        uint32_t vy = (di.display_y + y) & 511;
         for (uint32_t x = 0; x < w; x++) {
-            uint32_t vx = (di.display_x + x) & 1023;
-            uint16_t pixel = vram[vy * 1024 + vx];
-            snprintf(hex + x * 4, 5, "%04x", pixel);
+            if (di.depth24) {
+                uint8_t r, g, b;
+                gpu_display_pixel_rgb(&di, x, y, &r, &g, &b);
+                snprintf(hex + x * 6, 7, "%02x%02x%02x", r, g, b);
+            } else {
+                uint16_t pixel = gpu_vram_peek((int)(di.display_x + x), (int)(di.display_y + y));
+                snprintf(hex + x * 4, 5, "%04x", pixel);
+            }
         }
         send_fmt("{\"row\":%u,\"hex\":\"%s\"}", y, hex);
     }
@@ -6626,6 +6859,9 @@ static void handle_fn_clear(int id, const char *json) {
     s_fn_unmatched_returns = 0;
     s_fn_stack_overflows   = 0;
     s_fn_tail_calls        = 0;
+    s_fn_direct_seen       = 0;
+    s_fn_direct_no_cpu     = 0;
+    s_fn_direct_filtered   = 0;
     if (s_fn_entry) memset(s_fn_entry, 0, (size_t)FN_TRACE_CAP * sizeof(FnEntryEntry));
     if (s_fn_exit)  memset(s_fn_exit,  0, (size_t)FN_EXIT_TRACE_CAP * sizeof(FnExitEntry));
     send_ok(id);
@@ -6638,7 +6874,9 @@ static void handle_fn_stats(int id, const char *json) {
              "\"stack_top\":%d,\"unmatched_returns\":%llu,"
              "\"stack_overflows\":%llu,\"tail_calls\":%llu,"
              "\"entry_capacity\":%llu,\"exit_capacity\":%llu,"
-             "\"filter_lo\":\"0x%08X\",\"filter_hi\":\"0x%08X\"}\n",
+             "\"filter_lo\":\"0x%08X\",\"filter_hi\":\"0x%08X\","
+             "\"active\":%d,\"direct_seen\":%llu,"
+             "\"direct_no_cpu\":%llu,\"direct_filtered\":%llu}\n",
              id,
              (unsigned long long)s_fn_entry_seq,
              (unsigned long long)s_fn_exit_seq,
@@ -6648,7 +6886,11 @@ static void handle_fn_stats(int id, const char *json) {
              (unsigned long long)s_fn_tail_calls,
              (unsigned long long)FN_TRACE_CAP,
              (unsigned long long)FN_EXIT_TRACE_CAP,
-             s_fn_trace_filter_lo, s_fn_trace_filter_hi);
+             s_fn_trace_filter_lo, s_fn_trace_filter_hi,
+             s_fn_trace_active,
+             (unsigned long long)s_fn_direct_seen,
+             (unsigned long long)s_fn_direct_no_cpu,
+             (unsigned long long)s_fn_direct_filtered);
 }
 
 /* Helper: parse filter / range / count for fn_*_dump.
@@ -7190,9 +7432,14 @@ static const CmdEntry s_commands[] = {
     { "mem_words",         handle_mem_words },
     { "vram_peek",         handle_vram_peek },
     { "irq_state",         handle_irq_state },
+    { "timers_state",      handle_timers_state },
     { "cdrom_state",       handle_cdrom_state },
+    { "cdrom_sector_dump", handle_cdrom_sector_dump },
+    { "cdrom_sector_history", handle_cdrom_sector_history },
+    { "cdrom_sector_history_clear", handle_cdrom_sector_history_clear },
     { "cdrom_trace_dump",  handle_cdrom_trace_dump },
     { "cdrom_trace_clear", handle_cdrom_trace_clear },
+    { "dma_state",         handle_dma_state },
     { "dma_trace_dump",    handle_dma_trace_dump },
     { "dma_trace_clear",   handle_dma_trace_clear },
     { "sio_state",         handle_sio_state },
@@ -7290,6 +7537,8 @@ static const CmdEntry s_commands[] = {
     { "press",             handle_press },
     { "pad_status",        handle_pad_status },
     { "clear_input",       handle_clear_input },
+    { "turbo",             handle_turbo },
+    { "turbo_state",       handle_turbo_state },
     { "pause",             handle_pause },
     { "continue",          handle_continue },
     { "step",              handle_step },
@@ -7440,6 +7689,8 @@ void debug_server_init(int port)
     s_wtrace_trans_head = 0;
     s_wtrace_trans_range_count = 0;
 
+    fntrace_arm_from_env("PSX_FNTRACE_ARM");
+
     /* Function entry/exit ring buffers (32 MB each, 64 MB total). */
     if (!s_fn_entry) s_fn_entry = (FnEntryEntry *)calloc(FN_TRACE_CAP, sizeof(FnEntryEntry));
     if (!s_fn_exit)  s_fn_exit  = (FnExitEntry *)calloc(FN_EXIT_TRACE_CAP, sizeof(FnExitEntry));
@@ -7448,6 +7699,15 @@ void debug_server_init(int port)
     s_fn_stack_top = 0;
     s_fn_unmatched_returns = 0;
     s_fn_stack_overflows   = 0;
+    s_fn_tail_calls = 0;
+    s_fn_prev_ra = 0;
+    s_fn_direct_seen = 0;
+    s_fn_direct_no_cpu = 0;
+    s_fn_direct_filtered = 0;
+    s_fn_trace_active = 0;
+    s_fn_trace_filter_lo = 0u;
+    s_fn_trace_filter_hi = 0xFFFFFFFFu;
+    fn_trace_filter_from_env("PSX_FN_FILTER");
 
     if (!s_call_focus) {
         s_call_focus = (CallFocusEntry *)calloc(CALL_FOCUS_CAP,
@@ -7526,7 +7786,17 @@ void debug_server_init(int port)
      * writer to identify the BIOS function driving this sub-state. */
     s_wtrace_ranges[14].lo = 0x00066BC0u;
     s_wtrace_ranges[14].hi = 0x00066BD0u;
-    s_wtrace_range_count = 15;
+    s_wtrace_ranges[15].lo = 0x00097420u; /* movie/frame handoff state */
+    s_wtrace_ranges[15].hi = 0x00097430u;
+    s_wtrace_range_count = 16;
+
+    s_wtrace_boot_ranges[0].lo = 0x00097420u; /* movie/frame handoff state */
+    s_wtrace_boot_ranges[0].hi = 0x00097430u;
+    s_wtrace_boot_range_count = 1;
+
+    s_wtrace_trans_ranges[0].lo = 0x00097420u; /* movie/frame handoff state */
+    s_wtrace_trans_ranges[0].hi = 0x00097430u;
+    s_wtrace_trans_range_count = 1;
 
 #if DEFAULT_DEBUG_PORT == 4470
     /* Tomba STR/FMVs: movie state, CD sector descriptor ring, and CD globals.
@@ -7591,7 +7861,9 @@ void debug_server_init(int port)
     s_wtrace_ranges[29].hi = 0x000B3800u;
     s_wtrace_ranges[30].lo = 0x000EA000u; /* BIOS licensed-screen GPU packet buffer */
     s_wtrace_ranges[30].hi = 0x000ED000u;
-    s_wtrace_range_count = 31;
+    s_wtrace_ranges[31].lo = 0x00097420u; /* movie/frame handoff state */
+    s_wtrace_ranges[31].hi = 0x00097430u;
+    s_wtrace_range_count = 32;
 
     s_wtrace_boot_ranges[0].lo = 0x0009B3B0u; /* slot0 callbacks */
     s_wtrace_boot_ranges[0].hi = 0x0009B3C4u;
@@ -7615,7 +7887,9 @@ void debug_server_init(int port)
     s_wtrace_boot_ranges[9].hi = 0x000B3800u;
     s_wtrace_boot_ranges[10].lo = 0x000EA000u; /* BIOS licensed-screen GPU packet buffer */
     s_wtrace_boot_ranges[10].hi = 0x000ED000u;
-    s_wtrace_boot_range_count = 11;
+    s_wtrace_boot_ranges[11].lo = 0x00097420u; /* movie/frame handoff state */
+    s_wtrace_boot_ranges[11].hi = 0x00097430u;
+    s_wtrace_boot_range_count = 12;
 
     s_wtrace_trans_ranges[0].lo = 0x0000E1F4u; /* BIOS TCB save areas */
     s_wtrace_trans_ranges[0].hi = 0x0000E400u;
@@ -7635,7 +7909,9 @@ void debug_server_init(int port)
     s_wtrace_trans_ranges[7].hi = 0x0009C9E0u;
     s_wtrace_trans_ranges[8].lo = 0x0009C970u; /* title/menu state variables */
     s_wtrace_trans_ranges[8].hi = 0x0009C9A0u;
-    s_wtrace_trans_range_count = 9;
+    s_wtrace_trans_ranges[9].lo = 0x00097420u; /* movie/frame handoff state */
+    s_wtrace_trans_ranges[9].hi = 0x00097430u;
+    s_wtrace_trans_range_count = 10;
 #endif
 
     /* Tier 1: heap-allocate MMIO trace ring buffer (2 MB). */
@@ -7841,4 +8117,9 @@ int debug_server_get_input_override(void)
             s_input_override = -1;
     }
     return s_input_override;
+}
+
+int debug_server_turbo_enabled(void)
+{
+    return s_turbo_enabled != 0;
 }

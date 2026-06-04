@@ -351,9 +351,43 @@ const uint16_t* gpu_get_vram(void) {
     return vram;
 }
 
+static uint8_t gpu_vram_byte(uint32_t byte_x, uint32_t y) {
+    uint16_t hw = vram[((y & 511u) * 1024u) + ((byte_x >> 1) & 1023u)];
+    return (byte_x & 1u) ? (uint8_t)(hw >> 8) : (uint8_t)hw;
+}
+
+static void gpu_rgb555_to_rgb888(uint16_t c, uint8_t* r, uint8_t* g, uint8_t* b) {
+    *r = (uint8_t)((c & 0x1Fu) << 3);
+    *g = (uint8_t)(((c >> 5) & 0x1Fu) << 3);
+    *b = (uint8_t)(((c >> 10) & 0x1Fu) << 3);
+}
+
+void gpu_display_pixel_rgb(const GpuDisplayInfo* di, uint32_t x, uint32_t y,
+                           uint8_t* r, uint8_t* g, uint8_t* b) {
+    if (di->depth24) {
+        uint32_t byte_x = ((di->display_x & 1023u) * 2u) + x * 3u;
+        uint32_t vy = (di->display_y + y) & 511u;
+        *r = gpu_vram_byte(byte_x + 0u, vy);
+        *g = gpu_vram_byte(byte_x + 1u, vy);
+        *b = gpu_vram_byte(byte_x + 2u, vy);
+        return;
+    }
+
+    uint32_t vx = (di->display_x + x) & 1023u;
+    uint32_t vy = (di->display_y + y) & 511u;
+    gpu_rgb555_to_rgb888(vram[vy * 1024u + vx], r, g, b);
+}
+
+uint32_t gpu_display_pixel_argb(const GpuDisplayInfo* di, uint32_t x, uint32_t y) {
+    uint8_t r, g, b;
+    gpu_display_pixel_rgb(di, x, y, &r, &g, &b);
+    return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
 void gpu_get_display_info(GpuDisplayInfo* out) {
     out->display_x = display_area_x;
     out->display_y = display_area_y;
+    out->depth24   = (int)(display_depth & 1u);
     out->disabled  = (int)display_disabled;
 
     /* Derive pixel width from horizontal display range and resolution mode.

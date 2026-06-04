@@ -61,6 +61,7 @@ void fntrace_arm(uint32_t target);     /* add to arm list, or 0 to clear */
 void fntrace_arm_clear(void);
 uint32_t fntrace_arm_count(void);
 uint32_t fntrace_arm_get(uint32_t i);
+void fntrace_arm_from_env(const char *env_name);
 
 /* Reset ring (clears seq, leaves storage in place). */
 void fntrace_clear(void);

@@ -2,6 +2,7 @@
 
 #include "fntrace.h"
 #include <string.h>
+#include <stdlib.h>
 
 FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
 uint64_t     g_fntrace_seq = 0;
@@ -85,6 +86,43 @@ void fntrace_arm_clear(void) {
 uint32_t fntrace_arm_count(void) { return s_arm_count; }
 uint32_t fntrace_arm_get(uint32_t i) {
     return (i < s_arm_count) ? s_arm_targets[i] : 0;
+}
+
+void fntrace_arm_from_env(const char *env_name) {
+    const char *spec = getenv(env_name);
+    if (!spec || !*spec) return;
+
+    const char *p = spec;
+    while (*p) {
+        while (*p == ',' || *p == ';' || *p == ' ' || *p == '\t' ||
+               *p == '\r' || *p == '\n') {
+            p++;
+        }
+        if (!*p) break;
+
+        if ((p[0] == 'a' || p[0] == 'A') &&
+            (p[1] == 'l' || p[1] == 'L') &&
+            (p[2] == 'l' || p[2] == 'L') &&
+            (p[3] == '\0' || p[3] == ',' || p[3] == ';' ||
+             p[3] == ' ' || p[3] == '\t' || p[3] == '\r' || p[3] == '\n')) {
+            fntrace_arm(0xFFFFFFFFu);
+            p += 3;
+            continue;
+        }
+
+        char *end = NULL;
+        unsigned long value = strtoul(p, &end, 0);
+        if (end == p) {
+            while (*p && *p != ',' && *p != ';' && *p != ' ' && *p != '\t' &&
+                   *p != '\r' && *p != '\n') {
+                p++;
+            }
+            continue;
+        }
+
+        fntrace_arm((uint32_t)value);
+        p = end;
+    }
 }
 
 void fntrace_clear(void) {

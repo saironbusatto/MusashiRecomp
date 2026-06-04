@@ -10,6 +10,12 @@ extern "C" {
 #define TIMER_BASE 0x1F801100
 
 void timers_init(void);
+void timers_get_snapshot(uint16_t counter[3], uint32_t mode[3],
+                         uint16_t target[3], int32_t irq_line[3],
+                         uint32_t frac[3]);
+void timers_set_snapshot(const uint16_t counter[3], const uint32_t mode[3],
+                         const uint16_t target[3], const int32_t irq_line[3],
+                         const uint32_t frac[3]);
 
 /* MMIO read/write for 0x1F801100..0x1F80112F.
  * Accepts 16-bit or 32-bit access (caller zero-extends). */

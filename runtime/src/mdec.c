@@ -161,8 +161,33 @@ static void finish_command(void) {
     mdec.expected_halfwords = 0;
     mdec.input_count = 0;
     mdec.busy = 0;
-    mdec.input_full = 1;
+    mdec.input_full = 0;
     trace_event(MDEC_EVT_CMD_DONE, mdec.command);
+}
+
+static void soft_reset(void) {
+    uint16_t *input = mdec.input;
+    uint32_t input_cap = mdec.input_cap;
+    uint8_t *output = mdec.output;
+    uint32_t output_cap = mdec.output_cap;
+    uint8_t y_quant[64];
+    uint8_t uv_quant[64];
+    int16_t scale[64];
+
+    memcpy(y_quant, mdec.y_quant, sizeof(y_quant));
+    memcpy(uv_quant, mdec.uv_quant, sizeof(uv_quant));
+    memcpy(scale, mdec.scale, sizeof(scale));
+
+    memset(&mdec, 0, sizeof(mdec));
+    mdec.input = input;
+    mdec.input_cap = input_cap;
+    mdec.output = output;
+    mdec.output_cap = output_cap;
+    memcpy(mdec.y_quant, y_quant, sizeof(mdec.y_quant));
+    memcpy(mdec.uv_quant, uv_quant, sizeof(mdec.uv_quant));
+    memcpy(mdec.scale, scale, sizeof(mdec.scale));
+    mdec.output_depth = 3;
+    mdec.current_block = 4;
 }
 
 static void idct_block(int16_t *block) {
@@ -414,10 +439,11 @@ uint32_t mdec_read(uint32_t addr) {
     status |= ((uint32_t)mdec.output_bit15 & 1u) << 23;
     status |= ((uint32_t)mdec.output_signed & 1u) << 24;
     status |= ((uint32_t)mdec.output_depth & 3u) << 25;
-    if (mdec.enable_dma_out && mdec.output_pos < mdec.output_size) status |= 1u << 27;
-    if (mdec.enable_dma_in && mdec.busy && mdec.input_count < mdec.expected_halfwords) status |= 1u << 28;
+    int write_ready = mdec_dma_write_ready();
+    if (!write_ready) status |= 1u << 30;
+    if (mdec.enable_dma_out && mdec_dma_read_ready()) status |= 1u << 27;
+    if (mdec.enable_dma_in && write_ready) status |= 1u << 28;
     if (mdec.busy) status |= 1u << 29;
-    if (mdec.input_full) status |= 1u << 30;
     if (mdec.output_pos >= mdec.output_size) status |= 1u << 31;
     mdec.last_status = status;
     return status;
@@ -431,15 +457,7 @@ void mdec_write(uint32_t addr, uint32_t value) {
     }
 
     if (value & 0x80000000u) {
-        free(mdec.input);
-        free(mdec.output);
-        memset(&mdec, 0, sizeof(mdec));
-        mdec.output_depth = 3;
-        mdec.current_block = 4;
-        for (int i = 0; i < 64; i++) {
-            mdec.y_quant[i] = 1;
-            mdec.uv_quant[i] = 1;
-        }
+        soft_reset();
         trace_event(MDEC_EVT_RESET, value);
     }
     mdec.enable_dma_in = (uint8_t)((value >> 30) & 1u);
@@ -474,6 +492,7 @@ uint32_t mdec_dma_read_word(void) {
 }
 
 int mdec_dma_write_ready(void) {
+    if (mdec.output_pos < mdec.output_size) return 0;
     return !mdec.busy || mdec.input_count < mdec.expected_halfwords;
 }
 

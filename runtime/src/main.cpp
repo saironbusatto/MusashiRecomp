@@ -496,14 +496,6 @@ static void sdl_audio_pump(void) {
                    (uint32_t)frames * bytes_per_frame);
 }
 
-/* Convert PS1 16-bit color (1-5-5-5) to ARGB8888 */
-static inline uint32_t psx16_to_argb(uint16_t c) {
-    uint32_t r = (c & 0x1F) << 3;
-    uint32_t g = ((c >> 5) & 0x1F) << 3;
-    uint32_t b = ((c >> 10) & 0x1F) << 3;
-    return 0xFF000000u | (r << 16) | (g << 8) | b;
-}
-
 /* PS1 digital pad button bits (active-low: 0=pressed, 1=released).
  * Bit 0 = SELECT, Bit 3 = START, Bit 4 = UP, Bit 5 = RIGHT,
  * Bit 6 = DOWN, Bit 7 = LEFT, Bit 8 = L2, Bit 9 = R2,
@@ -948,6 +940,13 @@ static void sdl_vblank_present(void) {
     sdl_audio_pump();
 #endif
 
+    /* TCP turbo is for automated validation and trace capture. It keeps the
+     * simulation advancing and the debug server polling, but removes frontend
+     * presentation and wall-clock pacing. */
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (debug_server_turbo_enabled()) return;
+#endif
+
     /* Turbo mode: while TAB is held, skip both VRAM->ARGB conversion and
      * SDL_RenderPresent. The recompiled BIOS still advances simulated
      * cycles every vblank, so the BIOS proceeds at whatever rate the host
@@ -1004,23 +1003,25 @@ static void sdl_vblank_present(void) {
     /* ---- Display from our VRAM ---- */
     uint32_t w = 0, h = 0;
     {
+        static bool disabled_frame_presented = false;
         GpuDisplayInfo di;
         gpu_get_display_info(&di);
         if (di.disabled || di.width == 0 || di.height == 0) {
 #ifndef PSX_SDL_NO_RENDER
-            SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
-            SDL_RenderClear(sdl_renderer);
-            SDL_RenderPresent(sdl_renderer);
+            if (!disabled_frame_presented) {
+                disabled_frame_presented = true;
+                SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
+                SDL_RenderClear(sdl_renderer);
+                SDL_RenderPresent(sdl_renderer);
+            }
 #endif
             return;
         }
-        const uint16_t* vram = gpu_get_vram();
+        disabled_frame_presented = false;
         w = di.width; h = di.height;
         for (uint32_t y = 0; y < h; y++) {
-            uint32_t vy = (di.display_y + y) & 511;
             for (uint32_t x = 0; x < w; x++) {
-                uint32_t vx = (di.display_x + x) & 1023;
-                sdl_pixel_buf[y * w + x] = psx16_to_argb(vram[vy * 1024 + vx]);
+                sdl_pixel_buf[y * w + x] = gpu_display_pixel_argb(&di, x, y);
             }
         }
     }

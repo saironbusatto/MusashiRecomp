@@ -77,6 +77,10 @@ static bool is_sw_reg_base(uint32_t instr, uint32_t base_reg, uint32_t value_reg
     return opcode == 0x2B && rs == base_reg && rt == value_reg;
 }
 
+static bool is_sw_reg_sp(uint32_t instr, uint32_t value_reg) {
+    return is_sw_reg_base(instr, 29, value_reg);
+}
+
 static bool is_lui(uint32_t instr, uint32_t& rt_out) {
     uint32_t opcode = (instr >> 26) & 0x3F;
     if (opcode != 0x0F) return false;
@@ -219,6 +223,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     result.jr_ra_count = 0;
     result.prologue_count = 0;
     result.call_discovered_count = 0;
+    result.strong_prologue_count = 0;
     result.state_continuation_count = 0;
 
     fmt::print("\n=== Function Boundary Detection ===\n\n");
@@ -303,6 +308,72 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     result.call_discovered_count = static_cast<int>(function_starts.size() - jr_ra_discovered);
     fmt::print("✓ Identified {} unique functions ({} call-discovered)\n\n",
                function_starts.size(), result.call_discovered_count);
+
+    // Pass 2.55: promote strong standalone prologues.
+    //
+    // Return-scanning alone misses scheduler/task entry points that never
+    // return normally, and direct JAL following misses callback entries whose
+    // addresses are derived at runtime. A standard stack-frame prologue that
+    // quickly saves $ra is a strong function-entry signal, provided the ADDIU
+    // is not itself a branch delay slot.
+    fmt::print("Finding strong standalone prologue entries...\n");
+    int strong_prologues = 0;
+    for (uint32_t addr = exe_start; addr < exe_end; addr += 4) {
+        auto word_opt = exe_.read_word(addr);
+        if (!word_opt.has_value()) break;
+
+        int32_t stack_size = 0;
+        if (!is_prologue(*word_opt, stack_size)) continue;
+
+        if (addr >= exe_start + 4) {
+            auto prev_opt = exe_.read_word(addr - 4);
+            if (prev_opt.has_value() && is_branch_or_jump(*prev_opt)) {
+                continue;
+            }
+        }
+
+        if (addr >= exe_start + 8) {
+            auto prev2_opt = exe_.read_word(addr - 8);
+            auto prev1_opt = exe_.read_word(addr - 4);
+            if (prev2_opt.has_value() && prev1_opt.has_value()) {
+                uint32_t lui_rt = 0;
+                if (is_lui(*prev2_opt, lui_rt) &&
+                    is_lw_same_reg_base(*prev1_opt, lui_rt)) {
+                    continue;
+                }
+            }
+        }
+
+        auto existing_it = function_starts.upper_bound(addr);
+        if (existing_it != function_starts.begin()) {
+            --existing_it;
+            auto return_it = function_last_return.find(*existing_it);
+            if (return_it != function_last_return.end() &&
+                return_it->second + 8u > addr) {
+                continue;
+            }
+        }
+
+        bool saves_ra = false;
+        for (uint32_t look = addr + 4; look < addr + 64 && look < exe_end; look += 4) {
+            auto next_opt = exe_.read_word(look);
+            if (!next_opt.has_value()) break;
+            if (is_sw_reg_sp(*next_opt, 31)) {
+                saves_ra = true;
+                break;
+            }
+            if (is_branch_or_jump(*next_opt)) {
+                break;
+            }
+        }
+
+        if (saves_ra && function_starts.insert(addr).second) {
+            strong_prologues++;
+        }
+    }
+    result.strong_prologue_count = strong_prologues;
+    fmt::print("Identified {} strong prologue entries\n\n",
+               result.strong_prologue_count);
 
     // Pass 2.6: discover continuations saved by setjmp/SaveState-style helpers.
     //

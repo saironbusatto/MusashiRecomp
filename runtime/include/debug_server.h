@@ -166,6 +166,10 @@ void debug_server_check_watchpoints(void);
  * -1 if no override is active. Value is PS1 16-bit button mask. */
 int debug_server_get_input_override(void);
 
+/* TCP-controlled turbo mode. When enabled the frontend skips presentation and
+ * wall-clock pacing at vblank, matching the keyboard TAB turbo path. */
+int debug_server_turbo_enabled(void);
+
 /* ---- Send helpers (for extensions) ---- */
 
 /* Set the CPU state pointer for register queries. Call after CPU init. */

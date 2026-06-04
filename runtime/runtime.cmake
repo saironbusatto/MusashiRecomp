@@ -233,3 +233,8 @@ function(psxrecomp_add_runtime_target target)
             $<$<CONFIG:Release>:/ENTRY:mainCRTStartup>)
     endif()
 endfunction()
+
+# Compatibility for early v4 game projects that used the longer helper name.
+function(psxrecomp_v4_add_runtime_target target)
+    psxrecomp_add_runtime_target(${target} ${ARGN})
+endfunction()

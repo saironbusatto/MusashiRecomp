@@ -35,6 +35,7 @@ typedef struct CDROMDebugState {
     uint64_t seq;
     uint8_t index_reg;
     uint8_t stat_reg;
+    uint8_t request_reg;
     uint8_t irq_enable;
     uint8_t irq_flag;
     uint8_t mode_reg;
@@ -62,7 +63,23 @@ typedef struct CDROMDebugState {
     int pending_delay;
     int pending_phase;
     uint32_t i_stat;
+    int last_sector_lba;
+    int last_sector_size;
+    uint32_t last_sector_frame;
+    uint8_t last_sector_mode;
+    uint8_t last_sector_have_raw;
 } CDROMDebugState;
+
+typedef struct CDROMSectorDebugState {
+    int current_available;
+    int current_read_pos;
+    int current_size;
+    int last_lba;
+    int last_size;
+    uint32_t last_frame;
+    uint8_t last_mode;
+    uint8_t last_have_raw;
+} CDROMSectorDebugState;
 
 typedef struct CDROMTraceEntry {
     uint64_t seq;
@@ -82,6 +99,7 @@ typedef struct CDROMTraceEntry {
     uint8_t response_read;
     uint8_t response_count;
     uint8_t sector_available;
+    uint8_t request_reg;
     uint8_t mode_reg;
     uint8_t pending_cmd;
     uint8_t pending_pending;
@@ -94,10 +112,36 @@ typedef struct CDROMTraceEntry {
 } CDROMTraceEntry;
 
 #define CDROM_TRACE_CAP (1 << 16)
+#define CDROM_SECTOR_HISTORY_CAP (1 << 10)
+#define CDROM_SECTOR_HISTORY_BYTES 128
+
+typedef struct CDROMSectorHistoryEntry {
+    uint64_t seq;
+    int lba;
+    int size;
+    uint32_t frame;
+    uint8_t mode;
+    uint8_t have_raw;
+    uint8_t raw_mode;
+    uint8_t xa_file;
+    uint8_t xa_channel;
+    uint8_t xa_submode;
+    uint8_t xa_coding;
+    uint8_t data_delivered;
+    uint8_t xa_audio_delivered;
+    uint8_t skip_reason;
+    uint16_t bytes_len;
+    uint8_t bytes[CDROM_SECTOR_HISTORY_BYTES];
+} CDROMSectorHistoryEntry;
 
 void cdrom_debug_snapshot(CDROMDebugState* out);
 uint64_t cdrom_debug_get_trace(const CDROMTraceEntry** out_entries);
 void cdrom_debug_clear_trace(void);
+uint32_t cdrom_debug_copy_last_sector(uint32_t offset, uint32_t len,
+                                      uint8_t* out,
+                                      CDROMSectorDebugState* state);
+uint64_t cdrom_debug_get_sector_history(const CDROMSectorHistoryEntry** out_entries);
+void cdrom_debug_clear_sector_history(void);
 
 #ifdef __cplusplus
 }
