@@ -45,6 +45,14 @@ static uint32_t ram_to_rom(uint32_t addr, const PS1Executable& exe) {
 CodeGenerator::CodeGenerator(const PS1Executable& exe, const CodeGenConfig& config)
     : exe_(exe), config_(config) {}
 
+void CodeGenerator::set_continuation_entries(const std::map<uint32_t, uint32_t>& owners) {
+    continuation_owners_ = owners;
+    continuation_entries_by_function_.clear();
+    for (const auto& [continuation_addr, owner_addr] : continuation_owners_) {
+        continuation_entries_by_function_[owner_addr].insert(continuation_addr);
+    }
+}
+
 std::string CodeGenerator::reg_name(int reg_num) {
     if (reg_num >= 0 && reg_num < 32) {
         return fmt::format("cpu->gpr[{}]", reg_num);
@@ -865,7 +873,8 @@ std::string CodeGenerator::translate_basic_block(
                                             static_cast<uint32_t>(block.instruction_count));
         ss << "#endif\n";
     }
-    ss << config_.indent << "psx_check_interrupts(cpu);\n";
+    ss << config_.indent
+       << fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", block.start_addr);
 
     // Translate each instruction in the block
     uint32_t addr = block.start_addr;
@@ -1207,6 +1216,7 @@ std::string CodeGenerator::translate_basic_block(
                     } else {
                         ss << config_.indent << fmt::format("call_by_address(cpu, 0x{:08X}u);  /* external jal */\n", target);
                     }
+                    ss << config_.indent << "if (cpu->pc != 0) return;\n";
                     if (!block.successors.empty()) {
                         ss << config_.indent
                            << fmt::format("goto block_{:08X};  /* continue after call */\n", block.successors[0]);
@@ -1234,6 +1244,7 @@ std::string CodeGenerator::translate_basic_block(
                     // Dispatch indirect call — target is a runtime register value
                     ss << config_.indent << fmt::format("call_by_address(cpu, {});  /* jalr {} */\n",
                                                         reg_name(rs), reg_name(rs));
+                    ss << config_.indent << "if (cpu->pc != 0) return;\n";
 
                     // Continue to successor block (instruction at return address)
                     if (!block.successors.empty()) {
@@ -1289,7 +1300,7 @@ GeneratedFunction CodeGenerator::generate_function(
     std::stringstream body_ss;
     body_ss << "{\n";
     body_ss << config_.indent
-            << fmt::format("debug_server_log_call_entry(0x{:08X}u);\n",
+            << fmt::format("debug_server_log_call_entry_cpu(0x{:08X}u, cpu);\n",
                           func.start_addr);
 
     // Add function comment
@@ -1297,6 +1308,21 @@ GeneratedFunction CodeGenerator::generate_function(
         body_ss << config_.indent
                 << fmt::format("/* Address: 0x{:08X}, Size: {} bytes, Blocks: {} */\n",
                               func.start_addr, func.size, cfg.blocks.size());
+    }
+
+    auto cont_it = continuation_entries_by_function_.find(func.start_addr);
+    if (cont_it != continuation_entries_by_function_.end() && !cont_it->second.empty()) {
+        body_ss << config_.indent << "switch (cpu->pc) {\n";
+        for (uint32_t continuation_addr : cont_it->second) {
+            if (!cfg.blocks.count(continuation_addr)) {
+                continue;
+            }
+            body_ss << config_.indent
+                    << fmt::format("    case 0x{:08X}u: cpu->pc = 0; goto block_{:08X};\n",
+                                   continuation_addr, continuation_addr);
+        }
+        body_ss << config_.indent << "    default: break;\n";
+        body_ss << config_.indent << "}\n";
     }
 
     // Pre-scan: find jump table targets that land mid-block (not a block boundary).
@@ -1473,7 +1499,7 @@ std::string CodeGenerator::generate_file(
     // Include the generic PSX runtime header.
     // This provides CPUState, GTE/trap declarations, and call_by_address().
     ss << "#include \"psx_runtime.h\"\n\n";
-    ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n\n";
+    ss << "extern void debug_server_log_call_entry_cpu(uint32_t func_addr, CPUState *cpu);\n\n";
 
     // Emit reference implementations for unaligned memory helpers.
     // These implement the MIPS lwl/lwr/swl/swr semantics.
@@ -1693,6 +1719,74 @@ std::string CodeGenerator::generate_file(
     }
 
     set_known_functions(known_addrs);
+
+    std::map<uint32_t, uint32_t> continuation_owners;
+    size_t call_continuation_count = 0;
+    size_t internal_continuation_count = 0;
+    for (const Function& func : functions_mut) {
+        if (func.is_data_section) {
+            continue;
+        }
+
+        auto cfg_it = cfgs_mut.find(func.start_addr);
+        if (cfg_it == cfgs_mut.end()) {
+            continue;
+        }
+
+        const ControlFlowGraph& cfg = cfg_it->second;
+
+        /*
+         * Any block leader can become a non-local re-entry point.  Hardware
+         * interrupts resume at block leaders after RFE, and unrecognised
+         * computed jumps (for example jump tables whose pattern was not
+         * statically decoded) fall back through psx_dispatch.  Registering the
+         * owning function plus cpu->pc lets dispatch land on the exact local
+         * label instead of treating valid in-function control flow as unknown.
+         */
+        for (const auto& [block_addr, block] : cfg.blocks) {
+            if (block_addr == cfg.function_start) {
+                continue;
+            }
+            if (block_addr < cfg.function_start || block_addr >= cfg.function_end) {
+                continue;
+            }
+            if (known_addrs.count(block_addr)) {
+                continue;
+            }
+
+            if (continuation_owners.emplace(block_addr, func.start_addr).second) {
+                internal_continuation_count++;
+            }
+        }
+
+        for (const auto& [block_addr, block] : cfg.blocks) {
+            if (block.exit_instr.type != ControlFlowType::JumpLink &&
+                block.exit_instr.type != ControlFlowType::JumpLinkReg) {
+                continue;
+            }
+
+            uint32_t continuation_addr = block.exit_instr.address + 8;
+            if (continuation_addr == cfg.function_start) {
+                continue;
+            }
+            if (continuation_addr < cfg.function_start || continuation_addr >= cfg.function_end) {
+                continue;
+            }
+            if (!cfg.blocks.count(continuation_addr)) {
+                continue;
+            }
+            if (known_addrs.count(continuation_addr)) {
+                continue;
+            }
+
+            if (continuation_owners.emplace(continuation_addr, func.start_addr).second) {
+                call_continuation_count++;
+            }
+        }
+    }
+    set_continuation_entries(continuation_owners);
+    fmt::print("Dispatchable internal continuations: {} ({} block leaders, {} call-only)\n",
+               continuation_owners_.size(), internal_continuation_count, call_continuation_count);
 
     // Generate all functions first (to collect names)
     auto gen_funcs = generate_all_functions(functions_mut, cfgs_mut);

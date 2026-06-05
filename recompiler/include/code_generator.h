@@ -5,6 +5,7 @@
 #include <vector>
 #include <sstream>
 #include <set>
+#include <map>
 #include "ps1_exe_parser.h"
 #include "function_analysis.h"
 #include "control_flow.h"
@@ -85,12 +86,20 @@ public:
     // Set annotation table (optional — no-op if not called)
     void set_annotations(const AnnotationTable* at) { annotations_ = at; }
 
+    const std::map<uint32_t, uint32_t>& continuation_owners() const {
+        return continuation_owners_;
+    }
+
 private:
     const PS1Executable& exe_;
     CodeGenConfig config_;
     std::set<uint32_t> known_functions_;  // Addresses of functions in this compilation unit
     std::set<uint32_t> extra_labels_;    // Mid-block addresses that need inline labels (jump table targets)
+    std::map<uint32_t, uint32_t> continuation_owners_;
+    std::map<uint32_t, std::set<uint32_t>> continuation_entries_by_function_;
     const AnnotationTable* annotations_ = nullptr;
+
+    void set_continuation_entries(const std::map<uint32_t, uint32_t>& owners);
 
     // Instruction translation
     std::string translate_instruction(uint32_t addr, uint32_t instr);

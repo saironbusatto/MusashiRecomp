@@ -133,11 +133,45 @@ static bool is_lui(uint32_t instr, uint32_t& rt_out) {
     return true;
 }
 
-static bool is_lw_same_reg_base(uint32_t instr, uint32_t reg) {
+static bool is_lw_from_reg_base(uint32_t instr, uint32_t base_reg, uint32_t& rt_out) {
     uint32_t opcode = (instr >> 26) & 0x3F;
     uint32_t rs = (instr >> 21) & 0x1F;
     uint32_t rt = (instr >> 16) & 0x1F;
-    return opcode == 0x23 && rs == reg && rt == reg;
+    if (opcode != 0x23 || rs != base_reg) return false;
+    rt_out = rt;
+    return true;
+}
+
+static bool find_preprologue_setup_start(const PS1Executable& exe,
+                                         uint32_t prologue_addr,
+                                         uint32_t exe_start,
+                                         uint32_t& setup_start_out) {
+    if (prologue_addr < exe_start + 8) return false;
+
+    uint32_t setup_start = prologue_addr;
+    constexpr uint32_t max_setup_pairs = 4;
+    uint32_t pair_count = 0;
+
+    while (setup_start >= exe_start + 8 && pair_count < max_setup_pairs) {
+        auto prev2_opt = exe.read_word(setup_start - 8);
+        auto prev1_opt = exe.read_word(setup_start - 4);
+        if (!prev2_opt.has_value() || !prev1_opt.has_value()) break;
+
+        uint32_t lui_rt = 0;
+        uint32_t load_rt = 0;
+        if (!is_lui(*prev2_opt, lui_rt) ||
+            !is_lw_from_reg_base(*prev1_opt, lui_rt, load_rt) ||
+            load_rt == 0) {
+            break;
+        }
+
+        setup_start -= 8;
+        pair_count++;
+    }
+
+    if (pair_count == 0) return false;
+    setup_start_out = setup_start;
+    return true;
 }
 
 uint32_t FunctionAnalyzer::find_function_start(uint32_t return_addr) {
@@ -177,15 +211,12 @@ uint32_t FunctionAnalyzer::find_function_start(uint32_t return_addr) {
                     continue;  // delay slot, not a real prologue — keep scanning
                 }
             }
-            if (search_addr >= exe_.header.load_address + 8) {
-                auto prev2_opt = exe_.read_word(search_addr - 8);
-                auto prev1_opt = exe_.read_word(search_addr - 4);
-                if (prev2_opt.has_value() && prev1_opt.has_value()) {
-                    uint32_t lui_rt = 0;
-                    if (is_lui(*prev2_opt, lui_rt) &&
-                        is_lw_same_reg_base(*prev1_opt, lui_rt)) {
-                        return search_addr - 8;
-                    }
+            {
+                uint32_t setup_start = 0;
+                if (find_preprologue_setup_start(exe_, search_addr,
+                                                 exe_.header.load_address,
+                                                 setup_start)) {
+                    return setup_start;
                 }
             }
             return search_addr;
@@ -346,6 +377,16 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
 
             // Only add if target is within EXE range and word-aligned
             if (target >= exe_start && target < exe_end && (target & 3) == 0) {
+                auto target_word = exe_.read_word(target);
+                int32_t target_stack_size = 0;
+                if (target_word.has_value() &&
+                    is_prologue(*target_word, target_stack_size)) {
+                    uint32_t setup_start = 0;
+                    if (find_preprologue_setup_start(exe_, target, exe_start,
+                                                     setup_start)) {
+                        target = setup_start;
+                    }
+                }
                 function_starts.insert(target);
             }
         }
@@ -378,24 +419,18 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
             }
         }
 
-        if (addr >= exe_start + 8) {
-            auto prev2_opt = exe_.read_word(addr - 8);
-            auto prev1_opt = exe_.read_word(addr - 4);
-            if (prev2_opt.has_value() && prev1_opt.has_value()) {
-                uint32_t lui_rt = 0;
-                if (is_lui(*prev2_opt, lui_rt) &&
-                    is_lw_same_reg_base(*prev1_opt, lui_rt)) {
-                    continue;
-                }
-            }
+        uint32_t entry_addr = addr;
+        uint32_t setup_start = 0;
+        if (find_preprologue_setup_start(exe_, addr, exe_start, setup_start)) {
+            entry_addr = setup_start;
         }
 
-        auto existing_it = function_starts.upper_bound(addr);
+        auto existing_it = function_starts.upper_bound(entry_addr);
         if (existing_it != function_starts.begin()) {
             --existing_it;
             auto return_it = function_last_return.find(*existing_it);
             if (return_it != function_last_return.end() &&
-                return_it->second + 8u > addr) {
+                return_it->second + 8u > entry_addr) {
                 continue;
             }
         }
@@ -413,7 +448,10 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
             }
         }
 
-        if (saves_ra && function_starts.insert(addr).second) {
+        if (saves_ra && function_starts.insert(entry_addr).second) {
+            if (entry_addr != addr) {
+                function_starts.erase(addr);
+            }
             strong_prologues++;
         }
     }

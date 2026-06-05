@@ -28,6 +28,7 @@ void interrupts_init(void);
  * Fires vblank on schedule, checks (i_stat & i_mask), and if
  * pending + COP0 allows, dispatches the exception handler. */
 void psx_check_interrupts(struct CPUState* cpu);
+void psx_check_interrupts_at(struct CPUState* cpu, uint32_t resume_pc);
 
 /* Accumulate emitted PSX cycles toward the next VBlank trigger.
  * Called from psx_advance_cycles() so the VBlank rate is gated on
@@ -49,10 +50,34 @@ void psx_get_freeze_diag(uint64_t *out_total_checks,
                          uint64_t *out_exc_entries,
                          uint64_t *out_exc_reentry_blocks);
 
+#define PSX_IRQ_CHECK_TRACE_CAP (1u << 18)
+typedef struct PsxIrqCheckTraceEntry {
+    uint64_t seq;
+    uint32_t frame;
+    uint32_t resume_pc;
+    uint32_t i_stat;
+    uint32_t i_mask;
+    uint32_t sr;
+    uint32_t cause;
+    uint32_t call_depth;
+    uint32_t reason;
+} PsxIrqCheckTraceEntry;
+
+extern PsxIrqCheckTraceEntry g_psx_irq_check_trace[PSX_IRQ_CHECK_TRACE_CAP];
+extern uint64_t g_psx_irq_check_trace_seq;
+extern uint64_t g_psx_nonlocal_epoch;
+
+/* Bumped whenever BIOS exception/RestoreState/RFE flow abandons the current
+ * generated C call stack. Dispatch uses this to avoid consuming a synthetic
+ * JAL/JALR return address as a normal inline return after guest context has
+ * been restored elsewhere. */
+void psx_note_nonlocal_control_flow(void);
+
 /* longjmp back to psx_check_interrupts, unwinding the exception handler.
  * Called by ReturnFromException (B0:0x17 or SYSCALL(3)) when inside
  * the exception handler to model real hardware's RFE+JR $k0 unwind. */
 void psx_exception_longjmp(void);
+void psx_rfe_return(struct CPUState* cpu);
 
 /* longjmp back to psx_check_interrupts for RestoreState redirection.
  *

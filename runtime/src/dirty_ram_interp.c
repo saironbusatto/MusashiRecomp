@@ -58,8 +58,15 @@ DirtyRamBlockLogEntry g_dirty_ram_block_log[DIRTY_RAM_BLOCK_LOG_CAP] = {0};
 uint64_t              g_dirty_ram_block_log_seq = 0;
 DirtyRamFlowLogEntry  g_dirty_ram_flow_log[DIRTY_RAM_FLOW_LOG_CAP] = {0};
 uint64_t              g_dirty_ram_flow_log_seq = 0;
+DirtyRamExitLogEntry  g_dirty_ram_exit_log[DIRTY_RAM_EXIT_LOG_CAP] = {0};
+uint64_t              g_dirty_ram_exit_log_seq = 0;
+DirtyRamCallLogEntry  g_dirty_ram_call_log[DIRTY_RAM_CALL_LOG_CAP] = {0};
+uint64_t              g_dirty_ram_call_log_seq = 0;
 DirtyRamInsnLogEntry  g_dirty_ram_insn_log[DIRTY_RAM_INSN_LOG_CAP] = {0};
 uint64_t              g_dirty_ram_insn_log_seq = 0;
+
+static struct { uint32_t lo, hi; } g_dirty_ram_trace_ranges[DIRTY_RAM_TRACE_MAX_RANGES];
+static int g_dirty_ram_trace_range_count = 0;
 
 /* Current frame counter, defined in debug_server.c. */
 extern uint64_t s_frame_count;
@@ -88,6 +95,9 @@ extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
 extern int psx_game_address_in_text(uint32_t addr);
 #endif
 extern void psx_dispatch_call(CPUState* cpu, uint32_t addr, uint32_t return_addr);
+extern int g_psx_call_depth;
+extern uint32_t i_stat;
+extern uint32_t i_mask;
 
 /* Forward decls from memory.c — used to read instruction bytes. */
 extern uint8_t *memory_get_ram_ptr(void);
@@ -113,14 +123,55 @@ static inline uint32_t fetch_word(uint32_t phys) {
          | ((uint32_t)ram[phys + 3] << 24);
 }
 
+int dirty_ram_trace_add_range(uint32_t lo, uint32_t hi) {
+    if (g_dirty_ram_trace_range_count >= DIRTY_RAM_TRACE_MAX_RANGES) return 0;
+    lo &= 0x1FFFFFFFu;
+    hi &= 0x1FFFFFFFu;
+    if (lo == hi) return 0;
+    int slot = g_dirty_ram_trace_range_count++;
+    g_dirty_ram_trace_ranges[slot].lo = lo;
+    g_dirty_ram_trace_ranges[slot].hi = hi;
+    return 1;
+}
+
+void dirty_ram_trace_clear_ranges(void) {
+    g_dirty_ram_trace_range_count = 0;
+}
+
+int dirty_ram_trace_range_count(void) {
+    return g_dirty_ram_trace_range_count;
+}
+
+int dirty_ram_trace_get_range(int slot, uint32_t *lo, uint32_t *hi) {
+    if (slot < 0 || slot >= g_dirty_ram_trace_range_count) return 0;
+    if (lo) *lo = g_dirty_ram_trace_ranges[slot].lo;
+    if (hi) *hi = g_dirty_ram_trace_ranges[slot].hi;
+    return 1;
+}
+
+static int dirty_ram_trace_should_log(uint32_t phys) {
+    if (g_dirty_ram_trace_range_count > 0) {
+        for (int i = 0; i < g_dirty_ram_trace_range_count; i++) {
+            if (phys >= g_dirty_ram_trace_ranges[i].lo &&
+                phys <  g_dirty_ram_trace_ranges[i].hi) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+
+    return ((phys >= 0x000E0000u && phys < 0x000F0000u) ||
+            (phys >= 0x000000A0u && phys < 0x000000C0u) ||
+            (phys >= 0x000005C0u && phys < 0x00000620u) ||
+            (phys >= 0x00001E00u && phys < 0x00002000u));
+}
+
 static void dirty_ram_log_instruction(CPUState *cpu, uint32_t pc, uint32_t insn,
-                                      uint32_t before_s0, uint32_t next_pc,
+                                      const uint32_t before_s[4],
+                                      uint32_t next_pc,
                                       uint32_t target, int transferred) {
     uint32_t phys = pc & 0x1FFFFFFFu;
-    if (!((phys >= 0x000E0000u && phys < 0x000F0000u) ||
-          (phys >= 0x000000A0u && phys < 0x000000C0u) ||
-          (phys >= 0x000005C0u && phys < 0x00000620u) ||
-          (phys >= 0x00001E00u && phys < 0x00002000u))) {
+    if (!dirty_ram_trace_should_log(phys)) {
         return;
     }
 
@@ -136,8 +187,14 @@ static void dirty_ram_log_instruction(CPUState *cpu, uint32_t pc, uint32_t insn,
     e->insn         = insn;
     e->next_pc      = next_pc;
     e->target       = target;
-    e->before_s0    = before_s0;
+    e->before_s0    = before_s[0];
     e->after_s0     = cpu->gpr[16];
+    e->before_s1    = before_s[1];
+    e->after_s1     = cpu->gpr[17];
+    e->before_s2    = before_s[2];
+    e->after_s2     = cpu->gpr[18];
+    e->before_s3    = before_s[3];
+    e->after_s3     = cpu->gpr[19];
     e->sp           = cpu->gpr[29];
     e->ra           = cpu->gpr[31];
     e->v0           = cpu->gpr[2];
@@ -233,29 +290,125 @@ static int abort_unsupported(uint32_t pc, uint32_t insn, const char *reason) {
 static int is_local_dirty_target(uint32_t target) {
     uint32_t phys = target & 0x1FFFFFFFu;
     if (!dirty_ram_is_dirty(phys)) return 0;
-    if (phys >= 0x00098000u) return 1;
 #ifdef PSX_HAS_GAME_DISPATCH
-    return fntrace_is_game_started() && psx_game_address_in_text(target);
-#else
-    return 0;
+    if (fntrace_is_game_started() && psx_game_address_in_text(target)) return 0;
 #endif
+    return phys >= 0x00098000u;
 }
 
 static int allow_dirty_local_flow_for_addr(uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
-    if (phys >= 0x00098000u) return 1;
 #ifdef PSX_HAS_GAME_DISPATCH
-    return fntrace_is_game_started() && psx_game_address_in_text(addr);
-#else
-    return 0;
+    if (fntrace_is_game_started() && psx_game_address_in_text(addr)) return 0;
 #endif
+    return phys >= 0x00098000u;
+}
+
+static uint32_t dirty_ram_current_tcb(CPUState *cpu) {
+    uint32_t tcb_ptr_addr = cpu->read_word(0x00000108u);
+    return tcb_ptr_addr ? cpu->read_word(tcb_ptr_addr) : 0;
+}
+
+enum {
+    DIRTY_EXIT_ZERO_ADDR          = 1,
+    DIRTY_EXIT_EXCEPTION_VECTOR  = 2,
+    DIRTY_EXIT_UNSUPPORTED_ENTRY = 3,
+    DIRTY_EXIT_UNSUPPORTED_MID   = 4,
+    DIRTY_EXIT_STOP_ADDR         = 5,
+    DIRTY_EXIT_NONLOCAL_TARGET   = 6,
+    DIRTY_EXIT_CLEAN_NEXT        = 7,
+    DIRTY_EXIT_GUARD             = 8,
+};
+
+static void dirty_ram_log_exit(CPUState *cpu, uint32_t entry, uint32_t pc,
+                               uint32_t target, uint32_t stop_addr,
+                               uint32_t reason, uint32_t insns,
+                               int handled) {
+    uint32_t entry_phys = entry & 0x1FFFFFFFu;
+    if (entry_phys < 0x00098000u && stop_addr == 0) {
+        return;
+    }
+
+    uint64_t s = g_dirty_ram_exit_log_seq++;
+    DirtyRamExitLogEntry *e =
+        &g_dirty_ram_exit_log[s & (DIRTY_RAM_EXIT_LOG_CAP - 1u)];
+    e->seq = s;
+    e->entry = entry;
+    e->pc = pc;
+    e->target = target;
+    e->stop_addr = stop_addr;
+    e->reason = reason;
+    e->insns = insns;
+    e->s0 = cpu ? cpu->gpr[16] : 0;
+    e->s1 = cpu ? cpu->gpr[17] : 0;
+    e->s2 = cpu ? cpu->gpr[18] : 0;
+    e->s3 = cpu ? cpu->gpr[19] : 0;
+    e->sp = cpu ? cpu->gpr[29] : 0;
+    e->ra = cpu ? cpu->gpr[31] : 0;
+    e->v0 = cpu ? cpu->gpr[2] : 0;
+    e->v1 = cpu ? cpu->gpr[3] : 0;
+    e->a0 = cpu ? cpu->gpr[4] : 0;
+    e->a1 = cpu ? cpu->gpr[5] : 0;
+    e->a2 = cpu ? cpu->gpr[6] : 0;
+    e->a3 = cpu ? cpu->gpr[7] : 0;
+    e->current_tcb = cpu ? dirty_ram_current_tcb(cpu) : 0;
+    e->frame = (uint32_t)s_frame_count;
+    e->handled = (uint8_t)(handled ? 1u : 0u);
+    e->in_exception = (uint8_t)(psx_get_in_exception() ? 1u : 0u);
 }
 
 static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
                                   uint32_t return_pc,
                                   uint32_t *next_pc_out) {
     cpu->pc = 0;
+    int defer_interrupts = 0;
+#ifdef PSX_HAS_GAME_DISPATCH
+    defer_interrupts = fntrace_is_game_started() &&
+                       psx_game_address_in_text(target) &&
+                       ((i_stat & i_mask) != 0);
+#endif
+    /* Use the normal dispatcher call path for compiled/static callees too,
+     * so stop-address handling matches generated JAL/JALR calls. The dirty
+     * interpreter's caller continuation is not represented on the native C
+     * stack. When an overlay callback calls into statically recompiled game
+     * text while an IRQ is already pending, defer interrupt delivery until the
+     * post-JAL interpreter PC is selected; otherwise the callback can reenter
+     * before its immediate stores run. Calls made before an IRQ is pending
+     * remain interruptible because they can legitimately wait for CD/SIO IRQs.
+     * Hardware sources are still ticked by psx_check_interrupts. */
+    uint64_t call_seq = g_dirty_ram_call_log_seq++;
+    DirtyRamCallLogEntry *call_log =
+        &g_dirty_ram_call_log[call_seq & (DIRTY_RAM_CALL_LOG_CAP - 1u)];
+    call_log->seq = call_seq;
+    call_log->pc = return_pc - 8u;
+    call_log->target = target;
+    call_log->return_pc = return_pc;
+    call_log->before_s0 = cpu->gpr[16];
+    call_log->before_s1 = cpu->gpr[17];
+    call_log->before_s2 = cpu->gpr[18];
+    call_log->before_s3 = cpu->gpr[19];
+    call_log->before_sp = cpu->gpr[29];
+    call_log->before_ra = cpu->gpr[31];
+    call_log->a0 = cpu->gpr[4];
+    call_log->a1 = cpu->gpr[5];
+    call_log->a2 = cpu->gpr[6];
+    call_log->a3 = cpu->gpr[7];
+    call_log->current_tcb = dirty_ram_current_tcb(cpu);
+    call_log->frame = (uint32_t)s_frame_count;
+    call_log->defer_interrupts = (uint8_t)(defer_interrupts ? 1u : 0u);
+    call_log->in_exception = (uint8_t)(psx_get_in_exception() ? 1u : 0u);
+    call_log->returned_pc_nonzero = 0;
+
+    if (defer_interrupts) g_psx_call_depth++;
     psx_dispatch_call(cpu, target, return_pc);
+    if (defer_interrupts) g_psx_call_depth--;
+    call_log->after_s0 = cpu->gpr[16];
+    call_log->after_s1 = cpu->gpr[17];
+    call_log->after_s2 = cpu->gpr[18];
+    call_log->after_s3 = cpu->gpr[19];
+    call_log->after_sp = cpu->gpr[29];
+    call_log->after_ra = cpu->gpr[31];
+    call_log->returned_pc_nonzero = (uint8_t)(cpu->pc != 0 ? 1u : 0u);
     if (cpu->pc != 0) return 1;
     *next_pc_out = return_pc;
     return 0;
@@ -350,14 +503,6 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             cpu->gpr[rd ? rd : 31] = return_pc;
             cpu->gpr[0] = 0;
             exec_delay_slot(cpu, pc + 4);
-#ifdef PSX_HAS_GAME_DISPATCH
-            cpu->pc = 0;
-            if (psx_dispatch_game_compiled(cpu, target)) {
-                if (cpu->pc != 0) return 1;
-                *next_pc_out = return_pc;
-                return 0;
-            }
-#endif
             if (!is_local_dirty_target(target)) {
                 return dispatch_nonlocal_call(cpu, target, return_pc, next_pc_out);
             }
@@ -473,14 +618,6 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         uint32_t return_pc = pc + 8;
         cpu->gpr[31] = return_pc;
         exec_delay_slot(cpu, pc + 4);
-#ifdef PSX_HAS_GAME_DISPATCH
-        cpu->pc = 0;
-        if (psx_dispatch_game_compiled(cpu, target)) {
-            if (cpu->pc != 0) return 1;
-            *next_pc_out = return_pc;
-            return 0;
-        }
-#endif
         if (!is_local_dirty_target(target)) {
             return dispatch_nonlocal_call(cpu, target, return_pc, next_pc_out);
         }
@@ -690,9 +827,11 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
  * mask. Returns 1 if interpretation handled the basic block; 0 if the
  * caller should fall back (e.g. unsupported opcode at the entry, page
  * not dirty). */
-int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
+int dirty_ram_dispatch_until(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     if (addr == 0) {
         cpu->pc = 0;
+        dirty_ram_log_exit(cpu, addr, addr, 0, stop_addr,
+                           DIRTY_EXIT_ZERO_ADDR, 0, 1);
         return 1;
     }
 
@@ -700,6 +839,8 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
 
     if (addr == 0x80000048u) {
         cpu->pc = 0;
+        dirty_ram_log_exit(cpu, addr, addr, 0, stop_addr,
+                           DIRTY_EXIT_EXCEPTION_VECTOR, 0, 1);
         if (psx_get_in_exception()) {
             psx_exception_longjmp(); /* does not return */
         }
@@ -708,6 +849,7 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
 
 #ifdef PSX_HAS_GAME_DISPATCH
     if (psx_dispatch_game_compiled(cpu, addr)) return 1;
+    if (fntrace_is_game_started() && psx_game_address_in_text(addr)) return 0;
 #endif
 
     if (!dirty_ram_is_dirty(phys)) return 0;
@@ -744,6 +886,7 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
     if (debug_server_dirty_break_maybe_pause(addr, cpu)) {
         debug_server_wait_if_paused();
     }
+    psx_check_interrupts_at(cpu, addr);
 
     /* Run dirty code locally until it returns to compiled/non-dirty code.
      * This is required for overlays and for any static text page that has
@@ -756,12 +899,14 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
     for (int i = 0; i < MAX_INSNS_PER_DISPATCH; i++) {
         uint32_t next_pc = 0;
         uint32_t insn = fetch_word(pc & 0x1FFFFFFFu);
-        uint32_t before_s0 = cpu->gpr[16];
+        uint32_t before_s[4] = {
+            cpu->gpr[16], cpu->gpr[17], cpu->gpr[18], cpu->gpr[19]
+        };
         int transferred = exec_one(cpu, pc, &next_pc);
 #ifdef PSX_ENABLE_BLOCK_CYCLES
         psx_advance_cycles(1u);
 #endif
-        dirty_ram_log_instruction(cpu, pc, insn, before_s0, next_pc,
+        dirty_ram_log_instruction(cpu, pc, insn, before_s, next_pc,
                                   transferred ? cpu->pc : next_pc,
                                   transferred);
         if (g_unsupported_seen) {
@@ -771,6 +916,9 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
                  * code (stale data, return-target into save area, etc.).
                  * Hand off to psx_unknown_dispatch which has its own
                  * pattern-matching trampoline resolver. */
+                dirty_ram_log_exit(cpu, addr, pc, cpu->pc, stop_addr,
+                                   DIRTY_EXIT_UNSUPPORTED_ENTRY,
+                                   (uint32_t)insns_executed, 0);
                 return 0;
             }
             /* Made some progress, then hit unknown.  Treat as a no-op
@@ -792,19 +940,24 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
             g_dirty_ram_last_unsupported_insn   = g_unsupported_insn;
             g_dirty_ram_last_unsupported_reason = g_unsupported_reason;
             cpu->pc = 0;
+            dirty_ram_log_exit(cpu, addr, pc, 0, stop_addr,
+                               DIRTY_EXIT_UNSUPPORTED_MID,
+                               (uint32_t)insns_executed, 1);
             return 1;
         }
         g_dirty_ram_insns_run++;
         insns_executed++;
         if (transferred) {
             uint32_t target = cpu->pc;
-#ifdef PSX_HAS_GAME_DISPATCH
-            if (target != 0 && psx_dispatch_game_compiled(cpu, target)) {
+            if (stop_addr != 0 &&
+                ((target ^ stop_addr) & 0x1FFFFFFFu) == 0) {
                 g_dirty_ram_blocks_run++;
                 if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                dirty_ram_log_exit(cpu, addr, pc, target, stop_addr,
+                                   DIRTY_EXIT_STOP_ADDR,
+                                   (uint32_t)insns_executed, 1);
                 return 1;
             }
-#endif
             if (allow_local_dirty_flow && target != 0 &&
                 is_local_dirty_target(target)) {
                 uint64_t s = g_dirty_ram_flow_log_seq++;
@@ -824,12 +977,15 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
                 if ((insns_executed & 0xFFF) == 0) {
                     debug_server_poll();
                     debug_server_wait_if_paused();
-                    psx_check_interrupts(cpu);
+                    psx_check_interrupts_at(cpu, pc);
                 }
                 continue;
             }
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+            dirty_ram_log_exit(cpu, addr, pc, target, stop_addr,
+                               DIRTY_EXIT_NONLOCAL_TARGET,
+                               (uint32_t)insns_executed, 1);
             return 1;
         }
         pc = next_pc;
@@ -840,6 +996,9 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
             cpu->pc = pc;
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+            dirty_ram_log_exit(cpu, addr, pc, pc, stop_addr,
+                               DIRTY_EXIT_CLEAN_NEXT,
+                               (uint32_t)insns_executed, 1);
             return 1;
         }
     }
@@ -850,6 +1009,19 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
     g_dirty_ram_blocks_run++;
     cpu->pc = pc;
     if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
-    psx_check_interrupts(cpu);
+    dirty_ram_log_exit(cpu, addr, pc, pc, stop_addr,
+                       DIRTY_EXIT_GUARD,
+                       (uint32_t)insns_executed, 1);
+    psx_check_interrupts_at(cpu, pc);
+    /* Generated static code resumes inline after RFE with cpu->pc == 0.
+     * Dirty code's resume point is this explicit interpreter PC, so keep the
+     * dispatcher from treating an interrupt return as a completed call. */
+    if (cpu->pc == 0) {
+        cpu->pc = pc;
+    }
     return 1;
+}
+
+int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
+    return dirty_ram_dispatch_until(cpu, addr, 0);
 }

@@ -32,6 +32,7 @@
 
 #include "cpu_state.h"
 #include "crash_trace.h"
+#include "debug_server.h"
 
 /* Output path — overwritten per dump. */
 static const char *kReportPath = "psx_last_run_report.json";
@@ -55,7 +56,9 @@ extern uint64_t crash_trace_dispatch_seq_get(void);
  * UnknownDispatchEntry. Accessor wrappers exported by debug_server.c. */
 typedef struct {
     uint64_t seq;
-    uint32_t addr, phys, ra, a0, a1, frame, pad;
+    uint32_t addr, phys, ra, sp, v0, v1;
+    uint32_t a0, a1, a2, a3, t0, t1, t2;
+    uint32_t s0, s1, s2, s3, frame, current_func;
 } UnknownDispatchEntry;
 #define UNKNOWN_DISPATCH_CAP (1 << 16)
 extern UnknownDispatchEntry crash_trace_unknown_get(uint64_t seq);
@@ -63,6 +66,26 @@ extern uint64_t crash_trace_unknown_seq_get(void);
 
 /* Dirty-RAM block log (defined in dirty_ram_interp.c). */
 #include "dirty_ram_interp.h"
+
+static void write_sidecar_trace(const char *path, const char *field,
+                                void (*dump_fn)(FILE *, uint32_t),
+                                uint32_t max_count,
+                                const char *reason)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f,
+            "{\n"
+            "  \"reason\": \"%s\",\n"
+            "  \"frame\": %llu,\n"
+            "  \"%s\": ",
+            reason ? reason : "(unknown)",
+            (unsigned long long)s_frame_count,
+            field);
+    dump_fn(f, max_count);
+    fputs("\n}\n", f);
+    fclose(f);
+}
 
 /* JSON helpers. Hand-rolled to avoid allocations on the SEH path. */
 
@@ -201,11 +224,19 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
             UnknownDispatchEntry e = crash_trace_unknown_get(start + i);
             append_fmt(buf, sizeof(buf), &pos,
                 "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"phys\":\"0x%08X\","
-                "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
-                "\"frame\":%u}",
+                "\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+                "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
+                "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+                "\"t0\":\"0x%08X\",\"t1\":\"0x%08X\",\"t2\":\"0x%08X\","
+                "\"s0\":\"0x%08X\",\"s1\":\"0x%08X\","
+                "\"s2\":\"0x%08X\",\"s3\":\"0x%08X\","
+                "\"current_func\":\"0x%08X\",\"frame\":%u}",
                 i == 0 ? "" : ",",
                 (unsigned long long)e.seq, e.addr, e.phys,
-                e.ra, e.a0, e.a1, e.frame);
+                e.ra, e.sp, e.v0, e.v1, e.a0, e.a1, e.a2, e.a3,
+                e.t0, e.t1, e.t2, e.s0, e.s1, e.s2, e.s3,
+                e.current_func, e.frame);
         }
         append_str(buf, sizeof(buf), &pos, "]\n  },\n");
     }
@@ -243,6 +274,22 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         fwrite(buf, 1, pos, f);
         fclose(f);
     }
+
+    write_sidecar_trace("psx_last_restore_trace.json", "restore_trace",
+                        debug_server_freeze_dump_restore_trace_json, 2048,
+                        reason);
+    write_sidecar_trace("psx_last_thread_trace.json", "thread_trace",
+                        debug_server_freeze_dump_thread_trace_json, 1024,
+                        reason);
+    write_sidecar_trace("psx_last_irq_check_log.json", "irq_check_log",
+                        debug_server_freeze_dump_irq_check_json, 2048,
+                        reason);
+    write_sidecar_trace("psx_last_fn_entry_trace.json", "fn_entry_trace",
+                        debug_server_freeze_dump_fn_entry_json, 2048,
+                        reason);
+    write_sidecar_trace("psx_last_evcb_trace.json", "evcb_trace",
+                        debug_server_freeze_dump_evcb_json, 1024,
+                        reason);
 }
 
 /* ── Crash handlers ──────────────────────────────────────────────────── */

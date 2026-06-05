@@ -126,6 +126,7 @@ void debug_server_trace_dispatch_return(uint32_t func_addr, CPUState *cpu);
  * touching the shadow stack — the native C call/return discipline already
  * handles unwinding for direct calls. */
 void debug_server_log_call_entry(uint32_t func_addr);
+void debug_server_log_call_entry_cpu(uint32_t func_addr, CPUState *cpu);
 
 /* Last store instruction PC — set by the recompiler before every memory
  * store (sb/sh/sw/swl/swr/swc2).  Read by SIO/MMIO write handlers to
@@ -211,6 +212,7 @@ void debug_server_freeze_dump_frame_history_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_sio_pc_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_thread_trace_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_restore_trace_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_irq_check_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_first_zero_restore_json(FILE *f);
 void debug_server_freeze_dump_entryint_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_cdrom_state_json(FILE *f);

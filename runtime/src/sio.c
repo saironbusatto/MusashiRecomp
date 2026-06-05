@@ -121,26 +121,30 @@ static void pad_prepare_command_response(uint8_t command) {
     static const uint8_t info_46[6] = { 0x00, 0x00, 0x01, 0x02, 0x00, 0x0A };
     static const uint8_t info_47[6] = { 0x00, 0x00, 0x02, 0x00, 0x01, 0x00 };
     static const uint8_t info_4c[6] = { 0x00, 0x00, 0x00, 0x04, 0x00, 0x00 };
-    const uint8_t id = 0xF3;
+    const uint8_t config_id = 0xF3;
 
     switch (command) {
     case 0x43: /* Enter/exit config mode */
+        /* The command itself is acknowledged using the controller's current
+         * mode ID; the first parameter takes effect on later bytes. */
+        pad_prepare_response(pad_poll_id(selected_slot), zeros, 6);
+        break;
     case 0x44: /* Set analog/digital mode */
     case 0x4D: /* Set vibration motor mapping */
     case 0x4F: /* Set poll response byte count / DualShock extension */
-        pad_prepare_response(id, zeros, 6);
+        pad_prepare_response(config_id, zeros, 6);
         break;
     case 0x45: /* Get controller type */
-        pad_prepare_response(id, info_45, 6);
+        pad_prepare_response(config_id, info_45, 6);
         break;
     case 0x46: /* Get mode table */
-        pad_prepare_response(id, info_46, 6);
+        pad_prepare_response(config_id, info_46, 6);
         break;
     case 0x47: /* Get actuator alignment */
-        pad_prepare_response(id, info_47, 6);
+        pad_prepare_response(config_id, info_47, 6);
         break;
     case 0x4C: /* Get supported modes */
-        pad_prepare_response(id, info_4c, 6);
+        pad_prepare_response(config_id, info_4c, 6);
         break;
     default:
         pad_clear_response();

@@ -28,6 +28,7 @@ extern "C" {
  * either 0 (block ended on jr $ra style return) or the target of a tail
  * jump that the dispatch trampoline should re-enter. */
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);
+int dirty_ram_dispatch_until(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
 
 /* Test whether a given physical kernel-RAM address is in a page that was
  * written-to since boot.  Defined in memory.c. */
@@ -115,6 +116,68 @@ typedef struct {
 extern DirtyRamFlowLogEntry g_dirty_ram_flow_log[DIRTY_RAM_FLOW_LOG_CAP];
 extern uint64_t             g_dirty_ram_flow_log_seq;
 
+#define DIRTY_RAM_EXIT_LOG_CAP (1u << 18)
+typedef struct {
+    uint64_t seq;
+    uint32_t entry;
+    uint32_t pc;
+    uint32_t target;
+    uint32_t stop_addr;
+    uint32_t reason;
+    uint32_t insns;
+    uint32_t s0;
+    uint32_t s1;
+    uint32_t s2;
+    uint32_t s3;
+    uint32_t sp;
+    uint32_t ra;
+    uint32_t v0;
+    uint32_t v1;
+    uint32_t a0;
+    uint32_t a1;
+    uint32_t a2;
+    uint32_t a3;
+    uint32_t current_tcb;
+    uint32_t frame;
+    uint8_t  handled;
+    uint8_t  in_exception;
+    uint8_t  pad[2];
+} DirtyRamExitLogEntry;
+extern DirtyRamExitLogEntry g_dirty_ram_exit_log[DIRTY_RAM_EXIT_LOG_CAP];
+extern uint64_t             g_dirty_ram_exit_log_seq;
+
+#define DIRTY_RAM_CALL_LOG_CAP (1u << 16)
+typedef struct {
+    uint64_t seq;
+    uint32_t pc;
+    uint32_t target;
+    uint32_t return_pc;
+    uint32_t before_s0;
+    uint32_t after_s0;
+    uint32_t before_s1;
+    uint32_t after_s1;
+    uint32_t before_s2;
+    uint32_t after_s2;
+    uint32_t before_s3;
+    uint32_t after_s3;
+    uint32_t before_sp;
+    uint32_t after_sp;
+    uint32_t before_ra;
+    uint32_t after_ra;
+    uint32_t a0;
+    uint32_t a1;
+    uint32_t a2;
+    uint32_t a3;
+    uint32_t current_tcb;
+    uint32_t frame;
+    uint8_t  defer_interrupts;
+    uint8_t  in_exception;
+    uint8_t  returned_pc_nonzero;
+    uint8_t  pad;
+} DirtyRamCallLogEntry;
+extern DirtyRamCallLogEntry g_dirty_ram_call_log[DIRTY_RAM_CALL_LOG_CAP];
+extern uint64_t             g_dirty_ram_call_log_seq;
+
 #define DIRTY_RAM_INSN_LOG_CAP (1u << 16)
 typedef struct {
     uint64_t seq;
@@ -124,6 +187,12 @@ typedef struct {
     uint32_t target;
     uint32_t before_s0;
     uint32_t after_s0;
+    uint32_t before_s1;
+    uint32_t after_s1;
+    uint32_t before_s2;
+    uint32_t after_s2;
+    uint32_t before_s3;
+    uint32_t after_s3;
     uint32_t sp;
     uint32_t ra;
     uint32_t v0;
@@ -145,6 +214,12 @@ typedef struct {
 } DirtyRamInsnLogEntry;
 extern DirtyRamInsnLogEntry g_dirty_ram_insn_log[DIRTY_RAM_INSN_LOG_CAP];
 extern uint64_t             g_dirty_ram_insn_log_seq;
+
+#define DIRTY_RAM_TRACE_MAX_RANGES 16
+int dirty_ram_trace_add_range(uint32_t lo, uint32_t hi);
+void dirty_ram_trace_clear_ranges(void);
+int dirty_ram_trace_range_count(void);
+int dirty_ram_trace_get_range(int slot, uint32_t *lo, uint32_t *hi);
 
 #ifdef __cplusplus
 }

@@ -73,6 +73,8 @@ static uint8_t last_sector_xa_submode;
 static uint8_t last_sector_xa_coding;
 static CDROMSectorHistoryEntry sector_history[CDROM_SECTOR_HISTORY_CAP];
 static uint64_t sector_history_seq;
+static CDROMCommandHistoryEntry command_history[CDROM_COMMAND_HISTORY_CAP];
+static uint64_t command_history_seq;
 
 /* Seek target */
 static uint8_t seek_min, seek_sec, seek_sect;
@@ -216,6 +218,43 @@ static void trace_cdrom(uint8_t kind, uint32_t addr, uint32_t val, uint8_t width
     e->reading = (uint8_t)reading;
     e->read_cmd = read_cmd;
     e->read_delay = read_delay;
+}
+
+static void record_command_history(uint8_t kind, uint8_t cmd,
+                                   const uint8_t* params, int count) {
+    CDROMCommandHistoryEntry *e =
+        &command_history[command_history_seq % CDROM_COMMAND_HISTORY_CAP];
+    memset(e, 0, sizeof(*e));
+    e->seq = command_history_seq++;
+    e->frame = (uint32_t)s_frame_count;
+    e->func = g_debug_current_func_addr;
+    e->pc = g_debug_last_store_pc;
+    e->i_stat = i_stat;
+    e->kind = kind;
+    e->cmd = cmd;
+    if (count < 0) count = 0;
+    if (count > PARAM_FIFO_SIZE) count = PARAM_FIFO_SIZE;
+    e->param_count = (uint8_t)count;
+    if (params && count > 0) {
+        memcpy(e->params, params, (size_t)count);
+    }
+    e->stat = stat_reg;
+    e->request = request_reg;
+    e->irq_enable = irq_enable;
+    e->irq_flag = irq_flag;
+    e->mode = mode_reg;
+    e->seek_min = seek_min;
+    e->seek_sec = seek_sec;
+    e->seek_sect = seek_sect;
+    e->read_min = (uint8_t)read_min;
+    e->read_sec = (uint8_t)read_sec;
+    e->read_sect = (uint8_t)read_sect;
+    e->read_cmd = read_cmd;
+    e->reading = (uint8_t)(reading ? 1 : 0);
+    e->pending_cmd = pending.cmd;
+    e->pending_pending = (uint8_t)(pending.pending ? 1 : 0);
+    e->queued_cmd = queued_cmd.cmd;
+    e->queued_pending = (uint8_t)(queued_cmd.pending ? 1 : 0);
 }
 
 static int xa_is_audio_realtime(const CDROMSectorDelivery *d) {
@@ -689,10 +728,16 @@ static void queue_or_exec_command(uint8_t cmd) {
     queued_cmd.pending = 1;
     param_count = 0;
     trace_cdrom('Q', 0, cmd, 0);
+    record_command_history('Q', cmd, queued_cmd.params, queued_cmd.param_count);
 }
 
 static void exec_command(uint8_t cmd) {
     trace_cdrom('C', 0, cmd, 0);
+    uint8_t cmd_params[PARAM_FIFO_SIZE];
+    int cmd_param_count = param_count;
+    if (cmd_param_count < 0) cmd_param_count = 0;
+    if (cmd_param_count > PARAM_FIFO_SIZE) cmd_param_count = PARAM_FIFO_SIZE;
+    memcpy(cmd_params, param_fifo, (size_t)cmd_param_count);
     response_clear();
 
     switch (cmd) {
@@ -941,6 +986,7 @@ static void exec_command(uint8_t cmd) {
     /* Fire the CDROM IRQ for the immediate response.
      * Delayed responses (pending) fire from process_pending(). */
     fire_cdrom_irq();
+    record_command_history('C', cmd, cmd_params, cmd_param_count);
 }
 
 static void process_pending(uint32_t cycles) {
@@ -1022,11 +1068,18 @@ static void process_pending(uint32_t cycles) {
 static void process_read_stream(uint32_t cycles) {
     if (!reading) return;
 
+    /*
+     * The controller exposes one sector buffer and one pending interrupt at a
+     * time. Do not let the stream timer accumulate a backlog while software is
+     * still draining or acknowledging the previous sector, or games that issue
+     * a Pause/next command from their data-ready callback can observe an extra
+     * immediate sector.
+     */
+    if (sector_available || irq_flag != 0) return;
+
     if (cycles > 0) {
         read_delay -= (int)cycles;
     }
-
-    if (sector_available || irq_flag != 0) return;
 
     if (read_delay <= 0) {
         deliver_read_sector();
@@ -1078,6 +1131,7 @@ void cdrom_init(const char* cue_path) {
 
     stat_reg = has_disc() ? CDSTAT_MOTOR : CDSTAT_SHELL;
     cdrom_debug_clear_trace();
+    cdrom_debug_clear_command_history();
     trace_cdrom('N', 0, has_disc() ? 1u : 0u, 0);
 }
 
@@ -1269,6 +1323,16 @@ uint64_t cdrom_debug_get_trace(const CDROMTraceEntry** out_entries) {
 void cdrom_debug_clear_trace(void) {
     memset(cdrom_trace, 0, sizeof(cdrom_trace));
     cdrom_trace_seq = 0;
+}
+
+uint64_t cdrom_debug_get_command_history(const CDROMCommandHistoryEntry** out_entries) {
+    if (out_entries) *out_entries = command_history;
+    return command_history_seq;
+}
+
+void cdrom_debug_clear_command_history(void) {
+    memset(command_history, 0, sizeof(command_history));
+    command_history_seq = 0;
 }
 
 uint64_t cdrom_debug_get_sector_history(const CDROMSectorHistoryEntry** out_entries) {

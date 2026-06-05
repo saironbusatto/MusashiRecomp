@@ -377,6 +377,13 @@ typedef struct {
     uint32_t current_tcb;
     uint32_t current_tcb_state;
     uint32_t current_tcb_cause;
+    uint32_t saved_s0;
+    uint32_t saved_s1;
+    uint32_t saved_s2;
+    uint32_t saved_s3;
+    uint32_t saved_sp;
+    uint32_t saved_ra;
+    uint32_t saved_pc;
     uint32_t sr;
     uint32_t epc;
     uint32_t istat;
@@ -567,6 +574,16 @@ void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t 
     e->current_tcb        = (cpu && e->tcbh_ptr) ? trace_read_word(cpu, e->tcbh_ptr) : 0;
     e->current_tcb_state  = (cpu && e->current_tcb) ? trace_read_word(cpu, e->current_tcb) : 0;
     e->current_tcb_cause  = (cpu && e->current_tcb) ? trace_read_word(cpu, e->current_tcb + 152u) : 0;
+    if (cpu && e->current_tcb) {
+        uint32_t save = e->current_tcb + 8u;
+        e->saved_s0 = trace_read_word(cpu, save + 64u);
+        e->saved_s1 = trace_read_word(cpu, save + 68u);
+        e->saved_s2 = trace_read_word(cpu, save + 72u);
+        e->saved_s3 = trace_read_word(cpu, save + 76u);
+        e->saved_sp = trace_read_word(cpu, save + 116u);
+        e->saved_ra = trace_read_word(cpu, save + 124u);
+        e->saved_pc = trace_read_word(cpu, save + 128u);
+    }
     e->queue_base = cpu ? trace_read_word(cpu, 0x00000100u) : 0;
     for (size_t q = 0; q < RESTORE_TRACE_QUEUE_COUNT; q++) {
         uint32_t queue_addr = e->queue_base + (uint32_t)(q * 8u);
@@ -854,10 +871,22 @@ typedef struct {
     uint32_t addr;
     uint32_t phys;
     uint32_t ra;
+    uint32_t sp;
+    uint32_t v0;
+    uint32_t v1;
     uint32_t a0;
     uint32_t a1;
+    uint32_t a2;
+    uint32_t a3;
+    uint32_t t0;
+    uint32_t t1;
+    uint32_t t2;
+    uint32_t s0;
+    uint32_t s1;
+    uint32_t s2;
+    uint32_t s3;
     uint32_t frame;
-    uint32_t pad;
+    uint32_t current_func;
 } UnknownDispatchEntry;
 static UnknownDispatchEntry s_unknown_ring[UNKNOWN_DISPATCH_CAP];
 static uint64_t s_unknown_seq = 0;
@@ -875,7 +904,13 @@ static UnknownUniqueEntry s_unknown_unique[UNKNOWN_UNIQUE_CAP];
 static int s_unknown_unique_count = 0;
 
 void psx_unknown_dispatch_record(uint32_t addr, uint32_t phys,
-                                  uint32_t ra, uint32_t a0, uint32_t a1)
+                                  uint32_t ra, uint32_t sp,
+                                  uint32_t v0, uint32_t v1,
+                                  uint32_t a0, uint32_t a1,
+                                  uint32_t a2, uint32_t a3,
+                                  uint32_t t0, uint32_t t1, uint32_t t2,
+                                  uint32_t s0, uint32_t s1,
+                                  uint32_t s2, uint32_t s3)
 {
     uint64_t seq = s_unknown_seq++;
     UnknownDispatchEntry *e = &s_unknown_ring[seq & (UNKNOWN_DISPATCH_CAP - 1u)];
@@ -883,9 +918,22 @@ void psx_unknown_dispatch_record(uint32_t addr, uint32_t phys,
     e->addr  = addr;
     e->phys  = phys;
     e->ra    = ra;
+    e->sp    = sp;
+    e->v0    = v0;
+    e->v1    = v1;
     e->a0    = a0;
     e->a1    = a1;
+    e->a2    = a2;
+    e->a3    = a3;
+    e->t0    = t0;
+    e->t1    = t1;
+    e->t2    = t2;
+    e->s0    = s0;
+    e->s1    = s1;
+    e->s2    = s2;
+    e->s3    = s3;
     e->frame = (uint32_t)s_frame_count;
+    e->current_func = g_debug_current_func_addr;
     /* Per-target count (linear probe). */
     uint32_t idx = (phys >> 2) % UNKNOWN_UNIQUE_CAP;
     for (int i = 0; i < UNKNOWN_UNIQUE_CAP; i++) {
@@ -1728,16 +1776,17 @@ static int is_chain_epilogue(uint32_t phys) {
  * psx_dispatch (e.g. shell -> firstfile -> bu_read -> card_read).  The shadow
  * stack is owned by function_trace_record and is only meaningful for
  * indirect dispatches; direct calls return through the native C stack. */
-void debug_server_log_call_entry(uint32_t func_addr) {
+static void debug_server_log_call_entry_with_cpu(uint32_t func_addr, CPUState *cpu) {
 #ifdef PSX_NO_DEBUG_TOOLS
     /* Hottest call site in the binary — called at the top of every
      * recompiled function. Early-return makes it a 1-instruction
      * function-call cost; the compiler will likely PLT it through. */
     (void)func_addr;
+    (void)cpu;
     return;
 #endif
     s_fn_direct_seen++;
-    if (!debug_cpu_ptr) {
+    if (!cpu) {
         s_fn_direct_no_cpu++;
         return;
     }
@@ -1751,19 +1800,27 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     e->seq             = s_fn_entry_seq;
     e->paired_exit_seq = 0;
     e->func_addr       = func_addr;
-    e->ra              = debug_cpu_ptr->gpr[31];
-    e->a0              = debug_cpu_ptr->gpr[4];
-    e->a1              = debug_cpu_ptr->gpr[5];
-    e->a2              = debug_cpu_ptr->gpr[6];
-    e->a3              = debug_cpu_ptr->gpr[7];
-    e->t1              = debug_cpu_ptr->gpr[9];
-    e->s0              = debug_cpu_ptr->gpr[16];
-    e->s1              = debug_cpu_ptr->gpr[17];
-    e->s2              = debug_cpu_ptr->gpr[18];
-    e->s3              = debug_cpu_ptr->gpr[19];
+    e->ra              = cpu->gpr[31];
+    e->a0              = cpu->gpr[4];
+    e->a1              = cpu->gpr[5];
+    e->a2              = cpu->gpr[6];
+    e->a3              = cpu->gpr[7];
+    e->t1              = cpu->gpr[9];
+    e->s0              = cpu->gpr[16];
+    e->s1              = cpu->gpr[17];
+    e->s2              = cpu->gpr[18];
+    e->s3              = cpu->gpr[19];
     e->depth           = (uint32_t)s_fn_stack_top;
     e->frame           = (uint32_t)s_frame_count;
     s_fn_entry_seq++;
+}
+
+void debug_server_log_call_entry(uint32_t func_addr) {
+    debug_server_log_call_entry_with_cpu(func_addr, debug_cpu_ptr);
+}
+
+void debug_server_log_call_entry_cpu(uint32_t func_addr, CPUState *cpu) {
+    debug_server_log_call_entry_with_cpu(func_addr, cpu);
 }
 
 static void exception_trace_record(uint32_t kind, uint32_t func_addr, CPUState *cpu)
@@ -2075,6 +2132,157 @@ static void handle_dirty_flow_log(int id, const char *json)
     free(out);
 }
 
+static void handle_dirty_exit_log(int id, const char *json)
+{
+    char buf[32];
+    uint32_t entry_lo = 0, entry_hi = 0xFFFFFFFFu;
+    uint32_t target_lo = 0, target_hi = 0xFFFFFFFFu;
+    uint32_t reason = 0;
+    int has_reason = 0;
+    if (json_get_str(json, "entry_lo", buf, sizeof(buf))) entry_lo = hex_to_u32(buf);
+    if (json_get_str(json, "entry_hi", buf, sizeof(buf))) entry_hi = hex_to_u32(buf);
+    if (json_get_str(json, "target_lo", buf, sizeof(buf))) target_lo = hex_to_u32(buf);
+    if (json_get_str(json, "target_hi", buf, sizeof(buf))) target_hi = hex_to_u32(buf);
+    if (json_get_str(json, "reason", buf, sizeof(buf))) {
+        reason = hex_to_u32(buf);
+        has_reason = 1;
+    }
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > (int)DIRTY_RAM_EXIT_LOG_CAP) count = DIRTY_RAM_EXIT_LOG_CAP;
+
+    uint64_t total = g_dirty_ram_exit_log_seq;
+    uint64_t avail = (total < DIRTY_RAM_EXIT_LOG_CAP) ? total : DIRTY_RAM_EXIT_LOG_CAP;
+    const size_t BUF_SZ = 16 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) {
+        send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"oom\"}\n", id);
+        return;
+    }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+                    "\"entry_lo\":\"0x%08X\",\"entry_hi\":\"0x%08X\","
+                    "\"target_lo\":\"0x%08X\",\"target_hi\":\"0x%08X\","
+                    "\"has_reason\":%d,\"reason\":%u,\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)avail,
+                    entry_lo, entry_hi, target_lo, target_hi,
+                    has_reason ? 1 : 0, reason);
+    int emitted = 0;
+    for (uint64_t i = 0; i < avail && emitted < count; i++) {
+        uint64_t seq = total - 1 - i;
+        DirtyRamExitLogEntry *e =
+            &g_dirty_ram_exit_log[seq & (DIRTY_RAM_EXIT_LOG_CAP - 1u)];
+        if (e->entry < entry_lo || e->entry >= entry_hi) continue;
+        if (e->target < target_lo || e->target >= target_hi) continue;
+        if (has_reason && e->reason != reason) continue;
+        if (pos > BUF_SZ - 1024) break;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"entry\":\"0x%08X\",\"pc\":\"0x%08X\","
+                        "\"target\":\"0x%08X\",\"stop_addr\":\"0x%08X\","
+                        "\"reason\":%u,\"insns\":%u,"
+                        "\"s0\":\"0x%08X\",\"s1\":\"0x%08X\","
+                        "\"s2\":\"0x%08X\",\"s3\":\"0x%08X\","
+                        "\"sp\":\"0x%08X\",\"ra\":\"0x%08X\","
+                        "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
+                        "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                        "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+                        "\"current_tcb\":\"0x%08X\",\"frame\":%u,"
+                        "\"handled\":%u,\"in_exception\":%u}",
+                        emitted == 0 ? "" : ",",
+                        (unsigned long long)e->seq, e->entry, e->pc,
+                        e->target, e->stop_addr, e->reason, e->insns,
+                        e->s0, e->s1, e->s2, e->s3, e->sp, e->ra,
+                        e->v0, e->v1, e->a0, e->a1, e->a2, e->a3,
+                        e->current_tcb, e->frame,
+                        (unsigned)e->handled, (unsigned)e->in_exception);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%d}\n", emitted);
+    debug_server_send_line(out);
+    free(out);
+}
+
+static void handle_dirty_call_log(int id, const char *json)
+{
+    char buf[32];
+    uint32_t pc_lo = 0, pc_hi = 0xFFFFFFFFu;
+    uint32_t target_lo = 0, target_hi = 0xFFFFFFFFu;
+    if (json_get_str(json, "pc_lo", buf, sizeof(buf))) pc_lo = hex_to_u32(buf);
+    if (json_get_str(json, "pc_hi", buf, sizeof(buf))) pc_hi = hex_to_u32(buf);
+    if (json_get_str(json, "target_lo", buf, sizeof(buf))) target_lo = hex_to_u32(buf);
+    if (json_get_str(json, "target_hi", buf, sizeof(buf))) target_hi = hex_to_u32(buf);
+    int changed_only = json_get_int(json, "changed_only", 0);
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > (int)DIRTY_RAM_CALL_LOG_CAP) count = DIRTY_RAM_CALL_LOG_CAP;
+
+    uint64_t total = g_dirty_ram_call_log_seq;
+    uint64_t avail = (total < DIRTY_RAM_CALL_LOG_CAP) ? total : DIRTY_RAM_CALL_LOG_CAP;
+    const size_t BUF_SZ = 16 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) {
+        send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"oom\"}\n", id);
+        return;
+    }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%llu,"
+                    "\"pc_lo\":\"0x%08X\",\"pc_hi\":\"0x%08X\","
+                    "\"target_lo\":\"0x%08X\",\"target_hi\":\"0x%08X\","
+                    "\"changed_only\":%d,\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)avail,
+                    pc_lo, pc_hi, target_lo, target_hi, changed_only ? 1 : 0);
+    int emitted = 0;
+    for (uint64_t i = 0; i < avail && emitted < count; i++) {
+        uint64_t seq = total - 1 - i;
+        DirtyRamCallLogEntry *e =
+            &g_dirty_ram_call_log[seq & (DIRTY_RAM_CALL_LOG_CAP - 1u)];
+        if (e->pc < pc_lo || e->pc >= pc_hi) continue;
+        if (e->target < target_lo || e->target >= target_hi) continue;
+        if (changed_only &&
+            e->before_s0 == e->after_s0 &&
+            e->before_s1 == e->after_s1 &&
+            e->before_s2 == e->after_s2 &&
+            e->before_s3 == e->after_s3) {
+            continue;
+        }
+        if (pos > BUF_SZ - 1024) break;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"pc\":\"0x%08X\","
+                        "\"target\":\"0x%08X\",\"return_pc\":\"0x%08X\","
+                        "\"before_s0\":\"0x%08X\",\"after_s0\":\"0x%08X\","
+                        "\"before_s1\":\"0x%08X\",\"after_s1\":\"0x%08X\","
+                        "\"before_s2\":\"0x%08X\",\"after_s2\":\"0x%08X\","
+                        "\"before_s3\":\"0x%08X\",\"after_s3\":\"0x%08X\","
+                        "\"before_sp\":\"0x%08X\",\"after_sp\":\"0x%08X\","
+                        "\"before_ra\":\"0x%08X\",\"after_ra\":\"0x%08X\","
+                        "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                        "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+                        "\"current_tcb\":\"0x%08X\",\"frame\":%u,"
+                        "\"defer_interrupts\":%u,\"in_exception\":%u,"
+                        "\"returned_pc_nonzero\":%u}",
+                        emitted == 0 ? "" : ",",
+                        (unsigned long long)e->seq, e->pc, e->target,
+                        e->return_pc,
+                        e->before_s0, e->after_s0,
+                        e->before_s1, e->after_s1,
+                        e->before_s2, e->after_s2,
+                        e->before_s3, e->after_s3,
+                        e->before_sp, e->after_sp,
+                        e->before_ra, e->after_ra,
+                        e->a0, e->a1, e->a2, e->a3,
+                        e->current_tcb, e->frame,
+                        (unsigned)e->defer_interrupts,
+                        (unsigned)e->in_exception,
+                        (unsigned)e->returned_pc_nonzero);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%d}\n", emitted);
+    debug_server_send_line(out);
+    free(out);
+}
+
 static void handle_dirty_insn_log(int id, const char *json)
 {
     char buf[32];
@@ -2107,12 +2315,21 @@ static void handle_dirty_insn_log(int id, const char *json)
         DirtyRamInsnLogEntry *e =
             &g_dirty_ram_insn_log[seq & (DIRTY_RAM_INSN_LOG_CAP - 1u)];
         if (e->pc < pc_lo || e->pc >= pc_hi) continue;
-        if (changed_only && e->before_s0 == e->after_s0) continue;
+        if (changed_only &&
+            e->before_s0 == e->after_s0 &&
+            e->before_s1 == e->after_s1 &&
+            e->before_s2 == e->after_s2 &&
+            e->before_s3 == e->after_s3) {
+            continue;
+        }
         if (pos > BUF_SZ - 768) break;
         pos += snprintf(out + pos, BUF_SZ - pos,
                         "%s{\"seq\":%llu,\"pc\":\"0x%08X\",\"insn\":\"0x%08X\","
                         "\"next_pc\":\"0x%08X\",\"target\":\"0x%08X\","
                         "\"before_s0\":\"0x%08X\",\"after_s0\":\"0x%08X\","
+                        "\"before_s1\":\"0x%08X\",\"after_s1\":\"0x%08X\","
+                        "\"before_s2\":\"0x%08X\",\"after_s2\":\"0x%08X\","
+                        "\"before_s3\":\"0x%08X\",\"after_s3\":\"0x%08X\","
                         "\"sp\":\"0x%08X\",\"ra\":\"0x%08X\","
                         "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
                         "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
@@ -2125,7 +2342,11 @@ static void handle_dirty_insn_log(int id, const char *json)
                         emitted == 0 ? "" : ",",
                         (unsigned long long)e->seq,
                         e->pc, e->insn, e->next_pc, e->target,
-                        e->before_s0, e->after_s0, e->sp, e->ra,
+                        e->before_s0, e->after_s0,
+                        e->before_s1, e->after_s1,
+                        e->before_s2, e->after_s2,
+                        e->before_s3, e->after_s3,
+                        e->sp, e->ra,
                         e->v0, e->v1, e->a0, e->a1, e->a2, e->a3,
                         e->t0, e->t1, e->t2,
                         e->current_tcb, e->task_ptr, e->task_mode,
@@ -2133,6 +2354,53 @@ static void handle_dirty_insn_log(int id, const char *json)
         emitted++;
     }
     pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%d}\n", emitted);
+    debug_server_send_line(out);
+    free(out);
+}
+
+static void handle_dirty_insn_add_range(int id, const char *json)
+{
+    char lo_str[32], hi_str[32];
+    if (!json_get_str(json, "lo", lo_str, sizeof(lo_str))) { send_err(id, "missing lo"); return; }
+    if (!json_get_str(json, "hi", hi_str, sizeof(hi_str))) { send_err(id, "missing hi"); return; }
+
+    uint32_t lo = hex_to_u32(lo_str);
+    uint32_t hi = hex_to_u32(hi_str);
+    if (!dirty_ram_trace_add_range(lo, hi)) {
+        send_err(id, "range add failed");
+        return;
+    }
+    send_fmt("{\"id\":%d,\"ok\":true,\"count\":%d}",
+             id, dirty_ram_trace_range_count());
+}
+
+static void handle_dirty_insn_clear_ranges(int id, const char *json)
+{
+    (void)json;
+    dirty_ram_trace_clear_ranges();
+    send_ok(id);
+}
+
+static void handle_dirty_insn_ranges(int id, const char *json)
+{
+    (void)json;
+    const size_t BUF_SZ = 2048;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) { send_err(id, "oom"); return; }
+
+    int count = dirty_ram_trace_range_count();
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"count\":%d,\"ranges\":[",
+                    id, count);
+    for (int i = 0; i < count; i++) {
+        uint32_t lo = 0, hi = 0;
+        dirty_ram_trace_get_range(i, &lo, &hi);
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "%s{\"slot\":%d,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}",
+                        i == 0 ? "" : ",", i, lo, hi);
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "]}");
     debug_server_send_line(out);
     free(out);
 }
@@ -2287,14 +2555,23 @@ static void handle_unknown_dispatch_log(int id, const char *json)
         for (int i = 0; i < tail; i++) {
             UnknownDispatchEntry *e =
                 &s_unknown_ring[(start + i) & (UNKNOWN_DISPATCH_CAP - 1u)];
-            if (pos > BUF_SZ - 256) break;
+            if (pos > BUF_SZ - 768) break;
             pos += snprintf(out + pos, BUF_SZ - pos,
                             "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"phys\":\"0x%08X\","
-                            "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
-                            "\"frame\":%u}",
+                            "\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+                            "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
+                            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                            "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+                            "\"t0\":\"0x%08X\",\"t1\":\"0x%08X\",\"t2\":\"0x%08X\","
+                            "\"s0\":\"0x%08X\",\"s1\":\"0x%08X\","
+                            "\"s2\":\"0x%08X\",\"s3\":\"0x%08X\","
+                            "\"current_func\":\"0x%08X\",\"frame\":%u}",
                             i == 0 ? "" : ",",
                             (unsigned long long)e->seq,
-                            e->addr, e->phys, e->ra, e->a0, e->a1, e->frame);
+                            e->addr, e->phys, e->ra, e->sp, e->v0, e->v1,
+                            e->a0, e->a1, e->a2, e->a3, e->t0, e->t1, e->t2,
+                            e->s0, e->s1, e->s2, e->s3, e->current_func,
+                            e->frame);
         }
         pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
         debug_server_send_line(out);
@@ -2548,13 +2825,20 @@ static void emit_restore_entry(const RestoreTraceEntry *e, int first)
              "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\",\"a0\":\"0x%08X\","
              "\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
              "\"s0\":\"0x%08X\",\"s1\":\"0x%08X\",\"sr\":\"0x%08X\","
+             "\"saved_s0\":\"0x%08X\",\"saved_s1\":\"0x%08X\","
+             "\"saved_s2\":\"0x%08X\",\"saved_s3\":\"0x%08X\","
+             "\"saved_sp\":\"0x%08X\",\"saved_ra\":\"0x%08X\","
+             "\"saved_pc\":\"0x%08X\","
              "\"epc\":\"0x%08X\",\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
              "\"frame\":%u,\"in_exc\":%u}",
              first ? "" : ",",
              (unsigned long long)e->seq, e->kind, restore_kind_name(e->kind),
              e->jmp_val, e->target_pc, e->cpu_pc, e->func, e->last_store_pc,
              e->byte_seq, e->ra, e->sp, e->v0, e->v1, e->a0, e->a1, e->a2,
-             e->a3, e->s0, e->s1, e->sr, e->epc, e->istat, e->imask,
+             e->a3, e->s0, e->s1, e->sr,
+             e->saved_s0, e->saved_s1, e->saved_s2, e->saved_s3,
+             e->saved_sp, e->saved_ra, e->saved_pc,
+             e->epc, e->istat, e->imask,
              e->frame, (unsigned)e->in_exception);
 }
 
@@ -2570,13 +2854,20 @@ static size_t append_restore_entry(char *buf, size_t pos, size_t cap,
                     "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\",\"a0\":\"0x%08X\","
                     "\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
                     "\"s0\":\"0x%08X\",\"s1\":\"0x%08X\",\"sr\":\"0x%08X\","
+                    "\"saved_s0\":\"0x%08X\",\"saved_s1\":\"0x%08X\","
+                    "\"saved_s2\":\"0x%08X\",\"saved_s3\":\"0x%08X\","
+                    "\"saved_sp\":\"0x%08X\",\"saved_ra\":\"0x%08X\","
+                    "\"saved_pc\":\"0x%08X\","
                     "\"epc\":\"0x%08X\",\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
                     "\"frame\":%u,\"in_exc\":%u}",
                     first ? "" : ",",
                     (unsigned long long)e->seq, e->kind, restore_kind_name(e->kind),
                     e->jmp_val, e->target_pc, e->cpu_pc, e->func, e->last_store_pc,
                     e->byte_seq, e->ra, e->sp, e->v0, e->v1, e->a0, e->a1, e->a2,
-                    e->a3, e->s0, e->s1, e->sr, e->epc, e->istat, e->imask,
+                    e->a3, e->s0, e->s1, e->sr,
+                    e->saved_s0, e->saved_s1, e->saved_s2, e->saved_s3,
+                    e->saved_sp, e->saved_ra, e->saved_pc,
+                    e->epc, e->istat, e->imask,
                     e->frame, (unsigned)e->in_exception);
     return pos;
 }
@@ -3590,6 +3881,108 @@ static void handle_irq_state(int id, const char *json)
              dma_get_dpcr(), dma_get_dicr());
 }
 
+static const char *irq_check_reason_name(uint32_t reason)
+{
+    switch (reason) {
+        case 1: return "in_exception";
+        case 2: return "call_depth";
+        case 3: return "cooldown";
+        case 4: return "ie_disabled";
+        case 5: return "im2_disabled";
+        case 6: return "invalid_resume_pc";
+        case 7: return "delivered";
+        default: return "unknown";
+    }
+}
+
+static void handle_irq_check_log(int id, const char *json)
+{
+    char buf32[32];
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 4096) count = 4096;
+
+    uint32_t pc_lo = 0, pc_hi = 0xFFFFFFFFu;
+    if (json_get_str(json, "pc_lo", buf32, sizeof(buf32))) pc_lo = hex_to_u32(buf32);
+    if (json_get_str(json, "pc_hi", buf32, sizeof(buf32))) pc_hi = hex_to_u32(buf32);
+
+    int reason_filter = -1;
+    if (json_get_str(json, "reason", buf32, sizeof(buf32))) {
+        reason_filter = (int)strtol(buf32, NULL, 0);
+    }
+
+    uint64_t total = g_psx_irq_check_trace_seq;
+    uint64_t oldest = (total > PSX_IRQ_CHECK_TRACE_CAP)
+                    ? total - PSX_IRQ_CHECK_TRACE_CAP : 0;
+
+    size_t cap = 256u + (size_t)count * 320u;
+    char *out = (char *)malloc(cap);
+    if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, cap - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"oldest\":%llu,"
+                    "\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)oldest);
+
+    int emitted = 0;
+    int first = 1;
+    for (uint64_t n = 0; n < total - oldest && emitted < count && pos < cap - 320u; n++) {
+        uint64_t seq = total - 1u - n;
+        if (seq < oldest) break;
+        const PsxIrqCheckTraceEntry *e =
+            &g_psx_irq_check_trace[seq & (PSX_IRQ_CHECK_TRACE_CAP - 1u)];
+        if (e->seq != seq) continue;
+        if (e->resume_pc < pc_lo || e->resume_pc >= pc_hi) continue;
+        if (reason_filter >= 0 && e->reason != (uint32_t)reason_filter) continue;
+        pos += snprintf(out + pos, cap - pos,
+                        "%s{\"seq\":%llu,\"frame\":%u,"
+                        "\"resume_pc\":\"0x%08X\",\"i_stat\":\"0x%08X\","
+                        "\"i_mask\":\"0x%08X\",\"sr\":\"0x%08X\","
+                        "\"cause\":\"0x%08X\",\"call_depth\":%u,"
+                        "\"reason\":%u,\"name\":\"%s\"}",
+                        first ? "" : ",",
+                        (unsigned long long)e->seq, e->frame,
+                        e->resume_pc, e->i_stat, e->i_mask, e->sr,
+                        e->cause, e->call_depth, e->reason,
+                        irq_check_reason_name(e->reason));
+        first = 0;
+        emitted++;
+    }
+    pos += snprintf(out + pos, cap - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(out);
+    free(out);
+}
+
+void debug_server_freeze_dump_irq_check_json(FILE *f, uint32_t max_count)
+{
+    if (!f) return;
+    uint64_t total = g_psx_irq_check_trace_seq;
+    uint64_t avail = (total < PSX_IRQ_CHECK_TRACE_CAP)
+                   ? total : PSX_IRQ_CHECK_TRACE_CAP;
+    if ((uint64_t)max_count > avail) max_count = (uint32_t)avail;
+    if (max_count == 0) { fputs("[]", f); return; }
+
+    uint64_t start = total - (uint64_t)max_count;
+    fputc('[', f);
+    for (uint32_t i = 0; i < max_count; i++) {
+        uint64_t seq = start + (uint64_t)i;
+        const PsxIrqCheckTraceEntry *e =
+            &g_psx_irq_check_trace[seq & (PSX_IRQ_CHECK_TRACE_CAP - 1u)];
+        fprintf(f,
+                "%s{\"seq\":%llu,\"frame\":%u,"
+                "\"resume_pc\":\"0x%08X\",\"i_stat\":\"0x%08X\","
+                "\"i_mask\":\"0x%08X\",\"sr\":\"0x%08X\","
+                "\"cause\":\"0x%08X\",\"call_depth\":%u,"
+                "\"reason\":%u,\"name\":\"%s\"}",
+                i ? "," : "",
+                (unsigned long long)e->seq, e->frame,
+                e->resume_pc, e->i_stat, e->i_mask, e->sr,
+                e->cause, e->call_depth, e->reason,
+                irq_check_reason_name(e->reason));
+    }
+    fputc(']', f);
+}
+
 static void handle_timers_state(int id, const char *json)
 {
     (void)json;
@@ -3800,6 +4193,79 @@ static void handle_cdrom_trace_clear(int id, const char *json)
     send_ok(id);
 }
 
+static void handle_cdrom_command_history_clear(int id, const char *json)
+{
+    (void)json;
+    cdrom_debug_clear_command_history();
+    send_ok(id);
+}
+
+static const char *cdrom_command_kind_name(uint8_t kind)
+{
+    switch (kind) {
+    case 'C': return "exec";
+    case 'Q': return "queue";
+    default: return "unknown";
+    }
+}
+
+static void handle_cdrom_command_history(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 128);
+    if (count < 1) count = 1;
+    if (count > CDROM_COMMAND_HISTORY_CAP) count = CDROM_COMMAND_HISTORY_CAP;
+
+    const CDROMCommandHistoryEntry *entries = NULL;
+    uint64_t total = cdrom_debug_get_command_history(&entries);
+    uint64_t oldest = (total > CDROM_COMMAND_HISTORY_CAP)
+        ? total - CDROM_COMMAND_HISTORY_CAP : 0;
+    uint64_t start = (total > (uint64_t)count) ? total - (uint64_t)count : 0;
+    if (start < oldest) start = oldest;
+
+    size_t bufsz = 256u + (size_t)count * 520u;
+    char *buf = (char *)malloc(bufsz);
+    if (!buf) { send_err(id, "oom"); return; }
+
+    size_t pos = 0;
+    int emitted = 0;
+    pos += snprintf(buf + pos, bufsz - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"oldest\":%llu,\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)oldest);
+    for (uint64_t seq = start; seq < total && pos < bufsz - 520; seq++) {
+        const CDROMCommandHistoryEntry *e =
+            &entries[seq % CDROM_COMMAND_HISTORY_CAP];
+        if (e->seq != seq) continue;
+
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s{\"seq\":%llu,\"kind\":\"%s\",\"cmd\":\"0x%02X\","
+                        "\"params_len\":%u,\"params\":\"",
+                        emitted ? "," : "",
+                        (unsigned long long)e->seq,
+                        cdrom_command_kind_name(e->kind),
+                        e->cmd, e->param_count);
+        append_hex_bytes(buf, bufsz, &pos, e->params, e->param_count);
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "\",\"frame\":%u,\"func\":\"0x%08X\",\"pc\":\"0x%08X\","
+                        "\"i_stat\":\"0x%08X\",\"stat\":\"0x%02X\","
+                        "\"request\":\"0x%02X\",\"irq_enable\":\"0x%02X\","
+                        "\"irq_flag\":\"0x%02X\",\"mode\":\"0x%02X\","
+                        "\"seek\":[%u,%u,%u],\"read\":[%u,%u,%u],"
+                        "\"read_cmd\":\"0x%02X\",\"reading\":%u,"
+                        "\"pending_cmd\":\"0x%02X\",\"pending\":%u,"
+                        "\"queued_cmd\":\"0x%02X\",\"queued\":%u}",
+                        e->frame, e->func, e->pc, e->i_stat,
+                        e->stat, e->request, e->irq_enable, e->irq_flag,
+                        e->mode, e->seek_min, e->seek_sec, e->seek_sect,
+                        e->read_min, e->read_sec, e->read_sect,
+                        e->read_cmd, e->reading, e->pending_cmd,
+                        e->pending_pending, e->queued_cmd, e->queued_pending);
+        emitted++;
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
+}
+
 static void handle_cdrom_trace_dump(int id, const char *json)
 {
     int count = json_get_int(json, "count", 256);
@@ -3865,6 +4331,17 @@ static const char *dma_trace_kind_name(uint32_t kind)
     }
 }
 
+static void append_hex_word_array(char *buf, size_t bufsz, size_t *pos,
+                                  const uint32_t *words, uint32_t count)
+{
+    *pos += snprintf(buf + *pos, bufsz - *pos, "[");
+    for (uint32_t i = 0; i < count && *pos < bufsz - 16; i++) {
+        *pos += snprintf(buf + *pos, bufsz - *pos,
+                         "%s\"0x%08X\"", i ? "," : "", words[i]);
+    }
+    *pos += snprintf(buf + *pos, bufsz - *pos, "]");
+}
+
 static void handle_dma_state(int id, const char *json)
 {
     (void)json;
@@ -3898,6 +4375,95 @@ static void handle_dma_trace_clear(int id, const char *json)
     (void)json;
     dma_debug_clear_trace();
     send_ok(id);
+}
+
+static void handle_dma_cdrom_history_clear(int id, const char *json)
+{
+    (void)json;
+    dma_debug_clear_cdrom_history();
+    send_ok(id);
+}
+
+static void handle_dma_cdrom_history(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > DMA_CDROM_HISTORY_CAP) count = DMA_CDROM_HISTORY_CAP;
+
+    int filter_lba = -1;
+    char lba_str[32];
+    if (json_get_str(json, "lba", lba_str, sizeof(lba_str))) {
+        filter_lba = (int)hex_to_u32(lba_str);
+    }
+
+    const DMACDROMHistoryEntry *entries = NULL;
+    uint64_t total = dma_debug_get_cdrom_history(&entries);
+    uint64_t oldest = (total > DMA_CDROM_HISTORY_CAP)
+        ? total - DMA_CDROM_HISTORY_CAP : 0;
+    uint64_t start = (total > (uint64_t)count) ? total - (uint64_t)count : 0;
+    if (start < oldest) start = oldest;
+
+    size_t bufsz = 256u + (size_t)count * 1150u;
+    char *buf = (char *)malloc(bufsz);
+    if (!buf) { send_err(id, "oom"); return; }
+
+    size_t pos = 0;
+    int emitted = 0;
+    pos += snprintf(buf + pos, bufsz - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,"
+                    "\"oldest\":%llu,\"entries\":[",
+                    id, (unsigned long long)total,
+                    (unsigned long long)oldest);
+
+    for (uint64_t seq = start; seq < total && pos < bufsz - 1150; seq++) {
+        const DMACDROMHistoryEntry *e =
+            &entries[seq % DMA_CDROM_HISTORY_CAP];
+        if (e->seq != seq) continue;
+        if (filter_lba >= 0 && e->lba != filter_lba) continue;
+
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s{\"seq\":%llu,\"frame_start\":%u,"
+                        "\"frame_end\":%u,\"start_addr\":\"0x%06X\","
+                        "\"final_addr\":\"0x%06X\",\"requested_words\":%u,"
+                        "\"moved_words\":%u,\"bcr\":\"0x%08X\","
+                        "\"chcr\":\"0x%08X\",\"dpcr\":\"0x%08X\","
+                        "\"dicr_start\":\"0x%08X\",\"dicr_end\":\"0x%08X\","
+                        "\"i_stat_start\":\"0x%08X\","
+                        "\"i_stat_end\":\"0x%08X\",\"func\":\"0x%08X\","
+                        "\"pc\":\"0x%08X\",\"lba\":%d,"
+                        "\"sector_size\":%d,\"mode\":\"0x%02X\","
+                        "\"sector_read_pos_start\":%d,"
+                        "\"sector_read_pos_end\":%d,"
+                        "\"sector_available_start\":%u,"
+                        "\"sector_available_end\":%u,\"completed\":%u,"
+                        "\"first_words\":",
+                        emitted ? "," : "",
+                        (unsigned long long)e->seq,
+                        e->frame_start, e->frame_end,
+                        e->start_addr, e->final_addr,
+                        e->requested_words, e->moved_words,
+                        e->bcr, e->chcr, e->dpcr,
+                        e->dicr_start, e->dicr_end,
+                        e->i_stat_start, e->i_stat_end,
+                        e->func, e->pc, e->lba,
+                        e->sector_size, e->mode,
+                        e->sector_read_pos_start,
+                        e->sector_read_pos_end,
+                        e->sector_available_start,
+                        e->sector_available_end,
+                        e->completed);
+        append_hex_word_array(buf, bufsz, &pos,
+                              e->first_words, e->first_count);
+        pos += snprintf(buf + pos, bufsz - pos, ",\"last_words\":");
+        append_hex_word_array(buf, bufsz, &pos,
+                              e->last_words, e->last_count);
+        pos += snprintf(buf + pos, bufsz - pos, "}");
+        emitted++;
+    }
+
+    pos += snprintf(buf + pos, bufsz - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
 }
 
 static void handle_dma_trace_dump(int id, const char *json)
@@ -8210,6 +8776,9 @@ void debug_server_freeze_dump_dirty_insn_json(FILE *f, uint32_t max_count)
             "%s{\"seq\":%llu,\"pc\":\"0x%08X\",\"insn\":\"0x%08X\","
             "\"next_pc\":\"0x%08X\",\"target\":\"0x%08X\","
             "\"before_s0\":\"0x%08X\",\"after_s0\":\"0x%08X\","
+            "\"before_s1\":\"0x%08X\",\"after_s1\":\"0x%08X\","
+            "\"before_s2\":\"0x%08X\",\"after_s2\":\"0x%08X\","
+            "\"before_s3\":\"0x%08X\",\"after_s3\":\"0x%08X\","
             "\"sp\":\"0x%08X\",\"ra\":\"0x%08X\","
             "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
             "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
@@ -8222,6 +8791,9 @@ void debug_server_freeze_dump_dirty_insn_json(FILE *f, uint32_t max_count)
             (unsigned long long)e->seq, e->pc, e->insn,
             e->next_pc, e->target,
             e->before_s0, e->after_s0,
+            e->before_s1, e->after_s1,
+            e->before_s2, e->after_s2,
+            e->before_s3, e->after_s3,
             e->sp, e->ra,
             e->v0, e->v1,
             e->a0, e->a1,
@@ -8295,16 +8867,21 @@ static const CmdEntry s_commands[] = {
     { "mem_words",         handle_mem_words },
     { "vram_peek",         handle_vram_peek },
     { "irq_state",         handle_irq_state },
+    { "irq_check_log",     handle_irq_check_log },
     { "timers_state",      handle_timers_state },
     { "cdrom_state",       handle_cdrom_state },
     { "cdrom_sector_dump", handle_cdrom_sector_dump },
     { "cdrom_sector_history", handle_cdrom_sector_history },
     { "cdrom_sector_history_clear", handle_cdrom_sector_history_clear },
+    { "cdrom_command_history", handle_cdrom_command_history },
+    { "cdrom_command_history_clear", handle_cdrom_command_history_clear },
     { "cdrom_trace_dump",  handle_cdrom_trace_dump },
     { "cdrom_trace_clear", handle_cdrom_trace_clear },
     { "dma_state",         handle_dma_state },
     { "dma_trace_dump",    handle_dma_trace_dump },
     { "dma_trace_clear",   handle_dma_trace_clear },
+    { "dma_cdrom_history", handle_dma_cdrom_history },
+    { "dma_cdrom_history_clear", handle_dma_cdrom_history_clear },
     { "sio_state",         handle_sio_state },
     { "mc_status",         handle_mc_status },
     { "spu_status",        handle_spu_status },
@@ -8339,7 +8916,12 @@ static const CmdEntry s_commands[] = {
     { "dirty_ram_unsupported", handle_dirty_ram_unsupported },
     { "dirty_block_log",   handle_dirty_block_log },
     { "dirty_flow_log",    handle_dirty_flow_log },
+    { "dirty_exit_log",    handle_dirty_exit_log },
+    { "dirty_call_log",    handle_dirty_call_log },
     { "dirty_insn_log",    handle_dirty_insn_log },
+    { "dirty_insn_add_range", handle_dirty_insn_add_range },
+    { "dirty_insn_clear_ranges", handle_dirty_insn_clear_ranges },
+    { "dirty_insn_ranges", handle_dirty_insn_ranges },
     { "fntrace_arm",       handle_fntrace_arm },
     { "fntrace_arm_clear", handle_fntrace_arm_clear },
     { "fntrace_armed",     handle_fntrace_armed },

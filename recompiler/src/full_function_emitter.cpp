@@ -354,7 +354,7 @@ bool FullFunctionEmitter::emit_function(
                 out += fmt::format("    psx_advance_cycles({}u);\n", bcyc);
                 out += "#endif\n";
             }
-            out += "    psx_check_interrupts(cpu);\n";
+            out += fmt::format("    psx_check_interrupts_at(cpu, 0x{:08X}u);\n", addr);
             if (should_probe_pc(addr)) {
                 out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n", addr);
             }
@@ -416,7 +416,7 @@ bool FullFunctionEmitter::emit_function(
                             else
                                 out += "    return;\n";
                         } else {
-                            out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
+                            out += fmt::format("    cpu->pc = cpu->gpr[{}]; psx_rfe_return(cpu); return;\n",
                                                static_cast<int>(rs));
                         }
                     } else {
@@ -523,6 +523,7 @@ bool FullFunctionEmitter::emit_function(
                     uint32_t return_addr = relocate_ra(addr + 8);
                     out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
                     out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
+                    out += "    if (cpu->pc != 0) return;\n";
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", return_addr);
                 } else if (kind == "jalr") {
                     uint32_t ds_addr = addr + 4;
@@ -548,6 +549,7 @@ bool FullFunctionEmitter::emit_function(
                     }
                     out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
                                        static_cast<int>(rs));
+                    out += "    if (cpu->pc != 0) return;\n";
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", return_addr);
                 }
             }
@@ -659,6 +661,7 @@ bool FullFunctionEmitter::emit_function(
                                        pb.terminator_addr);
                 }
                 out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
+                out += "    if (cpu->pc != 0) return;\n";
                 if (target == 0x00006380u) {
                     out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
                                        pb.terminator_addr + 1);
@@ -689,6 +692,7 @@ bool FullFunctionEmitter::emit_function(
                 }
                 out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
                                    static_cast<int>(rs));
+                out += "    if (cpu->pc != 0) return;\n";
                 // Safety net: if continuation falls outside this function, tail-call to it.
                 if (!addr_to_raw.count(pb.terminator_addr + 8)) {
                     out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jalr cont: outside func */\n", return_addr);
@@ -868,7 +872,7 @@ bool FullFunctionEmitter::emit_function(
     // Direct-call entry hook: captures into fn_entry ring (gated by
     // fn_filter at runtime).  Lets us see direct-jal call paths that
     // never go through psx_dispatch.
-    out += fmt::format("    debug_server_log_call_entry(0x{:08X}u);\n", norm);
+    out += fmt::format("    debug_server_log_call_entry_cpu(0x{:08X}u, cpu);\n", norm);
     // Branch predicate locals must be initialized before the continuation
     // switch. Continuation entry can jump directly to a merge block that reads
     // a predicate set only on a different inbound path.
@@ -924,13 +928,16 @@ void FullFunctionEmitter::emit_dispatch(
     // Extern declarations for runtime-provided functions.
     out += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
     out += "extern void psx_check_interrupts(CPUState* cpu);\n";
+    out += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     out += "extern void psx_restore_state_escape(void);\n";
+    out += "extern void psx_rfe_return(CPUState* cpu);\n";
     out += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     out += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     out += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
     out += "extern uint32_t g_debug_current_func_addr;\n";
     out += "extern void debug_server_trace_dispatch(uint32_t func_addr);\n";
     out += "extern void debug_server_trace_dispatch_return(uint32_t func_addr, CPUState* cpu);\n\n";
+    out += "extern uint64_t g_psx_nonlocal_epoch;\n\n";
     out += "#ifdef PSX_HAS_GAME_DISPATCH\n";
     out += "extern int psx_game_address_in_text(uint32_t addr);\n";
     out += "#endif\n\n";
@@ -1073,12 +1080,13 @@ void FullFunctionEmitter::emit_dispatch(
     out += "    return phys;\n";
     out += "}\n\n";
 
-    out += "extern int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);\n";
+    out += "extern int dirty_ram_dispatch_until(CPUState* cpu, uint32_t addr, uint32_t stop_addr);\n";
     out += "extern int dirty_ram_is_dirty(uint32_t phys);\n";
     out += "extern void fntrace_record(CPUState* cpu, uint32_t target);\n";
     out += "extern uint64_t g_dispatch_static_hits;\n";
     out += "\n";
-    out += "int g_psx_dispatch_depth = 0;\n\n";
+    out += "int g_psx_dispatch_depth = 0;\n";
+    out += "int g_psx_call_depth = 0;\n\n";
     out += "static void psx_dispatch_impl(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {\n";
     out += "    /* Tail-call trampoline: functions signal tail calls by setting\n";
     out += "     * cpu->pc to the target and returning. We loop here to re-dispatch\n";
@@ -1086,6 +1094,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "     * the outermost dispatch returns, so a nested callee cannot interrupt\n";
     out += "     * before its generated caller runs the post-call continuation. */\n";
     out += "    int outermost = (g_psx_dispatch_depth++ == 0);\n";
+    out += "    uint64_t nonlocal_epoch = g_psx_nonlocal_epoch;\n";
     out += "    for (;;) {\n";
     out += "        /* Always-on call ring: every iteration counts as a separate\n";
     out += "         * call (initial entry + each tail-call re-dispatch). a0..a3\n";
@@ -1101,7 +1110,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "         * path before normalizing it to shell ROM. */\n";
     out += "        uint32_t game_phys = addr & 0x1FFFFFFFu;\n";
     out += "        if (psx_game_address_in_text(addr) && dirty_ram_is_dirty(game_phys)) {\n";
-    out += "            found = dirty_ram_dispatch(cpu, addr);\n";
+    out += "            found = dirty_ram_dispatch_until(cpu, addr, stop_addr);\n";
     out += "        }\n";
     out += "#endif\n";
     out += "        uint32_t phys = normalize(addr);\n";
@@ -1129,7 +1138,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "         * boot, interpret the basic block on cpu state.  Falls back to\n";
     out += "         * psx_unknown_dispatch for genuinely unmapped PCs. */\n";
     out += "        if (!found) {\n";
-    out += "            if (dirty_ram_dispatch(cpu, addr)) {\n";
+    out += "            if (dirty_ram_dispatch_until(cpu, addr, stop_addr)) {\n";
     out += "                found = 1;\n";
     out += "            } else {\n";
     out += "                psx_unknown_dispatch(cpu, addr, phys);\n";
@@ -1137,15 +1146,16 @@ void FullFunctionEmitter::emit_dispatch(
     out += "        }\n";
     out += "        if (cpu->pc == 0) {\n";
     out += "            --g_psx_dispatch_depth;\n";
-    out += "            if (outermost) {\n";
+    out += "            if (outermost && g_psx_call_depth == 0) {\n";
     out += "                psx_check_interrupts(cpu);\n";
     out += "            }\n";
     out += "            return;\n";
     out += "        }\n";
-    out += "        if (stop_addr != 0 && cpu->pc == stop_addr) {\n";
-    out += "            cpu->pc = 0;\n";
+    out += "        if (stop_addr != 0 && ((cpu->pc ^ stop_addr) & 0x1FFFFFFFu) == 0) {\n";
+    out += "            int consume_stop = (g_psx_nonlocal_epoch == nonlocal_epoch);\n";
+    out += "            if (consume_stop) cpu->pc = 0;\n";
     out += "            --g_psx_dispatch_depth;\n";
-    out += "            if (outermost) {\n";
+    out += "            if (consume_stop && outermost && g_psx_call_depth == 0) {\n";
     out += "                psx_check_interrupts(cpu);\n";
     out += "            }\n";
     out += "            return;\n";
@@ -1220,11 +1230,13 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void psx_dispatch(CPUState* cpu, uint32_t addr);\n";
     full_c += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
     full_c += "extern void psx_check_interrupts(CPUState* cpu);\n";
+    full_c += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     full_c += "extern void psx_restore_state_escape(void);\n";
+    full_c += "extern void psx_rfe_return(CPUState* cpu);\n";
     full_c += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     full_c += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
-    full_c += "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
+    full_c += "extern void debug_server_log_call_entry_cpu(uint32_t func_addr, CPUState *cpu);\n";
     full_c += "extern void debug_server_log_probe(uint32_t pc, CPUState *cpu);\n";
     full_c += "extern uint32_t g_debug_last_store_pc;\n";
     full_c += "/* Phase 1.0e-d: per-block guest cycle accounting.\n";

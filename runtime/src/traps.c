@@ -511,8 +511,8 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
 
     /* Reject non-word-aligned targets — corrupt function pointer. Hard fail. */
     if (addr & 3) {
-        char buf[512];
-        snprintf(buf, sizeof(buf),
+        char buf[2048];
+        int n = snprintf(buf, sizeof(buf),
             "DISPATCH FATAL: misaligned target 0x%08X\n"
             "  aligned form: 0x%08X\n"
             "  physical:     0x%08X\n"
@@ -524,6 +524,11 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
             "  $a1:          0x%08X\n"
             "  $a2:          0x%08X\n"
             "  $a3:          0x%08X\n"
+            "  $s0:          0x%08X\n"
+            "  $s1:          0x%08X\n"
+            "  $s2:          0x%08X\n"
+            "  $s3:          0x%08X\n"
+            "  $sp:          0x%08X\n"
             "  COP0_EPC:     0x%08X\n"
             "  COP0_SR:      0x%08X\n"
             "  COP0_Cause:   0x%08X\n",
@@ -531,7 +536,25 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
             cpu->pc, cpu->gpr[31], cpu->gpr[25],
             cpu->gpr[2], cpu->gpr[4], cpu->gpr[5],
             cpu->gpr[6], cpu->gpr[7],
+            cpu->gpr[16], cpu->gpr[17], cpu->gpr[18], cpu->gpr[19],
+            cpu->gpr[29],
             cpu->cop0[14], cpu->cop0[12], cpu->cop0[13]);
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                      "  callback table:");
+        for (uint32_t off = 0; off < 32 && n < (int)sizeof(buf) - 32; off += 4) {
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                          " [%02X]=0x%08X",
+                          off, cpu->read_word(0x800A9B90u + off));
+        }
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                      "\n  s0 words:");
+        uint32_t s0 = cpu->gpr[16];
+        for (uint32_t off = 0; off < 32 && n < (int)sizeof(buf) - 32; off += 4) {
+            n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                          " [%02X]=0x%08X",
+                          off, cpu->read_word(s0 + off));
+        }
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "\n");
         trap_crash(buf);
         fprintf(stderr, "%s", buf);
         fflush(stderr);
@@ -685,10 +708,22 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
          * `unknown_dispatch_log` debug command. Replaces the prior
          * file-based log per CLAUDE.md §3. */
         extern void psx_unknown_dispatch_record(uint32_t addr, uint32_t phys,
-                                                 uint32_t ra, uint32_t a0,
-                                                 uint32_t a1);
+                                                 uint32_t ra, uint32_t sp,
+                                                 uint32_t v0, uint32_t v1,
+                                                 uint32_t a0, uint32_t a1,
+                                                 uint32_t a2, uint32_t a3,
+                                                 uint32_t t0, uint32_t t1,
+                                                 uint32_t t2, uint32_t s0,
+                                                 uint32_t s1, uint32_t s2,
+                                                 uint32_t s3);
         psx_unknown_dispatch_record(addr, phys, cpu->gpr[31],
-                                    cpu->gpr[4], cpu->gpr[5]);
+                                    cpu->gpr[29], cpu->gpr[2],
+                                    cpu->gpr[3], cpu->gpr[4],
+                                    cpu->gpr[5], cpu->gpr[6],
+                                    cpu->gpr[7], cpu->gpr[8],
+                                    cpu->gpr[9], cpu->gpr[10],
+                                    cpu->gpr[16], cpu->gpr[17],
+                                    cpu->gpr[18], cpu->gpr[19]);
 
         /* Fail-fast mode: silent no-op masks bugs by leaving stale
          * register state. When PSX_FAIL_FAST_UNKNOWN_DISPATCH=1, dump

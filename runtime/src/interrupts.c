@@ -79,6 +79,38 @@ static uint64_t exception_reentry_blocks;
  * very next psx_check_interrupts re-enters immediately. */
 static int post_exception_cooldown;
 
+extern int g_psx_call_depth;
+
+PsxIrqCheckTraceEntry g_psx_irq_check_trace[PSX_IRQ_CHECK_TRACE_CAP] = {0};
+uint64_t g_psx_irq_check_trace_seq = 0;
+extern uint64_t s_frame_count;
+
+enum {
+    IRQ_CHECK_IN_EXCEPTION = 1,
+    IRQ_CHECK_CALL_DEPTH = 2,
+    IRQ_CHECK_COOLDOWN = 3,
+    IRQ_CHECK_IE_DISABLED = 4,
+    IRQ_CHECK_IM2_DISABLED = 5,
+    IRQ_CHECK_INVALID_RESUME_PC = 6,
+    IRQ_CHECK_DELIVERED = 7
+};
+
+static void irq_check_trace_log(CPUState* cpu, uint32_t resume_pc, uint32_t reason)
+{
+    uint64_t seq = g_psx_irq_check_trace_seq++;
+    PsxIrqCheckTraceEntry *e =
+        &g_psx_irq_check_trace[seq & (PSX_IRQ_CHECK_TRACE_CAP - 1u)];
+    e->seq = seq;
+    e->frame = (uint32_t)s_frame_count;
+    e->resume_pc = resume_pc;
+    e->i_stat = i_stat;
+    e->i_mask = i_mask;
+    e->sr = cpu ? cpu->cop0[COP0_SR] : 0;
+    e->cause = cpu ? cpu->cop0[COP0_CAUSE] : 0;
+    e->call_depth = (uint32_t)g_psx_call_depth;
+    e->reason = reason;
+}
+
 /* setjmp target for ReturnFromException during handler dispatch.
  *
  * IMPORTANT: longjmp(exception_jmpbuf, ...) MUST execute on the same
@@ -100,6 +132,12 @@ jmp_buf exception_jmpbuf;  /* non-static so traps.c can deferred-longjmp */
 void* g_exception_owner_fiber = NULL;
 int   g_pending_exception_longjmp = 0;
 extern int g_psx_dispatch_depth;
+extern int g_psx_call_depth;
+uint64_t g_psx_nonlocal_epoch = 0;
+
+void psx_note_nonlocal_control_flow(void) {
+    g_psx_nonlocal_epoch++;
+}
 
 int psx_get_in_exception(void) { return in_exception; }
 
@@ -121,10 +159,13 @@ void interrupts_init(void) {
     dispatch_count = 0;
     in_exception = 0;
     g_psx_dispatch_depth = 0;
+    g_psx_call_depth = 0;
     total_checks = 0;
     post_exception_cooldown = 0;
     exception_entries_total = 0;
     exception_reentry_blocks = 0;
+    g_psx_irq_check_trace_seq = 0;
+    g_psx_nonlocal_epoch = 0;
 }
 
 /*
@@ -160,11 +201,21 @@ static void deferred_exception_longjmp(int code) {
 }
 
 void psx_exception_longjmp(void) {
+    psx_note_nonlocal_control_flow();
     debug_server_log_restore_event(2, debug_cpu_ptr ? debug_cpu_ptr->pc : 0, 1);
     deferred_exception_longjmp(1);
 }
 
+void psx_rfe_return(CPUState* cpu) {
+    (void)cpu;
+    if (in_exception) {
+        psx_exception_longjmp();
+    }
+    psx_note_nonlocal_control_flow();
+}
+
 void psx_restore_state_escape(void) {
+    psx_note_nonlocal_control_flow();
     if (in_exception) {
         debug_server_log_restore_event(1, debug_cpu_ptr ? debug_cpu_ptr->pc : 0, 2);
         deferred_exception_longjmp(2);
@@ -173,6 +224,10 @@ void psx_restore_state_escape(void) {
 }
 
 void psx_check_interrupts(CPUState* cpu) {
+    psx_check_interrupts_at(cpu, cpu ? cpu->pc : 0);
+}
+
+void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
     total_checks++;
     if ((total_checks & 0x3FFFu) == 0) {
         debug_server_poll();
@@ -261,19 +316,36 @@ void psx_check_interrupts(CPUState* cpu) {
     if ((i_stat & i_mask) == 0) return;
     if (in_exception) {
         exception_reentry_blocks++;
+        irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_IN_EXCEPTION);
+        return;
+    }
+    if (g_psx_call_depth > 0) {
+        irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_CALL_DEPTH);
         return;
     }
 
     /* Post-exception cooldown: let at least one block execute after RFE. */
     if (post_exception_cooldown > 0) {
         post_exception_cooldown--;
+        irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_COOLDOWN);
         return;
     }
 
     /* Check COP0 SR: IEc (bit 0) must be set, and IM2 (bit 10) must be set. */
     uint32_t sr = cpu->cop0[COP0_SR];
-    if (!(sr & 0x01)) return;    /* Interrupts globally disabled */
-    if (!(sr & (1 << 10))) return; /* Hardware interrupt bit not enabled */
+    if (!(sr & 0x01)) {
+        irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_IE_DISABLED);
+        return;    /* Interrupts globally disabled */
+    }
+    if (!(sr & (1 << 10))) {
+        irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_IM2_DISABLED);
+        return; /* Hardware interrupt bit not enabled */
+    }
+    if (resume_pc == 0 || (resume_pc & 3u) != 0) {
+        irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_INVALID_RESUME_PC);
+        return;
+    }
+    irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_DELIVERED);
 
     in_exception = 1;
     exception_entries_total++;
@@ -286,14 +358,12 @@ void psx_check_interrupts(CPUState* cpu) {
     /* Push SR exception stack: shift bits [5:0] left by 2. */
     cpu->cop0[COP0_SR] = (sr & ~0x3F) | ((sr & 0x0F) << 2);
 
-    /* EPC: set to a sentinel value. The recompiled exception handler reads
-     * memory at [EPC] to check for COP2 branch delay. We use a dedicated
-     * address in the kernel scratch area.  Address 0x80000048 is chosen
-     * because it's between the exception vectors (0x80-0xBF) and the
-     * kernel data pointer area (0x100+), and not used by the BIOS. */
-    uint32_t sentinel = 0x80000048u;
-    cpu->write_word(sentinel, 0x00000000u); /* NOP */
-    cpu->cop0[COP0_EPC] = sentinel;
+    /* EPC must be the guest PC that will execute next after the interrupt.
+     * The BIOS saves this into the current TCB and ReturnFromException
+     * later restores it.  A synthetic EPC is not safe: games can run event
+     * callbacks through BIOS RestoreState while the interrupted TCB is live,
+     * and those callbacks observe the same save area. */
+    cpu->cop0[COP0_EPC] = resume_pc;
 
     /* Save the interrupted code's full register state.
      *
@@ -348,6 +418,7 @@ void psx_check_interrupts(CPUState* cpu) {
     int   prev_pending = g_pending_exception_longjmp;
     g_exception_owner_fiber = psx_fiber_current();
     g_pending_exception_longjmp = 0;
+    int returned_from_exception = 0;
     for (;;) {
         int jmp_val = setjmp(exception_jmpbuf);
         if (jmp_val == 2) {
@@ -355,12 +426,15 @@ void psx_check_interrupts(CPUState* cpu) {
              * GPRs were already set by RestoreState — do NOT restore.
              * Stay in exception context so ReturnFromException works. */
             g_psx_dispatch_depth = 0;
+            g_psx_call_depth = 0;
             debug_server_log_restore_event(3, cpu->pc, (uint32_t)jmp_val);
             target_pc = cpu->pc;
             continue;
         }
         if (jmp_val == 1) {
             g_psx_dispatch_depth = 0;
+            g_psx_call_depth = 0;
+            returned_from_exception = 1;
             debug_server_log_restore_event(4, cpu->pc, (uint32_t)jmp_val);
         }
         if (jmp_val == 0) {
@@ -389,6 +463,9 @@ void psx_check_interrupts(CPUState* cpu) {
     for (int i = 0; i < 32; i++) cpu->gpr[i] = saved_gpr[i];
     cpu->hi = saved_hi;
     cpu->lo = saved_lo;
+    if (returned_from_exception) {
+        cpu->pc = 0;
+    }
 
     if (!(cpu->cop0[COP0_SR] & 0x01)) {
         uint32_t sr2 = cpu->cop0[COP0_SR];

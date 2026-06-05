@@ -5,6 +5,7 @@
 #include <string>
 #include <algorithm>
 #include <set>
+#include <map>
 
 #include "ps1_exe_parser.h"
 #include "gte.h"
@@ -388,6 +389,7 @@ int main(int argc, char** argv) {
     fmt::print("Generating complete C file: {}\n", output_filename.string());
 
     std::string full_c_code = codegen.generate_file(analysis_result.functions, all_cfgs);
+    const auto& continuation_owners = codegen.continuation_owners();
     std::set<uint32_t> dispatch_addrs;
     {
         const std::string marker = "void func_";
@@ -448,10 +450,28 @@ int main(int argc, char** argv) {
 
         ds << "/* Maps PS1 address to compiled game code. Returns 1 if dispatched, 0 if unknown. */\n";
         ds << "int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr) {\n";
+        ds << "    uint32_t phys = addr & 0x1FFFFFFFu;\n";
+        ds << fmt::format("    if (phys >= 0x{:08X}u && phys < 0x{:08X}u) {{\n",
+                          game_text_start, game_text_end);
+        ds << fmt::format("        addr = 0x{:08X}u + (phys - 0x{:08X}u);\n",
+                          exe->load_address(), game_text_start);
+        ds << "    }\n";
         ds << "    switch (addr) {\n";
         for (uint32_t addr : dispatch_addrs) {
-            ds << fmt::format("        case 0x{:08X}u: func_{:08X}(cpu); return 1;\n",
+            ds << fmt::format("        case 0x{:08X}u: cpu->pc = 0; func_{:08X}(cpu); return 1;\n",
                               addr, addr);
+        }
+        size_t continuation_dispatch_count = 0;
+        for (const auto& [continuation_addr, owner_addr] : continuation_owners) {
+            if (dispatch_addrs.count(continuation_addr)) {
+                continue;
+            }
+            if (!dispatch_addrs.count(owner_addr)) {
+                continue;
+            }
+            ds << fmt::format("        case 0x{:08X}u: cpu->pc = 0x{:08X}u; func_{:08X}(cpu); return 1;\n",
+                              continuation_addr, continuation_addr, owner_addr);
+            continuation_dispatch_count++;
         }
         ds << "        default: return 0;\n";
         ds << "    }\n";
@@ -463,6 +483,8 @@ int main(int argc, char** argv) {
             dispatch_file.close();
             fmt::print("✓ Dispatch table written ({} entries)\n\n",
                        dispatch_addrs.size());
+            fmt::print("Dispatch continuation entries: {}\n\n",
+                       continuation_dispatch_count);
         } else {
             fmt::print(stderr, "⚠ Failed to write dispatch file\n\n");
         }
