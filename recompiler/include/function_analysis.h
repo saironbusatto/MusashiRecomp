@@ -27,6 +27,7 @@ struct FunctionAnalysisResult {
     int strong_prologue_count = 0; // Functions found from prologues with saved $ra
     int bios_thunk_count = 0; // Packed A0/B0/C0 BIOS dispatch thunks
     int state_continuation_count = 0; // Split entries after calls to SaveState-style helpers
+    int pointer_table_entry_count = 0; // Function entries found from executable pointer tables
 };
 
 class FunctionAnalyzer {

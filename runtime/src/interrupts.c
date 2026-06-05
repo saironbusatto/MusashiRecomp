@@ -79,7 +79,7 @@ static uint64_t exception_reentry_blocks;
  * very next psx_check_interrupts re-enters immediately. */
 static int post_exception_cooldown;
 
-extern int g_psx_call_depth;
+int g_psx_call_depth = 0;
 
 PsxIrqCheckTraceEntry g_psx_irq_check_trace[PSX_IRQ_CHECK_TRACE_CAP] = {0};
 uint64_t g_psx_irq_check_trace_seq = 0;
@@ -132,7 +132,6 @@ jmp_buf exception_jmpbuf;  /* non-static so traps.c can deferred-longjmp */
 void* g_exception_owner_fiber = NULL;
 int   g_pending_exception_longjmp = 0;
 extern int g_psx_dispatch_depth;
-extern int g_psx_call_depth;
 uint64_t g_psx_nonlocal_epoch = 0;
 
 void psx_note_nonlocal_control_flow(void) {
@@ -224,7 +223,17 @@ void psx_restore_state_escape(void) {
 }
 
 void psx_check_interrupts(CPUState* cpu) {
-    psx_check_interrupts_at(cpu, cpu ? cpu->pc : 0);
+    uint32_t resume_pc = cpu ? cpu->pc : 0;
+    if (cpu && (resume_pc == 0 || (resume_pc & 3u) != 0)) {
+        /* Legacy generated BIOS safe points resume inline in native C and do
+         * not keep cpu->pc populated between dispatch calls. Use the scratch
+         * sentinel that the earlier runtime used so interrupts can still be
+         * delivered there. Callers with a real guest resume PC should use
+         * psx_check_interrupts_at(). */
+        resume_pc = 0x80000048u;
+        cpu->write_word(resume_pc, 0x00000000u);
+    }
+    psx_check_interrupts_at(cpu, resume_pc);
 }
 
 void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {

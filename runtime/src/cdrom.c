@@ -684,6 +684,12 @@ static void stop_read_stream(void) {
     read_delay = 0;
 }
 
+static int data_fifo_ready(void) {
+    return (request_reg & CDROM_REQUEST_BFRD) &&
+           sector_available &&
+           sector_read_pos < sector_size;
+}
+
 static int deliver_read_sector(void) {
     int delivered = read_sector_at(read_min, read_sec, read_sect);
     advance_msf(&read_min, &read_sec, &read_sect);
@@ -693,6 +699,12 @@ static int deliver_read_sector(void) {
     set_irq(CDIRQ_DATA_READY);
     fire_cdrom_irq();
     return 1;
+}
+
+static int deliver_read_sector_without_irq(void) {
+    int delivered = read_sector_at(read_min, read_sec, read_sect);
+    advance_msf(&read_min, &read_sec, &read_sect);
+    return delivered;
 }
 
 static void try_execute_queued_command(void) {
@@ -1069,20 +1081,31 @@ static void process_read_stream(uint32_t cycles) {
     if (!reading) return;
 
     /*
-     * The controller exposes one sector buffer and one pending interrupt at a
-     * time. Do not let the stream timer accumulate a backlog while software is
-     * still draining or acknowledging the previous sector, or games that issue
-     * a Pause/next command from their data-ready callback can observe an extra
-     * immediate sector.
+     * The controller exposes one sector buffer. Do not let the stream timer
+     * accumulate a data backlog while software is still handling the previous
+     * data-ready IRQ. Once software acknowledges that IRQ, any unread tail is
+     * discardable: later sectors replace the controller's single data buffer.
+     *
+     * Software can also start a multi-sector CD DMA from inside the
+     * data-ready callback before acknowledging the IRQ. In that case the IRQ
+     * line remains asserted, but the disc stream must still refill an empty
+     * sector buffer so the active DMA can continue.
      */
-    if (sector_available || irq_flag != 0) return;
-
     if (cycles > 0) {
         read_delay -= (int)cycles;
     }
 
+    if (sector_available && irq_flag != 0) return;
+
     if (read_delay <= 0) {
-        deliver_read_sector();
+        if (irq_flag == 0) {
+            if (sector_available) {
+                trace_cdrom('O', 0, (uint32_t)sector_read_pos, 0);
+            }
+            deliver_read_sector();
+        } else {
+            deliver_read_sector_without_irq();
+        }
         read_delay += sector_delay_cycles();
     }
 }
@@ -1144,7 +1167,7 @@ uint32_t cdrom_read(uint32_t addr) {
         if (param_count == 0) s |= (1 << 3);
         if (param_count < PARAM_FIFO_SIZE) s |= (1 << 4);
         if (response_read < response_count) s |= (1 << 5);
-        if (request_reg & CDROM_REQUEST_BFRD) s |= (1 << 6);
+        if (data_fifo_ready()) s |= (1 << 6);
         ret = s;
         break;
     }
@@ -1156,11 +1179,10 @@ uint32_t cdrom_read(uint32_t addr) {
         break;
 
     case 0x1F801802:
-        if ((request_reg & CDROM_REQUEST_BFRD) && sector_available && sector_read_pos < sector_size) {
+        if (data_fifo_ready()) {
             ret = sector_buffer[sector_read_pos++];
             if (sector_read_pos >= sector_size) {
                 sector_available = 0;
-                request_reg &= (uint8_t)~CDROM_REQUEST_BFRD;
             }
         }
         break;
@@ -1240,12 +1262,12 @@ void cdrom_tick(void) {
 
 uint32_t cdrom_dma_read(void) {
     uint32_t val = 0;
-    if ((request_reg & CDROM_REQUEST_BFRD) && sector_available && sector_read_pos + 4 <= sector_size) {
+    if ((request_reg & CDROM_REQUEST_BFRD) && sector_available &&
+        sector_read_pos + 4 <= sector_size) {
         memcpy(&val, sector_buffer + sector_read_pos, 4);
         sector_read_pos += 4;
         if (sector_read_pos >= sector_size) {
             sector_available = 0;
-            request_reg &= (uint8_t)~CDROM_REQUEST_BFRD;
         }
     }
     trace_cdrom('D', 0, val, 4);

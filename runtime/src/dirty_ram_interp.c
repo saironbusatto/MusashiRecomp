@@ -402,6 +402,9 @@ static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
     if (defer_interrupts) g_psx_call_depth++;
     psx_dispatch_call(cpu, target, return_pc);
     if (defer_interrupts) g_psx_call_depth--;
+    if (defer_interrupts && cpu->pc == 0) {
+        psx_check_interrupts_at(cpu, return_pc);
+    }
     call_log->after_s0 = cpu->gpr[16];
     call_log->after_s1 = cpu->gpr[17];
     call_log->after_s2 = cpu->gpr[18];
@@ -421,14 +424,32 @@ static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
  * Branches encode their delay slot themselves before returning 1. */
 static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out);
 
+static inline int is_rfe_instruction(uint32_t insn) {
+    return op_field(insn) == 0x10u &&
+           rs_field(insn) == 0x10u &&
+           funct_field(insn) == 0x10u;
+}
+
+static inline void exec_rfe(CPUState *cpu) {
+    uint32_t sr = cpu->cop0[12];
+    cpu->cop0[12] = (sr & 0xFFFFFFC0u) | ((sr >> 2) & 0x0Fu);
+}
+
 /* Forward: helper for delay-slot execution on jumps/branches. */
-static void exec_delay_slot(CPUState *cpu, uint32_t pc) {
+static int exec_delay_slot(CPUState *cpu, uint32_t pc, uint32_t branch_target) {
     /* Delay-slot instruction at pc must NOT be a control transfer.
      * Recursively interpret as a single non-branching instruction. */
     uint32_t ds_phys = pc & 0x1FFFFFFFu;
     uint32_t insn = fetch_word(ds_phys);
     uint32_t opc = op_field(insn);
     uint32_t fnt = funct_field(insn);
+    if (is_rfe_instruction(insn)) {
+        exec_rfe(cpu);
+        cpu->pc = branch_target;
+        g_dirty_ram_insns_run++;
+        psx_rfe_return(cpu);
+        return 1;
+    }
     /* Reject branches/jumps in delay slots — undefined on R3000A and our
      * static recompiler explicitly handles this case differently (the
      * fall-through fix from 2026-04-21).  In install stubs, delay slots
@@ -439,11 +460,12 @@ static void exec_delay_slot(CPUState *cpu, uint32_t pc) {
         opc == 0x01 /*regimm*/ ||
         (opc == 0x00 && (fnt == 0x08 /*jr*/ || fnt == 0x09 /*jalr*/))) {
         (void)abort_unsupported(pc, insn, "control-transfer in delay slot");
-        return;
+        return 0;
     }
     uint32_t dummy_next = 0;
     (void)exec_one(cpu, pc, &dummy_next);
     g_dirty_ram_insns_run++;
+    return 0;
 }
 
 static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
@@ -493,7 +515,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             return 0;
         case 0x08: { /* JR rs */
             uint32_t target = cpu->gpr[rs];
-            exec_delay_slot(cpu, pc + 4);
+            if (exec_delay_slot(cpu, pc + 4, target)) return 1;
             cpu->pc = target;
             return 1;
         }
@@ -502,7 +524,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             uint32_t return_pc = pc + 8;
             cpu->gpr[rd ? rd : 31] = return_pc;
             cpu->gpr[0] = 0;
-            exec_delay_slot(cpu, pc + 4);
+            if (exec_delay_slot(cpu, pc + 4, target)) return 1;
             if (!is_local_dirty_target(target)) {
                 return dispatch_nonlocal_call(cpu, target, return_pc, next_pc_out);
             }
@@ -609,7 +631,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
 
     case 0x02: { /* J target */
         uint32_t target = ((pc + 4) & 0xF0000000u) | (target26(insn) << 2);
-        exec_delay_slot(cpu, pc + 4);
+        if (exec_delay_slot(cpu, pc + 4, target)) return 1;
         cpu->pc = target;
         return 1;
     }
@@ -617,7 +639,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         uint32_t target = ((pc + 4) & 0xF0000000u) | (target26(insn) << 2);
         uint32_t return_pc = pc + 8;
         cpu->gpr[31] = return_pc;
-        exec_delay_slot(cpu, pc + 4);
+        if (exec_delay_slot(cpu, pc + 4, target)) return 1;
         if (!is_local_dirty_target(target)) {
             return dispatch_nonlocal_call(cpu, target, return_pc, next_pc_out);
         }
@@ -626,26 +648,30 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     }
     case 0x04: { /* BEQ rs, rt, simm */
         int taken = (cpu->gpr[rs] == cpu->gpr[rt]);
-        exec_delay_slot(cpu, pc + 4);
-        cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
+        uint32_t target = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
+        if (exec_delay_slot(cpu, pc + 4, target)) return 1;
+        cpu->pc = target;
         return 1;
     }
     case 0x05: { /* BNE */
         int taken = (cpu->gpr[rs] != cpu->gpr[rt]);
-        exec_delay_slot(cpu, pc + 4);
-        cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
+        uint32_t target = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
+        if (exec_delay_slot(cpu, pc + 4, target)) return 1;
+        cpu->pc = target;
         return 1;
     }
     case 0x06: { /* BLEZ */
         int taken = ((int32_t)cpu->gpr[rs] <= 0);
-        exec_delay_slot(cpu, pc + 4);
-        cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
+        uint32_t target = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
+        if (exec_delay_slot(cpu, pc + 4, target)) return 1;
+        cpu->pc = target;
         return 1;
     }
     case 0x07: { /* BGTZ */
         int taken = ((int32_t)cpu->gpr[rs] > 0);
-        exec_delay_slot(cpu, pc + 4);
-        cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
+        uint32_t target = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
+        if (exec_delay_slot(cpu, pc + 4, target)) return 1;
+        cpu->pc = target;
         return 1;
     }
     case 0x01: { /* REGIMM: BLTZ/BGEZ/BLTZAL/BGEZAL by rt field */
@@ -659,8 +685,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                                   cpu->gpr[31] = pc + 8; break;
         default: return abort_unsupported(pc, insn, "REGIMM rt");
         }
-        exec_delay_slot(cpu, pc + 4);
-        cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
+        uint32_t target = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
+        if (exec_delay_slot(cpu, pc + 4, target)) return 1;
+        cpu->pc = target;
         return 1;
     }
     case 0x08: /* ADDI rt, rs, simm — same as ADDIU, sans overflow trap (we don't model traps here) */
@@ -707,9 +734,10 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             return 0;
         }
         if (cop_op == 0x10 && fnt == 0x10) { /* RFE */
-            uint32_t sr = cpu->cop0[12];
-            cpu->cop0[12] = (sr & 0xFFFFFFF0u) | ((sr >> 2) & 0x0Fu);
-            return 0;
+            exec_rfe(cpu);
+            cpu->pc = pc + 4;
+            psx_rfe_return(cpu);
+            return 1;
         }
         return abort_unsupported(pc, insn, "COP0 op");
     }

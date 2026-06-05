@@ -354,7 +354,7 @@ bool FullFunctionEmitter::emit_function(
                 out += fmt::format("    psx_advance_cycles({}u);\n", bcyc);
                 out += "#endif\n";
             }
-            out += fmt::format("    psx_check_interrupts_at(cpu, 0x{:08X}u);\n", addr);
+            out += "    psx_check_interrupts(cpu);\n";
             if (should_probe_pc(addr)) {
                 out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n", addr);
             }
@@ -1086,7 +1086,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern uint64_t g_dispatch_static_hits;\n";
     out += "\n";
     out += "int g_psx_dispatch_depth = 0;\n";
-    out += "int g_psx_call_depth = 0;\n\n";
+    out += "extern int g_psx_call_depth;\n\n";
     out += "static void psx_dispatch_impl(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {\n";
     out += "    /* Tail-call trampoline: functions signal tail calls by setting\n";
     out += "     * cpu->pc to the target and returning. We loop here to re-dispatch\n";

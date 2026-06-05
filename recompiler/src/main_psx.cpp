@@ -249,6 +249,7 @@ int main(int argc, char** argv) {
                100.0 * with_epilogue / analysis_result.functions.size());
     fmt::print("Complete:        {} ({:.1f}%)\n\n", with_both,
                100.0 * with_both / analysis_result.functions.size());
+    fmt::print("Pointer entries: {}\n\n", analysis_result.pointer_table_entry_count);
 
     // Print first 20 functions
     fmt::print("First 20 Functions:\n");

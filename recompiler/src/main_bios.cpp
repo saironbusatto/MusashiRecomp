@@ -29,7 +29,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -437,6 +439,60 @@ std::vector<PSXRecompV4::Seed> load_seeds(const fs::path& seed_path) {
     return seeds;
 }
 
+size_t add_bios_vector_target_seeds(
+    std::vector<PSXRecompV4::Seed>& seeds,
+    const std::vector<uint8_t>& rom,
+    uint32_t base_addr,
+    uint32_t rom_end,
+    const std::vector<PSXRecompV4::BiosVectorTable>& bios_vectors)
+{
+    std::set<uint32_t> known;
+    for (const auto& seed : seeds) {
+        known.insert(seed.address);
+    }
+
+    const uint32_t base_phys = base_addr & 0x1FFFFFFFu;
+    const uint32_t rom_size = static_cast<uint32_t>(rom.size());
+    size_t added = 0;
+
+    for (const auto& bvt : bios_vectors) {
+        const uint32_t table_phys = bvt.table_rom_addr & 0x1FFFFFFFu;
+        if (table_phys < base_phys ||
+            table_phys + bvt.table_count * 4u > base_phys + rom_size) {
+            std::fprintf(stderr,
+                "psxrecomp-bios: WARNING: vector table 0x%08X out of ROM range; "
+                "not augmenting seeds from it\n",
+                bvt.table_rom_addr);
+            continue;
+        }
+
+        const uint32_t file_off = table_phys - base_phys;
+        for (uint32_t i = 0; i < bvt.table_count; ++i) {
+            const uint32_t off = file_off + i * 4u;
+            const uint32_t entry =
+                static_cast<uint32_t>(rom[off]) |
+                (static_cast<uint32_t>(rom[off + 1]) << 8) |
+                (static_cast<uint32_t>(rom[off + 2]) << 16) |
+                (static_cast<uint32_t>(rom[off + 3]) << 24);
+            if (entry == 0u) continue;
+            if (entry < base_addr || entry > rom_end) continue;
+            if (!known.insert(entry).second) continue;
+
+            PSXRecompV4::Seed seed;
+            seed.address = entry;
+            seed.label = fmt::format("bios_vector_{:02X}_{:02X}",
+                                     bvt.ram_addr & 0xFFu, i);
+            seed.rationale = fmt::format(
+                "ROM-resident target of configured BIOS vector 0x{:02X} table index 0x{:02X}",
+                bvt.ram_addr & 0xFFu, i);
+            seeds.push_back(std::move(seed));
+            ++added;
+        }
+    }
+
+    return added;
+}
+
 // ----- Phase 1c: artifact emission -----------------------------------------
 
 std::string make_function_manifest_json(const PSXRecompV4::DiscoveryResult& dr,
@@ -716,9 +772,18 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
     const std::string sha = sha256_hex(rom);
 
     // 2. Load seeds.
-    const auto seeds = load_seeds(seed_path);
+    auto seeds = load_seeds(seed_path);
+    const size_t vector_seed_count =
+        add_bios_vector_target_seeds(seeds, rom, kBiosBase,
+                                     kBiosBase + static_cast<uint32_t>(kBiosSize) - 1,
+                                     bios_vectors);
     std::fprintf(stdout, "psxrecomp-bios: loaded %zu seeds from %s\n",
                  seeds.size(), seed_path.string().c_str());
+    if (vector_seed_count != 0) {
+        std::fprintf(stdout,
+            "psxrecomp-bios: added %zu ROM-resident BIOS vector target seeds\n",
+            vector_seed_count);
+    }
 
     // 3. Run discovery.
     const auto dr = PSXRecompV4::FunctionDiscovery::discover(
