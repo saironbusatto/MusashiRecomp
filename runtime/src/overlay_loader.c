@@ -29,12 +29,42 @@ typedef void (*OverlayFn)(CPUState *);
 typedef struct {
     uint32_t   addr;   /* physical address, 0 = empty */
     OverlayFn  fn;
+    int        region; /* index into s_regions, -1 = none */
 } DynEntry;
 
 static DynEntry  s_table[DYNTAB_CAP];
 static int       s_count = 0;
 
-static void dyntab_insert(uint32_t phys, OverlayFn fn)
+/* ---- Registered overlay regions (Inc1-D: registration lifetime) --------- */
+/* A registration is only callable while the RAM it was compiled from is
+ * unchanged.  Each region carries a validity flag; a write into the region's
+ * watched pages flips it invalid.  We do NOT delete dyntab entries (messy with
+ * open addressing) — lookup consults the region's validity, so an invalidated
+ * region's functions become non-callable in O(1).  Invariant:
+ * Compiled (DLL loaded) != Registered (in dyntab) != Callable (region valid). */
+#define MAX_OVL_REGIONS 32
+typedef struct {
+    uint32_t base;        /* phys region start */
+    uint32_t size;        /* bytes (page-aligned span) */
+    uint32_t generation;  /* bumped on each invalidation */
+    int      valid;       /* 1 = functions callable */
+    int      func_count;  /* functions registered for this region */
+} OvlRegion;
+static OvlRegion s_regions[MAX_OVL_REGIONS];
+static int       s_nregions = 0;
+
+/* Counters / last-write info, surfaced via overlay_loader_status. */
+static uint32_t s_loads          = 0;
+static uint32_t s_invalidations  = 0;
+static uint32_t s_unregistered   = 0;
+static uint64_t s_disp_native    = 0;
+static uint64_t s_disp_interp    = 0;
+static uint64_t s_stale_blocked  = 0;
+static uint32_t s_last_write_pc   = 0;
+static uint32_t s_last_write_addr = 0;
+static uint32_t s_last_write_size = 0;
+
+static void dyntab_insert(uint32_t phys, OverlayFn fn, int region)
 {
     uint32_t h = (phys * 2654435761u) & DYNTAB_MASK;
     uint32_t i;
@@ -42,8 +72,9 @@ static void dyntab_insert(uint32_t phys, OverlayFn fn)
         uint32_t idx = (h + i) & DYNTAB_MASK;
         if (s_table[idx].addr == 0 || s_table[idx].addr == phys) {
             if (s_table[idx].addr == 0) s_count++;
-            s_table[idx].addr = phys;
-            s_table[idx].fn   = fn;
+            s_table[idx].addr   = phys;
+            s_table[idx].fn     = fn;
+            s_table[idx].region = region;
             return;
         }
     }
@@ -57,7 +88,17 @@ static OverlayFn dyntab_lookup(uint32_t phys)
     for (i = 0; i < DYNTAB_CAP; i++) {
         uint32_t idx = (h + i) & DYNTAB_MASK;
         if (s_table[idx].addr == 0) return NULL;
-        if (s_table[idx].addr == phys) return s_table[idx].fn;
+        if (s_table[idx].addr == phys) {
+            int r = s_table[idx].region;
+            /* A registered function whose source region was overwritten is
+             * NOT callable — block it and let the interpreter handle the new
+             * content (it self-heals via recapture). */
+            if (r >= 0 && r < s_nregions && !s_regions[r].valid) {
+                s_stale_blocked++;
+                return NULL;
+            }
+            return s_table[idx].fn;
+        }
     }
     return NULL;
 }
@@ -140,7 +181,7 @@ static void init_callbacks(void)
 /* ---- DLL loading and export enumeration -------------------------------- */
 
 #ifdef _WIN32
-static int load_overlay_dll(const char *dll_path, uint32_t load_addr_virt)
+static int load_overlay_dll(const char *dll_path, uint32_t load_addr_virt, int region)
 {
     HMODULE dll = LoadLibraryA(dll_path);
     if (!dll) {
@@ -190,7 +231,7 @@ static int load_overlay_dll(const char *dll_path, uint32_t load_addr_virt)
         OverlayFn fn = (OverlayFn)(base + funcs[ord]);
 
         uint32_t phys = addr & 0x1FFFFFFFu;
-        dyntab_insert(phys, fn);
+        dyntab_insert(phys, fn, region);
         registered++;
     }
 
@@ -198,8 +239,9 @@ static int load_overlay_dll(const char *dll_path, uint32_t load_addr_virt)
     return registered;
 }
 #else
-static int load_overlay_dll(const char *dll_path, uint32_t load_addr_virt)
+static int load_overlay_dll(const char *dll_path, uint32_t load_addr_virt, int region)
 {
+    (void)region;
     void *dll = dlopen(dll_path, RTLD_NOW | RTLD_LOCAL);
     if (!dll) {
         loader_log("dlopen(%s) failed: %s", dll_path, dlerror());
@@ -317,14 +359,73 @@ static void try_load_region(uint32_t phys)
 
     strncpy(dll_path, found_path, sizeof(dll_path) - 1);
     s_last_file_found = 1;
-    load_overlay_dll(dll_path, 0x80000000u | (region_start & 0x1FFFFFFFu));
+
+    if (s_nregions >= MAX_OVL_REGIONS) return;
+    int region = s_nregions;
+    s_regions[region].base        = region_start;
+    s_regions[region].size        = region_size;
+    s_regions[region].generation  = 0;
+    s_regions[region].valid       = 1;
+    s_regions[region].func_count  = 0;
+
+    int registered = load_overlay_dll(
+        dll_path, 0x80000000u | (region_start & 0x1FFFFFFFu), region);
+    if (registered <= 0) {
+        /* Nothing registered — don't keep an empty/watched region. The
+         * already-checked mark stays so we don't retry the same miss. */
+        return;
+    }
+    s_regions[region].func_count = registered;
+    s_nregions++;
+    s_loads++;
+
+    /* Watch this region's RAM pages: a later write invalidates the
+     * registration (Inc1-D). overlay_watch_set_range lives in memory.c, on
+     * the single psx_write_* store chokepoint. */
+    extern void overlay_watch_set_range(uint32_t phys, uint32_t len);
+    overlay_watch_set_range(region_start, region_size);
+}
+
+/* Invalidate the registered region containing `phys` (called from the store
+ * path in memory.c when a write lands on a watched overlay page).  Coarse:
+ * the whole region's registrations become non-callable. The DLL stays loaded;
+ * only callability (region validity) is revoked. The already-checked mark is
+ * left in place so the stale DLL is not auto-reloaded for changed bytes — the
+ * new content falls back to the interpreter (re-registration of a matching
+ * cache is a later increment). */
+void overlay_loader_invalidate_at(uint32_t phys, uint32_t size)
+{
+    extern uint32_t g_debug_last_store_pc;
+    uint32_t p = phys & 0x1FFFFFFFu;
+    int r;
+    for (r = 0; r < s_nregions; r++) {
+        if (!s_regions[r].valid) continue;
+        if (p < s_regions[r].base) continue;
+        if (p >= s_regions[r].base + s_regions[r].size) continue;
+
+        s_regions[r].valid = 0;
+        s_regions[r].generation++;
+        s_invalidations++;
+        s_unregistered += (uint32_t)s_regions[r].func_count;
+        s_last_write_pc   = g_debug_last_store_pc;
+        s_last_write_addr = phys;
+        s_last_write_size = size;
+
+        /* Stop watching: one invalidation per registration is enough. */
+        extern void overlay_watch_clear_range(uint32_t phys, uint32_t len);
+        overlay_watch_clear_range(s_regions[r].base, s_regions[r].size);
+        loader_log("invalidated region 0x%08X (+%u) on write 0x%08X -> %d funcs",
+                   s_regions[r].base, s_regions[r].size, phys,
+                   s_regions[r].func_count);
+        return;
+    }
 }
 
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr)
 {
     uint32_t phys = addr & 0x1FFFFFFFu;
     OverlayFn fn  = dyntab_lookup(phys);
-    if (fn) { fn(cpu); return 1; }
+    if (fn) { s_disp_native++; fn(cpu); return 1; }
 
     /* First miss for this region: check if a DLL is cached. */
     if (s_active && phys >= 0x98000u)
@@ -332,9 +433,31 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr)
 
     /* Retry after potential DLL load. */
     fn = dyntab_lookup(phys);
-    if (fn) { fn(cpu); return 1; }
+    if (fn) { s_disp_native++; fn(cpu); return 1; }
 
+    s_disp_interp++;
     return 0;
+}
+
+void overlay_loader_get_counters(uint32_t *loads, uint32_t *invalidations,
+                                 uint32_t *unregistered,
+                                 uint64_t *disp_native, uint64_t *disp_interp,
+                                 uint64_t *stale_blocked,
+                                 uint32_t *last_write_pc,
+                                 uint32_t *last_write_addr,
+                                 uint32_t *last_write_size,
+                                 int *regions)
+{
+    if (loads)           *loads           = s_loads;
+    if (invalidations)   *invalidations   = s_invalidations;
+    if (unregistered)    *unregistered    = s_unregistered;
+    if (disp_native)     *disp_native     = s_disp_native;
+    if (disp_interp)     *disp_interp     = s_disp_interp;
+    if (stale_blocked)   *stale_blocked   = s_stale_blocked;
+    if (last_write_pc)   *last_write_pc   = s_last_write_pc;
+    if (last_write_addr) *last_write_addr = s_last_write_addr;
+    if (last_write_size) *last_write_size = s_last_write_size;
+    if (regions)         *regions         = s_nregions;
 }
 
 int overlay_loader_registered_count(void)

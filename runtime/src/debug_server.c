@@ -7293,6 +7293,22 @@ static void handle_overlay_loader_status(int id, const char *json)
                           "%s\"0x%08X\"", i ? "," : "", checked[i]);
         n += snprintf(buf + n, sizeof(buf) - n, "]");
     }
+    /* Inc1-D registration-lifetime counters. */
+    {
+        uint32_t loads=0, invs=0, unreg=0, lw_pc=0, lw_addr=0, lw_size=0;
+        uint64_t dnat=0, dint=0, stale=0; int regions=0;
+        overlay_loader_get_counters(&loads, &invs, &unreg, &dnat, &dint,
+                                    &stale, &lw_pc, &lw_addr, &lw_size, &regions);
+        n += snprintf(buf + n, sizeof(buf) - n,
+            ",\"regions\":%d,\"loads\":%u,\"invalidations\":%u,"
+            "\"unregistered_funcs\":%u,\"dispatch_native\":%llu,"
+            "\"dispatch_interp_fallback\":%llu,\"stale_blocked\":%llu,"
+            "\"last_write_pc\":\"0x%08X\",\"last_write_addr\":\"0x%08X\","
+            "\"last_write_size\":%u",
+            regions, loads, invs, unreg,
+            (unsigned long long)dnat, (unsigned long long)dint,
+            (unsigned long long)stale, lw_pc, lw_addr, lw_size);
+    }
     snprintf(buf + n, sizeof(buf) - n, "}\n");
     send_fmt("%s", buf);
 }
