@@ -433,6 +433,19 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         if reason == 'DISPATCH_ENTRY' and impossible_entry_start(addr):
             excluded[addr] = 'UNKNOWN'
             return
+        # Boundary gate: a dispatched-to PC is proof of *code reachability*, not
+        # of a *callable function boundary*. A jr-driven jump-table case label
+        # or a data-table address can be dispatched-to yet have no prologue and
+        # no preceding jr $ra. Promoting it to a function makes the walk run off
+        # into the adjacent data (reserved-opcode / data-as-code). Require real
+        # boundary evidence (jr $ra-preceded, prologue, or region start) before
+        # registering a bare dispatch entry; otherwise leave it to the
+        # interpreter (it self-heals via recapture). Call-edge-proven reasons
+        # (DIRECT_JAL_TARGET, FUNCTION_POINTER_TARGET, TOML_DECLARED_ENTRY) are
+        # exempt — they carry their own proof.
+        if reason == 'DISPATCH_ENTRY' and not _callable_legacy_seed(data, load_addr, addr):
+            excluded[addr] = 'NO_ENTRY_BOUNDARY'
+            return
         if reason in FATAL_SEED_REASONS:
             raise RuntimeError(f'BUG: refusing to include 0x{addr:08X} as {reason}')
         old = included.get(addr)
@@ -1002,16 +1015,18 @@ def main():
                 src = patch_generated_c(src, load_addr, size)
                 c_audit = audit_generated_c(src, load_addr, size, crc32, toml)
                 print_generated_c_audit(load_addr, size, crc32, c_audit)
+                # Always save the debug copy for inspection — including on audit
+                # failure, so opcode gaps / boundary artifacts can be classified.
+                os.makedirs(os.path.dirname(dll_path), exist_ok=True)
+                debug_c = os.path.join(os.path.dirname(dll_path),
+                                       f'{crc32:08X}_patched.c')
+                with open(debug_c, 'w') as f:
+                    f.write(src)
                 if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
                     print('  GENERATED-C AUDIT FAILED\n')
                     continue
                 patched_c = os.path.join(tmp, 'overlay_patched.c')
                 with open(patched_c, 'w') as f:
-                    f.write(src)
-                # Save debug copy for inspection
-                debug_c = os.path.join(os.path.dirname(dll_path),
-                                       f'{crc32:08X}_patched.c')
-                with open(debug_c, 'w') as f:
                     f.write(src)
 
                 # Compile to DLL
