@@ -1631,12 +1631,58 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     s_fn_entry_seq++;
 }
 
+/* Always-on A0/B0/C0 BIOS-call ring (ported from ape-fw for good-vs-bad
+ * event-delivery comparison). Recorded at the central dispatch chokepoint. */
+#define BIOSCALL_RING_CAP (1 << 16)
+typedef struct {
+    uint64_t seq; uint32_t table_base; uint32_t index; uint32_t func_ptr;
+    uint32_t a0, a1, a2, a3; uint32_t ra; uint32_t current_func; uint32_t frame;
+    uint8_t in_exception;
+} BiosCallEntry;
+static BiosCallEntry s_bioscall_ring[BIOSCALL_RING_CAP];
+static uint64_t s_bioscall_seq = 0;
+#define BIOSCALL_UNIQUE_CAP 2048
+typedef struct { uint32_t table_base; uint32_t index; uint64_t count; } BiosCallUnique;
+static BiosCallUnique s_bioscall_unique[BIOSCALL_UNIQUE_CAP];
+static int s_bioscall_unique_count = 0;
+void psx_bioscall_record(uint32_t table_base, uint32_t index, uint32_t func_ptr,
+                         uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t ra)
+{
+    uint64_t seq = s_bioscall_seq++;
+    BiosCallEntry *e = &s_bioscall_ring[seq & (BIOSCALL_RING_CAP - 1u)];
+    e->seq = seq; e->table_base = table_base; e->index = index; e->func_ptr = func_ptr;
+    e->a0 = a0; e->a1 = a1; e->a2 = a2; e->a3 = a3; e->ra = ra;
+    e->current_func = g_debug_current_func_addr; e->frame = (uint32_t)s_frame_count;
+    e->in_exception = (uint8_t)(psx_get_in_exception() ? 1u : 0u);
+    uint32_t h = ((table_base >> 2) ^ (index * 2654435761u)) % BIOSCALL_UNIQUE_CAP;
+    for (int i = 0; i < BIOSCALL_UNIQUE_CAP; i++) {
+        uint32_t slot = (h + i) % BIOSCALL_UNIQUE_CAP;
+        if (s_bioscall_unique[slot].count != 0 &&
+            s_bioscall_unique[slot].table_base == table_base &&
+            s_bioscall_unique[slot].index == index) { s_bioscall_unique[slot].count++; return; }
+        if (s_bioscall_unique[slot].count == 0) {
+            s_bioscall_unique[slot].table_base = table_base; s_bioscall_unique[slot].index = index;
+            s_bioscall_unique[slot].count = 1; s_bioscall_unique_count++; return;
+        }
+    }
+}
+
 void debug_server_trace_dispatch(uint32_t func_addr) {
 #ifdef PSX_NO_DEBUG_TOOLS
     (void)func_addr;
     return;
 #endif
     card_mgr_trace_record(func_addr, 1);
+
+    {
+        uint32_t vphys = func_addr & 0x1FFFFFFFu;
+        if ((vphys == 0xA0u || vphys == 0xB0u || vphys == 0xC0u) && debug_cpu_ptr) {
+            psx_bioscall_record(vphys, debug_cpu_ptr->gpr[9], 0,
+                                debug_cpu_ptr->gpr[4], debug_cpu_ptr->gpr[5],
+                                debug_cpu_ptr->gpr[6], debug_cpu_ptr->gpr[7],
+                                debug_cpu_ptr->gpr[31]);
+        }
+    }
 
     /* Function entry/exit rings (always-on, hooked here so every dispatch
      * is recorded with args and a return value when the call unwinds). */
@@ -2086,6 +2132,48 @@ static void handle_fntrace_dump(int id, const char *json)
  * Two modes:
  *   - default: per-target count summary (sorted by hit count)
  *   - tail=N: most recent N entries from the ring */
+static void handle_bioscall_dump(int id, const char *json)
+{
+    int tail = json_get_int(json, "tail", 0);
+    long want_index = json_get_int(json, "index", -1);
+    char tbuf[32] = {0}; uint32_t want_table = 0; int have_table = 0;
+    if (json_get_str(json, "table", tbuf, sizeof tbuf)) { want_table = (uint32_t)strtoul(tbuf, NULL, 0); have_table = 1; }
+    const size_t BUF_SZ = 2 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ); if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    if (tail > 0) {
+        if (tail > (int)BIOSCALL_RING_CAP) tail = BIOSCALL_RING_CAP;
+        uint64_t total = s_bioscall_seq;
+        uint64_t avail = (total < BIOSCALL_RING_CAP) ? total : BIOSCALL_RING_CAP;
+        if ((uint64_t)tail > avail) tail = (int)avail;
+        pos += snprintf(out + pos, BUF_SZ - pos, "{\"id\":%d,\"ok\":true,\"total\":%llu,\"tail\":%d,\"entries\":[", id, (unsigned long long)total, tail);
+        uint64_t start = total - (uint64_t)tail; int first = 1;
+        for (int i = 0; i < tail; i++) {
+            BiosCallEntry *e = &s_bioscall_ring[(start + i) & (BIOSCALL_RING_CAP - 1u)];
+            if (want_index >= 0 && (long)e->index != want_index) continue;
+            if (have_table && e->table_base != want_table) continue;
+            if (pos > BUF_SZ - 512) break;
+            pos += snprintf(out + pos, BUF_SZ - pos, "%s{\"seq\":%llu,\"table\":\"0x%08X\",\"index\":%u,\"func\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\",\"ra\":\"0x%08X\",\"current_func\":\"0x%08X\",\"in_exc\":%u,\"frame\":%u}",
+                            first ? "" : ",", (unsigned long long)e->seq, e->table_base, e->index, e->func_ptr, e->a0, e->a1, e->a2, e->a3, e->ra, e->current_func, e->in_exception, e->frame);
+            first = 0;
+        }
+        pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
+        debug_server_send_line(out); free(out); return;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "{\"id\":%d,\"ok\":true,\"total\":%llu,\"unique\":%d,\"counts\":[", id, (unsigned long long)s_bioscall_seq, s_bioscall_unique_count);
+    int first = 1;
+    for (int i = 0; i < BIOSCALL_UNIQUE_CAP; i++) {
+        if (s_bioscall_unique[i].count == 0) continue;
+        if (want_index >= 0 && (long)s_bioscall_unique[i].index != want_index) continue;
+        if (have_table && s_bioscall_unique[i].table_base != want_table) continue;
+        if (pos > BUF_SZ - 256) break;
+        pos += snprintf(out + pos, BUF_SZ - pos, "%s{\"table\":\"0x%08X\",\"index\":%u,\"count\":%llu}", first ? "" : ",", s_bioscall_unique[i].table_base, s_bioscall_unique[i].index, (unsigned long long)s_bioscall_unique[i].count);
+        first = 0;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
+    debug_server_send_line(out); free(out);
+}
+
 static void handle_unknown_dispatch_log(int id, const char *json)
 {
     int tail = json_get_int(json, "tail", 0);
@@ -5544,6 +5632,83 @@ static void wtrace_transition_record(uint32_t phys, uint32_t old_val,
     s_wtrace_trans_head = (s_wtrace_trans_head + 1) % WRITE_TRACE_TRANS_CAP;
 }
 
+/* Compat no-op: ape-flavored generated code emits debug_server_log_call_entry_cpu
+ * at JAL sites (call-entry logging). Not needed for the card-driver comparison;
+ * stub it so the good baseline links + runs. */
+void debug_server_log_call_entry_cpu(uint32_t func_addr, CPUState *cpu) {
+    (void)func_addr; (void)cpu;
+}
+
+/* Dedicated sparse card-driver-state ring (ported from ape-fw for good-vs-bad
+ * comparison): card state table 0x9F20, result flags 0xB9D0, byte counter 0x72F0,
+ * chain success 0x7520, chain ptrs 0x7528, and the EvCB card-event entries
+ * 0xE044-0xE0D0 (status/spec/mode). Sparse => no eviction over a session. */
+#define CARD_TRACE_CAP (1u << 16)
+typedef struct {
+    uint64_t seq; uint32_t phys; uint32_t old_val; uint32_t new_val;
+    uint32_t pc; uint32_t cpu_pc; uint32_t ra; uint32_t func; uint32_t frame;
+    uint8_t width; uint8_t in_exception;
+} CardTraceEntry;
+static CardTraceEntry s_card_trace[CARD_TRACE_CAP];
+static uint64_t s_card_trace_seq = 0;
+static inline int is_card_critical_addr(uint32_t phys) {
+    return (phys >= 0x00009F20u && phys < 0x00009F40u) ||
+           (phys >= 0x0000B9D0u && phys < 0x0000B9F0u) ||
+           (phys >= 0x000072F0u && phys < 0x000072F4u) ||
+           (phys >= 0x00007520u && phys < 0x00007524u) ||
+           (phys >= 0x00007528u && phys < 0x00007530u) ||
+           (phys >= 0x0000E044u && phys < 0x0000E0D0u);
+}
+static void card_trace_record(uint32_t phys, uint32_t old_val, uint32_t new_val, uint8_t width) {
+    uint64_t seq = s_card_trace_seq++;
+    CardTraceEntry *e = &s_card_trace[seq & (CARD_TRACE_CAP - 1u)];
+    e->seq = seq; e->phys = phys; e->old_val = old_val; e->new_val = new_val;
+    e->pc = g_debug_last_store_pc;
+    e->cpu_pc = debug_cpu_ptr ? debug_cpu_ptr->pc : 0;
+    e->ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
+    e->func = g_debug_current_func_addr;
+    e->frame = (uint32_t)s_frame_count;
+    e->width = width;
+    e->in_exception = (uint8_t)(psx_get_in_exception() ? 1u : 0u);
+}
+
+static void handle_card_trace_dump(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 200);
+    if (count > (int)CARD_TRACE_CAP) count = CARD_TRACE_CAP;
+    char alo[32] = {0}, ahi[32] = {0};
+    uint32_t flo = 0, fhi = 0xFFFFFFFFu; int filt = 0;
+    if (json_get_str(json, "addr_lo", alo, sizeof alo)) { flo = (uint32_t)strtoul(alo, NULL, 0); filt = 1; }
+    if (json_get_str(json, "addr_hi", ahi, sizeof ahi)) { fhi = (uint32_t)strtoul(ahi, NULL, 0); filt = 1; }
+    uint64_t total = s_card_trace_seq;
+    uint64_t avail = (total < CARD_TRACE_CAP) ? total : CARD_TRACE_CAP;
+    const size_t BUF_SZ = 2 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%d,\"filtered\":%d,\"entries\":[",
+                    id, (unsigned long long)total, count, filt);
+    uint64_t start = filt ? (total - avail) : (total - ((uint64_t)count < avail ? (uint64_t)count : avail));
+    int emitted = 0; int first = 1;
+    for (uint64_t s = start; s < total && emitted < count; s++) {
+        CardTraceEntry *e = &s_card_trace[s & (CARD_TRACE_CAP - 1u)];
+        if (filt && (e->phys < flo || e->phys >= fhi)) continue;
+        if (pos > BUF_SZ - 512) break;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"phys\":\"0x%05X\",\"old\":\"0x%08X\",\"new\":\"0x%08X\","
+                        "\"w\":%u,\"pc\":\"0x%08X\",\"cpu_pc\":\"0x%08X\",\"ra\":\"0x%08X\","
+                        "\"func\":\"0x%08X\",\"in_exc\":%u,\"frame\":%u}",
+                        first ? "" : ",", (unsigned long long)e->seq, e->phys,
+                        e->old_val, e->new_val, e->width, e->pc, e->cpu_pc, e->ra,
+                        e->func, e->in_exception, e->frame);
+        first = 0; emitted++;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
+    debug_server_send_line(out);
+    free(out);
+}
+
 /* Multi-range check called from memory.c write paths.
  * Iterates up to 8 ranges; records if any match.
  * The always-on catch-all ring is recorded UNCONDITIONALLY first so
@@ -5555,6 +5720,7 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     (void)phys; (void)old_val; (void)new_val; (void)width;
     return;
 #endif
+    if (is_card_critical_addr(phys)) card_trace_record(phys, old_val, new_val, width);
     wtrace_all_record(phys, new_val, width);
     wtrace_transition_record(phys, old_val, new_val, width);
     wtrace_boot_record(phys, old_val, new_val, width);
@@ -7483,6 +7649,8 @@ static const CmdEntry s_commands[] = {
     { "fntrace_clear",     handle_fntrace_clear },
     { "fntrace_dump",      handle_fntrace_dump },
     { "unknown_dispatch_log", handle_unknown_dispatch_log },
+    { "bioscall_dump",     handle_bioscall_dump },
+    { "card_trace_dump",   handle_card_trace_dump },
     { "card_txn_dump",     handle_card_txn_dump },
     { "card_read_summary", handle_card_read_summary },
     { "card_read_summary_reset", handle_card_read_summary_reset },

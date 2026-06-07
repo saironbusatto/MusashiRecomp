@@ -418,3 +418,13 @@ void psx_check_interrupts(CPUState* cpu) {
                                          * fire within a single blocking wait. */
     }
 }
+
+/* Compatibility shim: the ape-flavored generated code calls
+ * psx_check_interrupts_at(cpu, resume_pc); the mmx6-fw baseline runtime delivers
+ * interrupts via psx_check_interrupts (cpu->pc / scratch sentinel). Forwarding
+ * here gives the mmx6 baseline interrupt behavior — sufficient to build+run the
+ * current generated code on the good baseline for instrumented comparison. */
+void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
+    (void)resume_pc;
+    psx_check_interrupts(cpu);
+}
