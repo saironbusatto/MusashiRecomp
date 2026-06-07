@@ -75,6 +75,7 @@ static uint64_t sector_history_seq;
 
 /* Seek target */
 static uint8_t seek_min, seek_sec, seek_sect;
+static int     s_setloc_lba = -1;  /* LBA captured at SetLoc time */
 
 /* Read state */
 static int reading;
@@ -137,6 +138,8 @@ void cdrom_set_game_speed(int divisor) {
 void cdrom_notify_game_started(void) {
     g_disc_speed_divisor = g_game_divisor;
 }
+
+int cdrom_get_setloc_lba(void) { return s_setloc_lba; }
 
 /* Minimum cycles between CD-ROM IRQs in fast modes. Must be enough for the
  * interrupt handler to save state, check the IRQ flag, process data, and
@@ -659,6 +662,7 @@ static void exec_command(uint8_t cmd) {
             seek_min = bcd_to_bin(param_fifo[0]);
             seek_sec = bcd_to_bin(param_fifo[1]);
             seek_sect = bcd_to_bin(param_fifo[2]);
+            s_setloc_lba = msf_to_lba(seek_min, seek_sec, seek_sect);
         }
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);

@@ -61,6 +61,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     if (runtime.contains("fast_boot")) {
         rt.fast_boot = toml::find<bool>(runtime, "fast_boot");
     }
+    if (runtime.contains("overlay_cache")) {
+        rt.overlay_cache = toml::find<bool>(runtime, "overlay_cache");
+    }
     return rt;
 }
 

@@ -47,6 +47,12 @@ struct RuntimeConfig {
     // subsequent launches, skipping BIOS execution entirely. Default off;
     // enable per-game in [runtime]. Snapshot is keyed on BIOS SHA256 + entry_pc.
     bool                  fast_boot = false;
+
+    // overlay_cache: enable the overlay DLL cache + capture (Layer A). Off by
+    // default. When true the runtime scans cache/<game_id>/ for precompiled
+    // overlay DLLs (loaded ahead of the dirty-RAM interpreter) and records
+    // overlay bytes to overlay_captures.json for offline compilation.
+    bool                  overlay_cache = false;
 };
 
 // One entry from [[recompiler.bios_vectors]].

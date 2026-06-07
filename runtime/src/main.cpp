@@ -10,6 +10,8 @@
 #include "cdrom.h"
 #include "fntrace.h"
 #include "boot_state.h"
+#include "overlay_capture.h"
+#include "overlay_loader.h"
 #include "gpu.h"
 #include "sio.h"
 #include "spu.h"
@@ -468,6 +470,7 @@ static void close_controller(void);
 
 static void shutdown_runtime(void) {
     memcard_flush_all();
+    overlay_capture_write_json();
     if (sdl_audio_device) {
         SDL_ClearQueuedAudio(sdl_audio_device);
         SDL_CloseAudioDevice(sdl_audio_device);
@@ -1106,6 +1109,16 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
+            /* Overlay DLL cache (Layer A). Off unless enabled in [runtime];
+             * when on, capture overlay bytes and scan cache/<game_id>/ for
+             * precompiled overlay DLLs. */
+            if (gc.runtime.overlay_cache) {
+                std::filesystem::path exe_dir = exe_dir_from_argv(argv[0]);
+                std::string cache_dir = (exe_dir / "cache").string();
+                overlay_capture_set_out_dir(exe_dir.string().c_str());
+                overlay_capture_set_enabled(1);
+                overlay_loader_init(cache_dir.c_str(), game_id.c_str());
+            }
             std::fprintf(stdout, "psxrecomp: loaded game config %s (%s, %s)\n",
                          game_config_path, game_name.c_str(), game_id.c_str());
         } catch (const std::exception& ex) {

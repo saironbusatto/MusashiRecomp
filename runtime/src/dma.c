@@ -17,6 +17,7 @@
 #include "dirty_ram_interp.h"
 #include "gpu.h"
 #include "mdec.h"
+#include "overlay_capture.h"
 #include "spu.h"
 #include <stdint.h>
 #include <stdio.h>
@@ -49,10 +50,42 @@ typedef struct {
     uint32_t total_words;
     uint32_t remaining_words;
     uint32_t cycles_accum;
+    uint32_t start_addr;   /* madr at transfer start (CD overlay capture) */
 } DMAAsyncChannel;
 
 static DMAAsyncChannel mdec_async[2];
 static DMAAsyncChannel cdrom_async;
+
+/* ---- CD DMA transfer log ---- */
+/* Every forward CH3 DMA that lands below 0x1C0000 (game data region) records
+ * (setloc_lba, dest_addr, size). Transfers to 0x1C0000+ are FMV/streaming
+ * buffers and are excluded to keep the ring focused on overlay loads.
+ * Surfaced via the cd_read_log TCP command; pairs with overlay_dump to map
+ * overlay regions back to disc positions for extract_overlays.py. */
+#define CD_DMA_LOG_CAP 65536
+typedef struct { int lba; uint32_t dest; uint32_t size; } CdDmaEntry;
+static CdDmaEntry cd_dma_log[CD_DMA_LOG_CAP];
+static uint32_t   cd_dma_log_head  = 0;
+static uint32_t   cd_dma_log_total = 0;
+
+static void cd_dma_log_push(int lba, uint32_t dest, uint32_t size) {
+    cd_dma_log[cd_dma_log_head % CD_DMA_LOG_CAP].lba  = lba;
+    cd_dma_log[cd_dma_log_head % CD_DMA_LOG_CAP].dest = dest;
+    cd_dma_log[cd_dma_log_head % CD_DMA_LOG_CAP].size = size;
+    cd_dma_log_head = (cd_dma_log_head + 1) % CD_DMA_LOG_CAP;
+    cd_dma_log_total++;
+}
+
+uint32_t cd_dma_log_get_total(void) { return cd_dma_log_total; }
+void     cd_dma_log_get_entry(uint32_t idx, int *lba, uint32_t *dest, uint32_t *size) {
+    uint32_t cap   = CD_DMA_LOG_CAP;
+    uint32_t oldest = cd_dma_log_total > cap ? cd_dma_log_total - cap : 0;
+    if (idx < oldest || idx >= cd_dma_log_total) { *lba = -1; return; }
+    uint32_t slot = idx % cap;
+    *lba  = cd_dma_log[slot].lba;
+    *dest = cd_dma_log[slot].dest;
+    *size = cd_dma_log[slot].size;
+}
 
 #define DMA_MDEC_IN_CYCLES_PER_WORD   1u
 #define DMA_MDEC_OUT_CYCLES_PER_WORD 14u
@@ -247,6 +280,7 @@ static void start_async_cdrom_transfer(void) {
     a->total_words = transfer_word_count(3);
     a->remaining_words = a->total_words;
     a->cycles_accum = 0;
+    a->start_addr = channels[3].madr & 0x1FFFFCu;
 
     if (a->total_words == 0) {
         cancel_async_transfer(3);
@@ -255,6 +289,25 @@ static void start_async_cdrom_transfer(void) {
 }
 
 static void finish_async_cdrom_transfer(uint32_t final_addr) {
+    DMAAsyncChannel *a = &cdrom_async;
+    uint32_t step       = (channels[3].chcr >> 1) & 1u;
+    uint32_t load_start = a->start_addr;
+    uint32_t size       = a->total_words * 4u;
+
+    /* Log and capture game-data transfers only.
+     * Transfers to 0x1C0000+ are FMV/streaming buffers; skip them. */
+    if (!step && size > 0 && load_start < 0x1C0000u) {
+        int lba = cdrom_get_setloc_lba();
+        if (lba >= 0) cd_dma_log_push(lba, load_start, size);
+
+        /* B-1: capture overlay bytes into the write-once capture set.
+         * overlay_capture_on_dma auto-activates after game handoff and is a
+         * no-op unless the overlay cache is enabled in config. */
+        extern uint8_t *memory_get_ram_ptr(void);
+        uint8_t *ram = memory_get_ram_ptr();
+        overlay_capture_on_dma(load_start, size, ram + load_start);
+    }
+
     channels[3].madr = final_addr;
     cancel_async_transfer(3);
     complete_transfer(3);

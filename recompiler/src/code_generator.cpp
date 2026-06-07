@@ -1573,7 +1573,11 @@ std::string CodeGenerator::generate_file(
     // hit `psx_unknown_dispatch`. Surfaced by Phase B2 audit. The 16-pass
     // cap is a safety limit; in practice each pass strictly reduces the
     // remaining target set so convergence is fast.
-    {
+    //
+    // Overlay exact mode disables this: overlay branch targets are basic-block
+    // labels, not callable function entries, so splitting them into standalone
+    // functions produces broken dispatch — the mid-function-seed failure mode.
+    if (config_.split_mid_function_targets) {
         std::set<uint32_t> cfgs_to_scan;  // Which CFGs to scan (empty = all)
         uint32_t exe_start = exe_.header.load_address;
         uint32_t exe_end = exe_.end_address();

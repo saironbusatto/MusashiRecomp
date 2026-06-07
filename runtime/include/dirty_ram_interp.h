@@ -56,13 +56,16 @@ extern const char *g_dirty_ram_last_unsupported_reason;
  * stubs actually fire — a single noisy spurious-dispatch site can mask
  * a legitimate handler that never runs.  This open-addressed table keys
  * on the entry PC of each interpreted block. */
-#define DIRTY_RAM_PC_TABLE_SIZE 64
+#define DIRTY_RAM_PC_TABLE_SIZE 65536
 typedef struct {
     uint32_t pc;        /* entry PC, 0 = empty slot */
     uint64_t hits;      /* number of times dispatched here */
     uint64_t insns;     /* total instructions executed across hits */
 } DirtyRamPcEntry;
 extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
+/* Companion table: every PC the interpreter actually executes (not just block
+ * entries). overlay_capture uses both to report execution-verified seeds. */
+extern DirtyRamPcEntry g_dirty_ram_exec_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
 
 /* Block-entry ring buffer. Records every dispatch into dirty RAM with the
  * caller's RA at entry, plus argument context — answers

@@ -52,6 +52,7 @@ uint32_t g_dirty_ram_last_unsupported_insn = 0;
 const char *g_dirty_ram_last_unsupported_reason = NULL;
 
 DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE] = {0};
+DirtyRamPcEntry g_dirty_ram_exec_pc_table[DIRTY_RAM_PC_TABLE_SIZE] = {0};
 
 DirtyRamBlockLogEntry g_dirty_ram_block_log[DIRTY_RAM_BLOCK_LOG_CAP] = {0};
 uint64_t              g_dirty_ram_block_log_seq = 0;
@@ -67,15 +68,27 @@ extern uint64_t s_frame_count;
  * the working set of install-stub PCs is tiny (handful), so this stays
  * O(1) in practice.  Returns NULL if the table is full — caller treats
  * that as "stop tracking" rather than failing. */
-static DirtyRamPcEntry *pc_table_get_or_insert(uint32_t pc) {
+static DirtyRamPcEntry *pc_table_get_or_insert_in(DirtyRamPcEntry *table, uint32_t pc) {
     uint32_t h = (pc * 2654435761u) & (DIRTY_RAM_PC_TABLE_SIZE - 1);
     for (uint32_t i = 0; i < DIRTY_RAM_PC_TABLE_SIZE; i++) {
         uint32_t idx = (h + i) & (DIRTY_RAM_PC_TABLE_SIZE - 1);
-        DirtyRamPcEntry *e = &g_dirty_ram_pc_table[idx];
+        DirtyRamPcEntry *e = &table[idx];
         if (e->pc == pc) return e;
         if (e->pc == 0) { e->pc = pc; return e; }
     }
     return NULL;
+}
+
+static DirtyRamPcEntry *pc_table_get_or_insert(uint32_t pc) {
+    return pc_table_get_or_insert_in(g_dirty_ram_pc_table, pc);
+}
+
+/* Record every PC the interpreter executes (not just block entries) so
+ * overlay_capture can report execution-verified seeds for the region. */
+static void exec_pc_table_record(uint32_t pc) {
+    DirtyRamPcEntry *e = pc_table_get_or_insert_in(g_dirty_ram_exec_pc_table,
+                                                   pc & 0x1FFFFFFFu);
+    if (e) e->hits++;
 }
 
 /* From debug_server.c — keep our outer-frame attribution coherent. */
@@ -233,6 +246,54 @@ static int is_local_dirty_target(uint32_t target) {
     return phys >= 0x00098000u && dirty_ram_is_dirty(phys);
 }
 
+/* A dirty-RAM target only deserves interpretation if its first word decodes
+ * as a plausible MIPS instruction.  A scatter-loaded overlay leaves data
+ * bytes in dirty pages; jumping into those and interpreting them as code is
+ * how the original cache build produced black/blue screens.  When the target
+ * word doesn't look like code, fall back to the normal dispatch path. */
+static int dirty_ram_word_looks_decodable(uint32_t insn) {
+    if (insn == 0xFFFFFFFFu || insn == 0xFFFFFFFDu) return 0;
+
+    uint32_t op = op_field(insn);
+    uint32_t fn = funct_field(insn);
+    uint32_t rt = rt_field(insn);
+
+    if (op == 0x00u) {
+        switch (fn) {
+        case 0x00u: case 0x02u: case 0x03u: case 0x04u:
+        case 0x06u: case 0x07u: case 0x08u: case 0x09u:
+        case 0x0Cu: case 0x0Du:
+        case 0x10u: case 0x11u: case 0x12u: case 0x13u:
+        case 0x18u: case 0x19u: case 0x1Au: case 0x1Bu:
+        case 0x20u: case 0x21u: case 0x22u: case 0x23u:
+        case 0x24u: case 0x25u: case 0x26u: case 0x27u:
+        case 0x2Au: case 0x2Bu:
+            return 1;
+        default:
+            return 0;
+        }
+    }
+    if (op == 0x01u) {
+        return rt == 0x00u || rt == 0x01u || rt == 0x10u || rt == 0x11u;
+    }
+
+    switch (op) {
+    case 0x02u: case 0x03u: case 0x04u: case 0x05u:
+    case 0x06u: case 0x07u:
+    case 0x08u: case 0x09u: case 0x0Au: case 0x0Bu:
+    case 0x0Cu: case 0x0Du: case 0x0Eu: case 0x0Fu:
+    case 0x10u: case 0x12u:
+    case 0x20u: case 0x21u: case 0x22u: case 0x23u:
+    case 0x24u: case 0x25u: case 0x26u:
+    case 0x28u: case 0x29u: case 0x2Au: case 0x2Bu:
+    case 0x2Eu:
+    case 0x30u: case 0x32u: case 0x38u: case 0x3Au:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
                                   uint32_t return_pc,
                                   uint32_t *next_pc_out) {
@@ -276,6 +337,7 @@ static void exec_delay_slot(CPUState *cpu, uint32_t pc) {
 }
 
 static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
+    exec_pc_table_record(pc);
     uint32_t phys = pc & 0x1FFFFFFFu;
     uint32_t insn = fetch_word(phys);
     uint32_t opc  = op_field(insn);
@@ -464,6 +526,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         }
 #endif
         if (!is_local_dirty_target(target)) {
+            return dispatch_nonlocal_call(cpu, target, return_pc, next_pc_out);
+        }
+        if (!dirty_ram_word_looks_decodable(fetch_word(target & 0x1FFFFFFFu))) {
             return dispatch_nonlocal_call(cpu, target, return_pc, next_pc_out);
         }
         cpu->pc = target;
@@ -686,6 +751,23 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
 #ifdef PSX_HAS_GAME_DISPATCH
     if (psx_dispatch_game_compiled(cpu, addr)) return 1;
 #endif
+
+    /* B-2: statically-compiled overlay functions (generated/overlays_static.c).
+     * Inert unless a game provides an overlays_static.c at build time. */
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+    {
+        extern int psx_overlay_dispatch(CPUState *cpu, uint32_t addr);
+        if (psx_overlay_dispatch(cpu, addr)) return 1;
+    }
+#endif
+
+    /* A-1: dynamically-loaded overlay DLL functions, checked before the
+     * interpreter.  No-op (returns 0) until overlay_loader_init() runs, which
+     * only happens when the overlay cache is enabled in config. */
+    {
+        extern int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
+        if (overlay_loader_dispatch(cpu, addr)) return 1;
+    }
 
     if (!dirty_ram_is_dirty(phys)) return 0;
 

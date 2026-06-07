@@ -8,6 +8,7 @@
  * so TCP.md and DEBUG.md are reusable across projects.
  */
 #include "debug_server.h"
+#include "overlay_loader.h"
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
@@ -7214,6 +7215,88 @@ static void handle_fn_exit_dump(int id, const char *json) {
     free(buf);
 }
 
+/* cd_read_log: dump the CD DMA transfer ring.  Each entry records the
+ * setloc LBA, destination RAM address, and byte count for one forward
+ * channel-3 DMA transfer.  Use with overlay_dump to map overlay regions
+ * back to their disc positions for the extract_overlays.py disc scanner.
+ *
+ * Parameters: "tail" (int, default 256) — how many recent entries to return.
+ */
+static void handle_cd_read_log(int id, const char *json)
+{
+    extern uint32_t cd_dma_log_get_total(void);
+    extern void     cd_dma_log_get_entry(uint32_t idx, int *lba,
+                                         uint32_t *dest, uint32_t *size);
+
+    int tail = json_get_int(json, "tail", 256);
+    uint32_t total = cd_dma_log_get_total();
+    uint32_t cap   = 65536;
+    uint32_t avail = total < cap ? total : cap;
+    if ((uint32_t)tail > avail) tail = (int)avail;
+
+    uint32_t start_idx = total > (uint32_t)tail ? total - (uint32_t)tail : 0;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"count\":%d,\"entries\":[",
+             id, total, tail);
+    int first = 1;
+    for (uint32_t i = start_idx; i < total; i++) {
+        int lba; uint32_t dest, size;
+        cd_dma_log_get_entry(i, &lba, &dest, &size);
+        if (lba < 0) continue;
+        send_fmt("%s{\"lba\":%d,\"dest\":\"0x%08X\",\"size\":%u}",
+                 first ? "" : ",", lba, dest, size);
+        first = 0;
+    }
+    send_fmt("]}\n");
+}
+
+/* overlay_loader_status: report the dynamic overlay DLL loader state —
+ * whether active, how many functions are registered, which regions have
+ * been checked, and the most recent load event. Rule-3 inspection path for
+ * the loader (it does no stderr logging). */
+static void handle_overlay_loader_status(int id, const char *json)
+{
+    (void)json;
+    int      active = 0, registered = 0, nchecked = 0, nwritten = 0;
+    int      file_found = 0;
+    uint32_t last_crc = 0;
+    char     cache_dir[512] = {0}, game_id[64] = {0};
+    uint32_t checked[8]     = {0};
+    overlay_loader_get_status(&active, &registered, &nchecked,
+                              cache_dir, sizeof(cache_dir),
+                              game_id,   sizeof(game_id),
+                              checked, 8, &nwritten,
+                              &last_crc, &file_found);
+    /* Escape backslashes in cache_dir for JSON */
+    char esc_dir[768] = {0};
+    for (int si = 0, di = 0; cache_dir[si] && di < (int)sizeof(esc_dir)-2; si++) {
+        if (cache_dir[si] == '\\') esc_dir[di++] = '\\';
+        esc_dir[di++] = cache_dir[si];
+    }
+    const char *msg = overlay_loader_last_msg();
+    char esc_msg[512] = {0};
+    for (int si = 0, di = 0; msg[si] && di < (int)sizeof(esc_msg)-2; si++) {
+        if (msg[si] == '\\' || msg[si] == '"') esc_msg[di++] = '\\';
+        esc_msg[di++] = msg[si];
+    }
+    char buf[1536];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"id\":%d,\"ok\":true,\"active\":%d,\"registered\":%d,"
+        "\"regions_checked\":%d,\"last_crc\":\"0x%08X\",\"file_found\":%d,"
+        "\"cache_dir\":\"%s\",\"game_id\":\"%s\",\"last_msg\":\"%s\"",
+        id, active, registered, nchecked, last_crc, file_found,
+        esc_dir, game_id, esc_msg);
+    if (nwritten > 0) {
+        n += snprintf(buf + n, sizeof(buf) - n, ",\"checked\":[");
+        for (int i = 0; i < nwritten; i++)
+            n += snprintf(buf + n, sizeof(buf) - n,
+                          "%s\"0x%08X\"", i ? "," : "", checked[i]);
+        n += snprintf(buf + n, sizeof(buf) - n, "]");
+    }
+    snprintf(buf + n, sizeof(buf) - n, "}\n");
+    send_fmt("%s", buf);
+}
+
 /* overlay_dump: extract RAM regions that dirty_ram has marked executable
  * above a threshold physical address. Writes <crc32>.bin files to a
  * caller-supplied directory and returns a JSON manifest.
@@ -7746,6 +7829,8 @@ static const CmdEntry s_commands[] = {
     { "fn_entry_tail",     handle_fn_entry_tail },
     { "fn_exit_dump",      handle_fn_exit_dump },
     { "overlay_dump",      handle_overlay_dump },
+    { "cd_read_log",       handle_cd_read_log },
+    { "overlay_loader_status", handle_overlay_loader_status },
     { NULL, NULL }
 };
 

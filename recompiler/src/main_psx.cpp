@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
     std::string           extra_funcs_storage;  // lifetime anchor for the .c_str() below
     const char*           extra_funcs_path = nullptr;
     bool                  inspect_mode = false;
+    bool                  overlay_exact_mode = false;
     std::filesystem::path out_dir = "generated";
 
     if (!config_path.empty()) {
@@ -72,6 +73,8 @@ int main(int argc, char** argv) {
                  * with psxrecomp-bios and project scripts. */
             } else if (arg == "--inspect") {
                 inspect_mode = true;
+            } else if (arg == "--overlay-exact") {
+                overlay_exact_mode = true;
             }
         }
     }
@@ -197,7 +200,11 @@ int main(int argc, char** argv) {
     fmt::print("Performing function analysis...\n");
 
     PSXRecomp::FunctionAnalyzer analyzer(*exe);
-    analyzer.add_forced_entry(exe->header.initial_pc);
+    std::vector<uint32_t> exact_entries;
+    exact_entries.push_back(exe->header.initial_pc);
+    if (!overlay_exact_mode) {
+        analyzer.add_forced_entry(exe->header.initial_pc);
+    }
 
     // Forced entry points: functions called from the dispatch table but not
     // automatically detected by the heuristic-based function analysis.
@@ -213,7 +220,10 @@ int main(int argc, char** argv) {
                 if (line.empty() || line[0] == '#') continue;
                 uint32_t addr = (uint32_t)std::strtoul(line.c_str(), nullptr, 16);
                 if (addr >= 0x80010000u && addr < 0x80200000u) {
-                    analyzer.add_forced_entry(addr);
+                    exact_entries.push_back(addr);
+                    if (!overlay_exact_mode) {
+                        analyzer.add_forced_entry(addr);
+                    }
                     extra_count++;
                 }
             }
@@ -223,7 +233,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    auto analysis_result = analyzer.analyze();
+    auto analysis_result = overlay_exact_mode
+        ? analyzer.analyze_exact_entries(exact_entries)
+        : analyzer.analyze();
 
     // Print summary statistics
     fmt::print("\n=== Function Analysis Summary ===\n\n");
@@ -344,6 +356,7 @@ int main(int argc, char** argv) {
     PSXRecomp::CodeGenConfig codegen_config;
     codegen_config.emit_comments = true;
     codegen_config.emit_line_numbers = true;
+    codegen_config.split_mid_function_targets = !overlay_exact_mode;
 
     // Load per-game annotations: annotations/<exe_stem>_annotations.csv
     // Silently skipped if the file doesn't exist.

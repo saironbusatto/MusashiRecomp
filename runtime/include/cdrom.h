@@ -15,6 +15,9 @@ void cdrom_set_speed(int divisor);
 void cdrom_set_game_speed(int divisor);
 /* Called by fntrace on first game-range dispatch; switches to game speed. */
 void cdrom_notify_game_started(void);
+/* LBA of the most recent SetLoc command (-1 if none yet). Used by the DMA
+ * ring buffer to correlate each sector transfer with its disc position. */
+int  cdrom_get_setloc_lba(void);
 
 /* MMIO read/write (0x1F801800-0x1F801803) */
 uint32_t cdrom_read(uint32_t addr);
