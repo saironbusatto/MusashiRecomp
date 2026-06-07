@@ -28,7 +28,26 @@ broken*, with evidence.
 
 ## Issues
 
-### OV-1 — Blue screen on village → overworld transition (OPEN, root-caused)
+### OV-1 — Blue screen on village → overworld transition (FIXED 2026-06-07, Inc1-D)
+**Resolution verified by mechanism, not just symptom.** With Inc1-D write-
+invalidation, the village→overworld transition no longer softlocks. Counters at
+the overworld: `invalidations=1` (`last_msg: invalidated region 0x000E7000
+(+16384) on write 0x000E7388 -> 88 funcs`, the write from BIOS pc 0xBFC12210),
+`unregistered_funcs=88`, and **`stale_blocked` climbing into the tens of
+millions** — i.e. the game dispatches into the reused region constantly, and
+every one of those (which pre-fix executed stale village native code = the blue
+screen) is now blocked and routed to the interpreter. A/B confirmed earlier:
+`overlay_cache=false` transitions cleanly. Verified one transition + free
+roaming; broader scenes/games still untested.
+
+**Note on benefit:** correctness only, so far. `dispatch_native≈122` vs
+interpreter ≈31M — near-0% native, because (a) only one overlay is compiled and
+(b) an invalidated region is not re-registered this session. Speed payoff needs
+broad overlay coverage + Inc2 reload-on-return (CRC-matched re-registration).
+
+Original root-cause analysis below, retained for the record.
+
+### OV-1 (original analysis) — stale registration
 **Symptom:** leaving the village to the overworld lands on a solid blue screen.
 Not a crash: frame counter still advancing (8358→8364), `dispatch_miss_total=0`,
 `in_exception=0`, GPU enabled and drawing. Execution cycles low BIOS/kernel
@@ -86,4 +105,7 @@ cause is upstream (interpreter or game-level) and this diagnosis is wrong.
 - Inc1-A ✅ evidence-scoped `--overlay`
 - Inc1-B ◐ boundary gate done; per-function audit + manifest pending
 - Inc1-C ☐ loader registers only manifest entries
-- Inc1-D ☐ write-invalidation — **now the critical path (fixes OV-1)**
+- Inc1-D ✅ write-invalidation — fixes OV-1 (verified)
+- **Inc2 (next, biggest benefit lever):** reload-on-return — re-register a
+  cached overlay when its region is reused and the bytes match, so a revisited
+  overlay runs native again instead of staying interpreted after first exit.
