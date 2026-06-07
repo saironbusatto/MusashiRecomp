@@ -34,7 +34,6 @@ struct CodeGenConfig {
     bool emit_line_numbers;       // Include original address as comments
     bool optimize_zero_reg;       // Optimize away $zero assignments
     bool use_switch_for_blocks;   // Use switch instead of goto labels
-    bool split_mid_function_targets; // Split branch targets into funcs for legacy main-EXE analysis
     std::string indent;           // Indentation string (default: "    ")
 
     CodeGenConfig()
@@ -42,7 +41,6 @@ struct CodeGenConfig {
         , emit_line_numbers(true)
         , optimize_zero_reg(true)
         , use_switch_for_blocks(false)
-        , split_mid_function_targets(true)
         , indent("    ") {}
 };
 

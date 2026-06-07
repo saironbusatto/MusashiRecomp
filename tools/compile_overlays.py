@@ -956,11 +956,15 @@ def main():
             out_dir_tmp = os.path.join(tmp, 'out')
             os.makedirs(out_dir_tmp)
 
-            # Run psxrecomp-game
+            # Run psxrecomp-game.
+            # NOTE: --overlay-exact was removed (the pivot). Overlays now compile
+            # via the normal whole-blob analysis, which splits mid-function branch
+            # targets into standalone functions. That is the original (buggy)
+            # behavior we are reproducing; the fix moves to ingester-side
+            # parent-merge of mid-function seeds, not scan-time exclusion.
             cmd = [args.recompiler, psx_path,
                    '--seeds', seeds_path,
-                   '--out-dir', out_dir_tmp,
-                   '--overlay-exact']
+                   '--out-dir', out_dir_tmp]
             print(f'  recompile: {args.recompiler} ...')
             toml_dir = os.path.dirname(os.path.abspath(args.game_toml))
             r = subprocess.run(cmd, capture_output=True, text=True,
