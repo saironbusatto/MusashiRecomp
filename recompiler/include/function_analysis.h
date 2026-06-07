@@ -35,6 +35,11 @@ public:
     // Scan entire executable for function boundaries
     FunctionAnalysisResult analyze();
 
+    // Analyze only explicit entry points and direct JAL targets reachable from
+    // them. This is for runtime-loaded overlays where scanning the whole blob
+    // treats data and basic-block targets as standalone functions.
+    FunctionAnalysisResult analyze_exact_entries(const std::vector<uint32_t>& entries);
+
     // Add a forced entry point address that is treated as a function start
     // even if it has no standard ADDIU $sp prologue. The function will be
     // included in the analysis result with has_prologue = false.

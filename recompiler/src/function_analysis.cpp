@@ -1,6 +1,7 @@
 #include "function_analysis.h"
 #include <algorithm>
 #include <map>
+#include <queue>
 #include <set>
 #include <fmt/format.h>
 
@@ -216,6 +217,381 @@ bool FunctionAnalyzer::is_likely_data_section(uint32_t start_addr, uint32_t end_
 
     return false;
 }
+
+namespace {
+
+enum class ExactCfKind {
+    Normal,
+    Branch,
+    Jump,
+    Jal,
+    JrRa,
+    JrOther,
+    Jalr,
+};
+
+struct ExactCf {
+    ExactCfKind kind = ExactCfKind::Normal;
+    uint32_t target = 0;
+};
+
+struct ExactWalkResult {
+    std::set<uint32_t> visited;
+    std::set<uint32_t> direct_jal_targets;
+    std::set<uint32_t> jump_table_targets;
+    uint32_t jr_ra_count = 0;
+};
+
+static bool exact_is_jr_ra_word(uint32_t instr) {
+    return instr == 0x03E00008u;
+}
+
+static bool exact_is_addiu_sp_neg(uint32_t instr) {
+    uint32_t opcode = (instr >> 26) & 0x3Fu;
+    uint32_t rs = (instr >> 21) & 0x1Fu;
+    uint32_t rt = (instr >> 16) & 0x1Fu;
+    int16_t imm = static_cast<int16_t>(instr & 0xFFFFu);
+    return opcode == 0x09u && rs == 29u && rt == 29u && imm < 0;
+}
+
+static bool exact_is_valid_mips_word(uint32_t instr) {
+    if (instr == 0xFFFFFFFFu || instr == 0xFFFFFFFDu) return false;
+
+    uint32_t opcode = (instr >> 26) & 0x3Fu;
+    uint32_t funct = instr & 0x3Fu;
+    uint32_t rt = (instr >> 16) & 0x1Fu;
+
+    if (opcode == 0x00u) {
+        switch (funct) {
+        case 0x00u: case 0x02u: case 0x03u: case 0x04u:
+        case 0x06u: case 0x07u: case 0x08u: case 0x09u:
+        case 0x0Cu: case 0x0Du:
+        case 0x10u: case 0x11u: case 0x12u: case 0x13u:
+        case 0x18u: case 0x19u: case 0x1Au: case 0x1Bu:
+        case 0x20u: case 0x21u: case 0x22u: case 0x23u:
+        case 0x24u: case 0x25u: case 0x26u: case 0x27u:
+        case 0x2Au: case 0x2Bu:
+            return true;
+        default:
+            return false;
+        }
+    }
+    if (opcode == 0x01u) {
+        return rt == 0x00u || rt == 0x01u || rt == 0x10u || rt == 0x11u;
+    }
+
+    switch (opcode) {
+    case 0x02u: case 0x03u: case 0x04u: case 0x05u:
+    case 0x06u: case 0x07u:
+    case 0x08u: case 0x09u: case 0x0Au: case 0x0Bu:
+    case 0x0Cu: case 0x0Du: case 0x0Eu: case 0x0Fu:
+    case 0x10u: case 0x12u:
+    case 0x20u: case 0x21u: case 0x22u: case 0x23u:
+    case 0x24u: case 0x25u: case 0x26u:
+    case 0x28u: case 0x29u: case 0x2Au: case 0x2Bu:
+    case 0x2Eu:
+    case 0x30u: case 0x32u: case 0x38u: case 0x3Au:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static uint32_t exact_branch_target(uint32_t pc, uint32_t instr) {
+    int16_t imm = static_cast<int16_t>(instr & 0xFFFFu);
+    return pc + 4u + (static_cast<int32_t>(imm) << 2);
+}
+
+static uint32_t exact_jump_target(uint32_t pc, uint32_t instr) {
+    return ((pc + 4u) & 0xF0000000u) | ((instr & 0x03FFFFFFu) << 2);
+}
+
+static ExactCf exact_classify_cf(uint32_t pc, uint32_t instr) {
+    ExactCf cf;
+    uint32_t opcode = (instr >> 26) & 0x3Fu;
+    uint32_t funct = instr & 0x3Fu;
+    uint32_t rs = (instr >> 21) & 0x1Fu;
+
+    if (opcode == 0x00u && funct == 0x08u) {
+        cf.kind = (rs == 31u) ? ExactCfKind::JrRa : ExactCfKind::JrOther;
+        return cf;
+    }
+    if (opcode == 0x00u && funct == 0x09u) {
+        cf.kind = ExactCfKind::Jalr;
+        return cf;
+    }
+    if (opcode == 0x02u) {
+        cf.kind = ExactCfKind::Jump;
+        cf.target = exact_jump_target(pc, instr);
+        return cf;
+    }
+    if (opcode == 0x03u) {
+        cf.kind = ExactCfKind::Jal;
+        cf.target = exact_jump_target(pc, instr);
+        return cf;
+    }
+    if (opcode == 0x01u || (opcode >= 0x04u && opcode <= 0x07u) ||
+        (opcode >= 0x14u && opcode <= 0x17u)) {
+        cf.kind = ExactCfKind::Branch;
+        cf.target = exact_branch_target(pc, instr);
+        return cf;
+    }
+    return cf;
+}
+
+} // namespace
+
+FunctionAnalysisResult FunctionAnalyzer::analyze_exact_entries(const std::vector<uint32_t>& entries) {
+    FunctionAnalysisResult result;
+    result.total_instructions = 0;
+    result.jr_ra_count = 0;
+    result.prologue_count = 0;
+    result.call_discovered_count = 0;
+    result.state_continuation_count = 0;
+
+    fmt::print("\n=== Exact Overlay Function Analysis ===\n\n");
+
+    auto in_exe = [&](uint32_t addr) {
+        return addr >= exe_.header.load_address && addr < exe_.end_address() && (addr & 3u) == 0;
+    };
+
+    auto callable_direct_jal_target = [&](uint32_t addr) {
+        auto word_opt = exe_.read_word(addr);
+        if (!word_opt.has_value() || !exact_is_valid_mips_word(*word_opt)) return false;
+        if (addr == exe_.header.load_address) return true;
+
+        if (addr >= exe_.header.load_address + 8u) {
+            auto prev8_opt = exe_.read_word(addr - 8u);
+            if (prev8_opt.has_value() && exact_is_jr_ra_word(*prev8_opt)) return true;
+        }
+
+        if (exact_is_addiu_sp_neg(*word_opt)) {
+            if (addr < exe_.header.load_address + 4u) return true;
+            auto prev_opt = exe_.read_word(addr - 4u);
+            if (!prev_opt.has_value()) return true;
+            return exact_classify_cf(addr - 4u, *prev_opt).kind == ExactCfKind::Normal;
+        }
+
+        return false;
+    };
+
+    auto find_jump_table_targets = [&](uint32_t entry, uint32_t hard_cap,
+                                       uint32_t jr_pc, uint32_t jr_rs) {
+        std::vector<uint32_t> targets;
+        uint32_t lw_base = 0xFFu;
+        int32_t lw_offset = 0;
+        uint32_t addu_cand[2] = {0xFFu, 0xFFu};
+        uint32_t lui_val = 0;
+        int16_t addiu_val[2] = {0, 0};
+        bool found_addiu[2] = {false, false};
+        bool found_lui = false;
+        uint32_t table_count = 0;
+
+        for (int back = 1; back <= 40; back++) {
+            uint32_t scan_addr = jr_pc - static_cast<uint32_t>(back * 4);
+            if (scan_addr < entry) break;
+            auto scan_opt = exe_.read_word(scan_addr);
+            if (!scan_opt.has_value()) break;
+
+            uint32_t instr = *scan_opt;
+            uint32_t op = (instr >> 26) & 0x3Fu;
+            uint32_t rs = (instr >> 21) & 0x1Fu;
+            uint32_t rt = (instr >> 16) & 0x1Fu;
+            uint32_t rd = (instr >> 11) & 0x1Fu;
+            uint32_t fn = instr & 0x3Fu;
+
+            if (op == 0x23u && rt == jr_rs && lw_base == 0xFFu) {
+                lw_base = rs;
+                lw_offset = static_cast<int32_t>(static_cast<int16_t>(instr & 0xFFFFu));
+                continue;
+            }
+            if (op == 0x00u && fn == 0x21u && rd == lw_base && lw_base != 0xFFu &&
+                addu_cand[0] == 0xFFu) {
+                addu_cand[0] = rs;
+                addu_cand[1] = rt;
+                continue;
+            }
+            if (op == 0x09u && addu_cand[0] != 0xFFu) {
+                for (int c = 0; c < 2; c++) {
+                    if (!found_addiu[c] && addu_cand[c] != 0xFFu &&
+                        rs == addu_cand[c] && rt == addu_cand[c]) {
+                        addiu_val[c] = static_cast<int16_t>(instr & 0xFFFFu);
+                        found_addiu[c] = true;
+                        break;
+                    }
+                }
+                continue;
+            }
+            if (op == 0x0Fu && addu_cand[0] != 0xFFu && !found_lui) {
+                for (int c = 0; c < 2; c++) {
+                    if (addu_cand[c] != 0xFFu && rt == addu_cand[c]) {
+                        lui_val = (instr & 0xFFFFu) << 16;
+                        if (!found_addiu[c]) addiu_val[c] = 0;
+                        addiu_val[0] = addiu_val[c];
+                        found_addiu[0] = found_addiu[c];
+                        found_lui = true;
+                        break;
+                    }
+                }
+                continue;
+            }
+            if (op == 0x0Bu && table_count == 0) {
+                table_count = instr & 0xFFFFu;
+                continue;
+            }
+            if (found_lui && table_count != 0) break;
+        }
+
+        if (!found_lui || table_count == 0 || table_count >= 512) return targets;
+
+        uint32_t table_base = lui_val +
+            (found_addiu[0] ? static_cast<uint32_t>(static_cast<int32_t>(addiu_val[0])) : 0u) +
+            static_cast<uint32_t>(lw_offset);
+        for (uint32_t i = 0; i < table_count; i++) {
+            auto entry_opt = exe_.read_word(table_base + i * 4u);
+            if (!entry_opt.has_value()) continue;
+            uint32_t target = *entry_opt;
+            if (target >= entry && target < hard_cap && in_exe(target)) {
+                targets.push_back(target);
+            }
+        }
+        return targets;
+    };
+
+    auto walk = [&](uint32_t entry, uint32_t hard_cap) {
+        ExactWalkResult wr;
+        std::queue<uint32_t> work;
+        work.push(entry);
+
+        auto in_function = [&](uint32_t addr) {
+            return in_exe(addr) && addr >= entry && addr < hard_cap;
+        };
+
+        while (!work.empty()) {
+            uint32_t pc = work.front();
+            work.pop();
+
+            if (wr.visited.count(pc) || !in_function(pc)) continue;
+            auto word_opt = exe_.read_word(pc);
+            if (!word_opt.has_value()) continue;
+
+            uint32_t instr = *word_opt;
+            wr.visited.insert(pc);
+            ExactCf cf = exact_classify_cf(pc, instr);
+            uint32_t delay = pc + 4u;
+
+            switch (cf.kind) {
+            case ExactCfKind::Normal:
+                if (in_function(pc + 4u)) work.push(pc + 4u);
+                break;
+            case ExactCfKind::Branch:
+                if (in_function(delay)) wr.visited.insert(delay);
+                if (in_function(pc + 8u)) work.push(pc + 8u);
+                if (in_function(cf.target)) work.push(cf.target);
+                break;
+            case ExactCfKind::Jump:
+                if (in_function(delay)) wr.visited.insert(delay);
+                if (in_function(cf.target)) work.push(cf.target);
+                break;
+            case ExactCfKind::Jal:
+                if (in_function(delay)) wr.visited.insert(delay);
+                if (in_function(pc + 8u)) work.push(pc + 8u);
+                if (in_exe(cf.target) && callable_direct_jal_target(cf.target)) {
+                    wr.direct_jal_targets.insert(cf.target);
+                }
+                break;
+            case ExactCfKind::Jalr:
+                if (in_function(delay)) wr.visited.insert(delay);
+                if (in_function(pc + 8u)) work.push(pc + 8u);
+                break;
+            case ExactCfKind::JrRa:
+                if (in_function(delay)) wr.visited.insert(delay);
+                wr.jr_ra_count++;
+                break;
+            case ExactCfKind::JrOther:
+                if (in_function(delay)) wr.visited.insert(delay);
+                {
+                    uint32_t jr_rs = (instr >> 21) & 0x1Fu;
+                    for (uint32_t target : find_jump_table_targets(entry, hard_cap, pc, jr_rs)) {
+                        wr.jump_table_targets.insert(target);
+                        if (in_function(target)) work.push(target);
+                    }
+                }
+                break;
+            }
+        }
+        return wr;
+    };
+
+    std::set<uint32_t> known_entries;
+    std::queue<uint32_t> pending;
+    for (uint32_t entry : entries) {
+        if (!in_exe(entry)) continue;
+        if (known_entries.insert(entry).second) pending.push(entry);
+    }
+
+    size_t explicit_count = known_entries.size();
+    fmt::print("Explicit entries: {}\n", explicit_count);
+
+    std::set<uint32_t> processed;
+    while (!pending.empty()) {
+        uint32_t entry = pending.front();
+        pending.pop();
+        if (processed.count(entry)) continue;
+        processed.insert(entry);
+
+        auto next_it = known_entries.upper_bound(entry);
+        uint32_t hard_cap = (next_it != known_entries.end()) ? *next_it : exe_.end_address();
+        ExactWalkResult wr = walk(entry, hard_cap);
+
+        for (uint32_t target : wr.direct_jal_targets) {
+            if (known_entries.insert(target).second) pending.push(target);
+        }
+    }
+
+    result.call_discovered_count = static_cast<int>(known_entries.size() - explicit_count);
+    fmt::print("Direct-JAL entries: {}\n", result.call_discovered_count);
+    fmt::print("Total exact entries: {}\n\n", known_entries.size());
+
+    std::vector<uint32_t> starts_vec(known_entries.begin(), known_entries.end());
+    std::sort(starts_vec.begin(), starts_vec.end());
+
+    for (size_t i = 0; i < starts_vec.size(); i++) {
+        uint32_t entry = starts_vec[i];
+        uint32_t hard_cap = (i + 1 < starts_vec.size()) ? starts_vec[i + 1] : exe_.end_address();
+        ExactWalkResult wr = walk(entry, hard_cap);
+        if (wr.visited.empty()) continue;
+
+        Function func;
+        func.start_addr = entry;
+        func.end_addr = *wr.visited.rbegin() + 4u;
+        if (func.end_addr > hard_cap) func.end_addr = hard_cap;
+        if (func.end_addr <= func.start_addr) func.end_addr = func.start_addr + 4u;
+        func.size = func.end_addr - func.start_addr;
+        func.name = fmt::format("func_{:08X}", func.start_addr);
+
+        auto first_instr = exe_.read_word(func.start_addr);
+        if (first_instr.has_value()) {
+            int32_t stack_size;
+            func.has_prologue = is_prologue(*first_instr, stack_size);
+            func.stack_frame_size = func.has_prologue ? stack_size : 0;
+            if (func.has_prologue) result.prologue_count++;
+        } else {
+            func.has_prologue = false;
+            func.stack_frame_size = 0;
+        }
+
+        func.has_epilogue = wr.jr_ra_count > 0;
+        func.is_data_section = false;
+
+        result.jr_ra_count += static_cast<int>(wr.jr_ra_count);
+        result.total_instructions += static_cast<int>(wr.visited.size());
+        result.functions.push_back(func);
+    }
+
+    return result;
+}
+
 
 FunctionAnalysisResult FunctionAnalyzer::analyze() {
     FunctionAnalysisResult result;
