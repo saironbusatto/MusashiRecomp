@@ -483,24 +483,31 @@ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
 
     in_exception = 0;
 
-    /* Adaptive cooldown: if the handler acknowledged the interrupt (cleared
-     * some I_STAT bits), the interrupt won't immediately re-fire and we need
-     * no cooldown.  If I_STAT is unchanged (no handler claimed the interrupt),
+    /* Adaptive cooldown: if the handler did not acknowledge the interrupt,
      * give the main code a generous window to make progress — e.g. to let
-     * the shell finish installing handlers.  On real hardware, the CPU
-     * executes at least one instruction between exceptions; in our model
-     * each "block" is many instructions, but the handler also consumes
-     * hundreds of sub-dispatches per invocation. */
+     * the shell finish installing handlers.
+     *
+     * If the handler did acknowledge it, normally skip one generated safe
+     * point: real hardware executes at least one instruction after RFE
+     * before another pending IRQ can be delivered, and a safe point is the
+     * closest reusable equivalent in recompiled code.
+     *
+     * EXCEPTION: while a memory-card protocol is in flight, re-fire
+     * immediately (cooldown 0). A card READ must deliver 128 consecutive
+     * SIO IRQs within a single blocking wait; inserting even one
+     * skipped safe point per byte desyncs the byte stream and the read
+     * never completes (observed as a black screen on Tomba's LOAD GAME).
+     * sio_card_protocol_active() is true for the whole transaction. */
     if ((i_stat & i_mask) != 0 && i_stat == pre_handler_istat) {
         post_exception_cooldown = 500;  /* unclaimed: give main code time */
     } else {
-        post_exception_cooldown = 0;    /* claimed: re-fire immediately
-                                         * Real hardware executes 1 instruction
-                                         * between exceptions. With cooldown=0,
-                                         * the next psx_check_interrupts call
-                                         * can immediately service a pending IRQ.
-                                         * This is critical for SIO card reads
-                                         * where 128 consecutive SIO IRQs must
-                                         * fire within a single blocking wait. */
+        /* [CLAUDE 2026-06-05] Re-fire immediately on a claimed IRQ, matching
+         * the pre-Ape baseline. A nonzero cooldown when the card protocol is
+         * idle starves the VBlank delivery that drives Tomba's VSync counter
+         * (scratchpad 0x1F8001E8); the title-LOAD wait loop then never sees
+         * the counter reach its target → black screen. Codex's WIP had set
+         * this to 1; the card-read burst that needed 0 is the SAME branch, so
+         * unconditional 0 satisfies both. */
+        post_exception_cooldown = 0;
     }
 }

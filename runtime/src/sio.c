@@ -76,9 +76,8 @@ static int pad_slot_dualshock(int slot) {
 }
 
 static uint8_t pad_poll_id(int slot) {
-    if (!pad_slot_dualshock(slot)) return 0x41;
     if (pad_config_mode[slot]) return 0xF3;
-    return pad_analog_mode[slot] ? 0x73 : 0x41;
+    return (pad_slot_dualshock(slot) && pad_analog_mode[slot]) ? 0x73 : 0x41;
 }
 
 static void pad_clear_response(void) {
@@ -100,15 +99,22 @@ static void pad_prepare_response(uint8_t id, const uint8_t *payload, uint8_t pay
     }
 }
 
-static void pad_prepare_poll_response(void) {
-    uint8_t payload[6];
+static void pad_fill_poll_payload(uint8_t payload[6]) {
+    memset(payload, 0, 6);
     payload[0] = (uint8_t)(pad_buttons & 0xFF);
     payload[1] = (uint8_t)(pad_buttons >> 8);
-    if (pad_slot_dualshock(selected_slot) && pad_analog_mode[selected_slot]) {
-        payload[2] = pad_rx;
-        payload[3] = pad_ry;
-        payload[4] = pad_lx;
-        payload[5] = pad_ly;
+    payload[2] = pad_rx;
+    payload[3] = pad_ry;
+    payload[4] = pad_lx;
+    payload[5] = pad_ly;
+}
+
+static void pad_prepare_poll_response(void) {
+    uint8_t payload[6] = { 0, 0, 0, 0, 0, 0 };
+    pad_fill_poll_payload(payload);
+    if (pad_config_mode[selected_slot]) {
+        pad_prepare_response(0xF3, payload, 6);
+    } else if (pad_slot_dualshock(selected_slot) && pad_analog_mode[selected_slot]) {
         pad_prepare_response(pad_poll_id(selected_slot), payload, 6);
     } else {
         pad_prepare_response(0x41, payload, 2);
@@ -125,9 +131,18 @@ static void pad_prepare_command_response(uint8_t command) {
 
     switch (command) {
     case 0x43: /* Enter/exit config mode */
-        /* The command itself is acknowledged using the controller's current
-         * mode ID; the first parameter takes effect on later bytes. */
-        pad_prepare_response(pad_poll_id(selected_slot), zeros, 6);
+        if (pad_slot_dualshock(selected_slot) && !pad_config_mode[selected_slot]) {
+            uint8_t payload[6];
+            pad_fill_poll_payload(payload);
+            pad_prepare_response(pad_poll_id(selected_slot), payload,
+                                 pad_analog_mode[selected_slot] ? 6 : 2);
+        } else {
+            /* Tomba's default digital project still probes these commands as
+             * a DualShock-capable config object and expects config-style IDs. */
+            uint8_t payload[6];
+            pad_fill_poll_payload(payload);
+            pad_prepare_response(config_id, payload, 6);
+        }
         break;
     case 0x44: /* Set analog/digital mode */
     case 0x4D: /* Set vibration motor mapping */
@@ -153,8 +168,6 @@ static void pad_prepare_command_response(uint8_t command) {
 }
 
 static void pad_apply_command_param(uint8_t command, uint8_t param_idx, uint8_t value) {
-    if (!pad_slot_dualshock(selected_slot)) return;
-
     switch (command) {
     case 0x43:
         if (param_idx == 0) {
@@ -162,6 +175,7 @@ static void pad_apply_command_param(uint8_t command, uint8_t param_idx, uint8_t 
         }
         break;
     case 0x44:
+        if (!pad_slot_dualshock(selected_slot)) break;
         if (param_idx == 0 && !pad_analog_locked[selected_slot]) {
             pad_analog_mode[selected_slot] = (value & 0x01u) ? 1 : 0;
         } else if (param_idx == 1) {
@@ -792,12 +806,9 @@ static void mc_process_byte(uint8_t tx_byte) {
             mc_state = MC_ID1;
             sio_rx_data = mc_flag;
             sio_stat |= SIO_STAT_ACK;
-            /* no$psx: FLAG byte is 0x08 only after newly-inserted/changed-battery
-             * card; cleared on first read or write. Without this clear, the BIOS
-             * sees 0x08 forever, treats every read as a fresh-card probe, and
-             * resets the chain counter (v0=-1 + 0x7520=1 path in BFC152E0).
-             * Beetle's card sim returns 0x00 in steady-state — match that. */
-            mc_flag = 0x00;
+            /* FLAG bit 3 indicates that the directory has not been accepted.
+             * Real cards keep it set across reads/get-id and clear it on a
+             * write, commonly the BIOS dummy write to sector 0x003F. */
         } else {
             mc_state = MC_IDLE;
             sio_rx_data = 0xFF;
@@ -981,7 +992,7 @@ static void mc_process_byte(uint8_t tx_byte) {
     case MC_WRITE_END:
         mc_state = MC_IDLE;
         sio_rx_data = mc_checksum;
-        mc_flag = 0x00; /* Clear "new data" flag after first write */
+        mc_flag = 0x00; /* Writes clear the persistent card-change flag. */
         break;
 
     default:
@@ -1122,6 +1133,9 @@ static void sio_process_byte(uint8_t tx_byte) {
 
         /* Natural close: mc_state went IDLE this byte from non-IDLE. */
         if (mc_state == MC_IDLE && txn_pre_state != MC_IDLE) {
+            if (mc_slot >= 0 && mc_slot <= 1) {
+                mc_slots[mc_slot].flag = mc_flag;
+            }
             uint8_t reason;
             switch (txn_pre_state) {
             case MC_READ_END:
@@ -1371,6 +1385,9 @@ void sio_write(uint32_t addr, uint32_t value) {
                 sio_mc_abort_state = (int)mc_state;
                 sio_mc_abort_ctrl = (uint16_t)value;
             }
+            if (active_device == DEV_MEMCARD && mc_slot >= 0 && mc_slot <= 1) {
+                mc_slots[mc_slot].flag = mc_flag;
+            }
             if (sio_txn_open) {
                 extern uint32_t g_debug_current_func_addr;
                 txn_close(SIO_TXN_END_ABORT_RESET, mc_state, g_debug_current_func_addr);
@@ -1442,8 +1459,8 @@ void sio_write(uint32_t addr, uint32_t value) {
          *
          * Cleared: state, cmd, sector, sector_msb, sector_lsb,
          *          data_idx, checksum (volatile protocol state).
-         * Preserved: flag (persistent "new card" metadata, only cleared
-         *            after first read/write completes; carries across
+         * Preserved: flag (persistent card-change metadata, only cleared
+         *            by a write command; carries across
          *            SELECT drops on real hardware) and data (sector
          *            buffer; harmless to retain since the next read
          *            overwrites it). */
@@ -1452,13 +1469,10 @@ void sio_write(uint32_t addr, uint32_t value) {
                 extern uint32_t g_debug_current_func_addr;
                 txn_close(SIO_TXN_END_ABORT_OTHER, mc_state, g_debug_current_func_addr);
             }
-            /* Persist mc_flag back to the active slot before resetting. mc_flag
-             * was loaded from mc_slots[mc_slot].flag on the 0x81 select and
-             * cleared to 0x00 in MC_CMD on the first 0x52/0x57/0x53. Without
-             * writing it back here, every reselect re-loads the stale 0x08
-             * "new card" value, and the BIOS aborts every multi-sector read
-             * after the first one (sees FLAG=0x08 → "card was just inserted,
-             * re-init" → 2-byte 0x81-0x52 abort). */
+            /* Persist mc_flag back to the active slot before resetting. It is
+             * loaded from the slot on 0x81 select, remains set across reads,
+             * and is cleared by writes such as the BIOS sector-0x003F dummy
+             * accept write. */
             if (active_device == DEV_MEMCARD && mc_slot >= 0 && mc_slot <= 1) {
                 mc_slots[mc_slot].flag = mc_flag;
             }

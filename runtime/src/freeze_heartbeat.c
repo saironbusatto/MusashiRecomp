@@ -58,17 +58,22 @@ static int    s_sym_initialized = 0;
  * Two failure modes to catch:
  *   A. HARD freeze — main thread is fully wedged; frame_count stops
  *      advancing entirely. Detected by zero frame_delta over the window.
- *   B. SOFT freeze / reentry storm — frame_count keeps advancing
- *      (sometimes at near-normal rate) but the main thread is starved
- *      by exception-handler reentry. Detected by exc_reentry_blocks
- *      delta exceeding a threshold over the window. OPTIONS-black on
- *      psx-runtime is this case: ~58 Hz frame rate, ~45K reentries/sec.
+ *   B. SOFT freeze / reentry storm — frame_count may keep advancing
+ *      because VBlank is still being serviced, but game execution is
+ *      starved by exception-handler reentry. Detected by a high
+ *      exc_reentry_blocks delta only when the heartbeat progress counters
+ *      are also stalled or near-stalled. Legitimate streaming workloads
+ *      such as FMV/XA playback can have high reentry rates while CD, MDEC,
+ *      audio, cycle, and dirty-RAM execution still advance.
  *
- * Window = 20 ticks = 2.0 sec. Long enough that legitimate startup
- * activity (boot, FMV decode, save load) doesn't trip it; short enough
- * that real wedges dump within seconds. */
-#define WEDGE_WINDOW_TICKS 20u
+ * Window = 60 ticks = 6.0 sec. Long enough that legitimate startup
+ * activity (boot, FMV decode, save load, host device init) doesn't trip it;
+ * short enough that real wedges still dump promptly. */
+#define WEDGE_WINDOW_TICKS 60u
 #define WEDGE_EXC_REENTRY_DELTA_THRESHOLD 10000u  /* >5K/sec sustained = wedge */
+#define WEDGE_PROGRESS_MIN_FRAME_DELTA 2u
+#define WEDGE_PROGRESS_MIN_CYCLE_DELTA 100000u
+#define WEDGE_PROGRESS_MIN_DIRTY_DELTA 64u
 
 /* Per-ring caps for auto-dump. Newest-first window. Sized so the total
  * dump fits in ~10-15 MB JSON even when every ring is full. */
@@ -464,6 +469,10 @@ static void heartbeat_write(void) {
 
     int mc_max = sio_get_mc_max_state();
     int tx_writes = sio_get_tx_writes();
+    int debug_listening = 0;
+    int debug_port = 0;
+    int debug_error = 0;
+    debug_server_get_status(&debug_listening, &debug_port, &debug_error);
 
     /* Wall-clock seconds since epoch — coarse but enough to spot stalls. */
     long long wall = (long long)time(NULL);
@@ -491,29 +500,49 @@ static void heartbeat_write(void) {
     /* ---- Wedge detection: arm-once auto-dump ----
      * Walk back WEDGE_WINDOW_TICKS in the heartbeat ring (just pushed
      * above) and compute deltas. Trigger if either:
-     *   A. frame_count delta == 0          (hard freeze)
-     *   B. exc_reentry delta > threshold   (reentry storm; soft freeze)
+     *   A. frame_count delta == 0 after at least one frame has presented and
+     *      core progress is stalled
+     *   B. exc_reentry delta > threshold and progress is stalled
      *
      * Only fires once the ring has enough history. When the wedge clears
-     * (a healthy tick: frames advancing AND exc_re quiet), re-arm. */
+     * (a healthy tick: frames advancing or exception reentry quiet), re-arm. */
     uint32_t wedge_kind = 0;  /* 0=healthy, 1=hard freeze, 2=reentry storm */
-    if (s_ring_count >= WEDGE_WINDOW_TICKS) {
+    if (s_ring_count >= WEDGE_WINDOW_TICKS &&
+        (frame != 0 || cyc != 0 || total_checks != 0)) {
         /* The just-pushed tick is at (s_ring_head - 1). The oldest in
          * our window is WEDGE_WINDOW_TICKS - 1 ticks before it. */
         uint32_t newest_idx = (s_ring_head + RING_CAP - 1u) % RING_CAP;
         uint32_t oldest_idx = (s_ring_head + RING_CAP - WEDGE_WINDOW_TICKS) % RING_CAP;
         uint64_t newest_frame = s_ring[newest_idx].frame_count;
         uint64_t oldest_frame = s_ring[oldest_idx].frame_count;
+        uint64_t newest_cyc = s_ring[newest_idx].psx_cycle_count;
+        uint64_t oldest_cyc = s_ring[oldest_idx].psx_cycle_count;
         uint64_t newest_excre = s_ring[newest_idx].exc_reentry;
         uint64_t oldest_excre = s_ring[oldest_idx].exc_reentry;
+        uint64_t newest_dirty = s_ring[newest_idx].dirty_ram_insns;
+        uint64_t oldest_dirty = s_ring[oldest_idx].dirty_ram_insns;
         uint64_t frame_delta = (newest_frame >= oldest_frame)
                                ? (newest_frame - oldest_frame) : 0;
+        uint64_t cycle_delta = (newest_cyc >= oldest_cyc)
+                               ? (newest_cyc - oldest_cyc) : 0;
         uint64_t excre_delta = (newest_excre >= oldest_excre)
                                ? (newest_excre - oldest_excre) : 0;
+        uint64_t dirty_delta = (newest_dirty >= oldest_dirty)
+                               ? (newest_dirty - oldest_dirty) : 0;
+        int cycle_frame_stalled =
+            (frame_delta < WEDGE_PROGRESS_MIN_FRAME_DELTA &&
+             cycle_delta < WEDGE_PROGRESS_MIN_CYCLE_DELTA);
+        int dirty_is_relevant = (newest_dirty != 0 || oldest_dirty != 0);
+        int dirty_stalled =
+            (dirty_is_relevant && dirty_delta < WEDGE_PROGRESS_MIN_DIRTY_DELTA);
+        int progress_stalled = cycle_frame_stalled || dirty_stalled;
 
-        if (frame_delta == 0)
+        if (newest_frame != 0 &&
+            frame_delta == 0 &&
+            cycle_delta < WEDGE_PROGRESS_MIN_CYCLE_DELTA &&
+            dirty_delta < WEDGE_PROGRESS_MIN_DIRTY_DELTA)
             wedge_kind = 1;
-        else if (excre_delta > WEDGE_EXC_REENTRY_DELTA_THRESHOLD)
+        else if (excre_delta > WEDGE_EXC_REENTRY_DELTA_THRESHOLD && progress_stalled)
             wedge_kind = 2;
     }
 
@@ -566,6 +595,9 @@ static void heartbeat_write(void) {
         "  \"i_mask\":\"0x%08X\",\n"
         "  \"mc_max_state\":%d,\n"
         "  \"tx_writes\":%d,\n"
+        "  \"debug_server_listening\":%d,\n"
+        "  \"debug_server_port\":%d,\n"
+        "  \"debug_server_error\":%d,\n"
         "  \"dirty_ram_blocks\":%llu,\n"
         "  \"dirty_ram_insns\":%llu\n"
         "}\n",
@@ -589,6 +621,9 @@ static void heartbeat_write(void) {
         i_stat, i_mask,
         mc_max,
         tx_writes,
+        debug_listening,
+        debug_port,
+        debug_error,
         (unsigned long long)g_dirty_ram_blocks_run,
         (unsigned long long)g_dirty_ram_insns_run);
 

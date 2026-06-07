@@ -36,6 +36,7 @@
 
 uint64_t g_dirty_ram_blocks_run = 0;
 uint64_t g_dirty_ram_insns_run  = 0;
+uint64_t g_dirty_ram_static_text_blocks_run = 0;
 uint64_t g_dirty_ram_aborts     = 0;
 uint64_t g_dirty_ram_guard_yields = 0;
 
@@ -318,6 +319,7 @@ enum {
     DIRTY_EXIT_NONLOCAL_TARGET   = 6,
     DIRTY_EXIT_CLEAN_NEXT        = 7,
     DIRTY_EXIT_GUARD             = 8,
+    DIRTY_EXIT_STATIC_TEXT_BLOCK = 9,
 };
 
 static void dirty_ram_log_exit(CPUState *cpu, uint32_t entry, uint32_t pc,
@@ -855,7 +857,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
  * mask. Returns 1 if interpretation handled the basic block; 0 if the
  * caller should fall back (e.g. unsupported opcode at the entry, page
  * not dirty). */
-int dirty_ram_dispatch_until(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
+static int dirty_ram_dispatch_until_impl(CPUState* cpu, uint32_t addr,
+                                         uint32_t stop_addr,
+                                         int static_text_fallback) {
     if (addr == 0) {
         cpu->pc = 0;
         dirty_ram_log_exit(cpu, addr, addr, 0, stop_addr,
@@ -877,10 +881,16 @@ int dirty_ram_dispatch_until(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
 
 #ifdef PSX_HAS_GAME_DISPATCH
     if (psx_dispatch_game_compiled(cpu, addr)) return 1;
-    if (fntrace_is_game_started() && psx_game_address_in_text(addr)) return 0;
+    if (static_text_fallback) {
+        if (!psx_game_address_in_text(addr)) return 0;
+    } else {
+        if (fntrace_is_game_started() && psx_game_address_in_text(addr)) return 0;
+    }
+#else
+    if (static_text_fallback) return 0;
 #endif
 
-    if (!dirty_ram_is_dirty(phys)) return 0;
+    if (!static_text_fallback && !dirty_ram_is_dirty(phys)) return 0;
 
     /* Reset soft-fail state at block entry. */
     g_unsupported_seen = 0;
@@ -980,9 +990,19 @@ int dirty_ram_dispatch_until(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
             if (stop_addr != 0 &&
                 ((target ^ stop_addr) & 0x1FFFFFFFu) == 0) {
                 g_dirty_ram_blocks_run++;
+                if (static_text_fallback) g_dirty_ram_static_text_blocks_run++;
                 if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
                 dirty_ram_log_exit(cpu, addr, pc, target, stop_addr,
                                    DIRTY_EXIT_STOP_ADDR,
+                                   (uint32_t)insns_executed, 1);
+                return 1;
+            }
+            if (static_text_fallback) {
+                g_dirty_ram_blocks_run++;
+                g_dirty_ram_static_text_blocks_run++;
+                if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                dirty_ram_log_exit(cpu, addr, pc, target, stop_addr,
+                                   DIRTY_EXIT_STATIC_TEXT_BLOCK,
                                    (uint32_t)insns_executed, 1);
                 return 1;
             }
@@ -1020,7 +1040,20 @@ int dirty_ram_dispatch_until(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
         /* Straight-line code that left the dirty page — hand back to
          * static dispatch by setting cpu->pc and returning. */
         uint32_t next_phys = pc & 0x1FFFFFFFu;
-        if (!dirty_ram_is_dirty(next_phys)) {
+        if (static_text_fallback) {
+#ifdef PSX_HAS_GAME_DISPATCH
+            if (!psx_game_address_in_text(pc)) {
+                cpu->pc = pc;
+                g_dirty_ram_blocks_run++;
+                g_dirty_ram_static_text_blocks_run++;
+                if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                dirty_ram_log_exit(cpu, addr, pc, pc, stop_addr,
+                                   DIRTY_EXIT_CLEAN_NEXT,
+                                   (uint32_t)insns_executed, 1);
+                return 1;
+            }
+#endif
+        } else if (!dirty_ram_is_dirty(next_phys)) {
             cpu->pc = pc;
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
@@ -1050,6 +1083,14 @@ int dirty_ram_dispatch_until(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     return 1;
 }
 
+int dirty_ram_dispatch_until(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
+    return dirty_ram_dispatch_until_impl(cpu, addr, stop_addr, 0);
+}
+
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
     return dirty_ram_dispatch_until(cpu, addr, 0);
+}
+
+int dirty_ram_dispatch_static_text(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
+    return dirty_ram_dispatch_until_impl(cpu, addr, stop_addr, 1);
 }

@@ -30,6 +30,7 @@ void     dma_write_masked(uint32_t addr, uint32_t val, uint32_t mask);
 void     dma_advance(uint32_t cycles);
 uint32_t dma_get_dicr(void);
 uint32_t dma_get_dpcr(void);
+int      dma_cdrom_transfer_active(void);
 
 typedef struct DMAChannelDebugState {
     uint32_t madr;

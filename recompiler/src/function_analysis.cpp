@@ -592,9 +592,44 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     // function and cap it after the JR delay slot.
     fmt::print("Finding packed BIOS dispatch thunk entries...\n");
     int bios_thunks = 0;
+    int bios_thunks_skipped = 0;
     for (uint32_t addr = exe_start; addr + 12u <= exe_end; addr += 4) {
         uint32_t jr_addr = 0;
         if (!is_bios_dispatch_thunk(addr, jr_addr)) continue;
+
+        // A li/jr BIOS-dispatch sequence is only a STANDALONE thunk when it
+        // sits in a gap that earlier discovery (prologue scan, jr-$ra scan,
+        // call-target following) missed. A real function may legitimately
+        // *begin* with this sequence (a tail call into the BIOS) yet continue
+        // with reachable code — e.g. a libcard routine that calls the BIOS and
+        // then polls card status. Treating such a function as a thunk and
+        // capping function_last_return at its first JR silently truncates the
+        // rest of its body. That is exactly what gutted Tomba's card-poll
+        // routine func_8005CDB8 (104B -> 12B) and stalled LOAD GAME.
+        //
+        // Mirror segagenesisrecomp's boundary-split discipline: a pattern
+        // heuristic must never shrink or split an already-discovered function.
+        // Only promote+cap thunks that are NOT already a known entry and do
+        // NOT fall inside an existing function's discovered extent.
+        if (function_starts.count(addr)) {
+            // Already discovered as a real function start — leave its extent
+            // alone; do not re-cap it to the first JR.
+            bios_thunks_skipped++;
+            continue;
+        }
+        auto owner_it = function_starts.upper_bound(addr); // first start > addr
+        if (owner_it != function_starts.begin()) {
+            --owner_it;                                     // greatest start <= addr
+            uint32_t owner = *owner_it;
+            auto ret_it = function_last_return.find(owner);
+            if (owner < addr && ret_it != function_last_return.end() &&
+                addr <= ret_it->second) {
+                // Inside an existing function's body — promoting here would
+                // split that function. Leave it whole.
+                bios_thunks_skipped++;
+                continue;
+            }
+        }
 
         if (function_starts.insert(addr).second) {
             bios_thunks++;
@@ -605,8 +640,9 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
         }
     }
     result.bios_thunk_count = bios_thunks;
-    fmt::print("Identified {} packed BIOS dispatch thunk entries\n\n",
-               result.bios_thunk_count);
+    fmt::print("Identified {} packed BIOS dispatch thunk entries "
+               "({} candidates skipped: already discovered / inside a function)\n\n",
+               result.bios_thunk_count, bios_thunks_skipped);
 
     // Pass 2.6: discover continuations saved by setjmp/SaveState-style helpers.
     //

@@ -692,13 +692,19 @@ static void try_execute(int ch) {
 
 uint32_t dma_get_dicr(void) { return dicr_read_value(dicr); }
 uint32_t dma_get_dpcr(void) { return dpcr; }
+int dma_cdrom_transfer_active(void) {
+    return cdrom_async.active &&
+           ((channels[3].chcr >> 24) & 1u) &&
+           channel_enabled(3) &&
+           ((channels[3].chcr & 1u) == 0);
+}
 
 void dma_advance(uint32_t cycles) {
     if (cycles == 0) return;
     advance_mdec_channel(0, cycles);
     advance_mdec_channel(1, cycles);
     DMAAsyncChannel *a = &cdrom_async;
-    if (a->active && ((channels[3].chcr >> 24) & 1u) && channel_enabled(3)) {
+    if (dma_cdrom_transfer_active()) {
         uint32_t chcr = channels[3].chcr;
         uint32_t direction = chcr & 1u;
         uint32_t step = (chcr >> 1) & 1u;

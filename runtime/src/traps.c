@@ -6,6 +6,7 @@
 
 #include "cpu_state.h"
 #include "debug_server.h"
+#include "dirty_ram_interp.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -199,14 +200,16 @@ static void psx_thread_fiber_entry(void* param)
     HostThreadFiber* slot = (HostThreadFiber*)param;
     CPUState* cpu = slot->cpu;
 
-    debug_server_log_thread_event(10, cpu, psx_current_tcb_ptr(cpu), slot->tcb, 0);
+    debug_server_log_thread_event_ex(10, cpu, psx_current_tcb_ptr(cpu), slot->tcb, 0,
+                                     (uintptr_t)psx_fiber_current(), (uintptr_t)slot->fiber);
     psx_set_current_tcb(cpu, slot->tcb);
     uint32_t target_pc = psx_restore_context_from_tcb(cpu, slot->tcb);
     if (target_pc != 0) {
         psx_dispatch(cpu, target_pc);
     }
 
-    debug_server_log_thread_event(11, cpu, psx_current_tcb_ptr(cpu), slot->tcb, target_pc);
+    debug_server_log_thread_event_ex(11, cpu, psx_current_tcb_ptr(cpu), slot->tcb, target_pc,
+                                     (uintptr_t)psx_fiber_current(), (uintptr_t)slot->fiber);
     slot->closed = 1;
     /* Guest BIOS code owns the TCB state. A host fiber can finish because a
      * thread returned through the BIOS scheduler path, but changing the BIOS
@@ -217,7 +220,8 @@ static void psx_thread_fiber_entry(void* param)
             psx_set_current_tcb(cpu, slot->return_tcb);
             (void)psx_restore_context_from_tcb(cpu, slot->return_tcb);
         }
-        debug_server_log_thread_event(12, cpu, slot->tcb, slot->return_tcb, 0);
+        debug_server_log_thread_event_ex(12, cpu, slot->tcb, slot->return_tcb, 0,
+                                         (uintptr_t)slot->fiber, (uintptr_t)slot->return_fiber);
         psx_fiber_switch(slot->return_fiber);
     }
 
@@ -297,8 +301,11 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
 
     psx_set_current_tcb(cpu, target_tcb);
     (void)psx_restore_context_from_tcb(cpu, target_tcb);
-    debug_server_log_thread_event(8, cpu, current_tcb, target_tcb, 0);
+    debug_server_log_thread_event_ex(8, cpu, current_tcb, target_tcb, 0,
+                                     (uintptr_t)current->fiber, (uintptr_t)target->fiber);
     psx_fiber_switch(target->fiber);
+    debug_server_log_thread_event_ex(13, cpu, current_tcb, target_tcb, 0,
+                                     (uintptr_t)current->fiber, (uintptr_t)target->fiber);
 
     /* The switch returns on the original native stack, but CPUState is
      * shared globally and still contains the fiber that just yielded back.
@@ -306,6 +313,8 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     if (saved_current_context && psx_is_valid_tcb(cpu, current_tcb)) {
         psx_set_current_tcb(cpu, current_tcb);
         (void)psx_restore_context_from_tcb(cpu, current_tcb);
+        debug_server_log_thread_event_ex(14, cpu, current_tcb, target_tcb, cpu->gpr[26],
+                                         (uintptr_t)current->fiber, (uintptr_t)target->fiber);
     }
 
     /* If a non-owner fiber requested an exception longjmp while we were
@@ -317,10 +326,15 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     if (g_pending_exception_longjmp && psx_fiber_current() == g_exception_owner_fiber) {
         int code = g_pending_exception_longjmp;
         g_pending_exception_longjmp = 0;
+        debug_server_log_thread_event_ex(15, cpu, current_tcb, target_tcb, (uint32_t)code,
+                                         (uintptr_t)current->fiber, (uintptr_t)target->fiber);
         longjmp(exception_jmpbuf, code);
     }
 
-    debug_server_log_thread_event(9, cpu, target_tcb, current_tcb, 0);
+    debug_server_log_thread_event_ex(16, cpu, current_tcb, target_tcb, cpu->pc,
+                                     (uintptr_t)current->fiber, (uintptr_t)target->fiber);
+    debug_server_log_thread_event_ex(9, cpu, target_tcb, current_tcb, 0,
+                                     (uintptr_t)target->fiber, (uintptr_t)current->fiber);
     cpu->pc = 0;
     return 1;
 }
@@ -561,6 +575,15 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
         exit(1);
     }
 
+#ifdef PSX_HAS_GAME_DISPATCH
+    /* Valid game-text misses can happen when an indirect call targets an
+     * instruction inside a generated function, not one of the dispatch table
+     * entries. Interpret the missing block and hand control back to dispatch. */
+    if (dirty_ram_dispatch_static_text(cpu, addr, 0)) {
+        return;
+    }
+#endif
+
     /*
      * The BIOS writes small jump trampolines into RAM at runtime
      * (e.g., at 0xA0, 0xB0, 0xC0 for the A0/B0/C0 vectors).
@@ -692,6 +715,15 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
                                     uint32_t index_val = cpu->gpr[idx_rt];
                                     uint32_t table_addr = computed + (index_val << 2);
                                     uint32_t func_ptr = cpu->read_word(table_addr);
+                                    /* Always-on A0/B0/C0 call ring (event-delivery
+                                     * visibility without arm-and-time). */
+                                    extern void psx_bioscall_record(
+                                        uint32_t, uint32_t, uint32_t, uint32_t,
+                                        uint32_t, uint32_t, uint32_t, uint32_t);
+                                    psx_bioscall_record(computed, index_val, func_ptr,
+                                                        cpu->gpr[4], cpu->gpr[5],
+                                                        cpu->gpr[6], cpu->gpr[7],
+                                                        cpu->gpr[31]);
                                     cpu->pc = func_ptr;
                                     return;
                                 }

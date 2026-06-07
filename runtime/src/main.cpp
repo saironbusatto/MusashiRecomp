@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <ctime>
 #include <exception>
 #include <array>
 #include <filesystem>
@@ -87,6 +88,19 @@ static SDL_GameController* sdl_controller;
 static SDL_JoystickID      sdl_controller_instance = -1;
 static uint32_t      sdl_pixel_buf[640 * 512]; /* ARGB8888 staging buffer */
 static int           s_fast_boot_active = 0;  /* cleared when game entry PC fires */
+
+static void write_startup_stage(const char* stage) {
+    FILE* f = std::fopen("psx_startup_status.json", "wb");
+    if (!f) return;
+    std::fprintf(f,
+                 "{\n"
+                 "  \"stage\":\"%s\",\n"
+                 "  \"wall_clock_epoch\":%lld\n"
+                 "}\n",
+                 stage ? stage : "(null)",
+                 (long long)std::time(nullptr));
+    std::fclose(f);
+}
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
 
@@ -536,6 +550,7 @@ struct PsxButtonMap {
 
 static int controller_device_index = 0;
 static int controller_deadzone = 12000;
+static bool controller_enabled = true;
 static std::array<PsxButtonMap, 14> controller_map = {{
     { PAD_UP,       "up",       {} },
     { PAD_DOWN,     "down",     {} },
@@ -727,6 +742,7 @@ static std::string default_input_ini_text(void) {
 
 static void load_input_config(const char* argv0) {
     set_default_controller_mapping();
+    controller_enabled = true;
 
     namespace fs = std::filesystem;
     fs::path config_path = exe_dir_from_argv(argv0) / "input.ini";
@@ -740,7 +756,6 @@ static void load_input_config(const char* argv0) {
     std::ifstream in(config_path);
     if (!in) return;
 
-    bool controller_enabled = true;
     std::string section;
     std::string line;
     while (std::getline(in, line)) {
@@ -945,7 +960,7 @@ static void sdl_vblank_present(void) {
         if (ev.type == SDL_QUIT) {
             shutdown_runtime();
             std::exit(0);
-        } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
+        } else if (ev.type == SDL_CONTROLLERDEVICEADDED && controller_enabled) {
             open_configured_controller();
         } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
             if (ev.cdevice.which == sdl_controller_instance) {
@@ -1102,6 +1117,7 @@ int main(int argc, char** argv) {
     std::setvbuf(stderr, nullptr, _IOLBF, 0);
     std::fprintf(stderr, "psxrecomp: main() entered\n");
     std::fflush(stderr);
+    write_startup_stage("main_entered");
 
     /* Install crash handlers early so they catch issues during init too.
      * Writes psx_last_run_report.json on signal/SEH/atexit/fail-fast. */
@@ -1128,6 +1144,7 @@ int main(int argc, char** argv) {
             bios_path = argv[i];
         }
     }
+    write_startup_stage("args_parsed");
 
     std::string default_game_config_storage;
     if (!game_config_path) {
@@ -1152,6 +1169,7 @@ int main(int argc, char** argv) {
 
     if (game_config_path) {
         try {
+            write_startup_stage("game_config_loading");
             const auto gc = PSXRecompV4::load_game_config(game_config_path);
             game_name = gc.name;
             game_id   = gc.id;
@@ -1165,6 +1183,7 @@ int main(int argc, char** argv) {
             fast_boot     = gc.runtime.fast_boot;
             std::fprintf(stdout, "psxrecomp: loaded game config %s (%s, %s)\n",
                          game_config_path, game_name.c_str(), game_id.c_str());
+            write_startup_stage("game_config_loaded");
         } catch (const std::exception& ex) {
             std::fprintf(stderr, "psxrecomp: failed to load --game %s: %s\n",
                          game_config_path, ex.what());
@@ -1177,6 +1196,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "psxrecomp: no BIOS selected; exiting.\n");
         return 1;
     }
+    write_startup_stage("bios_resolved");
     if (game_config_path || disc_override_path || !resolved_disc.empty()) {
         resolved_disc = resolve_disc_for_runtime(resolved_disc, disc_override_path, game_id, argv[0]);
         if (game_config_path && resolved_disc.empty()) {
@@ -1184,6 +1204,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    write_startup_stage("disc_resolved");
 
     if (memcard_dir.empty()) {
         memcard_dir = default_memcard_dir(argv[0]);
@@ -1195,6 +1216,7 @@ int main(int argc, char** argv) {
 
     std::fprintf(stdout, "psxrecomp runtime: loading BIOS from %s\n", bios_path_str.c_str());
     memory_init(bios_path_str.c_str());
+    write_startup_stage("memory_initialized");
     gpu_init();
     dma_init();
     mdec_init();
@@ -1223,13 +1245,16 @@ int main(int argc, char** argv) {
     }
     memcard_init(memcard_dir_str.c_str());
     std::atexit(memcard_flush_all);
+    write_startup_stage("core_devices_initialized");
 #ifndef PSX_NO_DEBUG_TOOLS
     debug_server_init(debug_port);
+    write_startup_stage("debug_server_initialized");
 #else
     (void)debug_port;
 #endif
     /* Heartbeat always on — see freeze_heartbeat.c rationale. */
     freeze_heartbeat_start("psx-runtime");
+    write_startup_stage("heartbeat_started");
     /* Register game entry_pc for post-BIOS disc speed switch. Fires once when
      * the BIOS hands control to the game EXE — not on the BIOS shell. */
     if (game_entry_pc != 0)
@@ -1243,27 +1268,12 @@ int main(int argc, char** argv) {
      * as a game controller rather than a raw HID device. */
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
     }
+    write_startup_stage("sdl_video_initialized");
     load_input_config(argv[0]);
-    open_configured_controller();
-#ifndef PSX_SDL_NO_AUDIO
-    if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
-        SDL_AudioSpec want;
-        SDL_AudioSpec have;
-        SDL_zero(want);
-        want.freq = 44100;
-        want.format = AUDIO_S16SYS;
-        want.channels = 2;
-        want.samples = 1024;
-        sdl_audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-        if (sdl_audio_device) {
-            SDL_PauseAudioDevice(sdl_audio_device, 0);
-        }
-    }
-#endif
 
     sdl_window = SDL_CreateWindow(
         window_title.c_str(),
@@ -1275,6 +1285,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;
     }
+    write_startup_stage("window_created");
 
     /* Force OpenGL renderer.
      *
@@ -1314,6 +1325,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
         return 1;
     }
+    write_startup_stage("renderer_created");
 
     /* Present in a fixed 640x480 logical space; SDL scales (and, in
      * fullscreen, letterboxes) it to the real output. Identity in the
@@ -1331,6 +1343,37 @@ int main(int argc, char** argv) {
         return 1;
     }
     SDL_SetTextureScaleMode(sdl_texture, SDL_ScaleModeNearest);
+    write_startup_stage("texture_created");
+
+    /* Optional host devices come after the window/renderer are live. Some
+     * Windows controller/audio backends can take a long time to enumerate; a
+     * visible render surface plus the heartbeat/debug diagnostics make that
+     * startup state observable instead of looking like a PSX boot hang. */
+    if (controller_enabled) {
+        if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) == 0) {
+            open_configured_controller();
+            write_startup_stage("controller_initialized");
+        } else {
+            std::fprintf(stderr, "SDL game-controller init failed: %s\n", SDL_GetError());
+            write_startup_stage("controller_init_failed");
+        }
+    }
+#ifndef PSX_SDL_NO_AUDIO
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
+        SDL_AudioSpec want;
+        SDL_AudioSpec have;
+        SDL_zero(want);
+        want.freq = 44100;
+        want.format = AUDIO_S16SYS;
+        want.channels = 2;
+        want.samples = 1024;
+        sdl_audio_device = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        if (sdl_audio_device) {
+            SDL_PauseAudioDevice(sdl_audio_device, 0);
+        }
+        write_startup_stage("audio_initialized");
+    }
+#endif
 
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
@@ -1382,6 +1425,7 @@ int main(int argc, char** argv) {
 
     /* Execute. */
     std::fprintf(stdout, "psxrecomp runtime: executing from PC=0x%08X\n", cpu.pc);
+    write_startup_stage("dispatch_enter");
 
 #if defined(PSX_ORACLE_BUILD)
     std::fprintf(stdout, "psxrecomp ORACLE: interpreter mode (port %d)\n", DEFAULT_DEBUG_PORT);

@@ -83,6 +83,10 @@ typedef struct {
  * port=0 uses the default (4370). */
 void debug_server_init(int port);
 
+/* Current listener status for heartbeat diagnostics. error is the platform
+ * socket error captured by init, or 0 when the listener is active. */
+void debug_server_get_status(int *listening, int *port, int *error);
+
 /* Poll for incoming connections and commands. Non-blocking.
  * Call once per vblank. */
 void debug_server_poll(void);
@@ -152,6 +156,12 @@ void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
                                    uint32_t current_tcb,
                                    uint32_t target_tcb,
                                    uint32_t target_pc);
+void debug_server_log_thread_event_ex(uint32_t kind, CPUState *cpu,
+                                      uint32_t current_tcb,
+                                      uint32_t target_tcb,
+                                      uint32_t target_pc,
+                                      uintptr_t current_fiber,
+                                      uintptr_t target_fiber);
 
 /* Dirty-RAM dispatch break.  Used by the dynamic-code interpreter to pause
  * immediately when dispatch enters a configured address range, before a hot

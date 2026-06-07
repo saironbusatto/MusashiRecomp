@@ -11,6 +11,7 @@
  */
 
 #include "cdrom.h"
+#include "dma.h"
 #include "spu.h"
 #include <string.h>
 #include <stdlib.h>
@@ -1095,6 +1096,7 @@ static void process_read_stream(uint32_t cycles) {
         read_delay -= (int)cycles;
     }
 
+    if (irq_flag != 0 && !dma_cdrom_transfer_active()) return;
     if (sector_available && irq_flag != 0) return;
 
     if (read_delay <= 0) {

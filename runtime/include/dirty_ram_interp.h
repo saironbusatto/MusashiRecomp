@@ -6,11 +6,12 @@
  * static recompiler can't see those bytes at compile time, so a small MIPS
  * interpreter here runs them at dispatch time on the same CPUState.
  *
- * Scope: this is NOT a fallback for code the recompiler failed to translate.
- * It runs only against PCs in pages that have been written-to since boot.
- * Static-recompiled code continues to handle ROM-resident code and game
- * RAM.  See docs/dynamic_handler_install.md for the inline note about a
- * potential future migration to runtime JIT (Option B).
+ * Scope: the primary path runs only against PCs in pages that have been
+ * written-to since boot. Static-recompiled code continues to handle normal
+ * game RAM. A separate static-text entry point exists for valid game-text
+ * dispatch targets that land inside a generated function but not on a
+ * generated dispatch entry; it interprets the missing basic block and then
+ * returns to the normal dispatcher.
  */
 #ifndef PSXRECOMP_DIRTY_RAM_INTERP_H
 #define PSXRECOMP_DIRTY_RAM_INTERP_H
@@ -29,6 +30,7 @@ extern "C" {
  * jump that the dispatch trampoline should re-enter. */
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);
 int dirty_ram_dispatch_until(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
+int dirty_ram_dispatch_static_text(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
 
 /* Test whether a given physical kernel-RAM address is in a page that was
  * written-to since boot.  Defined in memory.c. */
@@ -42,6 +44,7 @@ void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
  * via debug_server.c if helpful. */
 extern uint64_t g_dirty_ram_blocks_run;     /* basic blocks interpreted */
 extern uint64_t g_dirty_ram_insns_run;      /* instructions interpreted */
+extern uint64_t g_dirty_ram_static_text_blocks_run;
 extern uint64_t g_dirty_ram_aborts;         /* unsupported-opcode aborts */
 extern uint64_t g_dirty_ram_guard_yields;   /* long dirty loops yielded */
 extern uint64_t g_dirty_ram_unsupported_midblock;

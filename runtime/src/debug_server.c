@@ -70,6 +70,7 @@ extern void     psx_write_byte(uint32_t addr, uint8_t val);
 static sock_t s_listen  = SOCK_INVALID;
 static sock_t s_client  = SOCK_INVALID;
 static int    s_port    = DEFAULT_DEBUG_PORT;
+static int    s_listen_error = 0;
 
 #define RECV_BUF_SIZE 8192
 static char s_recv_buf[RECV_BUF_SIZE];
@@ -110,6 +111,19 @@ static uint8_t s_input_lx = 0x80;
 static uint8_t s_input_ly = 0x80;
 static uint8_t s_input_rx = 0x80;
 static uint8_t s_input_ry = 0x80;
+
+#define INPUT_SEQ_CAP 64
+typedef struct DebugInputStep {
+    uint16_t buttons;
+    int frames;
+} DebugInputStep;
+
+static DebugInputStep s_input_seq[INPUT_SEQ_CAP];
+static int s_input_seq_count = 0;
+static int s_input_seq_index = 0;
+
+static void input_seq_clear(void);
+static void input_seq_maybe_start_next(void);
 
 /* ---- Frontend turbo override ---- */
 static volatile int s_turbo_enabled = 0;
@@ -409,6 +423,8 @@ typedef struct {
     uint32_t target_state;
     uint32_t current_tcb_ptr;
     uint32_t target_pc;
+    uint64_t current_fiber;
+    uint64_t target_fiber;
     uint32_t func;
     uint32_t last_store_pc;
     uint32_t ra;
@@ -754,8 +770,20 @@ void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
                                    uint32_t target_tcb,
                                    uint32_t target_pc)
 {
+    debug_server_log_thread_event_ex(kind, cpu, current_tcb, target_tcb,
+                                     target_pc, 0, 0);
+}
+
+void debug_server_log_thread_event_ex(uint32_t kind, CPUState *cpu,
+                                      uint32_t current_tcb,
+                                      uint32_t target_tcb,
+                                      uint32_t target_pc,
+                                      uintptr_t current_fiber,
+                                      uintptr_t target_fiber)
+{
 #ifdef PSX_NO_DEBUG_TOOLS
     (void)kind; (void)cpu; (void)current_tcb; (void)target_tcb; (void)target_pc;
+    (void)current_fiber; (void)target_fiber;
     return;
 #endif
     if (!cpu) return;
@@ -771,6 +799,8 @@ void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
     e->target_state    = target_tcb ? trace_read_word(cpu, target_tcb) : 0;
     e->current_tcb_ptr = tcb_ptr_addr ? trace_read_word(cpu, tcb_ptr_addr) : 0;
     e->target_pc       = target_pc;
+    e->current_fiber   = (uint64_t)current_fiber;
+    e->target_fiber    = (uint64_t)target_fiber;
     e->func            = g_debug_current_func_addr;
     e->last_store_pc   = g_debug_last_store_pc;
     e->ra              = cpu->gpr[31];
@@ -946,6 +976,73 @@ void psx_unknown_dispatch_record(uint32_t addr, uint32_t phys,
             s_unknown_unique[slot].phys = phys;
             s_unknown_unique[slot].count = 1;
             s_unknown_unique_count++;
+            return;
+        }
+    }
+}
+
+/* ============================================================
+ * BIOS A0/B0/C0 call ring — always-on, sparse (BIOS vector calls
+ * are infrequent vs RAM writes), so it covers a whole session
+ * without eviction. Recorded at the vector-dispatch chokepoint in
+ * traps.c (Pattern 5), where the table base + function index +
+ * resolved target are all in hand. Used to answer event-delivery
+ * questions (e.g. is DeliverEvent=B0(0x07) ever called, how many
+ * TestEvent=B0(0x0B) polls) without arm-and-time.
+ *
+ * Two layers: a detailed recent-call ring AND eviction-proof
+ * per-(table_base,index) counters — the counters survive any churn,
+ * so "was this call ever made" is always answerable. */
+#define BIOSCALL_RING_CAP (1 << 16)
+typedef struct {
+    uint64_t seq;
+    uint32_t table_base;   /* A0/B0/C0 dispatch-table base (computed) */
+    uint32_t index;        /* function number */
+    uint32_t func_ptr;     /* resolved target */
+    uint32_t a0, a1, a2, a3;
+    uint32_t ra;
+    uint32_t current_func;
+    uint32_t frame;
+    uint8_t  in_exception;
+} BiosCallEntry;
+static BiosCallEntry s_bioscall_ring[BIOSCALL_RING_CAP];
+static uint64_t s_bioscall_seq = 0;
+
+#define BIOSCALL_UNIQUE_CAP 2048
+typedef struct { uint32_t table_base; uint32_t index; uint64_t count; } BiosCallUnique;
+static BiosCallUnique s_bioscall_unique[BIOSCALL_UNIQUE_CAP];
+static int s_bioscall_unique_count = 0;
+
+void psx_bioscall_record(uint32_t table_base, uint32_t index, uint32_t func_ptr,
+                         uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+                         uint32_t ra)
+{
+    uint64_t seq = s_bioscall_seq++;
+    BiosCallEntry *e = &s_bioscall_ring[seq & (BIOSCALL_RING_CAP - 1u)];
+    e->seq = seq;
+    e->table_base = table_base;
+    e->index = index;
+    e->func_ptr = func_ptr;
+    e->a0 = a0; e->a1 = a1; e->a2 = a2; e->a3 = a3;
+    e->ra = ra;
+    e->current_func = g_debug_current_func_addr;
+    e->frame = (uint32_t)s_frame_count;
+    e->in_exception = (uint8_t)(psx_get_in_exception() ? 1u : 0u);
+    /* Eviction-proof per-(table,index) counter (linear probe). */
+    uint32_t h = ((table_base >> 2) ^ (index * 2654435761u)) % BIOSCALL_UNIQUE_CAP;
+    for (int i = 0; i < BIOSCALL_UNIQUE_CAP; i++) {
+        uint32_t slot = (h + i) % BIOSCALL_UNIQUE_CAP;
+        if (s_bioscall_unique[slot].count != 0 &&
+            s_bioscall_unique[slot].table_base == table_base &&
+            s_bioscall_unique[slot].index == index) {
+            s_bioscall_unique[slot].count++;
+            return;
+        }
+        if (s_bioscall_unique[slot].count == 0) {
+            s_bioscall_unique[slot].table_base = table_base;
+            s_bioscall_unique[slot].index = index;
+            s_bioscall_unique[slot].count = 1;
+            s_bioscall_unique_count++;
             return;
         }
     }
@@ -1868,6 +1965,21 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
      * is recorded with args and a return value when the call unwinds). */
     function_trace_record(func_addr);
 
+    /* A0/B0/C0 BIOS-call vector: every such call dispatches to 0x{A,B,C}0 with
+     * $t1 ($9) = function index (set by the caller before jr). Record into the
+     * always-on bioscall ring (event-delivery visibility, no arm-and-time).
+     * Hooked here (the central dispatch recorder) rather than dirty_ram_interp,
+     * because the B0 trampolines/dispatcher are statically recompiled. */
+    {
+        uint32_t vphys = func_addr & 0x1FFFFFFFu;
+        if ((vphys == 0xA0u || vphys == 0xB0u || vphys == 0xC0u) && debug_cpu_ptr) {
+            psx_bioscall_record(vphys, debug_cpu_ptr->gpr[9], 0,
+                                debug_cpu_ptr->gpr[4], debug_cpu_ptr->gpr[5],
+                                debug_cpu_ptr->gpr[6], debug_cpu_ptr->gpr[7],
+                                debug_cpu_ptr->gpr[31]);
+        }
+    }
+
     /* Track when we ENTER a chain state subtree. */
     if (is_chain_state_entry(func_addr)) {
         s_chain_state_active = func_addr;
@@ -1973,12 +2085,14 @@ static void handle_dirty_ram_stats(int id, const char *json)
              "{\"id\":%d,\"ok\":true,\"blocks_run\":%llu,"
              "\"insns_run\":%llu,\"aborts\":%llu,"
              "\"guard_yields\":%llu,"
+             "\"static_text_blocks_run\":%llu,"
              "\"dirty_bitmap\":\"0x%08X\",\"per_pc\":[",
              id,
              (unsigned long long)g_dirty_ram_blocks_run,
              (unsigned long long)g_dirty_ram_insns_run,
              (unsigned long long)g_dirty_ram_aborts,
              (unsigned long long)g_dirty_ram_guard_yields,
+             (unsigned long long)g_dirty_ram_static_text_blocks_run,
              (unsigned)dirty_ram_get_bitmap());
 
     int first = 1;
@@ -2533,6 +2647,169 @@ static void handle_fntrace_dump(int id, const char *json)
  * Two modes:
  *   - default: per-target count summary (sorted by hit count)
  *   - tail=N: most recent N entries from the ring */
+/* Dedicated card-driver-state ring. The card-op state addresses are SPARSE
+ * (a handful of writes per card op), so a 64K-entry ring covers an entire
+ * session with zero eviction — unlike the shared wtrace ring which the
+ * high-traffic task/movie ranges flood, evicting the read-phase card history.
+ * This is the ring-buffer-first fix for diagnosing the card-read-loop halt. */
+#define CARD_TRACE_CAP (1u << 16)
+typedef struct {
+    uint64_t seq; uint32_t phys; uint32_t old_val; uint32_t new_val;
+    uint32_t pc; uint32_t cpu_pc; uint32_t ra; uint32_t func; uint32_t frame;
+    uint8_t width; uint8_t in_exception;
+} CardTraceEntry;
+static CardTraceEntry s_card_trace[CARD_TRACE_CAP];
+static uint64_t s_card_trace_seq = 0;
+
+static inline int is_card_critical_addr(uint32_t phys) {
+    return (phys >= 0x00009F20u && phys < 0x00009F40u) ||  /* card per-slot state {3,5,6} */
+           (phys >= 0x0000B9D0u && phys < 0x0000B9F0u) ||  /* card-op result/error flags */
+           (phys >= 0x000072F0u && phys < 0x000072F4u) ||  /* per-sector byte counter */
+           (phys >= 0x000074A0u && phys < 0x000074A4u) ||  /* RX byte latch (BFC15720 sw v1,0x74A0 abort path) */
+           (phys >= 0x000074C0u && phys < 0x000074C4u) ||  /* completion gate: BFC15790 bne *(0x74C0)!=0 -> skips DeliverEvent */
+           (phys >= 0x00007500u && phys < 0x00007504u) ||  /* card-shell mode flag (dispatcher reads 0x7500 @BFC156D4) */
+           (phys >= 0x00007510u && phys < 0x00007520u) ||  /* chain dispatch counter 0x7514 (BFC15668), slot-save 0x751C (completion-only @BFC157C8) */
+           (phys >= 0x00007520u && phys < 0x00007524u) ||  /* chain success flag (completion sets =1 @BFC157E4) */
+           (phys >= 0x00007528u && phys < 0x00007530u) ||  /* chain handler ptrs */
+           (phys >= 0x00007264u && phys < 0x00007268u) ||  /* slot toggle / selected slot */
+           (phys >= 0x00007550u && phys < 0x00007570u) ||  /* gate/state incl R-mode gate 0x7568+slot, 0x755A abort */
+           (phys >= 0x000075C0u && phys < 0x000075C8u) ||  /* SIO data-mode flag / buffer ptr */
+           (phys >= 0x0000E044u && phys < 0x0000E0D0u);     /* EvCB entries for the 5 card events (status/spec/mode) */
+}
+
+static void card_trace_record(uint32_t phys, uint32_t old_val, uint32_t new_val, uint8_t width) {
+    if (old_val == new_val) return;  /* skip no-op writes (e.g. 0x7560 SIO-status hammer) so the sparse ring covers boot->LOAD without eviction */
+    uint64_t seq = s_card_trace_seq++;
+    CardTraceEntry *e = &s_card_trace[seq & (CARD_TRACE_CAP - 1u)];
+    e->seq = seq; e->phys = phys; e->old_val = old_val; e->new_val = new_val;
+    e->pc = g_debug_last_store_pc;
+    e->cpu_pc = debug_cpu_ptr ? debug_cpu_ptr->pc : 0;
+    e->ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
+    e->func = g_debug_current_func_addr;
+    e->frame = (uint32_t)s_frame_count;
+    e->width = width;
+    e->in_exception = (uint8_t)(psx_get_in_exception() ? 1u : 0u);
+}
+
+/* card_trace_dump — query the dedicated sparse card-driver-state ring.
+ *   {"cmd":"card_trace_dump","count":N}   -> recent N card-state writes (default 200)
+ * Sparse + always-on => covers the whole read phase without eviction. */
+static void handle_card_trace_dump(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 200);
+    if (count > (int)CARD_TRACE_CAP) count = CARD_TRACE_CAP;
+    /* Optional server-side address filter: pull the full history of a sparse
+     * address (e.g. the 0x9F20 state table) across the WHOLE ring without the
+     * high-rate 0x72F0 byte-counter flood. Iterates oldest->newest, emits
+     * matching entries up to count (chronological). */
+    char alo[32] = {0}, ahi[32] = {0};
+    uint32_t flo = 0, fhi = 0xFFFFFFFFu; int filt = 0;
+    if (json_get_str(json, "addr_lo", alo, sizeof alo)) { flo = (uint32_t)strtoul(alo, NULL, 0); filt = 1; }
+    if (json_get_str(json, "addr_hi", ahi, sizeof ahi)) { fhi = (uint32_t)strtoul(ahi, NULL, 0); filt = 1; }
+    uint64_t total = s_card_trace_seq;
+    uint64_t avail = (total < CARD_TRACE_CAP) ? total : CARD_TRACE_CAP;
+    const size_t BUF_SZ = 2 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%d,\"filtered\":%d,\"entries\":[",
+                    id, (unsigned long long)total, count, filt);
+    uint64_t start = filt ? (total - avail) : (total - ((uint64_t)count < avail ? (uint64_t)count : avail));
+    int emitted = 0; int first = 1;
+    for (uint64_t s = start; s < total && emitted < count; s++) {
+        CardTraceEntry *e = &s_card_trace[s & (CARD_TRACE_CAP - 1u)];
+        if (filt && (e->phys < flo || e->phys >= fhi)) continue;
+        if (pos > BUF_SZ - 512) break;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"phys\":\"0x%05X\",\"old\":\"0x%08X\",\"new\":\"0x%08X\","
+                        "\"w\":%u,\"pc\":\"0x%08X\",\"cpu_pc\":\"0x%08X\",\"ra\":\"0x%08X\","
+                        "\"func\":\"0x%08X\",\"in_exc\":%u,\"frame\":%u}",
+                        first ? "" : ",", (unsigned long long)e->seq, e->phys,
+                        e->old_val, e->new_val, e->width, e->pc, e->cpu_pc, e->ra,
+                        e->func, e->in_exception, e->frame);
+        first = 0;
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
+    debug_server_send_line(out);
+    free(out);
+}
+
+/* bioscall_dump — query the always-on A0/B0/C0 call ring.
+ *   {"cmd":"bioscall_dump"}                 -> summary: per-(table,index) counts
+ *   {"cmd":"bioscall_dump","tail":N}        -> recent N detailed calls
+ *   optional "index":<n> / "table":<hex>    -> filter (both modes)
+ * The summary counts are eviction-proof: "was B0(0x07) ever called" is always
+ * answerable regardless of how much later churn occurred. */
+static void handle_bioscall_dump(int id, const char *json)
+{
+    int tail = json_get_int(json, "tail", 0);
+    long want_index = json_get_int(json, "index", -1);
+    char tbuf[32] = {0};
+    uint32_t want_table = 0; int have_table = 0;
+    if (json_get_str(json, "table", tbuf, sizeof tbuf)) {
+        want_table = (uint32_t)strtoul(tbuf, NULL, 0); have_table = 1;
+    }
+    const size_t BUF_SZ = 2 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+
+    if (tail > 0) {
+        if (tail > (int)BIOSCALL_RING_CAP) tail = BIOSCALL_RING_CAP;
+        uint64_t total = s_bioscall_seq;
+        uint64_t avail = (total < BIOSCALL_RING_CAP) ? total : BIOSCALL_RING_CAP;
+        if ((uint64_t)tail > avail) tail = (int)avail;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "{\"id\":%d,\"ok\":true,\"total\":%llu,\"tail\":%d,\"entries\":[",
+                        id, (unsigned long long)total, tail);
+        uint64_t start = total - (uint64_t)tail;
+        int first = 1;
+        for (int i = 0; i < tail; i++) {
+            BiosCallEntry *e = &s_bioscall_ring[(start + i) & (BIOSCALL_RING_CAP - 1u)];
+            if (want_index >= 0 && (long)e->index != want_index) continue;
+            if (have_table && e->table_base != want_table) continue;
+            if (pos > BUF_SZ - 512) break;
+            pos += snprintf(out + pos, BUF_SZ - pos,
+                            "%s{\"seq\":%llu,\"table\":\"0x%08X\",\"index\":%u,"
+                            "\"func\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                            "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\",\"ra\":\"0x%08X\","
+                            "\"current_func\":\"0x%08X\",\"in_exc\":%u,\"frame\":%u}",
+                            first ? "" : ",", (unsigned long long)e->seq,
+                            e->table_base, e->index, e->func_ptr,
+                            e->a0, e->a1, e->a2, e->a3, e->ra,
+                            e->current_func, e->in_exception, e->frame);
+            first = 0;
+        }
+        pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
+        debug_server_send_line(out);
+        free(out);
+        return;
+    }
+
+    /* Summary: eviction-proof per-(table,index) counts. */
+    pos += snprintf(out + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"unique\":%d,\"counts\":[",
+                    id, (unsigned long long)s_bioscall_seq, s_bioscall_unique_count);
+    int first = 1;
+    for (int i = 0; i < BIOSCALL_UNIQUE_CAP; i++) {
+        if (s_bioscall_unique[i].count == 0) continue;
+        if (want_index >= 0 && (long)s_bioscall_unique[i].index != want_index) continue;
+        if (have_table && s_bioscall_unique[i].table_base != want_table) continue;
+        if (pos > BUF_SZ - 256) break;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "%s{\"table\":\"0x%08X\",\"index\":%u,\"count\":%llu}",
+                        first ? "" : ",", s_bioscall_unique[i].table_base,
+                        s_bioscall_unique[i].index,
+                        (unsigned long long)s_bioscall_unique[i].count);
+        first = 0;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
+    debug_server_send_line(out);
+    free(out);
+}
+
 static void handle_unknown_dispatch_log(int id, const char *json)
 {
     int tail = json_get_int(json, "tail", 0);
@@ -2962,6 +3239,10 @@ static const char *thread_kind_name(uint32_t kind)
         case 10: return "fiber_entry";
         case 11: return "fiber_done";
         case 12: return "fiber_return_restore";
+        case 13: return "switch_resumed";
+        case 14: return "current_restored";
+        case 15: return "pending_longjmp";
+        case 16: return "change_return";
         default: return "unknown";
     }
 }
@@ -2975,6 +3256,7 @@ static size_t append_thread_entry(char *buf, size_t pos, size_t cap,
                     "\"current_tcb\":\"0x%08X\",\"target_tcb\":\"0x%08X\","
                     "\"current_state\":\"0x%08X\",\"target_state\":\"0x%08X\","
                     "\"current_ptr\":\"0x%08X\",\"target_pc\":\"0x%08X\","
+                    "\"current_fiber\":\"0x%016llX\",\"target_fiber\":\"0x%016llX\","
                     "\"func\":\"0x%08X\",\"store_pc\":\"0x%08X\","
                     "\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
                     "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
@@ -2996,7 +3278,10 @@ static size_t append_thread_entry(char *buf, size_t pos, size_t cap,
                     first ? "" : ",",
                     (unsigned long long)e->seq, e->kind, thread_kind_name(e->kind),
                     e->current_tcb, e->target_tcb, e->current_state, e->target_state,
-                    e->current_tcb_ptr, e->target_pc, e->func, e->last_store_pc,
+                    e->current_tcb_ptr, e->target_pc,
+                    (unsigned long long)e->current_fiber,
+                    (unsigned long long)e->target_fiber,
+                    e->func, e->last_store_pc,
                     e->ra, e->sp, e->a0, e->a1, e->a2, e->a3,
                     e->s0, e->s1, e->s2, e->s3, e->sr, e->epc,
                     e->saved_a0, e->saved_a1, e->saved_a2, e->saved_a3,
@@ -5672,6 +5957,7 @@ static void handle_set_input(int id, const char *json)
     if (!json_get_str(json, "buttons", val_str, sizeof(val_str))) {
         send_err(id, "missing buttons"); return;
     }
+    input_seq_clear();
     s_input_override = (int)hex_to_u32(val_str);
     any_axis |= json_get_axis_u8(json, "lx", &s_input_lx);
     any_axis |= json_get_axis_u8(json, "ly", &s_input_ly);
@@ -5688,6 +5974,7 @@ static void handle_press(int id, const char *json)
     int frames  = json_get_int(json, "frames", 2);
     int any_axis = 0;
     if (buttons < 0) { send_err(id, "missing buttons"); return; }
+    input_seq_clear();
     s_input_override = buttons;
     any_axis |= json_get_axis_u8(json, "lx", &s_input_lx);
     any_axis |= json_get_axis_u8(json, "ly", &s_input_ly);
@@ -5696,6 +5983,83 @@ static void handle_press(int id, const char *json)
     if (any_axis) s_input_axes_override = 1;
     s_input_frames   = frames;
     send_ok(id);
+}
+
+static void input_seq_clear(void)
+{
+    s_input_seq_count = 0;
+    s_input_seq_index = 0;
+}
+
+static void input_seq_maybe_start_next(void)
+{
+    if (s_input_override >= 0 || s_input_axes_override) return;
+    if (s_input_seq_index >= s_input_seq_count) {
+        input_seq_clear();
+        return;
+    }
+
+    const DebugInputStep *step = &s_input_seq[s_input_seq_index++];
+    s_input_override = (int)step->buttons;
+    s_input_frames = step->frames;
+    s_input_axes_override = 0;
+    s_input_lx = 0x80;
+    s_input_ly = 0x80;
+    s_input_rx = 0x80;
+    s_input_ry = 0x80;
+}
+
+static void handle_input_seq(int id, const char *json)
+{
+    char seq[2048];
+    if (!json_get_str(json, "seq", seq, sizeof(seq))) {
+        send_err(id, "missing seq"); return;
+    }
+
+    int count = 0;
+    char *p = seq;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',' || *p == ';') p++;
+        if (!*p) break;
+
+        char *end = NULL;
+        unsigned long buttons = strtoul(p, &end, 0);
+        if (end == p || *end != ':') {
+            send_err(id, "bad seq buttons"); return;
+        }
+        p = end + 1;
+
+        long frames = strtol(p, &end, 0);
+        if (end == p || frames <= 0 || frames > 60000) {
+            send_err(id, "bad seq frames"); return;
+        }
+        if (count >= INPUT_SEQ_CAP) {
+            send_err(id, "seq too long"); return;
+        }
+
+        s_input_seq[count].buttons = (uint16_t)buttons;
+        s_input_seq[count].frames = (int)frames;
+        count++;
+        p = end;
+        if (*p && *p != ',' && *p != ';' && *p != ' ' && *p != '\t') {
+            send_err(id, "bad seq separator"); return;
+        }
+    }
+
+    if (count == 0) {
+        send_err(id, "empty seq"); return;
+    }
+
+    s_input_override = -1;
+    s_input_frames = 0;
+    s_input_axes_override = 0;
+    s_input_lx = 0x80;
+    s_input_ly = 0x80;
+    s_input_rx = 0x80;
+    s_input_ry = 0x80;
+    s_input_seq_count = count;
+    s_input_seq_index = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"count\":%d}\n", id, count);
 }
 
 /* Reports the current pad word and any active input override. */
@@ -5708,9 +6072,11 @@ static void handle_pad_status(int id, const char *json)
     sio_get_pad_analog(0, &lx, &ly, &rx, &ry);
     send_fmt("{\"id\":%d,\"ok\":true,\"pad\":\"0x%04X\","
              "\"override\":%d,\"override_frames\":%d,"
+             "\"seq_index\":%d,\"seq_count\":%d,"
              "\"axis_override\":%d,\"lx\":%u,\"ly\":%u,\"rx\":%u,\"ry\":%u,"
              "\"model\":%d,\"analog_enabled\":%d}\n",
              id, pad, s_input_override, s_input_frames,
+             s_input_seq_index, s_input_seq_count,
              s_input_axes_override,
              (unsigned)lx, (unsigned)ly, (unsigned)rx, (unsigned)ry,
              (int)sio_get_pad_model(0), sio_get_pad_analog_enabled(0));
@@ -5722,6 +6088,7 @@ static void handle_clear_input(int id, const char *json)
     s_input_override = -1;
     s_input_frames   = 0;
     s_input_axes_override = 0;
+    input_seq_clear();
     s_input_lx = 0x80;
     s_input_ly = 0x80;
     s_input_rx = 0x80;
@@ -6437,6 +6804,7 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     (void)phys; (void)old_val; (void)new_val; (void)width;
     return;
 #endif
+    if (is_card_critical_addr(phys)) card_trace_record(phys, old_val, new_val, width);
     wtrace_all_record(phys, new_val, width);
     wtrace_transition_record(phys, old_val, new_val, width);
     wtrace_boot_record(phys, old_val, new_val, width);
@@ -8284,6 +8652,7 @@ void debug_server_freeze_dump_thread_trace_json(FILE *f, uint32_t max_count)
             "\"current_tcb\":\"0x%08X\",\"target_tcb\":\"0x%08X\","
             "\"current_state\":\"0x%08X\",\"target_state\":\"0x%08X\","
             "\"target_pc\":\"0x%08X\",\"func\":\"0x%08X\","
+            "\"current_fiber\":\"0x%016llX\",\"target_fiber\":\"0x%016llX\","
             "\"store_pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
             "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
             "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\","
@@ -8294,6 +8663,8 @@ void debug_server_freeze_dump_thread_trace_json(FILE *f, uint32_t max_count)
             e->current_tcb, e->target_tcb,
             e->current_state, e->target_state,
             e->target_pc, e->func,
+            (unsigned long long)e->current_fiber,
+            (unsigned long long)e->target_fiber,
             e->last_store_pc, e->ra, e->sp,
             e->a0, e->a1,
             e->sr, e->epc, e->istat, e->imask,
@@ -8928,6 +9299,8 @@ static const CmdEntry s_commands[] = {
     { "fntrace_clear",     handle_fntrace_clear },
     { "fntrace_dump",      handle_fntrace_dump },
     { "unknown_dispatch_log", handle_unknown_dispatch_log },
+    { "bioscall_dump",     handle_bioscall_dump },
+    { "card_trace_dump",   handle_card_trace_dump },
     { "card_txn_dump",     handle_card_txn_dump },
     { "card_read_summary", handle_card_read_summary },
     { "card_read_summary_reset", handle_card_read_summary_reset },
@@ -8980,6 +9353,7 @@ static const CmdEntry s_commands[] = {
     { "mdec_trace_clear",  handle_mdec_trace_clear },
     { "set_input",         handle_set_input },
     { "press",             handle_press },
+    { "input_seq",         handle_input_seq },
     { "pad_status",        handle_pad_status },
     { "clear_input",       handle_clear_input },
     { "turbo",             handle_turbo },
@@ -9061,20 +9435,22 @@ void debug_server_set_cpu(CPUState *cpu)
     debug_cpu_ptr = cpu;
 }
 
+void debug_server_get_status(int *listening, int *port, int *error)
+{
+    if (listening) *listening = (s_listen != SOCK_INVALID) ? 1 : 0;
+    if (port) *port = s_port;
+    if (error) *error = s_listen_error;
+}
+
 void debug_server_init(int port)
 {
     if (port > 0) s_port = port;
+    s_listen_error = 0;
 
 #ifdef _WIN32
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
-
-    s_listen = socket(AF_INET, SOCK_STREAM, 0);
-    if (s_listen == SOCK_INVALID) return;
-
-    int yes = 1;
-    setsockopt(s_listen, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -9082,9 +9458,32 @@ void debug_server_init(int port)
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons((uint16_t)s_port);
 
-    if (bind(s_listen, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    int bind_err = 0;
+    for (int attempt = 0; attempt < 50; attempt++) {
+        s_listen = socket(AF_INET, SOCK_STREAM, 0);
+        if (s_listen == SOCK_INVALID) {
+            bind_err = sock_error();
+            break;
+        }
+
+        int yes = 1;
+        setsockopt(s_listen, SOL_SOCKET, SO_REUSEADDR, (const char *)&yes, sizeof(yes));
+
+        if (bind(s_listen, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            bind_err = 0;
+            break;
+        }
+
+        bind_err = sock_error();
         sock_close(s_listen);
         s_listen = SOCK_INVALID;
+        SDL_Delay(50);
+    }
+
+    if (s_listen == SOCK_INVALID) {
+        s_listen_error = bind_err;
+        fprintf(stderr, "psxrecomp debug_server: failed to bind 127.0.0.1:%d (error %d)\n",
+                s_port, bind_err);
         return;
     }
 
@@ -9093,7 +9492,16 @@ void debug_server_init(int port)
      * fills the queue and every subsequent probe gets RST/ConnectionRefused.
      * 16 leaves room for a few probes to queue while we investigate. This
      * is observability infrastructure, not a freeze fix. */
-    listen(s_listen, 16);
+    if (listen(s_listen, 16) != 0) {
+        int listen_err = sock_error();
+        sock_close(s_listen);
+        s_listen = SOCK_INVALID;
+        s_listen_error = listen_err;
+        fprintf(stderr, "psxrecomp debug_server: failed to listen on 127.0.0.1:%d (error %d)\n",
+                s_port, listen_err);
+        return;
+    }
+    s_listen_error = 0;
     set_nonblocking(s_listen);
 
     if (!s_frame_history) {
@@ -9557,6 +9965,7 @@ int debug_server_is_connected(void)
 
 int debug_server_get_input_override(void)
 {
+    input_seq_maybe_start_next();
     int ret = s_input_override;
     if (s_input_override >= 0 && s_input_frames > 0) {
         if (--s_input_frames == 0) {
@@ -9570,8 +9979,9 @@ int debug_server_get_input_override(void)
 int debug_server_get_input_state(uint16_t *buttons,
                                  int *axes_override,
                                  uint8_t *lx, uint8_t *ly,
-                                 uint8_t *rx, uint8_t *ry)
+                                  uint8_t *rx, uint8_t *ry)
 {
+    input_seq_maybe_start_next();
     int ret = s_input_override;
     if (buttons && s_input_override >= 0) *buttons = (uint16_t)s_input_override;
     if (axes_override) *axes_override = s_input_axes_override;
