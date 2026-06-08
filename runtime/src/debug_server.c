@@ -7321,6 +7321,14 @@ static void handle_overlay_loader_status(int id, const char *json)
             regions, loads, invs, reval, unreg,
             (unsigned long long)dnat, (unsigned long long)dint,
             (unsigned long long)stale, lw_pc, lw_addr, lw_size);
+        int r0v=0; uint32_t r0w=0, r0lo=0, r0hi=0, r0crc=0, ratt=0, rmiss=0, rlast=0;
+        overlay_loader_get_reload_debug(&r0v, &r0w, &r0lo, &r0hi, &r0crc,
+                                        &ratt, &rmiss, &rlast);
+        n += snprintf(buf + n, sizeof(buf) - n,
+            ",\"r0_valid\":%d,\"r0_writes_since_invalid\":%u,"
+            "\"r0_fn_lo\":\"0x%08X\",\"r0_fn_hi\":\"0x%08X\",\"r0_crc_live\":\"0x%08X\","
+            "\"reval_attempts\":%u,\"reval_crc_miss\":%u,\"last_reval_crc\":\"0x%08X\"",
+            r0v, r0w, r0lo, r0hi, r0crc, ratt, rmiss, rlast);
     }
     snprintf(buf + n, sizeof(buf) - n, "}\n");
     send_fmt("%s", buf);
