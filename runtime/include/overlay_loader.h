@@ -65,7 +65,7 @@ void overlay_loader_get_counters(uint32_t *loads, uint32_t *invalidations,
                                  uint32_t *last_write_pc,
                                  uint32_t *last_write_addr,
                                  uint32_t *last_write_size,
-                                 int *regions);
+                                 int *regions, uint32_t *revalidations);
 
 #ifdef __cplusplus
 }
