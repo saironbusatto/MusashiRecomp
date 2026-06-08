@@ -49,6 +49,14 @@ typedef struct {
     uint32_t generation;  /* bumped on each invalidation */
     int      valid;       /* 1 = functions callable */
     int      func_count;  /* functions registered for this region */
+    /* Inc2 reload-on-return: re-validate when the SAME overlay loads back.
+     * crc_live = content hash of the region when it last registered OK.
+     * After invalidation we keep watching and count writes; once the region
+     * is substantially rewritten (a real reload, not incidental data writes)
+     * we re-hash once and, on a match, flip valid back on — the dyntab entries
+     * never left, so this is O(1) and needs no DLL reload. */
+    uint32_t crc_live;
+    uint32_t writes_since_invalid;
 } OvlRegion;
 static OvlRegion s_regions[MAX_OVL_REGIONS];
 static int       s_nregions = 0;
@@ -60,6 +68,7 @@ static uint32_t s_unregistered   = 0;
 static uint64_t s_disp_native    = 0;
 static uint64_t s_disp_interp    = 0;
 static uint64_t s_stale_blocked  = 0;
+static uint32_t s_revalidations  = 0;
 static uint32_t s_last_write_pc   = 0;
 static uint32_t s_last_write_addr = 0;
 static uint32_t s_last_write_size = 0;
@@ -376,6 +385,14 @@ static void try_load_region(uint32_t phys)
         return;
     }
     s_regions[region].func_count = registered;
+    /* Content hash of the live region as registered — used to recognize the
+     * same overlay when it loads back later (Inc2 reload-on-return). */
+    {
+        extern uint8_t *memory_get_ram_ptr(void);
+        uint8_t *ram = memory_get_ram_ptr();
+        s_regions[region].crc_live = crc32_compute(ram + region_start, region_size);
+    }
+    s_regions[region].writes_since_invalid = 0;
     s_nregions++;
     s_loads++;
 
@@ -399,24 +416,60 @@ void overlay_loader_invalidate_at(uint32_t phys, uint32_t size)
     uint32_t p = phys & 0x1FFFFFFFu;
     int r;
     for (r = 0; r < s_nregions; r++) {
-        if (!s_regions[r].valid) continue;
         if (p < s_regions[r].base) continue;
         if (p >= s_regions[r].base + s_regions[r].size) continue;
 
-        s_regions[r].valid = 0;
-        s_regions[r].generation++;
-        s_invalidations++;
-        s_unregistered += (uint32_t)s_regions[r].func_count;
-        s_last_write_pc   = g_debug_last_store_pc;
-        s_last_write_addr = phys;
-        s_last_write_size = size;
+        if (s_regions[r].valid) {
+            /* First write into a live region: revoke callability. Keep
+             * watching so we can detect a later reload of the same overlay. */
+            s_regions[r].valid = 0;
+            s_regions[r].generation++;
+            s_regions[r].writes_since_invalid = 0;
+            s_invalidations++;
+            s_unregistered += (uint32_t)s_regions[r].func_count;
+            s_last_write_pc   = g_debug_last_store_pc;
+            s_last_write_addr = phys;
+            s_last_write_size = size;
+            loader_log("invalidated region 0x%08X (+%u) on write 0x%08X -> %d funcs",
+                       s_regions[r].base, s_regions[r].size, phys,
+                       s_regions[r].func_count);
+        } else {
+            /* Already invalid: count writes so a substantial rewrite (a real
+             * reload, not incidental data writes) can trigger one re-hash. */
+            s_regions[r].writes_since_invalid += size;
+        }
+        return;
+    }
+}
 
-        /* Stop watching: one invalidation per registration is enough. */
-        extern void overlay_watch_clear_range(uint32_t phys, uint32_t len);
-        overlay_watch_clear_range(s_regions[r].base, s_regions[r].size);
-        loader_log("invalidated region 0x%08X (+%u) on write 0x%08X -> %d funcs",
-                   s_regions[r].base, s_regions[r].size, phys,
-                   s_regions[r].func_count);
+/* Attempt to re-validate an invalidated region whose RAM was substantially
+ * rewritten (i.e. the overlay likely loaded back). One content hash; on a
+ * match to the originally-registered hash, the 88 functions become callable
+ * again with no DLL reload (the dyntab entries never left). Cheap-gated: only
+ * hashes after a near-full rewrite, then resets the counter. */
+static void try_revalidate(uint32_t phys)
+{
+    extern uint8_t *memory_get_ram_ptr(void);
+    uint32_t p = phys & 0x1FFFFFFFu;
+    int r;
+    for (r = 0; r < s_nregions; r++) {
+        if (s_regions[r].valid) continue;
+        if (p < s_regions[r].base) continue;
+        if (p >= s_regions[r].base + s_regions[r].size) continue;
+        /* Require a near-full rewrite before paying for a hash (reload, not
+         * incidental data writes into the region). */
+        if (s_regions[r].writes_since_invalid < (s_regions[r].size / 2u)) return;
+        s_regions[r].writes_since_invalid = 0;
+
+        uint8_t *ram = memory_get_ram_ptr();
+        uint32_t crc = crc32_compute(ram + s_regions[r].base, s_regions[r].size);
+        if (crc == s_regions[r].crc_live) {
+            s_regions[r].valid = 1;
+            s_regions[r].generation++;
+            s_revalidations++;
+            loader_log("re-validated region 0x%08X (+%u) on reload -> %d funcs native",
+                       s_regions[r].base, s_regions[r].size, s_regions[r].func_count);
+        }
         return;
     }
 }
@@ -427,9 +480,16 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr)
     OverlayFn fn  = dyntab_lookup(phys);
     if (fn) { s_disp_native++; fn(cpu); return 1; }
 
-    /* First miss for this region: check if a DLL is cached. */
-    if (s_active && phys >= 0x98000u)
+    if (s_active && phys >= 0x98000u) {
+        /* Same overlay loaded back into an invalidated region? Re-enable its
+         * functions natively (Inc2). Cheap: only hashes after a near-full
+         * rewrite. */
+        try_revalidate(phys);
+        fn = dyntab_lookup(phys);
+        if (fn) { s_disp_native++; fn(cpu); return 1; }
+        /* First miss for a genuinely new region: load its cached DLL. */
         try_load_region(phys);
+    }
 
     /* Retry after potential DLL load. */
     fn = dyntab_lookup(phys);
@@ -446,7 +506,7 @@ void overlay_loader_get_counters(uint32_t *loads, uint32_t *invalidations,
                                  uint32_t *last_write_pc,
                                  uint32_t *last_write_addr,
                                  uint32_t *last_write_size,
-                                 int *regions)
+                                 int *regions, uint32_t *revalidations)
 {
     if (loads)           *loads           = s_loads;
     if (invalidations)   *invalidations   = s_invalidations;
@@ -458,6 +518,7 @@ void overlay_loader_get_counters(uint32_t *loads, uint32_t *invalidations,
     if (last_write_addr) *last_write_addr = s_last_write_addr;
     if (last_write_size) *last_write_size = s_last_write_size;
     if (regions)         *regions         = s_nregions;
+    if (revalidations)   *revalidations   = s_revalidations;
 }
 
 int overlay_loader_registered_count(void)

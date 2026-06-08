@@ -9,6 +9,7 @@
  */
 #include "debug_server.h"
 #include "overlay_loader.h"
+#include "overlay_capture.h"
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
@@ -7250,6 +7251,17 @@ static void handle_cd_read_log(int id, const char *json)
     send_fmt("]}\n");
 }
 
+/* overlay_capture_dump: flush overlay_captures.json on demand (does not require
+ * a clean window-close). Use after roaming through areas so a freeze/kill can't
+ * lose the captured overlays. Writes next to the runtime exe. */
+static void handle_overlay_capture_dump(int id, const char *json)
+{
+    (void)json;
+    overlay_capture_write_json();
+    send_fmt("{\"id\":%d,\"ok\":true,\"capture_entries\":%d}\n",
+             id, overlay_capture_count());
+}
+
 /* overlay_loader_status: report the dynamic overlay DLL loader state —
  * whether active, how many functions are registered, which regions have
  * been checked, and the most recent load event. Rule-3 inspection path for
@@ -7295,17 +7307,18 @@ static void handle_overlay_loader_status(int id, const char *json)
     }
     /* Inc1-D registration-lifetime counters. */
     {
-        uint32_t loads=0, invs=0, unreg=0, lw_pc=0, lw_addr=0, lw_size=0;
+        uint32_t loads=0, invs=0, unreg=0, lw_pc=0, lw_addr=0, lw_size=0, reval=0;
         uint64_t dnat=0, dint=0, stale=0; int regions=0;
         overlay_loader_get_counters(&loads, &invs, &unreg, &dnat, &dint,
-                                    &stale, &lw_pc, &lw_addr, &lw_size, &regions);
+                                    &stale, &lw_pc, &lw_addr, &lw_size, &regions,
+                                    &reval);
         n += snprintf(buf + n, sizeof(buf) - n,
             ",\"regions\":%d,\"loads\":%u,\"invalidations\":%u,"
-            "\"unregistered_funcs\":%u,\"dispatch_native\":%llu,"
+            "\"revalidations\":%u,\"unregistered_funcs\":%u,\"dispatch_native\":%llu,"
             "\"dispatch_interp_fallback\":%llu,\"stale_blocked\":%llu,"
             "\"last_write_pc\":\"0x%08X\",\"last_write_addr\":\"0x%08X\","
             "\"last_write_size\":%u",
-            regions, loads, invs, unreg,
+            regions, loads, invs, reval, unreg,
             (unsigned long long)dnat, (unsigned long long)dint,
             (unsigned long long)stale, lw_pc, lw_addr, lw_size);
     }
@@ -7847,6 +7860,7 @@ static const CmdEntry s_commands[] = {
     { "overlay_dump",      handle_overlay_dump },
     { "cd_read_log",       handle_cd_read_log },
     { "overlay_loader_status", handle_overlay_loader_status },
+    { "overlay_capture_dump", handle_overlay_capture_dump },
     { NULL, NULL }
 };
 
