@@ -24,6 +24,60 @@ PSXRecomp is a framework. Game-specific projects live in their own
 repositories and pull this one in to build a game binary. The active end-to-end
 target is [TombaRecomp](https://github.com/mstan/TombaRecomp).
 
+## Philosophy — toward 100% static recompilation
+
+The goal is simple and absolute: **a PS1 game should run as native code, not be
+emulated.** Every MIPS instruction the game executes should ideally have been
+translated to C and compiled ahead of time. No interpreter on the hot path, no
+HLE shims, no "good enough" approximation of the hardware — the recompiled BIOS
+*is* the kernel, and the recompiled game *is* the game.
+
+PS1 games make that goal hard in one specific way: **overlays.** Games stream
+code off the disc into RAM at runtime and execute it, then overwrite it with the
+next overlay. That code does not exist in the executable at build time, so a
+pure ahead-of-time recompiler cannot see it. This is the frontier the project is
+working through, and it is why this is an **alpha/beta**: today a *majority* of a
+supported game runs as statically recompiled native code, but **not yet 100%.**
+
+How we close the gap, without ever compromising correctness:
+
+1. **Static first.** The main executable and the BIOS are fully recompiled
+   ahead of time. This is the bulk of execution and it is always native.
+2. **Capture → compile → cache for overlays.** As the game runs, overlays are
+   captured the moment they load. Offline, each is recompiled to a native DLL
+   keyed by its content, cached, and on later runs loaded and dispatched as
+   native code *before* any fallback. Coverage grows as the game is played:
+   every overlay someone reaches becomes native for everyone after.
+3. **Interpreter failover — only for code that isn't static yet.** A small
+   MIPS interpreter runs *runtime-installed* code (overlays/dirty RAM) that
+   hasn't been captured-and-compiled. It is a safety net and a coverage feeder,
+   never a substitute for recompiling static code, and never on the BIOS/main-EXE
+   path.
+4. **Precision over recall.** A piece of code we *haven't* compiled safely falls
+   back to the interpreter and gets captured for next time — under-coverage
+   self-heals. A piece we compile *wrong* would corrupt the machine, so the
+   system biases hard toward correctness: native code is only dispatched when its
+   source RAM is provably unchanged, and a registration is revoked the instant
+   the RAM it was compiled from is overwritten.
+
+Two honest bounds. **The worst case is always performance, never correctness** —
+anything not yet native simply runs interpreted, correctly.
+
+**Known corner case — genuinely self-modifying / per-load-relocated code.** Some
+code is rewritten or relocated to *different bytes on every load*, so it is not
+static by definition and cannot be recompiled ahead of time into a single
+correct translation. **This code remains interpreted** — permanently, as far as
+the current design is concerned, and that is an accepted, correct outcome (the
+interpreter runs it faithfully; only speed is lost). It is a narrow corner, not
+a wall. We **may someday aim to cover it** — e.g. by detecting the
+relocation/patch pattern and baking it in at compile time (keyed by relocation
+parameters), or by compiling at load time — but we make no promise, and the
+project is fully correct without it.
+
+The aspiration is **100% static coverage** — every reachable instruction native,
+the interpreter idle. The capture-and-recompile loop converges toward it the more
+a game is played; this branch is where that machinery is being built.
+
 ## Status
 
 Current milestone as of 2026-05-18:
