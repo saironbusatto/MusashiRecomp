@@ -67,6 +67,13 @@ void overlay_loader_get_counters(uint32_t *loads, uint32_t *invalidations,
                                  uint32_t *last_write_size,
                                  int *regions, uint32_t *revalidations);
 
+void overlay_loader_get_reload_debug(int *r0_valid, uint32_t *r0_writes,
+                                     uint32_t *r0_fn_lo, uint32_t *r0_fn_hi,
+                                     uint32_t *r0_crc_live,
+                                     uint32_t *reval_attempts,
+                                     uint32_t *reval_crc_miss,
+                                     uint32_t *last_reval_crc);
+
 #ifdef __cplusplus
 }
 #endif

@@ -57,6 +57,12 @@ typedef struct {
      * never left, so this is O(1) and needs no DLL reload. */
     uint32_t crc_live;
     uint32_t writes_since_invalid;
+    /* Code span = [fn_lo, fn_hi) covering the registered function entries. We
+     * watch and hash only this, NOT the whole dirty region — the overlay writes
+     * its own data elsewhere in the region during play, and watching that data
+     * would falsely invalidate the (unchanged) code registration. */
+    uint32_t fn_lo;
+    uint32_t fn_hi;
 } OvlRegion;
 static OvlRegion s_regions[MAX_OVL_REGIONS];
 static int       s_nregions = 0;
@@ -69,6 +75,10 @@ static uint64_t s_disp_native    = 0;
 static uint64_t s_disp_interp    = 0;
 static uint64_t s_stale_blocked  = 0;
 static uint32_t s_revalidations  = 0;
+/* Inc2 diagnostics: see exactly where reload-on-return stalls. */
+static uint32_t s_reval_attempts = 0;   /* threshold met -> hash computed */
+static uint32_t s_reval_crc_miss = 0;   /* hash computed but != crc_live */
+static uint32_t s_last_reval_crc = 0;   /* most recent recomputed code-span crc */
 static uint32_t s_last_write_pc   = 0;
 static uint32_t s_last_write_addr = 0;
 static uint32_t s_last_write_size = 0;
@@ -228,6 +238,7 @@ static int load_overlay_dll(const char *dll_path, uint32_t load_addr_virt, int r
     DWORD *funcs   = (DWORD *)(base + exp->AddressOfFunctions);
 
     int registered = 0;
+    uint32_t fn_lo = 0xFFFFFFFFu, fn_hi = 0;
     for (DWORD i = 0; i < exp->NumberOfNames; i++) {
         const char *name = (const char *)(base + names[i]);
         /* Match "func_XXXXXXXX" — exactly 13 chars */
@@ -241,7 +252,17 @@ static int load_overlay_dll(const char *dll_path, uint32_t load_addr_virt, int r
 
         uint32_t phys = addr & 0x1FFFFFFFu;
         dyntab_insert(phys, fn, region);
+        if (phys < fn_lo) fn_lo = phys;
+        if (phys > fn_hi) fn_hi = phys;
         registered++;
+    }
+    /* Record the code span (function-entry extent) for watch + hash. We watch
+     * through the page of the last entry only — NOT a page beyond, which would
+     * re-include the overlay's data and cause false invalidations. A reload
+     * rewrites the entries themselves, so invalidation still fires from those. */
+    if (registered > 0 && region >= 0) {
+        s_regions[region].fn_lo = fn_lo;
+        s_regions[region].fn_hi = fn_hi + 4u;
     }
 
     loader_log("loaded %s -> %d functions registered", dll_path, registered);
@@ -385,22 +406,28 @@ static void try_load_region(uint32_t phys)
         return;
     }
     s_regions[region].func_count = registered;
-    /* Content hash of the live region as registered — used to recognize the
-     * same overlay when it loads back later (Inc2 reload-on-return). */
+    /* Use the code span (function-entry extent), not the whole dirty region,
+     * so the overlay's own data writes don't churn the registration. fn_lo/fn_hi
+     * were set by load_overlay_dll. */
+    uint32_t code_lo  = s_regions[region].fn_lo;
+    uint32_t code_len = s_regions[region].fn_hi - code_lo;
+    /* Content hash of the live code span — recognizes the same overlay when it
+     * loads back later (Inc2 reload-on-return). Code is identical across loads;
+     * data (which we excluded) is not, so this is the reliable identity. */
     {
         extern uint8_t *memory_get_ram_ptr(void);
         uint8_t *ram = memory_get_ram_ptr();
-        s_regions[region].crc_live = crc32_compute(ram + region_start, region_size);
+        s_regions[region].crc_live = crc32_compute(ram + code_lo, code_len);
     }
     s_regions[region].writes_since_invalid = 0;
     s_nregions++;
     s_loads++;
 
-    /* Watch this region's RAM pages: a later write invalidates the
+    /* Watch the code span's RAM pages: a write there invalidates the
      * registration (Inc1-D). overlay_watch_set_range lives in memory.c, on
      * the single psx_write_* store chokepoint. */
     extern void overlay_watch_set_range(uint32_t phys, uint32_t len);
-    overlay_watch_set_range(region_start, region_size);
+    overlay_watch_set_range(code_lo, code_len);
 }
 
 /* Invalidate the registered region containing `phys` (called from the store
@@ -456,19 +483,28 @@ static void try_revalidate(uint32_t phys)
         if (s_regions[r].valid) continue;
         if (p < s_regions[r].base) continue;
         if (p >= s_regions[r].base + s_regions[r].size) continue;
-        /* Require a near-full rewrite before paying for a hash (reload, not
-         * incidental data writes into the region). */
-        if (s_regions[r].writes_since_invalid < (s_regions[r].size / 2u)) return;
+        uint32_t code_lo  = s_regions[r].fn_lo;
+        uint32_t code_len = s_regions[r].fn_hi - code_lo;
+        /* Require a near-full rewrite of the code span before paying for a hash
+         * (a real reload, not incidental writes). */
+        if (s_regions[r].writes_since_invalid < (code_len / 2u)) return;
         s_regions[r].writes_since_invalid = 0;
 
         uint8_t *ram = memory_get_ram_ptr();
-        uint32_t crc = crc32_compute(ram + s_regions[r].base, s_regions[r].size);
+        uint32_t crc = crc32_compute(ram + code_lo, code_len);
+        s_reval_attempts++;
+        s_last_reval_crc = crc;
         if (crc == s_regions[r].crc_live) {
             s_regions[r].valid = 1;
             s_regions[r].generation++;
             s_revalidations++;
             loader_log("re-validated region 0x%08X (+%u) on reload -> %d funcs native",
                        s_regions[r].base, s_regions[r].size, s_regions[r].func_count);
+        } else {
+            s_reval_crc_miss++;
+            loader_log("reval miss region 0x%08X span[%08X,%08X) crc=%08X want=%08X",
+                       s_regions[r].base, code_lo, s_regions[r].fn_hi,
+                       crc, s_regions[r].crc_live);
         }
         return;
     }
@@ -519,6 +555,26 @@ void overlay_loader_get_counters(uint32_t *loads, uint32_t *invalidations,
     if (last_write_size) *last_write_size = s_last_write_size;
     if (regions)         *regions         = s_nregions;
     if (revalidations)   *revalidations   = s_revalidations;
+}
+
+/* Inc2 reload diagnostics — region 0 state + revalidate attempt/miss counters. */
+void overlay_loader_get_reload_debug(int *r0_valid, uint32_t *r0_writes,
+                                     uint32_t *r0_fn_lo, uint32_t *r0_fn_hi,
+                                     uint32_t *r0_crc_live,
+                                     uint32_t *reval_attempts,
+                                     uint32_t *reval_crc_miss,
+                                     uint32_t *last_reval_crc)
+{
+    if (s_nregions > 0) {
+        if (r0_valid)    *r0_valid    = s_regions[0].valid;
+        if (r0_writes)   *r0_writes   = s_regions[0].writes_since_invalid;
+        if (r0_fn_lo)    *r0_fn_lo    = s_regions[0].fn_lo;
+        if (r0_fn_hi)    *r0_fn_hi    = s_regions[0].fn_hi;
+        if (r0_crc_live) *r0_crc_live = s_regions[0].crc_live;
+    }
+    if (reval_attempts) *reval_attempts = s_reval_attempts;
+    if (reval_crc_miss) *reval_crc_miss = s_reval_crc_miss;
+    if (last_reval_crc) *last_reval_crc = s_last_reval_crc;
 }
 
 int overlay_loader_registered_count(void)
