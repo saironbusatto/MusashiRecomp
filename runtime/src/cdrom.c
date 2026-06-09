@@ -1315,3 +1315,19 @@ uint32_t cdrom_debug_copy_last_sector(uint32_t offset, uint32_t len,
     memcpy(out, last_sector_buffer + offset, len);
     return len;
 }
+
+/* Load-in-progress predicate for turbo-through-loads (step 4). True while a
+ * data-sector read stream is active or a data sector was delivered within
+ * the burst-gap window (bridges the per-file Setloc/seek gaps inside one
+ * logical load). XA streaming (FMV / CD audio) is NEVER a load — its pacing
+ * must stay authentic. */
+int cdrom_load_in_progress(void) {
+    if (xa_stream_active) return 0;
+    if (reading) return 1;
+    if (s_burst_count > 0) {
+        const CdBurst *b = &s_bursts[(s_burst_count - 1u) % CD_BURST_CAP];
+        if ((uint32_t)s_frame_count <= b->end_frame + CD_BURST_GAP_FRAMES)
+            return 1;
+    }
+    return 0;
+}

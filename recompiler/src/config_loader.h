@@ -60,6 +60,12 @@ struct RuntimeConfig {
     // overlay DLLs (loaded ahead of the dirty-RAM interpreter) and records
     // overlay bytes to overlay_captures.json for offline compilation.
     bool                  overlay_cache = false;
+
+    // turbo_loads: OPT-IN per game. While the game is loading (CD data
+    // stream active, XA/FMV excluded, post-BIOS-handoff only) the frontend
+    // skips wall-clock pacing so the guest runs at host speed — compressing
+    // load wall-time. Streaming titles (e.g. Crash) must leave this off.
+    bool                  turbo_loads = false;
 };
 
 // One entry from [[recompiler.bios_vectors]].

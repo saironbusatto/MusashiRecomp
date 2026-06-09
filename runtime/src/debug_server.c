@@ -7340,6 +7340,23 @@ static void handle_cdrom_instant_rate(int id, const char *json)
              id, cdrom_get_instant_rate());
 }
 
+/* turbo_loads: get/set the turbo-through-loads enable (step 4). Param "n"
+ * (optional: 0/1). Reports the enable, whether the load predicate holds RIGHT
+ * NOW, and how many vblanks have run unpaced. */
+static void handle_turbo_loads(int id, const char *json)
+{
+    extern int      g_turbo_loads_enabled;
+    extern uint64_t g_turbo_loads_frames;
+    extern int      fntrace_is_game_started(void);
+    int n = json_get_int(json, "n", -1);
+    if (n == 0 || n == 1) g_turbo_loads_enabled = n;
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"load_active\":%d,"
+             "\"game_started\":%d,\"turbo_frames\":%llu}\n",
+             id, g_turbo_loads_enabled, cdrom_load_in_progress(),
+             fntrace_is_game_started(),
+             (unsigned long long)g_turbo_loads_frames);
+}
+
 /* cdrom_bursts: dump the always-on CD load-burst ring, newest first. Each
  * record is one gap-separated run of delivered data sectors — i.e. one load.
  * Param "count" (optional, default 32, max 128). */
@@ -8236,6 +8253,7 @@ static const CmdEntry s_commands[] = {
     { "overlay_capture_dump", handle_overlay_capture_dump },
     { "cdrom_instant_rate",   handle_cdrom_instant_rate },
     { "cdrom_bursts",         handle_cdrom_bursts },
+    { "turbo_loads",          handle_turbo_loads },
     { NULL, NULL }
 };
 

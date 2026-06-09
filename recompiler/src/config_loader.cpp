@@ -73,6 +73,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     if (runtime.contains("overlay_cache")) {
         rt.overlay_cache = toml::find<bool>(runtime, "overlay_cache");
     }
+    if (runtime.contains("turbo_loads")) {
+        rt.turbo_loads = toml::find<bool>(runtime, "turbo_loads");
+    }
     return rt;
 }
 
