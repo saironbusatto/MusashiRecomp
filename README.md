@@ -243,11 +243,11 @@ game gets. This happens automatically; you don't have to do anything.
 **Make your discoveries permanent for everyone.** Your discoveries are saved
 in a small file written next to the game called `overlay_captures.json`.
 After a play session — especially if you visited areas nobody has explored
-yet — you can share that file with the project (attach it to a GitHub issue
-on the game's repository, or send it to a maintainer). We fold it into the
-next release, and every player gets your areas at full speed from the first
+yet — open a GitHub issue on the game's repository and attach that file.
+The project maintainer will work to fold your discoveries back into the
+project, and every player gets your areas at full speed from the first
 moment they arrive. No technical knowledge needed: play, find the file,
-share it.
+attach it to an issue.
 
 What's safe to know:
 - The file contains only game code snapshots and addresses — no personal
