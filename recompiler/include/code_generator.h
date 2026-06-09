@@ -79,6 +79,17 @@ public:
         const std::vector<Function>& functions,
         const std::map<uint32_t, ControlFlowGraph>& cfgs);
 
+    // Generate the per-function code-range manifest consumed by the overlay
+    // loader's per-entry validity hash (design §8). For each function, emits its
+    // compiled code byte-ranges (union of basic-block extents), coalesced;
+    // interleaved jump tables / constant pools fall in the gaps and are
+    // excluded — which is what makes the runtime hash stable across reloads.
+    //   F <entry_hex>          one per function (virtual entry address)
+    //   R <lo_hex> <len_hex>   one per coalesced code range (virtual addr)
+    std::string generate_ranges_manifest(
+        const std::vector<Function>& functions,
+        const std::map<uint32_t, ControlFlowGraph>& cfgs);
+
     // Set known functions for this compilation unit (for linking)
     void set_known_functions(const std::set<uint32_t>& functions) {
         known_functions_ = functions;

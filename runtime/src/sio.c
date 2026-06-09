@@ -15,6 +15,7 @@
 #include "sio.h"
 #include "memcard.h"
 #include "debug_server.h"
+#include "event_ring.h"
 #include <string.h>
 
 /* I_STAT is owned by memory.c */
@@ -1167,6 +1168,7 @@ void sio_write(uint32_t addr, uint32_t value) {
                     sio_stat &= ~(SIO_STAT_ACK | SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY);
                     sio_irq_pending = 1;
                     sio_irq_countdown = SIO_IRQ_DELAY_PAD;
+                    event_ring_record_aux(EV_ENQ, (uint8_t)SRC_SIO, (uint32_t)sio_irq_countdown);
                     sio_irq_pending_source = SIO_IRQ_SRC_PAD_ACK;
                     sio_irq_pending_slot = (uint8_t)selected_slot;
                     sio_irq_pending_delay = (uint8_t)sio_irq_countdown;
@@ -1225,6 +1227,7 @@ void sio_write(uint32_t addr, uint32_t value) {
                 sio_irq_pending = 1;
                 sio_irq_countdown = (active_device == DEV_MEMCARD)
                     ? SIO_IRQ_DELAY_CARD : SIO_IRQ_DELAY_PAD;
+                event_ring_record_aux(EV_ENQ, (uint8_t)SRC_SIO, (uint32_t)sio_irq_countdown);
                 sio_irq_pending_source   = (active_device == DEV_MEMCARD)
                                            ? SIO_IRQ_SRC_CARD_ACK : SIO_IRQ_SRC_PAD_ACK;
                 sio_irq_pending_slot     = (uint8_t)selected_slot;
@@ -1548,6 +1551,7 @@ static void sio_fire_ack_irq(void) {
 
     uint32_t i_stat_before = i_stat;
     i_stat |= (1 << IRQ_SIO0);
+    event_ring_record_aux(EV_DEQ, (uint8_t)SRC_SIO, 0u); /* SIO ACK IRQ fired */
 
     extern uint32_t g_debug_current_func_addr;
     extern uint8_t psx_read_byte(uint32_t addr);
@@ -1745,6 +1749,7 @@ void sio_tick(int cycles) {
             sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
             uint32_t i_stat_before = i_stat;
             i_stat |= (1 << IRQ_SIO0);
+            event_ring_record_aux(EV_DEQ, (uint8_t)SRC_SIO, 1u); /* SIO shift IRQ fired */
 
             /* SIO IRQ ring capture. */
             extern uint32_t g_debug_current_func_addr;

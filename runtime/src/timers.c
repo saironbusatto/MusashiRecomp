@@ -15,6 +15,7 @@
  */
 
 #include "timers.h"
+#include "event_ring.h"
 #include <string.h>
 
 /* Mode register bit definitions */
@@ -114,6 +115,8 @@ static void timer_fire_irq(int t) {
     if (!(tm->mode & MODE_IRQ_REPEAT)) {
         tm->mode &= ~(MODE_IRQ_TARGET | MODE_IRQ_OVERFLOW);
     }
+    /* DEQUEUE: timer IRQ event fired (aux = timer counter at fire). */
+    event_ring_record_aux(EV_DEQ, (uint8_t)(SRC_TIMER0 + t), tm->counter);
 }
 
 /* Tick a single timer by one count. Returns nothing; updates flags/IRQ. */
@@ -248,6 +251,9 @@ void timers_write(uint32_t addr, uint32_t value) {
             timers[timer].counter = 0;
             timers[timer].irq_line = 0;
             timer_frac[timer] = 0;
+            /* ENQUEUE: timer (re)armed via mode write (aux = current target). */
+            event_ring_record_aux(EV_ENQ, (uint8_t)(SRC_TIMER0 + timer),
+                                  timers[timer].target);
             break;
         case 0x08:
             timers[timer].target = value & 0xFFFF;

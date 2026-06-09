@@ -106,15 +106,22 @@ void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
         dirty_ram_bitmap[i] = words[i];
 }
 
-/* ---- Inc1-D: watched overlay pages -------------------------------------
- * Pages covered by a registered overlay DLL. A write into a watched page
- * invalidates that overlay's registration so the new RAM content falls back to
- * the interpreter instead of executing stale native code (OV-1). The bitmap is
- * almost always empty, so the per-store cost is a single bitmap lookup.
- * Set/cleared by the overlay loader; tested on the psx_write_* store path —
- * the single, audited RAM-write chokepoint (all CPU + DMA stores funnel here).
+/* ---- Inc3: watched overlay pages + per-page generation counters ---------
+ * Pages covered by a registered overlay function's code range. The store path
+ * (the single, audited RAM-write chokepoint — all CPU + DMA stores funnel
+ * here) tests the watch bitmap and, on a hit, bumps that page's generation
+ * counter. It does NOT eagerly invalidate (Inc1-D did): validity is now decided
+ * lazily, per compiled entry, at dispatch time (overlay_loader.c §8). The
+ * generation counter lets the loader cheaply detect "did any page covering this
+ * entry's code change since I last validated it?" without hashing on the store
+ * path. Monotonic: gen only increases, so a sum over an entry's pages is a
+ * perfect change detector (no aliasing).
+ *
+ * The bitmap is almost always empty, so the per-store cost on the common path
+ * is a single bitmap lookup.
  */
 static uint32_t overlay_watch_bitmap[DIRTY_RAM_BITMAP_WORDS];
+static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_COUNT];
 
 void overlay_watch_set_range(uint32_t phys, uint32_t len) {
     if (len == 0 || phys >= RAM_SIZE) return;
@@ -136,12 +143,30 @@ void overlay_watch_clear_range(uint32_t phys, uint32_t len) {
         overlay_watch_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
 }
 
+/* Sum of generation counters over the pages spanning [phys, phys+len). The
+ * loader stores this at validation time and compares on dispatch; any change
+ * means a watched page in the range was written. */
+uint32_t overlay_watch_pagegen_sum(uint32_t phys, uint32_t len) {
+    if (len == 0 || phys >= RAM_SIZE) return 0;
+    uint32_t end = phys + len - 1u;
+    if (end >= RAM_SIZE || end < phys) end = RAM_SIZE - 1u;
+    uint32_t fp = phys >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t lp = end  >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t sum = 0;
+    for (uint32_t pg = fp; pg <= lp; pg++) sum += overlay_page_gen[pg];
+    return sum;
+}
+
 static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
     uint32_t pg = phys >> DIRTY_RAM_PAGE_SHIFT;
     if (pg >= DIRTY_RAM_PAGE_COUNT) return;
     if ((overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
-        extern void overlay_loader_invalidate_at(uint32_t phys, uint32_t size);
-        overlay_loader_invalidate_at(phys, size);
+        overlay_page_gen[pg]++;
+        /* Self-modification of a currently-executing native entry cannot be
+         * recovered lazily (the next dispatch is too late) — the loader
+         * blacklists that entry. Everything else is handled at dispatch. */
+        extern void overlay_loader_active_write_check(uint32_t phys, uint32_t size);
+        overlay_loader_active_write_check(phys, size);
     }
 }
 

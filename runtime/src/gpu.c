@@ -14,6 +14,7 @@
 #include "gpu_sw_renderer.h"
 #include "debug_server.h"
 #include "cpu_state.h"
+#include "event_ring.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -236,6 +237,9 @@ uint32_t gpu_read_gpustat(void) {
         gpustat_poll_count = 0;
         lcf ^= 1;
         i_stat |= (1u << 0); /* IRQ_VBLANK */
+        /* DEQUEUE: VBlank fired via the GPUSTAT-poll fallback path (distinct
+         * from the cycle-paced VBlank in psx_check_interrupts). */
+        event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK, 0xFFFFFFFFu);
     }
 
     uint32_t stat = 0;

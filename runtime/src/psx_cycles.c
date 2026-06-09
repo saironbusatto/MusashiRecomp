@@ -16,14 +16,37 @@ uint64_t psx_cycle_count = 0;
 static uint32_t s_watchdog_throttle = 0;
 static uint32_t s_pc_sample_throttle = 0;
 
+/* Conservative event-granularity diagnostic (set via debug cmd
+ * overlay_native_event_granularity). Normally psx_advance_cycles charges a
+ * whole basic block's cycles in ONE step, so every device advances N cycles at
+ * once and any events that came due at sub-block cycles all fire together, in
+ * the fixed device order below (sio,cdrom,dma,timers,interrupts) — NOT in true
+ * due-cycle order. The dirty-RAM interpreter avoids this only because it calls
+ * us with N=1 per instruction. When this flag is set, a batched (N>1) advance
+ * is split into N single-cycle steps, so device events fire at their true
+ * due-cycle in order — i.e. native execution gets the same event timeline the
+ * interpreter produces. Diagnostic: if the village->overworld blue screen
+ * clears with this on, the root cause is per-block event-ordering, and the
+ * real fix is a due-cycle event scheduler (run-to-next-event), not this. */
+int g_event_step_conservative = 0;
+
+static void advance_devices(uint32_t c) {
+    psx_cycle_count += (uint64_t)c;
+    sio_advance(c);
+    cdrom_advance(c);
+    dma_advance(c);
+    timers_advance(c);
+    interrupts_advance_cycles(c);
+}
+
 void psx_advance_cycles(uint32_t cycles) {
     if (cycles == 0) return;
-    psx_cycle_count += (uint64_t)cycles;
-    sio_advance(cycles);
-    cdrom_advance(cycles);
-    dma_advance(cycles);
-    timers_advance(cycles);
-    interrupts_advance_cycles(cycles);
+    if (g_event_step_conservative && cycles > 1u) {
+        /* Fine-step so sub-block events fire in true cycle order. */
+        for (uint32_t i = 0; i < cycles; i++) advance_devices(1u);
+    } else {
+        advance_devices(cycles);
+    }
     s_watchdog_throttle += cycles;
     if (s_watchdog_throttle >= 65536u) {
         s_watchdog_throttle = 0;
