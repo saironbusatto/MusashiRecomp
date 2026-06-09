@@ -53,6 +53,49 @@ bool FunctionAnalyzer::is_epilogue(uint32_t instr, int32_t& stack_size) {
     return false;
 }
 
+bool FunctionAnalyzer::is_valid_mips_word(uint32_t instr) {
+    if (instr == 0xFFFFFFFFu || instr == 0xFFFFFFFDu) return false;
+
+    uint32_t opcode = (instr >> 26) & 0x3Fu;
+    uint32_t funct = instr & 0x3Fu;
+    uint32_t rt = (instr >> 16) & 0x1Fu;
+
+    if (opcode == 0x00u) {
+        switch (funct) {
+        case 0x00u: case 0x02u: case 0x03u: case 0x04u:
+        case 0x06u: case 0x07u: case 0x08u: case 0x09u:
+        case 0x0Cu: case 0x0Du:
+        case 0x10u: case 0x11u: case 0x12u: case 0x13u:
+        case 0x18u: case 0x19u: case 0x1Au: case 0x1Bu:
+        case 0x20u: case 0x21u: case 0x22u: case 0x23u:
+        case 0x24u: case 0x25u: case 0x26u: case 0x27u:
+        case 0x2Au: case 0x2Bu:
+            return true;
+        default:
+            return false;
+        }
+    }
+    if (opcode == 0x01u) {
+        return rt == 0x00u || rt == 0x01u || rt == 0x10u || rt == 0x11u;
+    }
+
+    switch (opcode) {
+    case 0x02u: case 0x03u: case 0x04u: case 0x05u:
+    case 0x06u: case 0x07u:
+    case 0x08u: case 0x09u: case 0x0Au: case 0x0Bu:
+    case 0x0Cu: case 0x0Du: case 0x0Eu: case 0x0Fu:
+    case 0x10u: case 0x12u:
+    case 0x20u: case 0x21u: case 0x22u: case 0x23u:
+    case 0x24u: case 0x25u: case 0x26u:
+    case 0x28u: case 0x29u: case 0x2Au: case 0x2Bu:
+    case 0x2Eu:
+    case 0x30u: case 0x32u: case 0x38u: case 0x3Au:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool FunctionAnalyzer::is_branch_or_jump(uint32_t instr) {
     uint32_t opcode = (instr >> 26) & 0x3F;
     // J, JAL
@@ -255,46 +298,7 @@ static bool exact_is_addiu_sp_neg(uint32_t instr) {
 }
 
 static bool exact_is_valid_mips_word(uint32_t instr) {
-    if (instr == 0xFFFFFFFFu || instr == 0xFFFFFFFDu) return false;
-
-    uint32_t opcode = (instr >> 26) & 0x3Fu;
-    uint32_t funct = instr & 0x3Fu;
-    uint32_t rt = (instr >> 16) & 0x1Fu;
-
-    if (opcode == 0x00u) {
-        switch (funct) {
-        case 0x00u: case 0x02u: case 0x03u: case 0x04u:
-        case 0x06u: case 0x07u: case 0x08u: case 0x09u:
-        case 0x0Cu: case 0x0Du:
-        case 0x10u: case 0x11u: case 0x12u: case 0x13u:
-        case 0x18u: case 0x19u: case 0x1Au: case 0x1Bu:
-        case 0x20u: case 0x21u: case 0x22u: case 0x23u:
-        case 0x24u: case 0x25u: case 0x26u: case 0x27u:
-        case 0x2Au: case 0x2Bu:
-            return true;
-        default:
-            return false;
-        }
-    }
-    if (opcode == 0x01u) {
-        return rt == 0x00u || rt == 0x01u || rt == 0x10u || rt == 0x11u;
-    }
-
-    switch (opcode) {
-    case 0x02u: case 0x03u: case 0x04u: case 0x05u:
-    case 0x06u: case 0x07u:
-    case 0x08u: case 0x09u: case 0x0Au: case 0x0Bu:
-    case 0x0Cu: case 0x0Du: case 0x0Eu: case 0x0Fu:
-    case 0x10u: case 0x12u:
-    case 0x20u: case 0x21u: case 0x22u: case 0x23u:
-    case 0x24u: case 0x25u: case 0x26u:
-    case 0x28u: case 0x29u: case 0x2Au: case 0x2Bu:
-    case 0x2Eu:
-    case 0x30u: case 0x32u: case 0x38u: case 0x3Au:
-        return true;
-    default:
-        return false;
-    }
+    return FunctionAnalyzer::is_valid_mips_word(instr);
 }
 
 static uint32_t exact_branch_target(uint32_t pc, uint32_t instr) {

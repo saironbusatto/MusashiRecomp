@@ -1302,40 +1302,8 @@ GeneratedFunction CodeGenerator::generate_function(
     // Pre-scan: find jump table targets that land mid-block (not a block boundary).
     // These need inline labels so goto statements in the switch can reach them.
     extra_labels_.clear();
-    for (const auto& [baddr, blk] : cfg.blocks) {
-        if (blk.exit_instr.type != ControlFlowType::JumpRegister) continue;
-        uint32_t jr_r = get_rs(blk.exit_instr.instruction);
-        // Run same backward scan as translate_basic_block to find table_base/count
-        uint32_t tb = 0, tc = 0;
-        {
-            uint32_t lw_base = 0xFF; int32_t lw_off = 0;
-            uint32_t ac[2] = {0xFF,0xFF}; uint32_t lui_v = 0;
-            int16_t av[2] = {0,0}; bool fa[2] = {false,false}, fl = false;
-            for (int b = 1; b <= 40; b++) {
-                uint32_t sa = blk.exit_instr.address - (uint32_t)(b*4);
-                if (sa < cfg.function_start) break;
-                auto so = exe_.read_word(sa); if (!so) break;
-                uint32_t si=*so, s_op=(si>>26)&0x3F, s_rs=(si>>21)&0x1F,
-                         s_rt=(si>>16)&0x1F, s_rd=(si>>11)&0x1F, s_fn=si&0x3F;
-                if (s_op==0x23 && s_rt==jr_r && lw_base==0xFF) { lw_base=s_rs; lw_off=(int32_t)(int16_t)(si&0xFFFF); continue; }
-                if (s_op==0x00 && s_fn==0x21 && s_rd==lw_base && lw_base!=0xFF && ac[0]==0xFF) { ac[0]=s_rs; ac[1]=s_rt; continue; }
-                if (s_op==0x09 && ac[0]!=0xFF) { for(int c=0;c<2;c++){if(!fa[c]&&ac[c]!=0xFF&&s_rs==ac[c]&&s_rt==ac[c]){av[c]=(int16_t)(si&0xFFFF);fa[c]=true;break;}} continue; }
-                if (s_op==0x0F && ac[0]!=0xFF && !fl) { for(int c=0;c<2;c++){if(ac[c]!=0xFF&&s_rt==ac[c]){lui_v=((uint32_t)(si&0xFFFF))<<16;if(!fa[c]){av[c]=0;}av[0]=av[c];fa[0]=fa[c];fl=true;break;}} continue; }
-                if (s_op==0x0B && tc==0) { tc=si&0xFFFF; continue; }
-                if (fl && tc!=0) break;
-            }
-            if (fl && tc>0 && tc<512) tb = (lui_v+(fa[0]?(uint32_t)(int32_t)av[0]:0u)) + (uint32_t)lw_off;
-        }
-        if (tb==0 || tc==0) continue;
-        uint32_t rom_tb = ram_to_rom(tb, exe_);
-        for (uint32_t i = 0; i < tc; i++) {
-            auto eopt = exe_.read_word(rom_tb + i*4);
-            if (!eopt) continue;
-            uint32_t t = ram_to_rom(*eopt, exe_);
-            if (t >= cfg.function_start && t < cfg.function_end && !cfg.blocks.count(t))
-                extra_labels_.insert(t);
-        }
-    }
+    std::map<uint32_t, std::vector<uint32_t>> jr_table_edges;
+    scan_jr_tables(cfg, jr_table_edges);
 
     // Generate code for each basic block
     for (uint32_t block_addr : cfg.block_order) {
@@ -1401,6 +1369,155 @@ GeneratedFunction CodeGenerator::generate_function(
     return result;
 }
 
+void CodeGenerator::scan_jr_tables(
+    const ControlFlowGraph& cfg,
+    std::map<uint32_t, std::vector<uint32_t>>& out_edges) {
+
+    for (const auto& [baddr, blk] : cfg.blocks) {
+        if (blk.exit_instr.type != ControlFlowType::JumpRegister) continue;
+        uint32_t jr_r = get_rs(blk.exit_instr.instruction);
+        // Run same backward scan as translate_basic_block to find table_base/count
+        uint32_t tb = 0, tc = 0;
+        {
+            uint32_t lw_base = 0xFF; int32_t lw_off = 0;
+            uint32_t ac[2] = {0xFF,0xFF}; uint32_t lui_v = 0;
+            int16_t av[2] = {0,0}; bool fa[2] = {false,false}, fl = false;
+            for (int b = 1; b <= 40; b++) {
+                uint32_t sa = blk.exit_instr.address - (uint32_t)(b*4);
+                if (sa < cfg.function_start) break;
+                auto so = exe_.read_word(sa); if (!so) break;
+                uint32_t si=*so, s_op=(si>>26)&0x3F, s_rs=(si>>21)&0x1F,
+                         s_rt=(si>>16)&0x1F, s_rd=(si>>11)&0x1F, s_fn=si&0x3F;
+                if (s_op==0x23 && s_rt==jr_r && lw_base==0xFF) { lw_base=s_rs; lw_off=(int32_t)(int16_t)(si&0xFFFF); continue; }
+                if (s_op==0x00 && s_fn==0x21 && s_rd==lw_base && lw_base!=0xFF && ac[0]==0xFF) { ac[0]=s_rs; ac[1]=s_rt; continue; }
+                if (s_op==0x09 && ac[0]!=0xFF) { for(int c=0;c<2;c++){if(!fa[c]&&ac[c]!=0xFF&&s_rs==ac[c]&&s_rt==ac[c]){av[c]=(int16_t)(si&0xFFFF);fa[c]=true;break;}} continue; }
+                if (s_op==0x0F && ac[0]!=0xFF && !fl) { for(int c=0;c<2;c++){if(ac[c]!=0xFF&&s_rt==ac[c]){lui_v=((uint32_t)(si&0xFFFF))<<16;if(!fa[c]){av[c]=0;}av[0]=av[c];fa[0]=fa[c];fl=true;break;}} continue; }
+                if (s_op==0x0B && tc==0) { tc=si&0xFFFF; continue; }
+                if (fl && tc!=0) break;
+            }
+            if (fl && tc>0 && tc<512) tb = (lui_v+(fa[0]?(uint32_t)(int32_t)av[0]:0u)) + (uint32_t)lw_off;
+        }
+        if (tb==0 || tc==0) continue;
+        uint32_t rom_tb = ram_to_rom(tb, exe_);
+        for (uint32_t i = 0; i < tc; i++) {
+            auto eopt = exe_.read_word(rom_tb + i*4);
+            if (!eopt) continue;
+            uint32_t t = ram_to_rom(*eopt, exe_);
+            if (t >= cfg.function_start && t < cfg.function_end) {
+                out_edges[baddr].push_back(t);
+                if (!cfg.blocks.count(t))
+                    extra_labels_.insert(t);
+            }
+        }
+    }
+}
+
+std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
+    const std::vector<const Function*>& aliases,
+    const ControlFlowGraph& cfg,
+    const std::string& fallthrough_name) {
+
+    std::vector<GeneratedFunction> results;
+    if (aliases.empty()) return results;
+    uint32_t host = aliases[0]->alias_walk_lo;
+
+    // Jump-table edges + mid-block labels for this host's CFG.
+    extra_labels_.clear();
+    std::map<uint32_t, std::vector<uint32_t>> jr_table_edges;
+    scan_jr_tables(cfg, jr_table_edges);
+
+    // Union of blocks reachable from any alias entry. Edges are
+    // BasicBlock::successors plus jump-table targets (mapped to their
+    // containing block — table targets may be mid-block labels).
+    auto containing_block = [&](uint32_t a) -> uint32_t {
+        auto it = cfg.blocks.upper_bound(a);
+        if (it == cfg.blocks.begin()) return 0;
+        --it;
+        return (a >= it->second.start_addr && a <= it->second.end_addr)
+            ? it->first : 0;
+    };
+    std::set<uint32_t> live_blocks;
+    std::vector<uint32_t> work;
+    for (const Function* a : aliases) {
+        uint32_t eb = containing_block(a->start_addr);
+        if (eb != 0) work.push_back(eb);
+    }
+    while (!work.empty()) {
+        uint32_t b = work.back();
+        work.pop_back();
+        if (!live_blocks.insert(b).second) continue;
+        const BasicBlock& blk = cfg.blocks.at(b);
+        for (uint32_t s : blk.successors) {
+            if (cfg.blocks.count(s)) work.push_back(s);
+        }
+        auto je = jr_table_edges.find(b);
+        if (je != jr_table_edges.end()) {
+            for (uint32_t t : je->second) {
+                uint32_t cb = containing_block(t);
+                if (cb != 0) work.push_back(cb);
+            }
+        }
+    }
+
+    // Shared body: host-range blocks (live subset) behind an entry switch.
+    std::stringstream body;
+    body << fmt::format("/* Overlapping-alias body for host func_{:08X}: {} entries */\n",
+                        host, aliases.size());
+    body << fmt::format("static void psx_alias_body_{:08X}(CPUState* cpu, uint32_t entry)\n{{\n",
+                        host);
+    body << config_.indent << "switch (entry) {\n";
+    for (const Function* a : aliases) {
+        body << config_.indent
+             << fmt::format("    case 0x{:08X}u: goto block_{:08X};\n",
+                            a->start_addr, a->start_addr);
+    }
+    body << config_.indent << "    default: return;\n";
+    body << config_.indent << "}\n";
+
+    for (uint32_t block_addr : cfg.block_order) {
+        if (!live_blocks.count(block_addr)) continue;
+        const BasicBlock& block = cfg.blocks.at(block_addr);
+        body << "\n" << translate_basic_block(block, cfg);
+    }
+
+    // Host-end fallthrough (mirrors generate_function): only relevant when the
+    // host's final block is live and ends without explicit control flow.
+    if (!fallthrough_name.empty() && !cfg.block_order.empty() &&
+        live_blocks.count(cfg.block_order.back())) {
+        const BasicBlock& last_block = cfg.blocks.at(cfg.block_order.back());
+        bool needs_fallthrough =
+            (last_block.exit_instr.type == ControlFlowType::None) ||
+            ((last_block.exit_instr.type == ControlFlowType::Branch ||
+              last_block.exit_instr.type == ControlFlowType::Jump) &&
+             last_block.successors.empty());
+        if (needs_fallthrough) {
+            body << fmt::format("    {}(cpu);  /* fallthrough to next function */\n",
+                                fallthrough_name);
+        }
+    }
+    body << "    ;  /* label compatibility */\n";
+    body << "}\n";
+
+    // One dispatchable wrapper per alias entry; the first carries the body.
+    for (size_t i = 0; i < aliases.size(); ++i) {
+        const Function* a = aliases[i];
+        GeneratedFunction gf;
+        gf.function_name = a->name;
+        gf.signature = fmt::format("void {}(CPUState* cpu)", a->name);
+        gf.body = fmt::format(
+            "{{\n"
+            "    debug_server_log_call_entry(0x{:08X}u);\n"
+            "    psx_alias_body_{:08X}(cpu, 0x{:08X}u);  /* alias entry into host func_{:08X} */\n"
+            "}}\n",
+            a->start_addr, host, a->start_addr, host);
+        gf.full_code = (i == 0 ? body.str() + "\n" : std::string()) +
+                       gf.signature + "\n" + gf.body;
+        gf.line_count = std::count(gf.full_code.begin(), gf.full_code.end(), '\n');
+        results.push_back(std::move(gf));
+    }
+    return results;
+}
+
 std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
     const std::vector<Function>& functions,
     const std::map<uint32_t, ControlFlowGraph>& cfgs) {
@@ -1420,9 +1537,36 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
         func_name_by_addr[f.start_addr] = f.name;
     }
 
+    // Group overlapping-alias entries by host: each group is emitted as one
+    // shared static body plus per-entry wrappers (see generate_alias_group),
+    // not as per-alias duplicates of the host's blocks.
+    std::map<uint32_t, std::vector<const Function*>> alias_groups;
+    for (const Function& f : functions) {
+        if (f.alias_walk_lo != 0) alias_groups[f.alias_walk_lo].push_back(&f);
+    }
+    std::set<uint32_t> alias_groups_emitted;
+
     int total_lines = 0;
 
     for (const Function& func : functions) {
+        if (func.alias_walk_lo != 0) {
+            if (!alias_groups_emitted.insert(func.alias_walk_lo).second) continue;
+            const auto& group = alias_groups.at(func.alias_walk_lo);
+            if (cfgs.count(func.start_addr) == 0) continue;
+            const ControlFlowGraph& cfg = cfgs.at(func.start_addr);
+
+            // Host-end fallthrough target (all group members share end_addr).
+            std::string fallthrough_name;
+            auto ft_it = func_name_by_addr.find(func.end_addr);
+            if (ft_it != func_name_by_addr.end()) fallthrough_name = ft_it->second;
+
+            auto group_funcs = generate_alias_group(group, cfg, fallthrough_name);
+            for (auto& gf : group_funcs) {
+                total_lines += gf.line_count;
+                results.push_back(std::move(gf));
+            }
+            continue;
+        }
         if (func.is_data_section) {
             GeneratedFunction stub;
             stub.function_name = func.name;
@@ -1582,7 +1726,12 @@ std::string CodeGenerator::generate_file(
         uint32_t exe_start = exe_.header.load_address;
         uint32_t exe_end = exe_.end_address();
         int total_new = 0;
-        const int MAX_PASSES = 16;
+        // Safety cap only — the loop must run to convergence. Unconverged
+        // targets emit `call_by_address(mid-func); return;` which misses the
+        // dispatch table at runtime. 16 proved too low once data-scan
+        // promotions and alias entries widened the function set.
+        const int MAX_PASSES = 256;
+        bool converged = false;
 
         for (int pass = 0; pass < MAX_PASSES; pass++) {
             std::set<uint32_t> mid_targets;
@@ -1617,15 +1766,20 @@ std::string CodeGenerator::generate_file(
                 }
             }
 
-            if (mid_targets.empty()) break;
+            if (mid_targets.empty()) { converged = true; break; }
 
             fmt::print("Pre-pass {}: {} mid-function branch targets\n", pass + 1, mid_targets.size());
 
-            // Sort functions for binary search
+            // Sort functions for binary search. Alias entries overlap their
+            // host's range and must never be treated as the containing
+            // function of a mid-target (that would split/truncate the alias
+            // instead of the host) — exclude them from containment.
             std::sort(functions_mut.begin(), functions_mut.end(),
                 [](const Function& a, const Function& b) { return a.start_addr < b.start_addr; });
             std::vector<uint32_t> func_starts;
-            for (const auto& f : functions_mut) func_starts.push_back(f.start_addr);
+            for (const auto& f : functions_mut) {
+                if (f.alias_walk_lo == 0) func_starts.push_back(f.start_addr);
+            }
 
             // Group targets by containing function
             std::map<uint32_t, std::vector<uint32_t>> splits_by_func;
@@ -1693,6 +1847,10 @@ std::string CodeGenerator::generate_file(
         if (total_new > 0) {
             fmt::print("Pre-pass total: {} new entry points, {} functions now\n",
                        total_new, functions_mut.size());
+        }
+        if (!converged) {
+            fmt::print("WARNING: mid-function split pre-pass did NOT converge after {} passes; "
+                       "remaining targets will dispatch-miss at runtime\n", MAX_PASSES);
         }
     }
 

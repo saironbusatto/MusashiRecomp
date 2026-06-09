@@ -74,6 +74,16 @@ public:
         const std::vector<Function>& functions,
         const std::map<uint32_t, ControlFlowGraph>& cfgs);
 
+    // Generate a group of overlapping-alias entries that share one host
+    // function: ONE static body holding the host-range blocks (restricted to
+    // the union of blocks reachable from the entries) with an entry switch,
+    // plus a dispatchable wrapper per entry. Returns one GeneratedFunction per
+    // entry; the first carries the shared body.
+    std::vector<GeneratedFunction> generate_alias_group(
+        const std::vector<const Function*>& aliases,
+        const ControlFlowGraph& cfg,
+        const std::string& fallthrough_name);
+
     // Generate complete C file with all functions
     std::string generate_file(
         const std::vector<Function>& functions,
@@ -115,6 +125,13 @@ private:
     std::string translate_basic_block(
         const BasicBlock& block,
         const ControlFlowGraph& cfg);
+
+    // Detect jr jump tables across all blocks of a CFG. Fills extra_labels_
+    // (mid-block table targets needing inline labels) and out_edges
+    // (jr block -> in-range rom targets), used for alias reachability.
+    void scan_jr_tables(
+        const ControlFlowGraph& cfg,
+        std::map<uint32_t, std::vector<uint32_t>>& out_edges);
 
     // Control flow translation
     std::string generate_branch_condition(uint32_t instr);

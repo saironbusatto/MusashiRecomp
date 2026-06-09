@@ -204,43 +204,172 @@ int main(int argc, char** argv) {
     // Function boundary detection
     fmt::print("Performing function analysis...\n");
 
-    PSXRecomp::FunctionAnalyzer analyzer(*exe);
     std::vector<uint32_t> exact_entries;
     exact_entries.push_back(exe->header.initial_pc);
-    if (!overlay_mode) {
-        analyzer.add_forced_entry(exe->header.initial_pc);
-    }
 
-    // Forced entry points: functions called from the dispatch table but not
+    // Explicit entry points: functions called through pointers but not
     // automatically detected by the heuristic-based function analysis.
     // Pass game-specific entry points via --extra-funcs file.
 
     /* Load extra function addresses from a file (one hex address per line) */
+    std::vector<uint32_t> file_seeds;
     if (extra_funcs_path) {
         std::ifstream ef(extra_funcs_path);
         if (ef.is_open()) {
             std::string line;
-            int extra_count = 0;
             while (std::getline(ef, line)) {
                 if (line.empty() || line[0] == '#') continue;
                 uint32_t addr = (uint32_t)std::strtoul(line.c_str(), nullptr, 16);
                 if (addr >= 0x80010000u && addr < 0x80200000u) {
+                    file_seeds.push_back(addr);
                     exact_entries.push_back(addr);
-                    if (!overlay_mode) {
-                        analyzer.add_forced_entry(addr);
-                    }
-                    extra_count++;
                 }
             }
-            fmt::print("Loaded {} extra function addresses from {}\n", extra_count, extra_funcs_path);
+            fmt::print("Loaded {} extra function addresses from {}\n",
+                       file_seeds.size(), extra_funcs_path);
         } else {
             fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
         }
     }
 
-    auto analysis_result = overlay_mode
-        ? analyzer.analyze_exact_entries(exact_entries)
-        : analyzer.analyze();
+    PSXRecomp::FunctionAnalysisResult analysis_result;
+
+    if (overlay_mode) {
+        PSXRecomp::FunctionAnalyzer analyzer(*exe);
+        analysis_result = analyzer.analyze_exact_entries(exact_entries);
+    } else {
+        // ── Iterative discovery: seed classification + static data-table scan ──
+        //
+        // Every candidate entry (explicit seed or scanned data pointer) is
+        // classified against the current function set:
+        //   * matches a function start            → already covered
+        //   * INSIDE a function's range           → ALIAS entry (overlapping
+        //     emission; the host is never capped/truncated — forcing such an
+        //     entry is the mid-function-seed softlock class)
+        //   * in a gap between functions          → forced entry (explicit
+        //     seeds are trusted; scanned pointers additionally need boundary
+        //     evidence: a jr $ra two slots earlier or a non-delay-slot
+        //     prologue)
+        //
+        // The data scan walks every word of the image OUTSIDE code-function
+        // ranges (pointer tables live in data regions) and collects words that
+        // point at valid instructions inside code-function ranges. Promotions
+        // change function boundaries, so iterate to a fixed point.
+        struct AliasEntry { uint32_t addr, host_start, host_end; };
+        std::vector<AliasEntry> alias_entries;
+
+        std::set<uint32_t> forced;
+        forced.insert(exe->header.initial_pc);
+        const uint32_t exe_lo = exe->header.load_address;
+        const uint32_t exe_hi = exe->end_address();
+        auto read_w = [&](uint32_t a) -> uint32_t {
+            auto w = exe->read_word(a);
+            return w.has_value() ? *w : 0u;
+        };
+
+        const int kMaxDiscoveryIters = 6;
+        for (int iter = 0; iter < kMaxDiscoveryIters; ++iter) {
+            PSXRecomp::FunctionAnalyzer analyzer(*exe);
+            for (uint32_t a : forced) analyzer.add_forced_entry(a);
+            analysis_result = analyzer.analyze();
+
+            std::vector<const PSXRecomp::Function*> code_funcs;
+            for (const auto& f : analysis_result.functions) {
+                if (!f.is_data_section) code_funcs.push_back(&f);
+            }
+            auto containing = [&](uint32_t a) -> const PSXRecomp::Function* {
+                auto it = std::upper_bound(code_funcs.begin(), code_funcs.end(), a,
+                    [](uint32_t v, const PSXRecomp::Function* f) { return v < f->start_addr; });
+                if (it == code_funcs.begin()) return nullptr;
+                --it;
+                return (a >= (*it)->start_addr && a < (*it)->end_addr) ? *it : nullptr;
+            };
+
+            struct Candidate { uint32_t addr; bool trusted; bool table_evidence; };
+            std::vector<Candidate> candidates;
+            for (uint32_t s : file_seeds) candidates.push_back({s, true, true});
+            uint32_t scanned_words = 0;
+            auto is_text_ptr = [&](uint32_t v) {
+                return (v & 3u) == 0 && v >= exe_lo && v < exe_hi && containing(v) != nullptr;
+            };
+            for (uint32_t p = exe_lo; p + 4 <= exe_hi; p += 4) {
+                if (containing(p)) continue;  // instruction word, not a data word
+                uint32_t w = read_w(p);
+                if ((w & 3u) || w < exe_lo || w >= exe_hi) continue;
+                // Table evidence: an adjacent data word that is also a text
+                // pointer. Interior handler entries live in dense pointer
+                // tables; a lone pointer-shaped data word is too weak to mint
+                // an alias from (random data aliases into loose code ranges).
+                bool table_evidence =
+                    (p >= exe_lo + 4 && is_text_ptr(read_w(p - 4))) ||
+                    (p + 8 <= exe_hi && is_text_ptr(read_w(p + 4)));
+                candidates.push_back({w, false, table_evidence});
+                scanned_words++;
+            }
+
+            alias_entries.clear();
+            std::set<uint32_t> alias_seen;
+            bool promoted_new = false;
+            for (const auto& [a, trusted, table_evidence] : candidates) {
+                if ((a & 3u) || a < exe_lo || a >= exe_hi) continue;
+                const PSXRecomp::Function* host = containing(a);
+                if (host && a == host->start_addr) continue;  // already an entry
+                uint32_t w = read_w(a);
+                if (!PSXRecomp::FunctionAnalyzer::is_valid_mips_word(w)) continue;
+                if (host) {
+                    if ((trusted || table_evidence) && alias_seen.insert(a).second) {
+                        alias_entries.push_back({a, host->start_addr, host->end_addr});
+                    }
+                    continue;
+                }
+                bool promote = trusted;
+                if (!promote) {
+                    bool after_ret = (a >= exe_lo + 8) && (read_w(a - 8) == 0x03E00008u);
+                    int32_t frame = 0;
+                    bool prologue =
+                        PSXRecomp::FunctionAnalyzer::is_prologue(w, frame) &&
+                        !(a >= exe_lo + 4 &&
+                          PSXRecomp::FunctionAnalyzer::is_branch_or_jump(read_w(a - 4)));
+                    promote = after_ret || prologue;
+                }
+                if (promote && forced.insert(a).second) promoted_new = true;
+            }
+
+            fmt::print("Discovery iteration {}: {} data pointers scanned, "
+                       "{} forced entries, {} alias entries\n",
+                       iter + 1, scanned_words, forced.size(), alias_entries.size());
+            if (!promoted_new) break;
+        }
+
+        // Materialize alias entries as overlapping functions, grouped by host.
+        // Each group shares one emitted body (entry switch + host-range
+        // blocks); every member lists its siblings so all group CFGs carry
+        // identical block leaders. The host function is emitted unchanged.
+        std::map<uint32_t, std::vector<const AliasEntry*>> aliases_by_host;
+        for (const auto& ae : alias_entries) {
+            aliases_by_host[ae.host_start].push_back(&ae);
+        }
+        for (const auto& [host_start, group] : aliases_by_host) {
+            std::vector<uint32_t> entries;
+            for (const AliasEntry* ae : group) entries.push_back(ae->addr);
+            for (const AliasEntry* ae : group) {
+                PSXRecomp::Function af;
+                af.start_addr = ae->addr;
+                af.end_addr = ae->host_end;
+                af.size = af.end_addr - af.start_addr;
+                af.has_prologue = false;
+                af.has_epilogue = false;
+                af.stack_frame_size = 0;
+                af.name = fmt::format("func_{:08X}", ae->addr);
+                af.is_data_section = false;
+                af.alias_walk_lo = ae->host_start;
+                af.alias_group_entries = entries;
+                analysis_result.functions.push_back(af);
+            }
+        }
+        fmt::print("Alias entries emitted: {} ({} host groups)\n\n",
+                   alias_entries.size(), aliases_by_host.size());
+    }
 
     // Print summary statistics
     fmt::print("\n=== Function Analysis Summary ===\n\n");

@@ -16,6 +16,17 @@ struct Function {
     int32_t stack_frame_size; // Size of stack frame (if has prologue)
     std::string name; // Optional name (for now, just "func_<addr>")
     bool is_data_section = false; // True if this "function" is actually a data section
+    // Overlapping-alias entry: nonzero means start_addr is an INTERIOR address of
+    // the host function beginning at alias_walk_lo. The CFG covers the host's
+    // full range [alias_walk_lo, end_addr) and the emitted C function enters via
+    // a goto to start_addr's block. The host function is emitted unchanged —
+    // aliases never cap or truncate it (the mid-function-seed hazard class).
+    uint32_t alias_walk_lo = 0;
+    // All alias entries sharing this host (including start_addr). Injected as
+    // block leaders so every sibling alias gets an identical CFG, letting the
+    // emitter generate ONE shared body per host with an entry switch instead
+    // of duplicating the host's blocks per alias.
+    std::vector<uint32_t> alias_group_entries;
 };
 
 struct FunctionAnalysisResult {
@@ -56,6 +67,10 @@ public:
 
     // Check if instruction is a branch or jump (has a delay slot)
     static bool is_branch_or_jump(uint32_t instr);
+
+    // Check if a raw word decodes as a plausible R3000 instruction. Used to
+    // validate scanned data pointers before promoting/aliasing them.
+    static bool is_valid_mips_word(uint32_t instr);
 
 private:
     const PS1Executable& exe_;
