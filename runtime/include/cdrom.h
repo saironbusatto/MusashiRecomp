@@ -39,6 +39,11 @@ typedef struct CdBurstRecord {
 int      cdrom_get_bursts(void *out, int max);
 uint32_t cdrom_get_burst_total(void);
 
+/* True while a data-sector load is in progress (read stream active or a
+ * data sector delivered within the burst-gap window). XA streaming is never
+ * a load. Drives turbo-through-loads (step 4). */
+int cdrom_load_in_progress(void);
+
 /* MMIO read/write (0x1F801800-0x1F801803) */
 uint32_t cdrom_read(uint32_t addr);
 void cdrom_write(uint32_t addr, uint32_t value);

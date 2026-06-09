@@ -89,6 +89,14 @@ static SDL_GameController* sdl_controller;
 static SDL_JoystickID      sdl_controller_instance = -1;
 static uint32_t      sdl_pixel_buf[640 * 512]; /* ARGB8888 staging buffer */
 static int           s_fast_boot_active = 0;  /* cleared when game entry PC fires */
+
+/* Turbo-through-loads (step 4). C linkage: debug_server.c reads/toggles the
+ * enable and reports the frame counter. Enabled by game.toml [runtime]
+ * turbo_loads (opt-in per game) or the turbo_loads TCP command. */
+extern "C" {
+int      g_turbo_loads_enabled = 0;
+uint64_t g_turbo_loads_frames  = 0;   /* vblanks run unpaced (observability) */
+}
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
 
@@ -975,6 +983,25 @@ static void sdl_vblank_present(void) {
         s_fast_boot_active = 0;
     }
 
+    /* Turbo-through-loads (step 4, OPT-IN via game.toml [runtime]
+     * turbo_loads): while the game is loading — CD data stream active,
+     * XA/FMV excluded, post-BIOS-handoff only — skip wall-clock pacing and
+     * most presents so the guest runs at host speed. Step-3 measurement
+     * showed loads are paced by the game's own per-sector processing at
+     * real time (2.2-4.8 sectors/frame against a 32-256 IRQ budget), so
+     * host-speed execution is the lever that compresses load wall-time.
+     * Presents 1-in-30 so visual progress stays visible. */
+    if (g_turbo_loads_enabled) {
+        extern int fntrace_is_game_started(void);
+        if (fntrace_is_game_started() && cdrom_load_in_progress()) {
+            g_turbo_loads_frames++;
+            static int tl_skip = 0;
+            const int TL_PRESENT_EVERY = 30;
+            tl_skip = (tl_skip + 1) % TL_PRESENT_EVERY;
+            if (tl_skip != 0) return;
+        }
+    }
+
     /* Wall-clock pacing: always runs once fast_boot has ended, even when the
      * display is still disabled (e.g. game crt0 setup). Skipped only by the
      * turbo and fast_boot early-returns above. */
@@ -1110,6 +1137,10 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
             if (gc.runtime.has_instant_max_per_frame)
                 instant_rate = gc.runtime.instant_max_per_frame;
+            if (gc.runtime.turbo_loads) {
+                g_turbo_loads_enabled = 1;
+                std::fprintf(stdout, "psxrecomp: turbo_loads enabled (opt-in)\n");
+            }
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
             /* Overlay DLL cache (Layer A). Off unless enabled in [runtime];
