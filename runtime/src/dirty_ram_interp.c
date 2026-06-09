@@ -280,9 +280,14 @@ static int abort_unsupported(uint32_t pc, uint32_t insn, const char *reason) {
     return 1; /* signal "control transferred" so the caller stops */
 }
 
+/* Local-flow gate: overlay region ONLY, by design. Kernel-window code
+ * (phys < DIRTY_RAM_KERNEL_WINDOW_END) keeps the verified per-block dispatch
+ * cadence — it runs in exception context, where interrupt-check cadence and
+ * EPC handling are delicate (see dirty_ram_interp.h window note). Kernel
+ * native coverage comes from overlay_loader candidates, not interp chaining. */
 static int is_local_dirty_target(uint32_t target) {
     uint32_t phys = target & 0x1FFFFFFFu;
-    return phys >= 0x00098000u && dirty_ram_is_dirty(phys);
+    return phys >= OVERLAY_REGION_FLOOR && dirty_ram_is_dirty(phys);
 }
 
 /* Target the last interp run handed back to the dispatch loop (chained
@@ -860,7 +865,8 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr) {
     extern void     overlay_regs_snap(uint32_t out[34], const CPUState *cpu);
     extern void     overlay_fp_log(uint32_t addr, const uint32_t *in_regs,
                                    const CPUState *cpu, int native);
-    int      _ovfp = (phys >= 0x00098000u) && overlay_loader_is_candidate(phys);
+    int      _ovfp = overlay_cache_window_contains(phys) &&
+                     overlay_loader_is_candidate(phys);
     uint32_t _in_regs[34];
     if (_ovfp) {
         overlay_regs_snap(_in_regs, cpu);
@@ -884,7 +890,9 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr) {
 
     /* Reset soft-fail state at block entry. */
     g_unsupported_seen = 0;
-    int allow_local_dirty_flow = (phys >= 0x00098000u);
+    /* Overlay region only — kernel window stays per-block (see
+     * is_local_dirty_target). */
+    int allow_local_dirty_flow = (phys >= OVERLAY_REGION_FLOOR);
 
     /* Per-PC entry counter (visible via dirty_ram_stats). */
     DirtyRamPcEntry *pc_entry = pc_table_get_or_insert(phys);
@@ -984,7 +992,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr) {
 #endif
             uint32_t target_phys = target & 0x1FFFFFFFu;
             if (allow_local_dirty_flow && target != 0 &&
-                target_phys >= 0x00098000u &&
+                target_phys >= OVERLAY_REGION_FLOOR &&
                 dirty_ram_is_dirty(target_phys)) {
                 /* Capture freeze gates ONLY the ring write — never flow. */
                 if (!g_insn_log_frozen) {

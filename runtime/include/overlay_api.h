@@ -23,6 +23,12 @@ typedef struct {
     void (*psx_unknown_dispatch)(CPUState *cpu, uint32_t addr, uint32_t phys);
     /* Debug instrumentation: called at every function entry (may be NULL) */
     void (*log_call_entry)(uint32_t func_addr);
+    /* RestoreState/ReturnFromException longjmp escape (interrupts.c). The
+     * recompiler emits this at longjmp-return sites in exception-context
+     * kernel code (the install-slot / kernel-window class). Appended LAST:
+     * overlay_init copies the struct by value, so older DLLs built against
+     * the shorter struct simply never read this member. */
+    void (*psx_restore_state_escape)(void);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

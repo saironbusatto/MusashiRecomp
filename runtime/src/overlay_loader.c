@@ -1,6 +1,7 @@
 #include "overlay_loader.h"
 #include "overlay_api.h"
 #include "crc32.h"
+#include "dirty_ram_interp.h"
 #include "interrupts.h"
 #include "debug_server.h"
 #include <stdint.h>
@@ -303,8 +304,17 @@ static void scan_cache_dir(void) {
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         if (strlen(fd.cFileName) != 21) continue; /* 8+1+8+4 = 21 */
+        /* Validate the <addr8>_<crc8>.dll shape explicitly: region_start 0 is
+         * LEGAL (the kernel-RAM window starts at phys 0), so a zero parse
+         * result can't be used as the invalid sentinel. */
+        int valid = (fd.cFileName[8] == '_');
+        for (int ci = 0; valid && ci < 8; ci++) {
+            char c = fd.cFileName[ci];
+            valid = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') ||
+                    (c >= 'a' && c <= 'f');
+        }
+        if (!valid) continue;
         uint32_t addr = (uint32_t)strtoul(fd.cFileName, NULL, 16);
-        if (addr == 0) continue;
         if (s_cache_idx_count >= CACHE_IDX_CAP) break;
         CacheEntry *e = &s_cache_idx[s_cache_idx_count++];
         e->region_start = addr;
@@ -368,12 +378,14 @@ static void overlay_ci_wrapper(CPUState *cpu) {
 }
 
 static void init_callbacks(void) {
+    extern void psx_restore_state_escape(void);
     s_callbacks.dispatch_call        = psx_dispatch_call;
     s_callbacks.check_interrupts     = overlay_ci_wrapper;
     s_callbacks.gte_execute          = gte_execute;
     s_callbacks.psx_syscall          = psx_syscall;
     s_callbacks.psx_unknown_dispatch = psx_unknown_dispatch;
     s_callbacks.log_call_entry       = debug_server_log_call_entry;
+    s_callbacks.psx_restore_state_escape = psx_restore_state_escape;
 }
 
 /* ---- DLL loading and export enumeration -------------------------------- */
@@ -556,7 +568,7 @@ static void try_load_region(uint32_t phys) {
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
     int head = idx_head(phys);
-    if (head < 0 && s_active && phys >= 0x98000u) {
+    if (head < 0 && s_active && overlay_cache_window_contains(phys)) {
         try_load_region(phys);
         head = idx_head(phys);
     }

@@ -29,6 +29,31 @@ extern "C" {
  * jump that the dispatch trampoline should re-enter. */
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);
 
+/* Overlay-cache windows — the address ranges eligible for capture, offline
+ * recompilation, and per-entry-validated native execution (Rule 18 code that
+ * does not exist in any compile-time image):
+ *
+ *   Kernel RAM   [0x00000, 0x10000): the BIOS part-2 image relocated to RAM
+ *     plus install-at-runtime stubs (e.g. the SIO data-byte stub at 0xCF0).
+ *     Dirty-tracked per CPU store (dirty_ram_mark_kernel_write).
+ *   Overlay region [OVERLAY_REGION_FLOOR, RAM_SIZE): game overlays loaded by
+ *     CD DMA (dirty_ram_mark_executable_range).
+ *
+ * Main-EXE text [0x10000, OVERLAY_REGION_FLOOR) is statically recompiled and
+ * is NEVER a capture/candidate window. The floor equals the main EXE text end
+ * (Tomba: load 0x10000 + text 0x88000).
+ *
+ * The interpreter's LOCAL-FLOW gates (is_local_dirty_target /
+ * allow_local_dirty_flow) intentionally use OVERLAY_REGION_FLOOR alone, NOT
+ * this window predicate: kernel-RAM code runs in exception context where the
+ * verified per-block dispatch cadence is preserved. Native coverage for the
+ * kernel window comes from the overlay loader, not from interp chaining. */
+#define DIRTY_RAM_KERNEL_WINDOW_END 0x00010000u
+#define OVERLAY_REGION_FLOOR        0x00098000u
+static inline int overlay_cache_window_contains(uint32_t phys) {
+    return phys < DIRTY_RAM_KERNEL_WINDOW_END || phys >= OVERLAY_REGION_FLOOR;
+}
+
 /* Test whether a given physical kernel-RAM address is in a page that was
  * written-to since boot.  Defined in memory.c. */
 int      dirty_ram_is_dirty(uint32_t phys);

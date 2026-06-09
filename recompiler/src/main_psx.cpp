@@ -250,34 +250,55 @@ int main(int argc, char** argv) {
 
     /* Load extra function addresses from a file (one hex address per line).
      * Lines of the form `interior 0xXXXXXXXX` mark dispatch-proven interior
-     * addresses: alias candidates, never walk roots. */
+     * addresses: alias candidates, never walk roots. Lines of the form
+     * `dispatch_root 0xXXXXXXXX` mark classifier-proven dispatch roots
+     * WITHOUT a callable boundary (the kernel install-slot class, e.g. RAM
+     * 0xCF0): the static recompiler's install-slot hooks tail-dispatch into
+     * exactly these PCs, so they are real execution roots even though no
+     * prologue / preceding jr $ra exists. They are trusted walk roots and
+     * exempt from the overlay-mode boundary re-check below.
+     *
+     * Seeds are accepted within the loaded image's own bounds — overlay mode
+     * wraps arbitrary regions (kernel RAM at 0x80000000, overlays at
+     * 0x800E7000, ...), so a hardcoded game-RAM window would silently drop
+     * valid seeds. */
     std::vector<uint32_t> file_seeds;
     std::vector<uint32_t> interior_seeds;
+    std::set<uint32_t>    trusted_root_seeds;
     if (extra_funcs_path) {
         std::ifstream ef(extra_funcs_path);
         if (ef.is_open()) {
+            const uint32_t seed_lo = exe->header.load_address;
+            const uint32_t seed_hi = exe->end_address();
             std::string line;
             while (std::getline(ef, line)) {
                 if (line.empty() || line[0] == '#') continue;
                 bool interior = false;
+                bool trusted_root = false;
                 const char* p = line.c_str();
                 if (line.rfind("interior", 0) == 0) {
                     interior = true;
                     p += 8;
+                } else if (line.rfind("dispatch_root", 0) == 0) {
+                    trusted_root = true;
+                    p += 13;
                 }
                 uint32_t addr = (uint32_t)std::strtoul(p, nullptr, 16);
-                if (addr >= 0x80010000u && addr < 0x80200000u) {
+                if (addr >= seed_lo && addr < seed_hi) {
                     if (interior) {
                         interior_seeds.push_back(addr);
                     } else {
+                        if (trusted_root) trusted_root_seeds.insert(addr);
                         file_seeds.push_back(addr);
                         exact_entries.push_back(addr);
                     }
                 }
             }
-            fmt::print("Loaded {} extra function addresses ({} interior) from {}\n",
+            fmt::print("Loaded {} extra function addresses ({} interior, "
+                       "{} dispatch-root) from {}\n",
                        file_seeds.size() + interior_seeds.size(),
-                       interior_seeds.size(), extra_funcs_path);
+                       interior_seeds.size(), trusted_root_seeds.size(),
+                       extra_funcs_path);
         } else {
             fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
         }
@@ -311,7 +332,14 @@ int main(int argc, char** argv) {
         std::set<uint32_t> roots;
         std::set<uint32_t> interior;
         for (uint32_t a : exact_entries) {
-            if (callable_boundary(a)) {
+            if (trusted_root_seeds.count(a)) {
+                /* Classifier-proven dispatch root (install-slot class): the
+                 * static code tail-dispatches into this PC, so it is a real
+                 * execution root despite having no callable boundary. */
+                fmt::print("  seed 0x{:08X} accepted as dispatch root "
+                           "(install-slot class, no boundary evidence)\n", a);
+                roots.insert(a);
+            } else if (callable_boundary(a)) {
                 roots.insert(a);
             } else {
                 fmt::print("  seed 0x{:08X} fails the boundary check — "
