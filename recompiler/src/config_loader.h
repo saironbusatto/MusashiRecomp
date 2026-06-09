@@ -43,6 +43,13 @@ struct RuntimeConfig {
     bool                  has_disc_speed = false;
     std::string           disc_speed;      // raw string; main.cpp converts to divisor
 
+    // instant_max_per_frame: per-frame sector-IRQ budget while disc_speed =
+    // "instant" (cdrom.c floors the per-sector period to VBLANK/N). Absent =
+    // cdrom.c built-in default. Runtime-tunable via the cdrom_instant_rate
+    // TCP command; the turbo-through-loads predicate drives the same knob.
+    bool                  has_instant_max_per_frame = false;
+    int                   instant_max_per_frame = 0;
+
     // fast_boot: snapshot BIOS state at first game handoff and restore it on
     // subsequent launches, skipping BIOS execution entirely. Default off;
     // enable per-game in [runtime]. Snapshot is keyed on BIOS SHA256 + entry_pc.

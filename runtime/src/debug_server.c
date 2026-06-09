@@ -7328,6 +7328,44 @@ static void handle_cd_read_log(int id, const char *json)
     send_fmt("]}\n");
 }
 
+/* cdrom_instant_rate: get/set the 'instant' per-frame sector-IRQ budget
+ * (step 3 tunable). Param "n" (optional int): new budget, clamped by
+ * cdrom_set_instant_rate. Always returns the current value, so a no-arg
+ * call is a pure query. */
+static void handle_cdrom_instant_rate(int id, const char *json)
+{
+    int n = json_get_int(json, "n", 0);
+    if (n > 0) cdrom_set_instant_rate(n);
+    send_fmt("{\"id\":%d,\"ok\":true,\"instant_max_per_frame\":%d}\n",
+             id, cdrom_get_instant_rate());
+}
+
+/* cdrom_bursts: dump the always-on CD load-burst ring, newest first. Each
+ * record is one gap-separated run of delivered data sectors — i.e. one load.
+ * Param "count" (optional, default 32, max 128). */
+static void handle_cdrom_bursts(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 32);
+    if (count < 1)   count = 1;
+    if (count > 128) count = 128;
+    CdBurstRecord recs[128];
+    int n = cdrom_get_bursts(recs, count);
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,"
+             "\"instant_max_per_frame\":%d,\"bursts\":[",
+             id, cdrom_get_burst_total(), cdrom_get_instant_rate());
+    for (int i = 0; i < n; i++) {
+        CdBurstRecord *b = &recs[i];
+        send_fmt("%s{\"start_frame\":%u,\"end_frame\":%u,"
+                 "\"frames\":%u,\"ms\":%llu,\"sectors\":%u,"
+                 "\"rate\":%u,\"divisor\":%u}",
+                 i ? "," : "", b->start_frame, b->end_frame,
+                 b->end_frame - b->start_frame + 1u,
+                 (unsigned long long)(b->end_ms - b->start_ms),
+                 b->sectors, b->rate, b->divisor);
+    }
+    send_fmt("]}\n");
+}
+
 /* overlay_capture_dump: flush overlay_captures.json on demand (does not require
  * a clean window-close). Use after roaming through areas so a freeze/kill can't
  * lose the captured overlays. Writes next to the runtime exe. */
@@ -8196,6 +8234,8 @@ static const CmdEntry s_commands[] = {
     { "overlay_native_on",    handle_overlay_native_on },
     { "overlay_native_off",   handle_overlay_native_off },
     { "overlay_capture_dump", handle_overlay_capture_dump },
+    { "cdrom_instant_rate",   handle_cdrom_instant_rate },
+    { "cdrom_bursts",         handle_cdrom_bursts },
     { NULL, NULL }
 };
 

@@ -15,6 +15,12 @@
 #include "event_ring.h"
 #include <string.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <time.h>
+#endif
 
 /* C wrappers for the C++ ISOReader (defined in iso_reader_c.cpp) */
 extern void* iso_open(const char* path);
@@ -161,18 +167,87 @@ int cdrom_get_setloc_lba(void) { return s_setloc_lba; }
  * the exception VOLUME sane so the framerate doesn't collapse. Tunable via the
  * MAX_PER_FRAME knob. */
 #define VBLANK_CYCLES_NTSC          564480   /* 33.8688 MHz / 60 Hz; matches interrupts.c */
-#define CDROM_INSTANT_MAX_PER_FRAME 32
-#define CDROM_INSTANT_PERIOD        (VBLANK_CYCLES_NTSC / CDROM_INSTANT_MAX_PER_FRAME) /* ~17640cy */
+#define CDROM_INSTANT_MAX_PER_FRAME_DEFAULT 32
+
+/* Runtime-tunable 'instant' budget (step 3). One knob drives three writers:
+ * game.toml [runtime] instant_max_per_frame, the cdrom_instant_rate TCP
+ * command (in-session A/B without rebuilds), and — step 4 — the
+ * turbo-through-loads predicate. Period floors at CDROM_MIN_DELAY, so the
+ * effective ceiling is VBLANK_CYCLES_NTSC/CDROM_MIN_DELAY ≈ 1128/frame. */
+static int g_instant_max_per_frame = CDROM_INSTANT_MAX_PER_FRAME_DEFAULT;
+
+void cdrom_set_instant_rate(int per_frame) {
+    if (per_frame < 1)    per_frame = 1;
+    if (per_frame > 4096) per_frame = 4096;
+    g_instant_max_per_frame = per_frame;
+}
+int cdrom_get_instant_rate(void) { return g_instant_max_per_frame; }
+
+static int instant_period(void) {
+    int p = VBLANK_CYCLES_NTSC / g_instant_max_per_frame;
+    return p < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : p;
+}
 
 static int apply_speed(int delay) {
     /* XA streaming (FMV / CDDA background music): preserve authentic timing.
      * FMVs interleave XA audio + MDEC video — speeding up sector delivery
      * would cause both to play faster than the display refresh rate. */
     if (xa_stream_active) return delay;
-    if (g_disc_speed_divisor == 0) return CDROM_INSTANT_PERIOD; /* bounded 'instant' */
+    if (g_disc_speed_divisor == 0) return instant_period(); /* bounded 'instant' */
     int d = delay / g_disc_speed_divisor;
     return d < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : d;
 }
+
+/* ---- CD load-burst ring (always-on; CLAUDE.md ring-buffer rule) ----------
+ * A "burst" is a run of delivered sectors with no gap longer than
+ * CD_BURST_GAP_FRAMES — i.e. one load. Records make "load duration" a
+ * measured quantity (frames + host wall ms + sectors + the instant rate in
+ * effect), queried via the cdrom_bursts TCP command. */
+#define CD_BURST_CAP        128
+#define CD_BURST_GAP_FRAMES 30
+typedef CdBurstRecord CdBurst;       /* layout shared with cdrom.h consumers */
+static CdBurst  s_bursts[CD_BURST_CAP];
+static uint32_t s_burst_count = 0;   /* monotonic; slot = (count-1) % CAP */
+
+static uint64_t host_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+#endif
+}
+
+static void burst_note_sector(void) {
+    uint32_t f  = (uint32_t)s_frame_count;
+    uint64_t ms = host_ms();
+    CdBurst *b = (s_burst_count > 0)
+               ? &s_bursts[(s_burst_count - 1u) % CD_BURST_CAP] : NULL;
+    if (!b || f > b->end_frame + CD_BURST_GAP_FRAMES) {
+        b = &s_bursts[s_burst_count++ % CD_BURST_CAP];
+        b->start_frame = f;
+        b->start_ms    = ms;
+        b->sectors     = 0;
+    }
+    b->end_frame = f;
+    b->end_ms    = ms;
+    b->sectors++;
+    b->rate    = (uint32_t)g_instant_max_per_frame;
+    b->divisor = (uint32_t)g_disc_speed_divisor;
+}
+
+/* Copy out the most recent `max` bursts, newest first. Returns count. */
+int cdrom_get_bursts(void *out, int max) {
+    CdBurst *dst = (CdBurst *)out;
+    int n = 0;
+    for (uint32_t k = 0; k < CD_BURST_CAP && n < max; k++) {
+        if (k >= s_burst_count) break;
+        dst[n++] = s_bursts[(s_burst_count - 1u - k) % CD_BURST_CAP];
+    }
+    return n;
+}
+uint32_t cdrom_get_burst_total(void) { return s_burst_count; }
 
 static int sector_delay_cycles(void) {
     /* PS1 CPU is 33.8688 MHz. CD-ROM sectors arrive at 75 Hz in 1x
@@ -585,6 +660,7 @@ static int read_sector_at(int min, int sec, int sect) {
     sector_available = delivery.data_delivered ? 1 : 0;
     if (delivery.data_delivered) {
         memcpy(last_sector_buffer, sector_buffer, (size_t)sector_size);
+        burst_note_sector();
     } else {
         uint32_t copy_size = history_size < SECTOR_BUFFER_SIZE ? (uint32_t)history_size
                                                                : SECTOR_BUFFER_SIZE;

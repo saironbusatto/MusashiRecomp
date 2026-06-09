@@ -1094,6 +1094,7 @@ int main(int argc, char** argv) {
     std::string game_name;
     std::string game_id;
     std::string disc_speed;   /* "1x" | "2x" | "4x" | "instant" */
+    int        instant_rate  = 0;   /* 0 = cdrom.c built-in default */
     uint32_t   game_entry_pc = 0;
     bool       fast_boot     = false;
 
@@ -1107,6 +1108,8 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
             if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
+            if (gc.runtime.has_instant_max_per_frame)
+                instant_rate = gc.runtime.instant_max_per_frame;
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
             /* Overlay DLL cache (Layer A). Off unless enabled in [runtime];
@@ -1168,9 +1171,11 @@ int main(int argc, char** argv) {
         /* Store for post-BIOS application; boot always runs at 1x so the
          * BIOS disc-init sequence sees correct timing. */
         cdrom_set_game_speed(divisor);
+        if (instant_rate > 0) cdrom_set_instant_rate(instant_rate);
         if (divisor != 1)
-            std::fprintf(stdout, "psxrecomp: disc_speed=%s (applied post-BIOS)\n",
-                         disc_speed.c_str());
+            std::fprintf(stdout, "psxrecomp: disc_speed=%s (applied post-BIOS, "
+                         "instant budget %d/frame)\n",
+                         disc_speed.c_str(), cdrom_get_instant_rate());
     }
     memcard_init(memcard_dir_str.c_str());
     std::atexit(memcard_flush_all);

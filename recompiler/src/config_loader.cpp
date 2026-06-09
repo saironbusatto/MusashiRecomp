@@ -58,6 +58,15 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         rt.disc_speed     = toml::find<std::string>(runtime, "disc_speed");
         rt.has_disc_speed = true;
     }
+    if (runtime.contains("instant_max_per_frame")) {
+        const auto n = toml::find<int64_t>(runtime, "instant_max_per_frame");
+        if (n < 1 || n > 4096) {
+            throw std::runtime_error(fmt::format(
+                "[runtime] instant_max_per_frame out of range (1..4096): {}", n));
+        }
+        rt.instant_max_per_frame     = static_cast<int>(n);
+        rt.has_instant_max_per_frame = true;
+    }
     if (runtime.contains("fast_boot")) {
         rt.fast_boot = toml::find<bool>(runtime, "fast_boot");
     }
