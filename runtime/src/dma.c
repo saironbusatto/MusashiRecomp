@@ -19,6 +19,7 @@
 #include "mdec.h"
 #include "overlay_capture.h"
 #include "spu.h"
+#include "event_ring.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -188,6 +189,8 @@ static void complete_transfer(int ch) {
         i_stat |= (1u << 3);
     }
     trace_dma('C', ch, 0, dicr_before, i_stat_before);
+    event_ring_record_aux(EV_DMA_DONE, (uint8_t)ch, channels[ch].chcr);
+    event_ring_record_aux(EV_DEQ, (uint8_t)(SRC_DMA0 + ch), channels[ch].chcr);
 }
 
 /* ---- Transfer execution ---- */
@@ -227,6 +230,7 @@ static void schedule_delayed_complete(int ch, uint32_t total_words,
     delayed_complete[ch].active = 1;
     delayed_complete[ch].total_words = total_words;
     delayed_complete[ch].cycles_remaining = (uint32_t)cycles;
+    event_ring_record_aux(EV_DMA_SCHED, (uint8_t)ch, channels[ch].chcr);
 }
 
 static void advance_delayed_complete(int ch, uint32_t cycles) {
@@ -589,6 +593,8 @@ static void try_execute(int ch) {
 
     channels[ch].chcr &= ~(1u << 28);
     trace_dma('S', ch, transfer_word_count(ch), dicr, i_stat);
+    event_ring_record_aux(EV_DMA_KICK, (uint8_t)ch, channels[ch].chcr);
+    event_ring_record_aux(EV_ENQ, (uint8_t)(SRC_DMA0 + ch), transfer_word_count(ch));
 
     switch (ch) {
         case 0:

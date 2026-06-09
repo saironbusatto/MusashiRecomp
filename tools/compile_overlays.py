@@ -854,6 +854,79 @@ def generate_overlay_dispatch(all_virt_addrs: list) -> str:
 # DLL compilation
 # ---------------------------------------------------------------------------
 
+def write_overlay_ranges(src_path: str, out_path: str,
+                         data: bytes, load_addr: int, size: int) -> int:
+    """Filter the recompiler's _full.ranges manifest to in-overlay functions,
+    compute each function's AUTHORITATIVE code hash from the captured bytes (the
+    exact bytes the recompiler compiled from), and write {phys}_{crc}.ranges
+    beside the DLL. The loader marks a compiled entry callable iff live RAM
+    matches this hash — making per-entry validity timing-independent and
+    reload-on-return correct (design §8). Returns the number of functions written.
+
+    Manifest v2 line format:
+      F <entry_hex> <code_crc_hex>     one per function
+      R <lo_hex> <len_hex>             one per coalesced code range
+
+    binascii.crc32 (zlib, poly 0xEDB88320, init/final 0xFFFFFFFF) is bit-identical
+    to the runtime's crc32_compute, and `data` is the raw little-endian RAM image,
+    so the offline hash matches the runtime's hash of live RAM byte-for-byte."""
+    ov_lo = load_addr & 0x1FFFFFFF
+    ov_hi = ov_lo + size
+
+    def in_ov(a: int) -> bool:
+        return ov_lo <= (a & 0x1FFFFFFF) < ov_hi
+
+    # Parse the recompiler manifest into [(entry, [(lo, len), ...]), ...].
+    funcs: list[tuple[int, list[tuple[int, int]]]] = []
+    cur = None
+    with open(src_path) as f:
+        for line in f:
+            s = line.split()
+            if not s:
+                continue
+            if s[0] == 'F':
+                try:
+                    addr = int(s[1], 16)
+                except (IndexError, ValueError):
+                    cur = None
+                    continue
+                if in_ov(addr):
+                    cur = (addr, [])
+                    funcs.append(cur)
+                else:
+                    cur = None
+            elif s[0] == 'R' and cur is not None:
+                try:
+                    lo, length = int(s[1], 16), int(s[2], 16)
+                except (IndexError, ValueError):
+                    continue
+                cur[1].append((lo, length))
+
+    out_lines = ['# psxrecomp overlay code-range manifest v2 (entry+code_crc)\n']
+    n = 0
+    for entry, ranges in funcs:
+        if not ranges:
+            continue
+        crc = 0
+        ok = True
+        for lo, length in ranges:
+            off = (lo & 0x1FFFFFFF) - ov_lo
+            if off < 0 or off + length > len(data):
+                ok = False  # range outside captured bytes — can't hash reliably
+                break
+            crc = binascii.crc32(data[off:off + length], crc)
+        if not ok:
+            continue
+        ev = (entry & 0x1FFFFFFF) | 0x80000000
+        out_lines.append(f'F {ev:08X} {crc & 0xFFFFFFFF:08X}\n')
+        for lo, length in ranges:
+            out_lines.append(f'R {(lo & 0x1FFFFFFF) | 0x80000000:08X} {length:X}\n')
+        n += 1
+    with open(out_path, 'w') as f:
+        f.writelines(out_lines)
+    return n
+
+
 def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
                 gcc: str = 'gcc') -> bool:
     import platform
@@ -1040,6 +1113,23 @@ def main():
                 success = compile_dll(patched_c, dll_path, include_dirs,
                                       gcc=args.gcc)
                 if success:
+                    # Emit the per-entry code-range manifest beside the DLL.
+                    # The loader keys it by the same filename stem with .ranges
+                    # (replacing .dll). Without it the loader leaves the region
+                    # to the interpreter (precision-first), so warn loudly.
+                    ranges_src = None
+                    for fn in os.listdir(out_dir_tmp):
+                        if fn.endswith('_full.ranges'):
+                            ranges_src = os.path.join(out_dir_tmp, fn)
+                            break
+                    ranges_out = dll_path[:-4] + '.ranges'
+                    if ranges_src:
+                        nfn = write_overlay_ranges(ranges_src, ranges_out,
+                                                   data, load_addr, size)
+                        print(f'  ranges: {nfn} functions -> {ranges_out}')
+                    else:
+                        print('  WARNING: recompiler emitted no _full.ranges — '
+                              'loader will leave this region to the interpreter')
                     print(f'  OK -> {dll_path}\n')
                 else:
                     print(f'  FAILED\n')

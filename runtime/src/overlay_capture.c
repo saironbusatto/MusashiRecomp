@@ -189,25 +189,25 @@ void overlay_capture_write_json(void)
                 continue;
             }
 
-            /* Assemble unpatched bytes from DMA-time captures.
-             * Start with a zeroed image, then blit each stored DMA block
-             * into its correct offset.  This gives pre-patch bytes, not
-             * the potentially-modified bytes now in live RAM. */
-            uint8_t *image = (uint8_t *)calloc(size, 1);
+            /* Execution-time capture (§2.2 fix): snapshot the overlay region
+             * from LIVE RAM, i.e. the bytes as they ACTUALLY EXECUTE — after the
+             * game's load-time fixups/relocation. The old code assembled
+             * "unpatched" bytes from DMA-time blocks, which omitted relocated
+             * jump tables and other fixed-up data: the recompiler then could not
+             * resolve `jr`-jump-tables (their address tables were wrong), fell
+             * back to call_by_address, and native diverged from the interpreter
+             * (the village→overworld blue screen). Live RAM is the faithful
+             * image. (Capture at a COHERENT moment — one overlay freshly loaded,
+             * via overlay_capture_dump — to avoid merging overlay generations.) */
+            extern uint8_t *memory_get_ram_ptr(void);
+            uint8_t *ram_base = memory_get_ram_ptr();
+            uint8_t *image = (uint8_t *)malloc(size);
             if (!image) {
                 free(executed);
                 free(dispatch);
                 continue;
             }
-            for (j = 0; j < s_count; j++) {
-                OvEntry *blk = &s_entries[j];
-                if (!blk->bytes) continue;
-                if (blk->load_addr < phys || blk->load_addr >= phys + size) continue;
-                uint32_t off = blk->load_addr - phys;
-                uint32_t copy_sz = blk->size;
-                if (off + copy_sz > size) copy_sz = size - off;
-                memcpy(image + off, blk->bytes, copy_sz);
-            }
+            memcpy(image, ram_base + phys, size);
 
             if (!first_region) fprintf(f, ",\n");
             first_region = 0;

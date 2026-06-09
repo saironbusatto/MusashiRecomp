@@ -51,13 +51,14 @@ void overlay_loader_get_status(int *active, int *registered,
  * the overlay_loader_status TCP command — no stderr logging (Rule 3). */
 const char *overlay_loader_last_msg(void);
 
-/* Inc1-D: invalidate the registered overlay region containing `phys`. Called
- * from the psx_write_* store path (memory.c) when a write lands on a watched
- * overlay page — the region's registered functions stop being callable and the
- * new RAM content falls back to the interpreter. */
-void overlay_loader_invalidate_at(uint32_t phys, uint32_t size);
+/* Inc3 §8.5: a write into the code range of a currently-executing native
+ * overlay entry cannot be recovered lazily — that entry is permanently
+ * blacklisted to the interpreter. Called from the psx_write_* store path
+ * (memory.c) only when the written page is a watched overlay code page. */
+void overlay_loader_active_write_check(uint32_t phys, uint32_t size);
 
-/* Inc1-D counters, surfaced via overlay_loader_status. */
+/* Inc3 counters, surfaced via overlay_loader_status (field meanings remapped
+ * to the per-entry model — see overlay_loader.c getters). */
 void overlay_loader_get_counters(uint32_t *loads, uint32_t *invalidations,
                                  uint32_t *unregistered,
                                  uint64_t *disp_native, uint64_t *disp_interp,

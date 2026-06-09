@@ -437,6 +437,22 @@ int main(int argc, char** argv) {
         fmt::print(stderr, "⚠ Failed to write output file\n\n");
     }
 
+    // Per-function code-range manifest (design §8): consumed by the overlay
+    // loader's per-entry validity hash. Emitted alongside _full.c for every
+    // build; only the overlay path actually loads it.
+    {
+        std::filesystem::path ranges_filename = out_dir / (exe_stem + "_full.ranges");
+        std::string ranges = codegen.generate_ranges_manifest(
+            analysis_result.functions, all_cfgs);
+        std::ofstream rf(ranges_filename);
+        if (rf.is_open()) {
+            rf << ranges;
+            rf.close();
+            fmt::print("✓ Saved code-range manifest to {}\n\n",
+                      ranges_filename.string());
+        }
+    }
+
     // Generate dispatch table (tomba_dispatch.c)
     // This maps PS1 addresses to compiled C functions so call_by_address() can
     // dispatch dynamic jalr/jr calls to the right compiled function.

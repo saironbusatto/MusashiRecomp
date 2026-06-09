@@ -1718,4 +1718,48 @@ std::string CodeGenerator::generate_file(
     return ss.str();
 }
 
+std::string CodeGenerator::generate_ranges_manifest(
+    const std::vector<Function>& functions,
+    const std::map<uint32_t, ControlFlowGraph>& cfgs) {
+
+    std::stringstream ss;
+    ss << "# psxrecomp overlay code-range manifest v1\n";
+    ss << "# F <entry>   one per function (virtual entry address)\n";
+    ss << "# R <lo> <len>  one per coalesced code range (hex, virtual)\n";
+
+    for (const auto& func : functions) {
+        auto it = cfgs.find(func.start_addr);
+        if (it == cfgs.end()) continue;
+        const ControlFlowGraph& cfg = it->second;
+
+        // Byte intervals [start_addr, end_addr+4) per block (end_addr is the
+        // last instruction, inclusive).
+        std::vector<std::pair<uint32_t, uint32_t>> iv;
+        for (const auto& [baddr, blk] : cfg.blocks) {
+            (void)baddr;
+            uint32_t lo = blk.start_addr;
+            uint32_t hi = blk.end_addr + 4u;
+            if (hi > lo) iv.emplace_back(lo, hi);
+        }
+        if (iv.empty()) continue;
+
+        // Merge overlapping/adjacent intervals. A gap > 0 between blocks is
+        // non-code (e.g. a jump table) and is intentionally left out.
+        std::sort(iv.begin(), iv.end());
+        std::vector<std::pair<uint32_t, uint32_t>> merged;
+        for (const auto& r : iv) {
+            if (!merged.empty() && r.first <= merged.back().second) {
+                if (r.second > merged.back().second) merged.back().second = r.second;
+            } else {
+                merged.push_back(r);
+            }
+        }
+
+        ss << fmt::format("F {:08X}\n", func.start_addr);
+        for (const auto& r : merged)
+            ss << fmt::format("R {:08X} {:X}\n", r.first, r.second - r.first);
+    }
+    return ss.str();
+}
+
 } // namespace PSXRecomp

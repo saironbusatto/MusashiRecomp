@@ -12,6 +12,7 @@
 
 #include "cdrom.h"
 #include "spu.h"
+#include "event_ring.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -147,12 +148,28 @@ int cdrom_get_setloc_lba(void) { return s_setloc_lba; }
  * game hangs. 500 cycles ≈ 15µs at 33MHz, still ~900x faster than authentic. */
 #define CDROM_MIN_DELAY 500
 
+/* 'instant' disc speed (divisor 0): as fast as the engine can absorb WITHOUT
+ * starving the 60Hz VBLANK or the main loop. A flat CDROM_MIN_DELAY collapses
+ * every sector read to 500cy, so a multi-sector load fires ~1100 DMA-completion
+ * IRQs per VBLANK frame (564480/500). That buries VBLANK and the main loop
+ * under a DMA-IRQ storm — the field loop is pinned and the watchdog reports a
+ * freeze. Floor the per-response period so at most ~CDROM_INSTANT_MAX_PER_FRAME
+ * sector IRQs land per frame. At 32/frame this is still ~3x faster than 4x
+ * (sector ≈ 17640cy vs 56448cy) so loads stay near-instant in wall-clock, but
+ * frames always advance. Paired with the per-source exception-progress
+ * guarantee in interrupts.c (the real anti-starvation fix); this floor keeps
+ * the exception VOLUME sane so the framerate doesn't collapse. Tunable via the
+ * MAX_PER_FRAME knob. */
+#define VBLANK_CYCLES_NTSC          564480   /* 33.8688 MHz / 60 Hz; matches interrupts.c */
+#define CDROM_INSTANT_MAX_PER_FRAME 32
+#define CDROM_INSTANT_PERIOD        (VBLANK_CYCLES_NTSC / CDROM_INSTANT_MAX_PER_FRAME) /* ~17640cy */
+
 static int apply_speed(int delay) {
     /* XA streaming (FMV / CDDA background music): preserve authentic timing.
      * FMVs interleave XA audio + MDEC video — speeding up sector delivery
      * would cause both to play faster than the display refresh rate. */
     if (xa_stream_active) return delay;
-    if (g_disc_speed_divisor == 0) return CDROM_MIN_DELAY;
+    if (g_disc_speed_divisor == 0) return CDROM_INSTANT_PERIOD; /* bounded 'instant' */
     int d = delay / g_disc_speed_divisor;
     return d < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : d;
 }
@@ -297,12 +314,15 @@ static void response_push(uint8_t val) {
 static void set_irq(int type) {
     irq_flag = (uint8_t)type;
     trace_cdrom('I', 0, (uint32_t)type, 0);
+    /* DEQUEUE: CD response/data event fired (aux = CD irq type). */
+    event_ring_record_aux(EV_DEQ, (uint8_t)SRC_CD_IRQ, (uint32_t)type);
 }
 
 /* Fire CDROM IRQ into the interrupt controller */
 static void fire_cdrom_irq(void) {
     if (irq_flag && (irq_enable & (1 << (irq_flag - 1)))) {
         i_stat |= (1u << 2); /* IRQ_CDROM */
+        event_ring_record(EV_ISTAT_RAISE, 2 /* IRQ_CDROM bit */);
         trace_cdrom('F', 0, irq_flag, 0);
     } else {
         trace_cdrom('f', 0, irq_flag, 0);
@@ -623,6 +643,10 @@ static void start_read_stream(uint8_t cmd) {
     read_delay = sector_delay_cycles();
     reading = 1;
     stat_reg |= CDSTAT_READ;
+    /* ENQUEUE: sector-read stream scheduled (due in read_delay cycles). A
+     * content load that happens in OFF but not ON shows up as a missing
+     * SRC_CD_READ enqueue here. */
+    event_ring_record_aux(EV_ENQ, (uint8_t)SRC_CD_READ, (uint32_t)read_delay);
 }
 
 static void stop_read_stream(void) {
@@ -644,6 +668,8 @@ static int deliver_read_sector(void) {
 
 static void exec_command(uint8_t cmd) {
     trace_cdrom('C', 0, cmd, 0);
+    /* ENQUEUE: a CD command was issued (aux = command byte). */
+    event_ring_record_aux(EV_ENQ, (uint8_t)SRC_CD_CMD, (uint32_t)cmd);
     response_clear();
 
     switch (cmd) {

@@ -216,6 +216,23 @@ static void freeze_dump_main_stack_json(FILE *f) {
 
     ResumeThread(s_main_thread);
 }
+
+/* Multi-sample stack capture for SOFT/reentry-storm freezes (wedge_kind==2).
+ * The main thread is still running (bouncing through the exception/VSync
+ * dispatch), so a single snapshot could land on a random recompiled block.
+ * Taking N snapshots a few ms apart reveals the RECURRING frames (the
+ * persistent dispatch/handler chain), which is what we want. Emits a JSON
+ * array of per-sample frame arrays: [[...],[...],...]. */
+static void freeze_dump_main_stack_samples_json(FILE *f, int n) {
+    if (!f) return;
+    fputc('[', f);
+    for (int i = 0; i < n; i++) {
+        if (i) fputc(',', f);
+        freeze_dump_main_stack_json(f);   /* one suspend/walk/resume snapshot */
+        Sleep(2);
+    }
+    fputc(']', f);
+}
 #endif /* _WIN32 */
 
 static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
@@ -346,12 +363,21 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
     fputs(",\n", f);
 
 #ifdef _WIN32
-    /* Main-thread call stack — only for hard freezes (wedge_kind==1).
-     * For reentry storms the main thread is still running; capturing its
-     * stack would just show a random recompiled-block frame. */
+    /* Main-thread call stack. Hard freeze (wedge_kind==1): one snapshot of the
+     * wedged thread in `main_stack`. Reentry storm (wedge_kind==2): the thread
+     * is still running, so a single frame is noise — take multiple samples in
+     * `main_stack_samples` to expose the recurring exception/VSync dispatch
+     * chain. (This freeze isn't reliably reproducible, so we capture the most
+     * useful possible stack whenever it does fire.) */
     fputs("  \"main_stack\":", f);
     if (s_last_wedge_kind == 1) {
         freeze_dump_main_stack_json(f);
+    } else {
+        fputs("[]", f);
+    }
+    fputs(",\n  \"main_stack_samples\":", f);
+    if (s_last_wedge_kind == 2) {
+        freeze_dump_main_stack_samples_json(f, 8);
     } else {
         fputs("[]", f);
     }
