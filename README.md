@@ -224,6 +224,38 @@ audio streaming is active, regardless of `disc_speed`. The speed switch fires
 only after the BIOS has handed off to the game EXE — boot and the license
 screen always run at authentic 1×.
 
+## Help make your game faster — just by playing it
+
+**Why isn't the game already at full speed everywhere?** Most of a game's
+code is converted ("recompiled") into a fast native program ahead of time.
+But PlayStation games don't keep all of their code on screen at once — they
+stream extra chunks of code off the disc as you reach new areas (these
+chunks are called *overlays*). We can't convert a chunk we've never seen,
+and the only way to see it is for someone to actually visit that area.
+Until then, that area's code runs in a slower compatibility mode.
+
+**You can help, just by playing.** While you play, the game quietly notices
+which areas are still running in the slow mode, takes a snapshot of them,
+and converts them to fast native code in the background — often within a
+minute, while you keep playing. The more places you visit, the faster the
+game gets. This happens automatically; you don't have to do anything.
+
+**Make your discoveries permanent for everyone.** Your discoveries are saved
+in a small file written next to the game called `overlay_captures.json`.
+After a play session — especially if you visited areas nobody has explored
+yet — you can share that file with the project (attach it to a GitHub issue
+on the game's repository, or send it to a maintainer). We fold it into the
+next release, and every player gets your areas at full speed from the first
+moment they arrive. No technical knowledge needed: play, find the file,
+share it.
+
+What's safe to know:
+- The file contains only game code snapshots and addresses — no personal
+  data, no save files, no settings.
+- Sharing is optional. Your own copy still benefits either way.
+- Re-visiting an area someone already contributed is harmless — duplicates
+  are detected and skipped automatically.
+
 ## License
 
 PolyForm Noncommercial 1.0.0. See `LICENSE`.
