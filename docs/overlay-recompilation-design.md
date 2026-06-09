@@ -4,6 +4,12 @@
 external reviewer; the resolutions are recorded in §5–§7 at the end, which
 supersede any "OPEN" markers above. §0–§4 are preserved as the reasoning trail.
 
+**Increment 3 (current work):** the design of record is **§8 — Per-entry
+validity + multi-candidate dispatch**, which supersedes the coarse region-level
+guard of §5-A *for Inc3* and demotes segmentation (§2.6) from a correctness
+mechanism to a coverage one. Read §8 first if you are working on the
+native-speedup / reload problem.
+
 ---
 
 ## 0. Context (for a reader unfamiliar with the project)
@@ -166,6 +172,22 @@ overlays, given overlapping/reused address ranges and overlays assembled from
 multiple DMA blocks? Is per-(load_addr, crc) keying sufficient, or does
 relocation (§2.2) force something else?
 
+**RESOLVED (see §8).** The framing above conflated two separate jobs. Keying the
+*cache lookup* and bounding *what's safe to run natively* are different axes:
+- **Validity / reload-on-return is now per-function** (§8), tracked by a content
+  hash of each function's own bytes — so it no longer matters whether the region
+  is cut perfectly. A merged 1.1 MB blob is correct; each function self-validates.
+- **Segmentation is demoted to a *coverage* concern**: its only remaining job is
+  ensuring every *distinct* overlay that reuses an address (Tomba reloads village
+  and overworld both into 0x800E7000) actually gets compiled, rather than the
+  cumulative dirty-bitmap folding them into one image. The boundary signal is
+  **mechanism-agnostic and uses no per-game knowledge**: a region that was
+  *written then executed*, when later *rewritten*, seals as one overlay
+  generation (snapshot bytes + exec seeds, content-hash it) and the next
+  generation accumulates fresh. The "rewrite" event is the same store-path
+  invalidation signal we already own — never a hooked game/BIOS install routine.
+  The earlier note about pc=0xBFC12210 was diagnostic only; nothing keys on it.
+
 ### 2.7 Code hygiene (DRY)
 The same low-level MIPS primitives (`jr $ra` detect, `addiu $sp` prologue,
 valid-MIPS-word, classify-control-flow) are currently reimplemented in at least
@@ -298,5 +320,342 @@ Edge-capture schema (B); DLL manifest with code/dependency ranges;
 registration-time validation; native-vs-interp differential harness (E).
 
 **Increment 3 — make it efficient and stable**
-Execution-time vs DMA-time dual capture; source-grouped + exec-specialized
-cache key; executed-code-envelope segmentation; CD-DMA as provenance only.
+Core: **per-entry validity + multi-candidate dispatch (§8)** — `PC → candidate
+list`; the unit of "safe to run natively" moves from the whole region to the
+individual compiled entry, decided by a lazy dependency-set hash gated on page
+generation counters. Multi-candidate dispatch fixes reload across overlays that
+reuse the same address. This delivers native speedup, kills false-invalidation
+churn, and makes reload-on-return gradual and automatic. Supporting: jump-table
+behavior check gates code-only vs manifest hashing (§8.3); active-entry
+self-modification blacklist (§8.5); segmentation demoted to *coverage* (§8.6);
+execution-time vs DMA-time dual capture; CD-DMA as provenance only.
+
+---
+
+## 8. Increment 3 — Per-entry validity + multi-candidate dispatch (design of record)
+
+This section supersedes the coarse region-level guard of §5-A **for Increment
+3**. §5-A's coarse per-region invalidation was the correct *Increment 1* choice
+(it shipped the OV-1 fix: no more stale-native blue screen). Inc3 refines the
+granularity now that correctness is established.
+
+The previous segmentation-first plan was directionally right but attacked the
+symptom at too high an altitude. The immediate blocker is not merely that the
+capture region is large; it is that **validity is tracked at region granularity
+while dispatch is per-function**. A compiled native entry corresponds to a
+specific set of bytes the recompiler consumed, so validity should be tracked per
+compiled entry, not per dirty region.
+
+### 8.0 Why region-level validity failed (reasoning trail)
+
+The Inc1 guard tracks one `valid` flag per `OvlRegion` over a single
+`[fn_lo, fn_hi)` envelope. Two consequences make native speedup impossible:
+
+1. **False-invalidation churn.** The envelope is a 343 KB span with the
+   overlay's *data interleaved between functions*. The overlay writes its own
+   state into that data during normal play; those writes land inside the
+   envelope and nuke the *entire* region's registration, even though no code
+   byte changed. Native execution collapses to interp almost immediately.
+2. **All-or-nothing reload.** Reload-on-return requires the whole 343 KB span to
+   hash-match atomically before *anything* goes native again. The rewrite
+   threshold (`span/2 ≈ 171 KB`) never trips, and a hash that includes mutable
+   data would never match anyway. `revalidations` is provably 0.
+
+The root error is the *granularity*, not the region size. Fixed-size
+alternatives (N-KB chunks, modulo-512 KB) were also rejected: they impose an
+*artificial* grid (a function spanning a chunk boundary makes ownership
+ambiguous; per-chunk reload implies per-chunk compilation → cache litter). The
+function boundary is the natural unit and is already known to the recompiler.
+
+### 8.1 Core model — PC → candidate list
+
+Replace the current single-entry dynamic table:
+
+```text
+PC -> native function pointer
+```
+
+with a candidate list:
+
+```text
+PC -> [candidate native entries]
+```
+
+This is required because different overlays can reuse the same RAM address —
+village and overworld content may both define code at `0x800E7xxx`. A
+single-entry table lets whichever DLL registered last clobber the earlier
+candidate, making reload-on-return impossible even if the earlier bytes reappear
+in RAM.
+
+Each candidate carries:
+
+```text
+entry_pc
+native function pointer
+dependency ranges
+dependency hash
+last validated page generation(s)
+valid / invalid / blacklisted state
+source DLL identity
+```
+
+Dispatch becomes:
+
+```text
+candidates = entries_by_pc[pc]
+
+for candidate in candidates:
+    if candidate is blacklisted:
+        continue
+    if candidate is still valid for current page generations:
+        call native candidate
+    else if candidate dependency hash matches live RAM:
+        mark candidate valid for current generations
+        call native candidate
+
+fall back to dirty-RAM interpreter
+```
+
+A hash match proves only that this previously-approved native candidate is
+applicable to the current RAM contents. It does **not** prove that an arbitrary
+PC is a callable function entry — the existing precision rules (three-bucket
+entry rule, §5) still govern what may be registered as a candidate. **Hash
+validity must not imply function-entry validity.**
+
+### 8.2 Validity unit — the dependency set
+
+Validity is per entry, but the hash must cover exactly what the recompiler
+consumed at compile time:
+
+```text
+reachable code bytes/basic blocks for this entry
+plus compile-time-resolved analysis data, if any
+```
+
+Examples of compile-time-resolved analysis data:
+
+```text
+jump tables baked into generated native control flow
+function-pointer tables resolved during recompilation
+constant tables used to shape the generated CFG
+```
+
+Do **not** include ordinary overlay state/data that the generated native code
+reads through runtime memory callbacks. Hashing live-read data would reintroduce
+the false-invalidation churn we are moving away from and defeat the purpose.
+
+```text
+compile-time-consumed data -> dependency hash
+runtime-read data           -> not part of validity hash
+```
+
+### 8.3 First gated work item — verify jump-table behavior
+
+Before implementing the heavier manifest path, verify how overlay codegen
+currently handles jump tables / indirect branches:
+
+```text
+Does overlay codegen bake jump-table contents into generated native control flow,
+or does it dispatch indirect targets at runtime through psx_dispatch_call / equivalent?
+```
+
+- If jump tables are **not** baked and indirect control flow goes through runtime
+  dispatch, **code-only dependency hashing is sufficient** for the first
+  implementation (and the manifest can be deferred).
+- If jump tables / other data-driven CFG facts **are** baked, a minimal
+  Inc2-style manifest must be pulled forward so the recompiler emits per-entry
+  dependency ranges.
+
+**The loader must not guess dependency ranges. They must come from the
+recompiler.**
+
+**RESOLVED — code-only hashing is sufficient.** Both emitters (overlays use
+`CodeGenerator`, `recompiler/src/code_generator.cpp`; `main_psx.cpp:378`) emit
+indirect jumps as `switch (cpu->gpr[jr_rs]) { case <resolved>: goto block; …
+default: call_by_address(cpu, jr_rs); }` — keyed on the **live runtime register
+value**, not on a table index, with a runtime-dispatch `default`. The register is
+loaded from the table at runtime by the normally-emitted `LW`, so a table rewrite
+is reflected in the switched value: a match goes to the (genuinely correct)
+target, a miss falls to runtime dispatch. Jump-table contents are therefore a
+compile-time *optimization*, never a correctness-bearing dependency. `jalr`
+(`code_generator.cpp:1235`) is pure `call_by_address` runtime dispatch. **The
+dependency set for an overlay entry is its reachable code bytes only.** The
+manifest can stay deferred to Inc2.
+
+### 8.4 Lazy verification — generation counters
+
+Writes stay cheap. On write:
+
+```text
+bump page_generation[page]
+```
+
+Do not hash on the store path. On dispatch:
+
+```text
+if candidate's dependency pages have unchanged generations:
+    call native
+else:
+    hash candidate dependency ranges against live RAM
+    if hash matches:
+        update candidate's validated generations
+        call native
+    else:
+        mark candidate invalid
+        try next candidate or fall back to interpreter
+```
+
+Page generation counters are preferred over boolean suspect bits: they avoid
+stale-clearing/race bookkeeping and make each candidate's validation epoch
+explicit.
+
+### 8.5 Active self-modifying entry handling
+
+Lazy verification is sound across dispatch boundaries but cannot recover from a
+native function that modifies its own code/dependency bytes and then continues
+executing modified code *within the same activation*. Track the currently
+executing native overlay entry. On any write:
+
+```text
+if write overlaps current native entry's dependency ranges:
+    blacklist that entry from native dispatch
+    increment selfmod_active_entry counter
+```
+
+This is **not** a recovery mechanism for the current activation — it is a safety
+classification: that entry joins the "must remain interpreted" class until a
+deopt/restart mechanism exists.
+
+### 8.6 Segmentation is demoted, not deleted
+
+Per-entry validity removes segmentation from the immediate *correctness* path: a
+merged region no longer has to atomically remain valid to keep individual
+functions native. But segmentation is still **load-bearing for coverage and
+cache hygiene**:
+
+```text
+discovering distinct overlays that reuse the same address
+creating multiple candidates per PC
+keeping cache artifacts small
+avoiding repeated compilation of giant merged captures
+improving dependency manifests
+```
+
+The boundary signal stays **mechanism-agnostic, zero per-game knowledge**: an
+overlay is RAM that was *written, then executed*; its lifetime ends when that RAM
+is *rewritten* (the same store-path invalidation signal we already own,
+`overlay_loader_invalidate_at` — never a hooked install routine; the earlier
+`pc=0xBFC12210` note was diagnostic only).
+
+### 8.7 Priority order
+
+```text
+1. Implement PC -> candidate-list dispatch.
+2. Implement per-entry validity using code-only hash if codegen permits it.
+3. If codegen bakes jump tables/data, pull forward a minimal manifest for
+   compile-time dependencies.
+4. Add active-entry self-modification blacklist.
+5. Then return to segmentation for coverage / cache hygiene.
+```
+
+Corrected framing:
+
+```text
+Region-level validity caused false invalidation and blocked reload-on-return.
+Per-entry validity fixes the runtime applicability problem.
+Multi-candidate dispatch fixes address-reuse reload.
+Segmentation remains necessary for good candidate coverage, but is no longer
+the primary correctness mechanism.
+```
+
+### 8.8 Validation (no symptom patches)
+
+village→overworld→village must show `disp_native` sustained across the round
+trip (gradual per-entry reload), `invalidations` no longer spiking from in-region
+data writes, and both overlays producing distinct compiled units / candidates.
+Reload is proven by counters **and** pixels, never by a forced revalidation or a
+hand-tuned threshold.
+
+## 9. The dispatch call contract (Bug A case study — RESOLVED 2026-06-09)
+
+### 9.1 The invariant
+
+Execution moves between three engines: statically-recompiled C (main EXE /
+BIOS), native overlay DLL code, and the dirty-RAM interpreter. A guest CALL
+(jal/jalr) carries an obligation: when the callee completes, execution resumes
+at the call's return address. That obligation is representable two ways:
+
+1. **C-stack continuation** — the caller is itself a native C function; the
+   generated call site is `call_by_address(target); goto continuation;`. The
+   obligation lives on the host C stack. The callee's plain `return` (pc==0)
+   correctly resumes the caller.
+2. **pc-chain continuation** — the caller is being interpreted; the
+   obligation lives in guest state (the ra register / the interpreter's
+   `*next_pc_out = return_pc`). The callee must hand back a guest pc.
+
+**The invariant: every path that executes a CALLEE as a unit (a native C
+function that returns with pc==0) must itself hold the continuation — either
+on the C stack or via explicit `resume at return_pc` logic. Surfacing a CALL
+to the psx_dispatch_impl tail-call loop as a bare `cpu->pc = target` violates
+this: the loop treats the callee's pc==0 return as "unwind to the C caller,"
+and the suspended interpreted caller's continuation is silently dropped.**
+
+### 9.2 Bug A (dwarf village → overworld native blue screen)
+
+- Main-EXE field dispatcher F=0x800338A8 (prologue `addiu sp,-0x18`, jr-v0
+  switch over `jumptable[0x80010748 + state*4]`, per-case `jal <overlay
+  handler>`, joint epilogue at 0x80033954) is reached only via a data-table
+  jalr; static discovery walked it from 0x338B0 (two insns late), so dispatches
+  of 0x338A8 miss the static table and the dirty-RAM interpreter executes F.
+- F's interp hit `jal 0x8011B0D4`. The jal handler preserved the call contract
+  for statically-compiled callees (psx_dispatch_game_compiled path) and
+  non-local targets (dispatch_nonlocal_call passes return_pc as stop), but a
+  LOCAL DIRTY target fell through to `cpu->pc = target; return 1` — a bare
+  pc-chain. The dispatch loop then ran the target as a NATIVE overlay
+  candidate; its C-style return (pc==0) unwound the loop past F's suspended
+  continuation. F's epilogue never ran: 0x18 of guest stack leaked per entity,
+  deterministically, until the world corrupted (blue screen). Interp-only mode
+  is immune because the callee's own `jr ra` is interpreted, keeping the
+  pc-chain intact.
+- Refuted by measurement before the fix: IRQ-check cadence (suppress armed,
+  902 checks suppressed, identical failure), device-event granularity
+  (conservative stepping, identical failure), and the jr-jumptable default
+  fallback (the failing execution took a short path that never reached a
+  jump table).
+
+### 9.3 The fix
+
+`overlay_loader_call_native()` (overlay_loader.c) + calls in the interpreter's
+jal AND jalr handlers (dirty_ram_interp.c), mirroring the existing
+psx_dispatch_game_compiled contract exactly: try the native candidate, and on
+completion `*next_pc_out = return_pc`. Fingerprint logging is preserved at the
+new call site. Side effect: native coverage jumped from 86 native overlay
+calls per village→overworld run to ~112,000 (interpreted jal/jalr now route to
+native candidates), since the old path only went native when the dispatch loop
+happened to land exactly on a candidate entry.
+
+### 9.4 Verification + measured benefit (2026-06-09)
+
+- dwarf→overworld renders and plays under native overlays (user-verified
+  pixels, Rule 5). 14 candidates valid, 0 invalidations, no wedge.
+- Same-scene A/B on the live overworld: 646 vs 645 frames / 10 s (vsync-locked
+  — fps cannot show the win); host CPU cost 7.31 (native) vs 7.83 (interp)
+  CPU-seconds per 15 s wall ≈ 7% of total process CPU on this scene. The win
+  is real but bounded by coverage: one cached DLL, 195 candidates, and ~93K
+  interp fallbacks remain (main-EXE dirty-text code + non-candidate overlay
+  functions).
+
+### 9.5 Known residue
+
+- Discovery-miss class: main-EXE functions reachable only via data jump
+  tables (e.g. 0x80010748 — static data in the EXE) are never discovered and
+  interp forever. A discovery pass over static jump-table data closes both a
+  perf gap and this bug-class exposure.
+- One unexplained one-off: a single black screen at the load screen on the
+  first post-fix run (process exited via atexit; its watchdog dump shows only
+  the known frame-~184 instant-disc boot transient). Not reproduced.
+- §8.3's "table contents are an optimization, not a correctness dependency"
+  now rests on the call contract above; the default fallback is a
+  tail-dispatch and is correct ONLY because tail jumps carry no return
+  obligation. Any future emission of the default in non-tail position would
+  reintroduce this bug class.
