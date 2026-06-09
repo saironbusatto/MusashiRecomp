@@ -30,10 +30,9 @@ import struct
 import subprocess
 import sys
 import tempfile
-import tomllib  # Python 3.11+; fallback below
 
 try:
-    import tomllib
+    import tomllib  # Python 3.11+
 except ImportError:
     try:
         import tomli as tomllib
