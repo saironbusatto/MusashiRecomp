@@ -12,6 +12,7 @@
 #include "boot_state.h"
 #include "overlay_capture.h"
 #include "overlay_loader.h"
+#include "autocompile.h"
 #include "gpu.h"
 #include "sio.h"
 #include "spu.h"
@@ -909,6 +910,12 @@ static void sdl_vblank_present(void) {
     int override = -1;
 #endif
 
+    /* Step 2.8 automation ticks — BEFORE the turbo/fast-boot early returns
+     * below, so capture detection and compile pickup keep running while the
+     * frontend is skipping presents. Both are cheap and emu-thread-only. */
+    overlay_autocapture_tick();
+    autocompile_poll_main();
+
     /* Pump SDL events to prevent window freeze. */
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
@@ -1152,6 +1159,16 @@ int main(int argc, char** argv) {
                 overlay_capture_set_out_dir(exe_dir.string().c_str());
                 overlay_capture_set_enabled(1);
                 overlay_loader_init(cache_dir.c_str(), game_id.c_str());
+                /* Step 2.8: variant-capture automation, gated on a
+                 * configured compile command. */
+                if (gc.runtime.has_overlay_autocompile_cmd) {
+                    autocompile_configure(
+                        gc.runtime.overlay_autocompile_cmd.c_str(),
+                        gc.project_root.string().c_str());
+                    overlay_autocapture_set_enabled(1);
+                    std::fprintf(stdout,
+                        "psxrecomp: overlay autocompile enabled\n");
+                }
             }
             std::fprintf(stdout, "psxrecomp: loaded game config %s (%s, %s)\n",
                          game_config_path, game_name.c_str(), game_id.c_str());

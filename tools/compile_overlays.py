@@ -999,7 +999,12 @@ def write_overlay_ranges(src_path: str, out_path: str,
 def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
                 gcc: str = 'gcc') -> bool:
     import platform
-    includes = [f'-I{d}' for d in include_dirs]
+    # Absolute OS-native paths: gcc invoked from cmd.exe (the runtime's
+    # autocompile spawn) silently fails (exit 1, no stderr) on relative
+    # forward-slash paths; absolute backslash paths work in every context.
+    c_path  = os.path.abspath(c_path)
+    out_dll = os.path.abspath(out_dll)
+    includes = [f'-I{os.path.abspath(d)}' for d in include_dirs]
     # On Windows, DLLs use PE relocations — -fPIC triggers GCC CRT init
     # that conflicts with the host process. Use -shared without -fPIC.
     pic_flag = [] if platform.system() == 'Windows' else ['-fPIC']
@@ -1013,7 +1018,7 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
     print(f'  compile: {" ".join(cmd)}')
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print(f'  COMPILE ERROR:\n{r.stderr}')
+        print(f'  COMPILE ERROR (exit {r.returncode}):\n{r.stderr or r.stdout}')
         return False
     return True
 

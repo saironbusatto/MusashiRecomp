@@ -35,6 +35,14 @@ void overlay_loader_check_cache(uint32_t load_addr, uint32_t size,
  * 0 if not found (fall through to interpreter). */
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
 
+/* Step 2.8: re-scan the cache dir for DLLs compiled after init and clear the
+ * checked-regions memo so the next dispatch reconsiders the cache. Idempotent
+ * (loaded DLLs stay loaded); emu thread only. */
+void overlay_loader_rescan(void);
+
+/* True if the cache holds a DLL named <region_start8>_<crc8>.dll. */
+int overlay_loader_has_cached_crc(uint32_t region_start, uint32_t crc);
+
 /* Returns number of functions currently registered in the dynamic table. */
 int overlay_loader_registered_count(void);
 

@@ -76,6 +76,11 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     if (runtime.contains("turbo_loads")) {
         rt.turbo_loads = toml::find<bool>(runtime, "turbo_loads");
     }
+    if (runtime.contains("overlay_autocompile_cmd")) {
+        rt.overlay_autocompile_cmd =
+            toml::find<std::string>(runtime, "overlay_autocompile_cmd");
+        rt.has_overlay_autocompile_cmd = !rt.overlay_autocompile_cmd.empty();
+    }
     return rt;
 }
 

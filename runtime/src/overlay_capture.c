@@ -274,6 +274,66 @@ int overlay_capture_count(void)
     return s_count;
 }
 
+/* ---- Variant-capture automation (step 2.8) -------------------------------
+ * Trigger = sustained dirty-RAM-interp pressure inside a capture window
+ * (g_dirty_window_dispatches), sampled every AUTOCAP_CHECK_FRAMES vblanks,
+ * gated on NOT loading (cdrom_load_in_progress — captures must be taken at
+ * a coherent moment, never mid-load) plus a cooldown and a session cap.
+ * On fire: write overlay_captures.json and kick the configured background
+ * compile (autocompile.c). Dedup is the tool's job — compile_overlays.py
+ * skips image CRCs already in the cache — and the loop self-limits: once
+ * the hot code goes native the pressure signal drops to zero and no more
+ * captures fire. */
+#define AUTOCAP_CHECK_FRAMES    600u   /* ~10 s between pressure samples    */
+#define AUTOCAP_MIN_DISPATCHES  256u   /* interp pressure gate per sample   */
+#define AUTOCAP_COOLDOWN_FRAMES 3600u  /* >= 60 s between auto-fires        */
+#define AUTOCAP_MAX_TRIGGERS    16u    /* session backstop (TCP-visible)    */
+
+static int      s_autocap_enabled    = 0;
+static uint64_t s_autocap_last_check = 0;
+static uint64_t s_autocap_last_fire  = 0;
+static uint64_t s_autocap_last_disp  = 0;
+static uint32_t s_autocap_triggers   = 0;
+static uint64_t s_autocap_last_delta = 0;
+
+void overlay_autocapture_set_enabled(int on) { s_autocap_enabled = on ? 1 : 0; }
+
+void overlay_autocapture_get_status(int *enabled, uint32_t *triggers,
+                                    uint64_t *last_delta) {
+    if (enabled)    *enabled    = s_autocap_enabled;
+    if (triggers)   *triggers   = s_autocap_triggers;
+    if (last_delta) *last_delta = s_autocap_last_delta;
+}
+
+void overlay_autocapture_tick(void)
+{
+    extern uint64_t s_frame_count;
+    extern int cdrom_load_in_progress(void);
+    extern int autocompile_request(void);
+    extern int autocompile_busy(void);
+
+    if (!s_autocap_enabled || !s_active) return;
+    if (s_frame_count - s_autocap_last_check < AUTOCAP_CHECK_FRAMES) return;
+    s_autocap_last_check = s_frame_count;
+
+    uint64_t disp  = g_dirty_window_dispatches;
+    uint64_t delta = disp - s_autocap_last_disp;
+    s_autocap_last_disp  = disp;
+    s_autocap_last_delta = delta;
+
+    if (delta < AUTOCAP_MIN_DISPATCHES) return;
+    if (cdrom_load_in_progress()) return;          /* coherent moment only  */
+    if (autocompile_busy()) return;
+    if (s_autocap_triggers >= AUTOCAP_MAX_TRIGGERS) return;
+    if (s_autocap_last_fire != 0 &&
+        s_frame_count - s_autocap_last_fire < AUTOCAP_COOLDOWN_FRAMES) return;
+
+    s_autocap_last_fire = s_frame_count;
+    s_autocap_triggers++;
+    overlay_capture_write_json();
+    autocompile_request();
+}
+
 uint32_t overlay_capture_get_region_crc(uint32_t region_start,
                                          uint32_t region_size)
 {

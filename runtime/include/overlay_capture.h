@@ -47,6 +47,16 @@ void overlay_capture_write_json(void);
 /* Returns number of unique overlays captured so far. */
 int overlay_capture_count(void);
 
+/* Variant-capture automation (step 2.8): per-vblank tick that fires an
+ * automatic capture + background compile when the dirty-RAM interpreter
+ * shows sustained pressure inside a capture window (an uncovered variant
+ * being executed) at a coherent (not-loading) moment. Enabled by main()
+ * when [runtime] overlay_autocompile_cmd is configured. */
+void overlay_autocapture_set_enabled(int on);
+void overlay_autocapture_tick(void);
+void overlay_autocapture_get_status(int *enabled, uint32_t *triggers,
+                                    uint64_t *last_delta);
+
 /* Compute CRC32 of the DMA-time bytes for the region [region_start,
  * region_start+region_size).  Zero-filled for gaps between DMA blocks,
  * exactly as overlay_captures.json bytes_b64 is assembled.  Use this

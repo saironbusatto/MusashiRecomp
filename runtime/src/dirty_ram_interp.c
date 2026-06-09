@@ -35,6 +35,7 @@
 
 uint64_t g_dirty_ram_blocks_run = 0;
 uint64_t g_dirty_ram_insns_run  = 0;
+uint64_t g_dirty_window_dispatches = 0;  /* capture-window interp dispatches */
 uint64_t g_dirty_ram_aborts     = 0;
 uint64_t g_dirty_ram_guard_yields = 0;
 
@@ -887,6 +888,12 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr) {
 #define OV_FPLOG_RET1() do { if (_ovfp) overlay_fp_log(addr, _in_regs, cpu, 0); return 1; } while (0)
 
     if (!dirty_ram_is_dirty(phys)) return 0;
+
+    /* Interp-pressure signal for variant-capture automation (step 2.8):
+     * counts dispatches the interpreter actually handles inside a capture
+     * window. The autocapture tick reads-and-resets this to decide whether
+     * an unseen region variant is being interp-executed right now. */
+    if (overlay_cache_window_contains(phys)) g_dirty_window_dispatches++;
 
     /* Reset soft-fail state at block entry. */
     g_unsupported_seen = 0;

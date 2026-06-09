@@ -66,6 +66,9 @@ void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
  * via debug_server.c if helpful. */
 extern uint64_t g_dirty_ram_blocks_run;     /* basic blocks interpreted */
 extern uint64_t g_dirty_ram_insns_run;      /* instructions interpreted */
+extern uint64_t g_dirty_window_dispatches;  /* interp dispatches inside a
+                                             * capture window (autocapture
+                                             * pressure signal, step 2.8) */
 extern uint64_t g_dirty_ram_aborts;         /* unsupported-opcode aborts */
 extern uint64_t g_dirty_ram_guard_yields;   /* long dirty loops yielded */
 extern uint64_t g_dirty_ram_unsupported_midblock;

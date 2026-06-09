@@ -295,6 +295,12 @@ typedef struct { uint32_t region_start; char path[768]; } CacheEntry;
 static CacheEntry s_cache_idx[CACHE_IDX_CAP];
 static int        s_cache_idx_count = 0;
 
+static int cache_idx_has_path(const char *path) {
+    for (int i = 0; i < s_cache_idx_count; i++)
+        if (strcmp(s_cache_idx[i].path, path) == 0) return 1;
+    return 0;
+}
+
 static void scan_cache_dir(void) {
 #ifdef _WIN32
     char pattern[768];
@@ -316,13 +322,29 @@ static void scan_cache_dir(void) {
         if (!valid) continue;
         uint32_t addr = (uint32_t)strtoul(fd.cFileName, NULL, 16);
         if (s_cache_idx_count >= CACHE_IDX_CAP) break;
+        char full[768];
+        snprintf(full, sizeof(full), "%s/%s/%s",
+                 s_cache_dir, s_game_id, fd.cFileName);
+        if (cache_idx_has_path(full)) continue;  /* rescan idempotence */
         CacheEntry *e = &s_cache_idx[s_cache_idx_count++];
         e->region_start = addr;
-        snprintf(e->path, sizeof(e->path), "%s/%s/%s",
-                 s_cache_dir, s_game_id, fd.cFileName);
+        snprintf(e->path, sizeof(e->path), "%s", full);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #endif
+}
+
+/* True if the cache holds a DLL for this region compiled from an image with
+ * this CRC (filename <addr8>_<crc8>.dll). Autocapture's "unseen" test. */
+int overlay_loader_has_cached_crc(uint32_t region_start, uint32_t crc) {
+    for (int i = 0; i < s_cache_idx_count; i++) {
+        if (s_cache_idx[i].region_start != region_start) continue;
+        const char *fn = strrchr(s_cache_idx[i].path, '/');
+        fn = fn ? fn + 1 : s_cache_idx[i].path;
+        if (strlen(fn) == 21 && (uint32_t)strtoul(fn + 9, NULL, 16) == crc)
+            return 1;
+    }
+    return 0;
 }
 
 /* ---- Runtime callbacks wired into overlay DLLs via overlay_init() ------ */
@@ -489,6 +511,16 @@ static int already_checked(uint32_t region_start) {
 }
 static void mark_checked(uint32_t region_start) {
     if (s_nchecked < MAX_CHECKED) s_checked[s_nchecked++] = region_start;
+}
+
+/* Re-scan the cache dir for DLLs compiled after init (step 2.8 autocompile)
+ * and clear the checked-regions memo so the next dispatch into a window
+ * region reconsiders the cache. Already-loaded DLLs stay loaded;
+ * dll_already_loaded() makes the re-walk idempotent. */
+void overlay_loader_rescan(void) {
+    if (!s_active) return;
+    scan_cache_dir();
+    s_nchecked = 0;
 }
 
 /* Loaded-DLL set — the cache is ADDITIVE: a memory slot reused by several

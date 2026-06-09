@@ -7383,6 +7383,46 @@ static void handle_cdrom_bursts(int id, const char *json)
     send_fmt("]}\n");
 }
 
+/* autocompile_status: variant-capture automation state — autocapture
+ * enable/trigger counters + the background compile's state and output tail
+ * (in-memory ring; no log files). */
+static void handle_autocompile_status(int id, const char *json)
+{
+    extern int  autocompile_status_json(char *out, int cap);
+    extern void overlay_autocapture_get_status(int *enabled,
+                                               uint32_t *triggers,
+                                               uint64_t *last_delta);
+    (void)json;
+    int      ac_en = 0;
+    uint32_t trig = 0;
+    uint64_t delta = 0;
+    overlay_autocapture_get_status(&ac_en, &trig, &delta);
+    char comp[4096];
+    autocompile_status_json(comp, sizeof(comp));
+    send_fmt("{\"id\":%d,\"ok\":true,\"autocapture_enabled\":%d,"
+             "\"triggers\":%u,\"last_pressure\":%llu,\"compile\":%s}\n",
+             id, ac_en, trig, (unsigned long long)delta, comp);
+}
+
+/* autocompile_run: manually kick the configured background compile. */
+static void handle_autocompile_run(int id, const char *json)
+{
+    extern int autocompile_request(void);
+    (void)json;
+    int started = autocompile_request();
+    send_fmt("{\"id\":%d,\"ok\":true,\"started\":%d}\n", id, started);
+}
+
+/* overlay_rescan: re-scan the DLL cache and clear the checked-regions memo
+ * so newly compiled DLLs load on the next dispatch. */
+static void handle_overlay_rescan(int id, const char *json)
+{
+    extern void overlay_loader_rescan(void);
+    (void)json;
+    overlay_loader_rescan();
+    send_fmt("{\"id\":%d,\"ok\":true}\n", id);
+}
+
 /* overlay_capture_dump: flush overlay_captures.json on demand (does not require
  * a clean window-close). Use after roaming through areas so a freeze/kill can't
  * lose the captured overlays. Writes next to the runtime exe. */
@@ -8254,6 +8294,9 @@ static const CmdEntry s_commands[] = {
     { "cdrom_instant_rate",   handle_cdrom_instant_rate },
     { "cdrom_bursts",         handle_cdrom_bursts },
     { "turbo_loads",          handle_turbo_loads },
+    { "autocompile_status",   handle_autocompile_status },
+    { "autocompile_run",      handle_autocompile_run },
+    { "overlay_rescan",       handle_overlay_rescan },
     { NULL, NULL }
 };
 

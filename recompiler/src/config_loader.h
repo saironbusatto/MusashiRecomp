@@ -66,6 +66,16 @@ struct RuntimeConfig {
     // skips wall-clock pacing so the guest runs at host speed — compressing
     // load wall-time. Streaming titles (e.g. Crash) must leave this off.
     bool                  turbo_loads = false;
+
+    // overlay_autocompile_cmd: variant-capture automation (step 2.8). A
+    // shell command (run via cmd.exe /C, cwd = project root) that compiles
+    // overlay_captures.json into the cache — normally the project's
+    // compile_overlays.py invocation. When set (and overlay_cache is on),
+    // the runtime auto-captures on sustained capture-window interp pressure
+    // and spawns this command in the background; on success the loader
+    // rescans the cache and the new variant goes native in-session.
+    bool                  has_overlay_autocompile_cmd = false;
+    std::string           overlay_autocompile_cmd;
 };
 
 // One entry from [[recompiler.bios_vectors]].
