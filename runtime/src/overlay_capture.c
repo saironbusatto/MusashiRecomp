@@ -108,38 +108,24 @@ void overlay_capture_on_dma(uint32_t load_addr, uint32_t size,
 
 /* ---- JSON output — assembled dirty_ram regions -------------------------- */
 
-void overlay_capture_write_json(void)
+/* Emit every dirty-page run within [win_lo_page, win_hi_page) as a capture
+ * region. Runs are clamped to the window: the kernel window must never merge
+ * with main-EXE pages (both can be dirty and adjacent — kernel via CPU
+ * stores, main EXE via CD DMA), and main-EXE text is statically recompiled,
+ * never captured. */
+static void write_json_window(FILE *f, uint32_t win_lo_page,
+                              uint32_t win_hi_page, int *first_region)
 {
-    extern uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
-    extern uint32_t dirty_ram_get_bitmap_word_count(void);
-
-    char     path[600];
-    FILE    *f;
-    uint32_t bw, page_sz, lo_page;
+    uint32_t page_sz = 4096u;
     uint32_t page, run_start;
-    int      in_run, first_region;
+    int      in_run;
 
-    if (!s_active) return;
+    in_run    = 0;
+    run_start = 0;
 
-    /* Use the same lo threshold as overlay_dump: only above 0x98000. */
-    uint32_t lo_phys = 0x00098000u;
-
-    bw     = dirty_ram_get_bitmap_word_count();
-    page_sz = 4096u;
-    lo_page = lo_phys / page_sz;
-
-    snprintf(path, sizeof(path), "%s/overlay_captures.json", s_out_dir);
-    f = fopen(path, "w");
-    if (!f) return;
-
-    fprintf(f, "[\n");
-    in_run       = 0;
-    run_start    = 0;
-    first_region = 1;
-
-    for (page = lo_page; page <= bw * 32u; page++) {
+    for (page = win_lo_page; page <= win_hi_page; page++) {
         int dirty = 0;
-        if (page < bw * 32u) {
+        if (page < win_hi_page) {
             uint32_t word = dirty_ram_get_bitmap_word(page >> 5);
             dirty = (word >> (page & 31u)) & 1u;
         }
@@ -209,8 +195,8 @@ void overlay_capture_write_json(void)
             }
             memcpy(image, ram_base + phys, size);
 
-            if (!first_region) fprintf(f, ",\n");
-            first_region = 0;
+            if (!*first_region) fprintf(f, ",\n");
+            *first_region = 0;
 
             fprintf(f, "  {\n");
             fprintf(f, "    \"schema\": \"psxrecomp overlay capture v2\",\n");
@@ -251,6 +237,33 @@ void overlay_capture_write_json(void)
             free(dispatch);
         }
     }
+}
+
+void overlay_capture_write_json(void)
+{
+    char     path[600];
+    FILE    *f;
+    uint32_t bw, page_sz;
+    int      first_region;
+
+    if (!s_active) return;
+
+    bw      = dirty_ram_get_bitmap_word_count();
+    page_sz = 4096u;
+
+    snprintf(path, sizeof(path), "%s/overlay_captures.json", s_out_dir);
+    f = fopen(path, "w");
+    if (!f) return;
+
+    fprintf(f, "[\n");
+    first_region = 1;
+
+    /* Kernel window first, then the overlay region (see dirty_ram_interp.h
+     * for the window model). Main-EXE text between them is never captured. */
+    write_json_window(f, 0u,
+                      DIRTY_RAM_KERNEL_WINDOW_END / page_sz, &first_region);
+    write_json_window(f, OVERLAY_REGION_FLOOR / page_sz, bw * 32u,
+                      &first_region);
 
     fprintf(f, "\n]\n");
     fclose(f);

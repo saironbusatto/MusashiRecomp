@@ -74,6 +74,18 @@ INCLUDE_REASONS = {
     # (a walk root there would truncate the host: the mid-function-seed
     # softlock class).
     'DISPATCH_INTERIOR',
+    # Kernel-window-only promotion of an ORPHAN dispatch interior: a
+    # dispatch-proven PC in kernel RAM [0, 0x10000) that no rooted walk
+    # covers. There is no host to alias into and no host a root could
+    # truncate — the static recompiler's install-slot hooks tail-dispatch
+    # into exactly such PCs (e.g. RAM 0xCF0, the SIO data-byte stub).
+    # Written to the seeds file as 'dispatch_root 0x...': a trusted walk
+    # root, exempt from the recompiler's boundary re-check. Overlay regions
+    # are NOT eligible: per-PC dispatch evidence persists across scene
+    # variants there, so an orphan may belong to a non-resident variant
+    # whose bytes in THIS image are data (the 0xE889C class) — rooting it
+    # would walk garbage.
+    'DISPATCH_ROOT',
 }
 FATAL_SEED_REASONS = {'BRANCH_TARGET_ONLY', 'OBSERVED_PC_ONLY', 'UNKNOWN'}
 
@@ -483,23 +495,52 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
     pending = deque(sorted(known))
     processed = set()
     all_branch_targets = set()
+    kernel_window = (load_addr & 0x1FFFFFFF) < 0x10000
 
-    while pending:
-        entry = pending.popleft()
-        if entry in processed:
-            continue
-        processed.add(entry)
+    while True:
+        while pending:
+            entry = pending.popleft()
+            if entry in processed:
+                continue
+            processed.add(entry)
+            sorted_known = sorted(known)
+            hard_cap = next((x for x in sorted_known if x > entry), hi)
+            walk = _walk_overlay_function(data, load_addr, size, entry, hard_cap)
+            all_branch_targets.update(walk['branch_targets'])
+            all_branch_targets.update(walk['jump_table_targets'])
+            for target in sorted(walk['direct_jals']):
+                if target not in known:
+                    include(target, 'DIRECT_JAL_TARGET')
+                    if target in included:
+                        known.add(target)
+                        pending.append(target)
+
+        if not kernel_window:
+            break
+
+        # Orphan promotion (see DISPATCH_ROOT in INCLUDE_REASONS): a kernel
+        # dispatch interior that no rooted walk covers is promoted to a
+        # trusted walk root. Re-enter the walk loop — the new root's walk
+        # may cover other interiors or discover direct-jal callees.
+        covered = set()
         sorted_known = sorted(known)
-        hard_cap = next((x for x in sorted_known if x > entry), hi)
-        walk = _walk_overlay_function(data, load_addr, size, entry, hard_cap)
-        all_branch_targets.update(walk['branch_targets'])
-        all_branch_targets.update(walk['jump_table_targets'])
-        for target in sorted(walk['direct_jals']):
-            if target not in known:
-                include(target, 'DIRECT_JAL_TARGET')
-                if target in included:
-                    known.add(target)
-                    pending.append(target)
+        for i, entry in enumerate(sorted_known):
+            hard_cap = sorted_known[i + 1] if i + 1 < len(sorted_known) else hi
+            walk = _walk_overlay_function(data, load_addr, size, entry, hard_cap)
+            covered |= walk['visited']
+        promoted = sorted(a for a, r in included.items()
+                          if r == 'DISPATCH_INTERIOR' and a not in covered
+                          and _is_valid_mips_word(_word_at(data, load_addr, a)))
+        if not promoted:
+            break
+        # Promote ONE orphan per iteration (lowest address first): its walk
+        # usually covers the remaining orphans, which then stay interiors and
+        # alias into the new root as host — rather than minting sibling roots
+        # that split one real function and hard-cap each other.
+        a = promoted[0]
+        included[a] = 'DISPATCH_ROOT'
+        known.add(a)
+        pending.append(a)
 
     # Re-walk with the final function set so the branch-target exclusion count
     # matches the actual compilation boundaries.
@@ -544,10 +585,17 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         'excluded_counts': excluded_counts,
     }
     # Interior entries carry the 'interior' marker so the recompiler emits
-    # them as overlapping aliases, never as walk roots.
-    seeds = [(f'interior 0x{addr:08X}'
-              if included[addr] == 'DISPATCH_INTERIOR' else f'0x{addr:08X}')
-             for addr in sorted(included)]
+    # them as overlapping aliases, never as walk roots. Promoted kernel
+    # orphans carry 'dispatch_root' so the recompiler roots them without
+    # boundary re-verification.
+    def seed_line(addr: int) -> str:
+        r = included[addr]
+        if r == 'DISPATCH_INTERIOR':
+            return f'interior 0x{addr:08X}'
+        if r == 'DISPATCH_ROOT':
+            return f'dispatch_root 0x{addr:08X}'
+        return f'0x{addr:08X}'
+    seeds = [seed_line(addr) for addr in sorted(included)]
     return seeds, audit
 
 
@@ -561,6 +609,7 @@ def print_seed_audit(audit: dict) -> None:
     print(f'function_pointer_targets_included: {audit["counts"].get("FUNCTION_POINTER_TARGET", 0)}')
     print(f'toml_entries_included: {audit["counts"].get("TOML_DECLARED_ENTRY", 0)}')
     print(f'dispatch_interior_included: {audit["counts"].get("DISPATCH_INTERIOR", 0)}')
+    print(f'dispatch_roots_promoted: {audit["counts"].get("DISPATCH_ROOT", 0)}')
     print(f'branch_targets_excluded: {audit["branch_targets_excluded_count"]}')
     print(f'observed_only_excluded: {audit["excluded_counts"].get("OBSERVED_PC_ONLY", 0)}')
     print(f'unknown_excluded: {audit["excluded_counts"].get("UNKNOWN", 0)}')
@@ -718,6 +767,9 @@ void psx_unknown_dispatch(CPUState *cpu, uint32_t addr, uint32_t phys) {
 }
 void debug_server_log_call_entry(uint32_t func_addr) {
     if (g_cbs.log_call_entry) g_cbs.log_call_entry(func_addr);
+}
+void psx_restore_state_escape(void) {
+    if (g_cbs.psx_restore_state_escape) g_cbs.psx_restore_state_escape();
 }
 /* ----------------------------------------------------------------------- */
 
@@ -1082,9 +1134,9 @@ def main():
 
         with tempfile.TemporaryDirectory() as tmp:
             # Write fake PS-EXE. The header entry PC becomes a walk root in the
-            # recompiler, so it must be a callable boundary — never an
-            # 'interior' seed.
-            entry_pc = int(root_seeds[0], 16)
+            # recompiler, so it must be a walk-root seed — never an 'interior'
+            # one. Root seed lines are either '0x...' or 'dispatch_root 0x...'.
+            entry_pc = int(root_seeds[0].split()[-1], 16)
             psx_path = os.path.join(tmp, f'overlay_{load_addr:08X}.psx')
             with open(psx_path, 'wb') as f:
                 f.write(make_psxexe(load_addr, entry_pc, data))
