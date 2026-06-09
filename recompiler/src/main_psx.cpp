@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <algorithm>
@@ -15,6 +16,42 @@
 #include "config_loader.h"
 #include "rabbitizer.hpp"
 #include "fmt/format.h"
+
+namespace {
+
+struct AliasEntry { uint32_t addr, host_start, host_end; };
+
+// Materialize alias entries as overlapping functions, grouped by host. Each
+// group shares one emitted body (entry switch + host-range blocks); every
+// member lists its siblings so all group CFGs carry identical block leaders.
+// Host functions are emitted unchanged — aliases never cap or truncate them.
+void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
+                              const std::vector<AliasEntry>& alias_entries) {
+    std::map<uint32_t, std::vector<const AliasEntry*>> by_host;
+    for (const auto& ae : alias_entries) {
+        by_host[ae.host_start].push_back(&ae);
+    }
+    for (const auto& [host_start, group] : by_host) {
+        std::vector<uint32_t> entries;
+        for (const AliasEntry* ae : group) entries.push_back(ae->addr);
+        for (const AliasEntry* ae : group) {
+            PSXRecomp::Function af;
+            af.start_addr = ae->addr;
+            af.end_addr = ae->host_end;
+            af.size = af.end_addr - af.start_addr;
+            af.has_prologue = false;
+            af.has_epilogue = false;
+            af.stack_frame_size = 0;
+            af.name = fmt::format("func_{:08X}", ae->addr);
+            af.is_data_section = false;
+            af.alias_walk_lo = ae->host_start;
+            af.alias_group_entries = entries;
+            result.functions.push_back(af);
+        }
+    }
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
     fmt::print("PSXRecomp - PlayStation 1 Static Recompiler\n");
@@ -211,22 +248,36 @@ int main(int argc, char** argv) {
     // automatically detected by the heuristic-based function analysis.
     // Pass game-specific entry points via --extra-funcs file.
 
-    /* Load extra function addresses from a file (one hex address per line) */
+    /* Load extra function addresses from a file (one hex address per line).
+     * Lines of the form `interior 0xXXXXXXXX` mark dispatch-proven interior
+     * addresses: alias candidates, never walk roots. */
     std::vector<uint32_t> file_seeds;
+    std::vector<uint32_t> interior_seeds;
     if (extra_funcs_path) {
         std::ifstream ef(extra_funcs_path);
         if (ef.is_open()) {
             std::string line;
             while (std::getline(ef, line)) {
                 if (line.empty() || line[0] == '#') continue;
-                uint32_t addr = (uint32_t)std::strtoul(line.c_str(), nullptr, 16);
+                bool interior = false;
+                const char* p = line.c_str();
+                if (line.rfind("interior", 0) == 0) {
+                    interior = true;
+                    p += 8;
+                }
+                uint32_t addr = (uint32_t)std::strtoul(p, nullptr, 16);
                 if (addr >= 0x80010000u && addr < 0x80200000u) {
-                    file_seeds.push_back(addr);
-                    exact_entries.push_back(addr);
+                    if (interior) {
+                        interior_seeds.push_back(addr);
+                    } else {
+                        file_seeds.push_back(addr);
+                        exact_entries.push_back(addr);
+                    }
                 }
             }
-            fmt::print("Loaded {} extra function addresses from {}\n",
-                       file_seeds.size(), extra_funcs_path);
+            fmt::print("Loaded {} extra function addresses ({} interior) from {}\n",
+                       file_seeds.size() + interior_seeds.size(),
+                       interior_seeds.size(), extra_funcs_path);
         } else {
             fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
         }
@@ -235,8 +286,73 @@ int main(int argc, char** argv) {
     PSXRecomp::FunctionAnalysisResult analysis_result;
 
     if (overlay_mode) {
-        PSXRecomp::FunctionAnalyzer analyzer(*exe);
-        analysis_result = analyzer.analyze_exact_entries(exact_entries);
+        // ── Overlay exact mode: partition seeds into walk roots and interior
+        // alias candidates. `interior`-marked seeds (classifier-proven
+        // dispatch targets without a callable boundary) are NEVER walk roots —
+        // a root inside a host function hard-caps (truncates) it, the
+        // mid-function-seed softlock class. Unmarked seeds are re-verified
+        // against the same boundary rule as defense in depth.
+        const uint32_t exe_lo = exe->header.load_address;
+        auto read_w = [&](uint32_t a) -> uint32_t {
+            auto w = exe->read_word(a);
+            return w.has_value() ? *w : 0u;
+        };
+        auto callable_boundary = [&](uint32_t a) -> bool {
+            uint32_t w = read_w(a);
+            if (!PSXRecomp::FunctionAnalyzer::is_valid_mips_word(w)) return false;
+            if (a == exe_lo) return true;
+            if (a >= exe_lo + 8 && read_w(a - 8) == 0x03E00008u) return true;
+            int32_t frame = 0;
+            return PSXRecomp::FunctionAnalyzer::is_prologue(w, frame) &&
+                   !(a >= exe_lo + 4 &&
+                     PSXRecomp::FunctionAnalyzer::is_branch_or_jump(read_w(a - 4)));
+        };
+
+        std::set<uint32_t> roots;
+        std::set<uint32_t> interior;
+        for (uint32_t a : exact_entries) {
+            if (callable_boundary(a)) {
+                roots.insert(a);
+            } else {
+                fmt::print("  seed 0x{:08X} fails the boundary check — "
+                           "treating as interior alias candidate\n", a);
+                interior.insert(a);
+            }
+        }
+        for (uint32_t a : interior_seeds) interior.insert(a);
+
+        auto containing = [&](uint32_t a) -> const PSXRecomp::Function* {
+            const PSXRecomp::Function* best = nullptr;
+            for (const auto& f : analysis_result.functions) {
+                if (a >= f.start_addr && a < f.end_addr) { best = &f; break; }
+            }
+            return best;
+        };
+
+        // Interior candidates attach only to functions the EVIDENCE-walked
+        // root set already owns. No backward-boundary guessing: a false
+        // prologue/jr-ra in embedded data mints a root that decodes data as
+        // code (audit-fatal). Orphans stay with the interpreter — it
+        // self-heals via recapture once real call evidence appears.
+        {
+            PSXRecomp::FunctionAnalyzer analyzer(*exe);
+            std::vector<uint32_t> roots_vec(roots.begin(), roots.end());
+            analysis_result = analyzer.analyze_exact_entries(roots_vec);
+        }
+
+        std::vector<AliasEntry> alias_entries;
+        for (uint32_t a : interior) {
+            const PSXRecomp::Function* host = containing(a);
+            if (host && a == host->start_addr) continue;  // became a real entry
+            if (host) {
+                alias_entries.push_back({a, host->start_addr, host->end_addr});
+            } else {
+                fmt::print("  WARNING: interior seed 0x{:08X} has no host "
+                           "function — left to the interpreter\n", a);
+            }
+        }
+        materialize_alias_groups(analysis_result, alias_entries);
+        fmt::print("Overlay alias entries emitted: {}\n\n", alias_entries.size());
     } else {
         // ── Iterative discovery: seed classification + static data-table scan ──
         //
@@ -255,7 +371,6 @@ int main(int argc, char** argv) {
         // ranges (pointer tables live in data regions) and collects words that
         // point at valid instructions inside code-function ranges. Promotions
         // change function boundaries, so iterate to a fixed point.
-        struct AliasEntry { uint32_t addr, host_start, host_end; };
         std::vector<AliasEntry> alias_entries;
 
         std::set<uint32_t> forced;
@@ -288,6 +403,7 @@ int main(int argc, char** argv) {
             struct Candidate { uint32_t addr; bool trusted; bool table_evidence; };
             std::vector<Candidate> candidates;
             for (uint32_t s : file_seeds) candidates.push_back({s, true, true});
+            for (uint32_t s : interior_seeds) candidates.push_back({s, true, true});
             uint32_t scanned_words = 0;
             auto is_text_ptr = [&](uint32_t v) {
                 return (v & 3u) == 0 && v >= exe_lo && v < exe_hi && containing(v) != nullptr;
@@ -341,34 +457,8 @@ int main(int argc, char** argv) {
             if (!promoted_new) break;
         }
 
-        // Materialize alias entries as overlapping functions, grouped by host.
-        // Each group shares one emitted body (entry switch + host-range
-        // blocks); every member lists its siblings so all group CFGs carry
-        // identical block leaders. The host function is emitted unchanged.
-        std::map<uint32_t, std::vector<const AliasEntry*>> aliases_by_host;
-        for (const auto& ae : alias_entries) {
-            aliases_by_host[ae.host_start].push_back(&ae);
-        }
-        for (const auto& [host_start, group] : aliases_by_host) {
-            std::vector<uint32_t> entries;
-            for (const AliasEntry* ae : group) entries.push_back(ae->addr);
-            for (const AliasEntry* ae : group) {
-                PSXRecomp::Function af;
-                af.start_addr = ae->addr;
-                af.end_addr = ae->host_end;
-                af.size = af.end_addr - af.start_addr;
-                af.has_prologue = false;
-                af.has_epilogue = false;
-                af.stack_frame_size = 0;
-                af.name = fmt::format("func_{:08X}", ae->addr);
-                af.is_data_section = false;
-                af.alias_walk_lo = ae->host_start;
-                af.alias_group_entries = entries;
-                analysis_result.functions.push_back(af);
-            }
-        }
-        fmt::print("Alias entries emitted: {} ({} host groups)\n\n",
-                   alias_entries.size(), aliases_by_host.size());
+        materialize_alias_groups(analysis_result, alias_entries);
+        fmt::print("Alias entries emitted: {}\n\n", alias_entries.size());
     }
 
     // Print summary statistics

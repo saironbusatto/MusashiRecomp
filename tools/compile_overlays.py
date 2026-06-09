@@ -67,6 +67,13 @@ INCLUDE_REASONS = {
     'DIRECT_JAL_TARGET',
     'FUNCTION_POINTER_TARGET',
     'TOML_DECLARED_ENTRY',
+    # Dispatch-proven PC with no callable boundary (mid-function code reached
+    # through a function pointer or dispatch chain). Compiled as an
+    # overlapping-alias entry into its host function — written to the seeds
+    # file as 'interior 0x...' so the recompiler never uses it as a walk root
+    # (a walk root there would truncate the host: the mid-function-seed
+    # softlock class).
+    'DISPATCH_INTERIOR',
 }
 FATAL_SEED_REASONS = {'BRANCH_TARGET_ONLY', 'OBSERVED_PC_ONLY', 'UNKNOWN'}
 
@@ -425,30 +432,33 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         if not region(addr):
             excluded[addr] = 'UNKNOWN'
             return
-        if (reason != 'TOML_DECLARED_ENTRY' and addr in jump_table_targets and
-                not _callable_legacy_seed(data, load_addr, addr)):
-            excluded[addr] = 'BRANCH_TARGET_ONLY'
-            return
-        if reason == 'DISPATCH_ENTRY' and impossible_entry_start(addr):
-            excluded[addr] = 'UNKNOWN'
-            return
         # Boundary gate: a dispatched-to PC is proof of *code reachability*, not
         # of a *callable function boundary*. A jr-driven jump-table case label
-        # or a data-table address can be dispatched-to yet have no prologue and
-        # no preceding jr $ra. Promoting it to a function makes the walk run off
-        # into the adjacent data (reserved-opcode / data-as-code). Require real
-        # boundary evidence (jr $ra-preceded, prologue, or region start) before
-        # registering a bare dispatch entry; otherwise leave it to the
-        # interpreter (it self-heals via recapture). Call-edge-proven reasons
+        # or a mid-function pointer target can be dispatched-to yet have no
+        # prologue and no preceding jr $ra. Promoting it to a WALK ROOT would
+        # truncate its host function (mid-function-seed softlock class) or run
+        # off into adjacent data. Such PCs are dispatch-proven code, though —
+        # classify them DISPATCH_INTERIOR: the recompiler emits them as
+        # overlapping-alias entries into their host (never walk roots).
+        # Invalid words stay excluded. Call-edge-proven reasons
         # (DIRECT_JAL_TARGET, FUNCTION_POINTER_TARGET, TOML_DECLARED_ENTRY) are
         # exempt — they carry their own proof.
-        if reason == 'DISPATCH_ENTRY' and not _callable_legacy_seed(data, load_addr, addr):
-            excluded[addr] = 'NO_ENTRY_BOUNDARY'
+        if reason == 'DISPATCH_ENTRY':
+            if impossible_entry_start(addr):
+                excluded[addr] = 'UNKNOWN'
+                return
+            if (addr in jump_table_targets or
+                    not _callable_legacy_seed(data, load_addr, addr)):
+                included.setdefault(addr, 'DISPATCH_INTERIOR')
+                return
+        elif (reason != 'TOML_DECLARED_ENTRY' and addr in jump_table_targets and
+                not _callable_legacy_seed(data, load_addr, addr)):
+            excluded[addr] = 'BRANCH_TARGET_ONLY'
             return
         if reason in FATAL_SEED_REASONS:
             raise RuntimeError(f'BUG: refusing to include 0x{addr:08X} as {reason}')
         old = included.get(addr)
-        if old is None or old == 'FUNCTION_POINTER_TARGET':
+        if old is None or old in ('FUNCTION_POINTER_TARGET', 'DISPATCH_INTERIOR'):
             included[addr] = reason
 
     for addr in dispatch_entry_pcs:
@@ -466,7 +476,10 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         for addr in legacy_callable_seeds:
             include(addr, 'FUNCTION_POINTER_TARGET')
 
-    known = set(included)
+    # Walk roots: callable entries only. DISPATCH_INTERIOR addresses are NOT
+    # roots — as roots they would hard-cap (truncate) the sibling walk that
+    # owns them.
+    known = {a for a, r in included.items() if r != 'DISPATCH_INTERIOR'}
     pending = deque(sorted(known))
     processed = set()
     all_branch_targets = set()
@@ -530,7 +543,11 @@ def classify_overlay_seeds(cap: dict, data: bytes, load_addr: int, size: int,
         'counts': counts,
         'excluded_counts': excluded_counts,
     }
-    seeds = [f'0x{addr:08X}' for addr in sorted(included)]
+    # Interior entries carry the 'interior' marker so the recompiler emits
+    # them as overlapping aliases, never as walk roots.
+    seeds = [(f'interior 0x{addr:08X}'
+              if included[addr] == 'DISPATCH_INTERIOR' else f'0x{addr:08X}')
+             for addr in sorted(included)]
     return seeds, audit
 
 
@@ -543,6 +560,7 @@ def print_seed_audit(audit: dict) -> None:
     print(f'direct_jal_targets_included: {audit["counts"].get("DIRECT_JAL_TARGET", 0)}')
     print(f'function_pointer_targets_included: {audit["counts"].get("FUNCTION_POINTER_TARGET", 0)}')
     print(f'toml_entries_included: {audit["counts"].get("TOML_DECLARED_ENTRY", 0)}')
+    print(f'dispatch_interior_included: {audit["counts"].get("DISPATCH_INTERIOR", 0)}')
     print(f'branch_targets_excluded: {audit["branch_targets_excluded_count"]}')
     print(f'observed_only_excluded: {audit["excluded_counts"].get("OBSERVED_PC_ONLY", 0)}')
     print(f'unknown_excluded: {audit["excluded_counts"].get("UNKNOWN", 0)}')
@@ -1017,8 +1035,9 @@ def main():
             print(f'  seeds: {len(seeds)}  dll: {dll_path}')
         print_seed_audit(seed_audit)
 
-        if not seeds:
-            print('  SKIP: no seeds (data-only region)\n')
+        root_seeds = [s for s in seeds if not s.startswith('interior')]
+        if not root_seeds:
+            print('  SKIP: no walk-root seeds (data-only region)\n')
             continue
 
         if not args.static and os.path.exists(dll_path) and not args.force:
@@ -1026,8 +1045,10 @@ def main():
             continue
 
         with tempfile.TemporaryDirectory() as tmp:
-            # Write fake PS-EXE
-            entry_pc = int(seeds[0], 16)
+            # Write fake PS-EXE. The header entry PC becomes a walk root in the
+            # recompiler, so it must be a callable boundary — never an
+            # 'interior' seed.
+            entry_pc = int(root_seeds[0], 16)
             psx_path = os.path.join(tmp, f'overlay_{load_addr:08X}.psx')
             with open(psx_path, 'wb') as f:
                 f.write(make_psxexe(load_addr, entry_pc, data))
