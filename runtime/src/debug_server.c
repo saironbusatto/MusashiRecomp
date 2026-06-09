@@ -2006,6 +2006,40 @@ static void handle_dirty_insn_log(int id, const char *json)
     free(out);
 }
 
+/* dirty_block_dump_file: write the WHOLE live block-log window (oldest->newest)
+ * to a file. Inline dumps above ~2MB wedge the single-threaded server (seen
+ * twice); file dumps are the only safe path for full-ring extraction. */
+static void handle_dirty_block_dump_file(int id, const char *json)
+{
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        snprintf(path, sizeof(path), "dirty_block_log.json");
+    FILE *f = fopen(path, "w");
+    if (!f) { send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"open failed\"}\n", id); return; }
+    uint64_t total = g_dirty_ram_block_log_seq;
+    uint64_t avail = (total < DIRTY_RAM_BLOCK_LOG_CAP) ? total : DIRTY_RAM_BLOCK_LOG_CAP;
+    fputc('[', f);
+    int first = 1, count = 0;
+    for (uint64_t s = total - avail; s < total; s++) {
+        DirtyRamBlockLogEntry *e =
+            &g_dirty_ram_block_log[s & (DIRTY_RAM_BLOCK_LOG_CAP - 1u)];
+        fprintf(f,
+            "%s{\"seq\":%llu,\"target\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+            "\"t0\":\"0x%08X\",\"t1\":\"0x%08X\",\"t2\":\"0x%08X\","
+            "\"sp\":\"0x%08X\",\"frame\":%u}",
+            first ? "" : ",\n",
+            (unsigned long long)e->seq, e->target, e->ra,
+            e->a0, e->a1, e->a2, e->a3, e->t0, e->t1, e->t2,
+            e->sp, e->frame);
+        first = 0; count++;
+    }
+    fputs("]\n", f);
+    fclose(f);
+    send_fmt("{\"id\":%d,\"ok\":true,\"file\":\"%s\",\"entries\":%d}\n",
+             id, path, count);
+}
+
 /* dirty_insn_dump_file: write the WHOLE live insn-log window (oldest->newest)
  * as a JSON array to a file. The inline dirty_insn_log path serializes into a
  * bounded TCP buffer and wedges the server on multi-MB dumps — file dumps have
@@ -8034,6 +8068,7 @@ static const CmdEntry s_commands[] = {
     { "dirty_flow_log",    handle_dirty_flow_log },
     { "dirty_insn_log",    handle_dirty_insn_log },
     { "dirty_insn_dump_file", handle_dirty_insn_dump_file },
+    { "dirty_block_dump_file", handle_dirty_block_dump_file },
     { "fntrace_arm",       handle_fntrace_arm },
     { "fntrace_arm_clear", handle_fntrace_arm_clear },
     { "fntrace_armed",     handle_fntrace_armed },

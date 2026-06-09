@@ -361,6 +361,12 @@ def build_cmd(args):
         if len(args) > 1:
             d["path"] = args[1]
         return d, pretty_json
+    elif cmd == "dirty_block_dump_file":
+        # [path]: write the whole block-log window to a JSON file (no TCP limit).
+        d = {"cmd": "dirty_block_dump_file"}
+        if len(args) > 1:
+            d["path"] = args[1]
+        return d, pretty_json
     elif cmd == "dirty_insn_log":
         # [count] [pc_lo] [pc_hi]: most-recent insn-log entries (newest first).
         d = {"cmd": "dirty_insn_log"}
