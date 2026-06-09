@@ -1798,11 +1798,13 @@ static void handle_dirty_ram_stats(int id, const char *json)
         DirtyRamPcEntry *e = &g_dirty_ram_pc_table[i];
         if (e->pc == 0 || e->hits == 0) continue;
         n += snprintf(buf + n, sizeof(buf) - n,
-                      "%s{\"pc\":\"0x%08X\",\"hits\":%llu,\"insns\":%llu}",
+                      "%s{\"pc\":\"0x%08X\",\"hits\":%llu,\"insns\":%llu,"
+                      "\"entries\":%llu}",
                       first ? "" : ",",
                       (unsigned)e->pc,
                       (unsigned long long)e->hits,
-                      (unsigned long long)e->insns);
+                      (unsigned long long)e->insns,
+                      (unsigned long long)e->entry_hits);
         first = 0;
         if (n >= (int)sizeof(buf) - 128) break;
     }

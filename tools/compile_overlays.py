@@ -1022,6 +1022,42 @@ def main():
         data      = base64.b64decode(cap['bytes_b64'])
         crc32     = binascii.crc32(data) & 0xFFFFFFFF
         phys_addr = (load_addr & 0x1FFFFFFF)
+
+        # Merge evidence from a prior build of the SAME bytes: every F entry
+        # in an existing ranges manifest for this exact image was proven
+        # compilable before, so a fresh (poorer) capture can't regress
+        # coverage on rebuild. Callable entries re-enter as captured function
+        # entries (walk-root eligible); non-callable ones (alias wrappers
+        # from a prior build) re-enter as dispatch entries so the classifier
+        # re-derives their interior/alias disposition — feeding them back as
+        # roots would truncate their hosts.
+        if not args.static:
+            prior_ranges = os.path.join(cache_dir,
+                                        f'{phys_addr:08X}_{crc32:08X}.ranges')
+            if os.path.exists(prior_ranges):
+                prior_entries = []
+                with open(prior_ranges) as pf:
+                    for ln in pf:
+                        parts = ln.split()
+                        if parts and parts[0] == 'F':
+                            try:
+                                prior_entries.append(int(parts[1], 16))
+                            except (IndexError, ValueError):
+                                pass
+                if prior_entries:
+                    fe = _parse_addr_list(cap.get('function_entry_pcs', []))
+                    de = _parse_addr_list(cap.get('dispatch_entry_pcs', []))
+                    for a in prior_entries:
+                        if _callable_legacy_seed(data, load_addr, a):
+                            fe.add(a)
+                        else:
+                            de.add(a)
+                    cap['function_entry_pcs'] = sorted(fe)
+                    cap['dispatch_entry_pcs'] = sorted(de)
+                    cap.setdefault('schema', 'merged')
+                    print(f'  merged {len(prior_entries)} prior-manifest entries '
+                          f'from {prior_ranges}')
+
         seeds, seed_audit = classify_overlay_seeds(cap, data, load_addr, size,
                                                    crc32, toml)
 

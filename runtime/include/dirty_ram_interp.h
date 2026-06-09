@@ -58,9 +58,15 @@ extern const char *g_dirty_ram_last_unsupported_reason;
  * on the entry PC of each interpreted block. */
 #define DIRTY_RAM_PC_TABLE_SIZE 65536
 typedef struct {
-    uint32_t pc;        /* entry PC, 0 = empty slot */
-    uint64_t hits;      /* number of times dispatched here */
-    uint64_t insns;     /* total instructions executed across hits */
+    uint32_t pc;         /* entry PC, 0 = empty slot */
+    uint64_t hits;       /* number of times dispatched here */
+    uint64_t insns;      /* total instructions executed across hits */
+    uint64_t entry_hits; /* dispatches that arrived from NATIVE code (call /
+                          * dispatch loop), not from the interpreter's own
+                          * block-to-block chaining. `hits` conflates the two:
+                          * below the local-flow floor every taken branch
+                          * re-dispatches, so chain blocks dominate. entry_hits
+                          * is the evidence stream for interior-alias seeds. */
 } DirtyRamPcEntry;
 extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
 /* Companion table: every PC the interpreter actually executes (not just block

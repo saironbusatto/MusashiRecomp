@@ -285,6 +285,12 @@ static int is_local_dirty_target(uint32_t target) {
     return phys >= 0x00098000u && dirty_ram_is_dirty(phys);
 }
 
+/* Target the last interp run handed back to the dispatch loop (chained
+ * continuation). Consumed by the next dirty dispatch to tell apart
+ * external entries (from native code) from the interpreter's own
+ * block-to-block chaining. */
+static uint32_t g_dirty_interp_chain_target = 0;
+
 /* A dirty-RAM target only deserves interpretation if its first word decodes
  * as a plausible MIPS instruction.  A scatter-loaded overlay leaves data
  * bytes in dirty pages; jumping into those and interpreting them as code is
@@ -884,6 +890,15 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr) {
     DirtyRamPcEntry *pc_entry = pc_table_get_or_insert(phys);
     if (pc_entry) pc_entry->hits++;
 
+    /* External-entry attribution: when the previous interp run exited by
+     * handing a target back to the dispatch loop, the very next dirty
+     * dispatch at that target is the SAME logical execution continuing —
+     * not a new entry. Anything else arrived from native code (a call or
+     * a fresh dispatch) and is real interior-entry evidence for alias
+     * seeding. */
+    if (pc_entry && addr != g_dirty_interp_chain_target) pc_entry->entry_hits++;
+    g_dirty_interp_chain_target = 0;
+
     /* Block-entry ring buffer — answers "who tried to JALR into this RAM
      * stub" by capturing cpu->gpr[31] (the caller's RA) at dispatch time.
      * Always-on; eviction keeps memory bounded. Honors the capture freeze. */
@@ -997,6 +1012,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr) {
             }
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+            g_dirty_interp_chain_target = cpu->pc;
             OV_FPLOG_RET1();
         }
         pc = next_pc;
@@ -1007,6 +1023,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr) {
             cpu->pc = pc;
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+            g_dirty_interp_chain_target = pc;
             OV_FPLOG_RET1();
         }
     }
@@ -1017,6 +1034,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr) {
     g_dirty_ram_blocks_run++;
     cpu->pc = pc;
     if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+    g_dirty_interp_chain_target = pc;
     psx_check_interrupts(cpu);
     OV_FPLOG_RET1();
 }
