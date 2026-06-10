@@ -28,8 +28,16 @@
 extern "C" {
 #endif
 
+/* The event ring is a dev diagnostic: it is only readable over the TCP
+ * debug server, which production builds strip (PSX_NO_DEBUG_TOOLS). It is
+ * not part of the freeze dump, so recording in production is pure
+ * hot-path cost — disable it there. */
 #ifndef EVENT_RING_ENABLED
+#ifdef PSX_NO_DEBUG_TOOLS
+#define EVENT_RING_ENABLED 0
+#else
 #define EVENT_RING_ENABLED 1
+#endif
 #endif
 
 /* 64K entries * 48 bytes ~= 3 MB. Covers many frames of transition activity. */

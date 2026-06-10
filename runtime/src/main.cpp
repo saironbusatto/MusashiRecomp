@@ -189,6 +189,17 @@ static void launcher_warning(const char* title, const std::string& msg) {
 #endif
 }
 
+static void launcher_info(const char* title, const std::string& msg) {
+    std::fprintf(stderr, "%s: %s\n", title, msg.c_str());
+#ifdef _WIN32
+    MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONINFORMATION);
+#endif
+}
+
+/* Game display name for picker dialogs ("Tomba!"); set after the game
+ * config loads, before any interactive file resolution. */
+static std::string s_picker_game_name = "PSXRecomp";
+
 static bool pick_runtime_file(const char* title, const char* filter,
                               std::filesystem::path& out) {
 #ifdef _WIN32
@@ -399,10 +410,23 @@ static std::filesystem::path resolve_bios_for_runtime(const char* requested,
         return cached;
     }
 
+    /* Interactive pick. Be explicit about WHICH of the two user-supplied
+     * files is being requested — first-time users see two pickers in a
+     * row and the difference between "BIOS" and "disc image" is not
+     * obvious to non-technical players. */
+    launcher_info((s_picker_game_name + " — PlayStation BIOS needed").c_str(),
+        s_picker_game_name + " does not include any Sony or game files.\n\n"
+        "Step 1 of 2 — PlayStation BIOS\n\n"
+        "In the next window, select your PlayStation BIOS dump. The file is "
+        "usually named SCPH1001.BIN and is exactly 512 KB. You must dump it "
+        "from your own console or otherwise legally obtain it.\n\n"
+        "(This is NOT the game disc — that is asked for next.)");
+    std::string bios_title =
+        s_picker_game_name + " — Step 1 of 2: select PlayStation BIOS (SCPH1001.BIN)";
     for (;;) {
         std::filesystem::path picked;
         if (!pick_runtime_file(
-                "Select SCPH1001.BIN BIOS",
+                bios_title.c_str(),
                 "PlayStation BIOS (*.bin)\0*.bin\0All Files (*.*)\0*.*\0",
                 picked)) {
             return {};
@@ -434,10 +458,21 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
         return cached;
     }
 
+    launcher_info((s_picker_game_name + " — game disc image needed").c_str(),
+        "Step 2 of 2 — game disc image\n\n"
+        "In the next window, select your " + s_picker_game_name +
+        (game_id.empty() ? std::string() : " (" + game_id + ")") +
+        " disc image ripped from your own disc.\n\n"
+        "Accepted formats: .cue (preferred, with its .bin next to it), "
+        ".bin, or .iso.\n\n"
+        "(This is NOT the BIOS — the BIOS was already chosen.)");
+    std::string disc_title =
+        s_picker_game_name + " — Step 2 of 2: select " + s_picker_game_name +
+        " disc image (.cue / .bin / .iso)";
     for (;;) {
         std::filesystem::path picked;
         if (!pick_runtime_file(
-                "Select PlayStation Disc Image",
+                disc_title.c_str(),
                 "PS1 Disc Images (*.cue;*.bin;*.iso)\0*.cue;*.bin;*.iso\0All Files (*.*)\0*.*\0",
                 picked)) {
             return {};
@@ -1175,13 +1210,17 @@ int main(int argc, char** argv) {
                 overlay_capture_set_out_dir(exe_dir.string().c_str());
                 overlay_capture_set_enabled(1);
                 overlay_loader_init(cache_dir.c_str(), game_id.c_str());
-                /* Step 2.8: variant-capture automation, gated on a
-                 * configured compile command. */
+                /* Step 2.8 variant-capture automation. Autocapture is ON
+                 * whenever the cache is on: it writes the player-shareable
+                 * overlay_captures.json (the contribution file the README
+                 * promises) even on machines with no compile toolchain.
+                 * The background compile additionally needs a configured
+                 * command; autocompile_request() no-ops without one. */
+                overlay_autocapture_set_enabled(1);
                 if (gc.runtime.has_overlay_autocompile_cmd) {
                     autocompile_configure(
                         gc.runtime.overlay_autocompile_cmd.c_str(),
                         gc.project_root.string().c_str());
-                    overlay_autocapture_set_enabled(1);
                     std::fprintf(stdout,
                         "psxrecomp: overlay autocompile enabled\n");
                 }
@@ -1194,6 +1233,8 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+
+    if (!game_name.empty()) s_picker_game_name = game_name;
 
     std::filesystem::path resolved_bios = resolve_bios_for_runtime(bios_path, argv[0]);
     if (resolved_bios.empty()) {
