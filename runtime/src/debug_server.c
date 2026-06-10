@@ -3291,18 +3291,46 @@ static uint32_t hex_to_u32(const char *s)
 
 /* ---- Send helpers ---- */
 
+/* TCP serve-stall telemetry. The server is pumped on the main thread, so
+ * every millisecond spent inside send_all_blocking is a millisecond the
+ * emulator did not run. Surfaced in the freeze heartbeat and wedge dumps
+ * so a TCP-throttled run can never be misread as a guest-side bug
+ * (2026-06-10: two pre-fix attract "degradations" were exactly this —
+ * 6 fps crawl + final stall, all main-thread time inside WS2_32!send). */
+static uint64_t s_tcp_send_stall_ms = 0;
+static uint32_t s_tcp_clients_dropped = 0;
+
+uint64_t debug_server_get_tcp_stall_ms(void)  { return s_tcp_send_stall_ms; }
+uint32_t debug_server_get_tcp_drops(void)     { return s_tcp_clients_dropped; }
+
+static uint64_t monotonic_ms(void)
+{
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+#endif
+}
+
 /* Bounded blocking send. Returns 0 on success, -1 on failure/timeout.
  *
  * The server is pumped on the main thread, so an unbounded send to a
  * client that has stopped draining stalls the emulator until the
  * starvation watchdog (4 s) kills the whole process. Each chunk gets a
- * 2 s send timeout and a watchdog heartbeat, so a healthy-but-slow
- * client can take as long as it likes (progress = heartbeats), while a
- * wedged client costs at most one timeout and then loses its
- * connection — never the runtime. */
+ * 2 s send timeout and a watchdog heartbeat. A slow-but-alive client is
+ * additionally bounded by a TOTAL budget per call: a trickle-draining
+ * client used to be able to throttle the emulator indefinitely (progress
+ * heartbeats kept the watchdog quiet). Past the budget the client loses
+ * its connection — never the runtime. Responses too big to send inside
+ * the budget must use the *_dump_file commands instead. */
+#define SEND_TOTAL_BUDGET_MS 15000u
+
 static int send_all_blocking(sock_t sock, const char *data, size_t len)
 {
     int ok = 0;
+    uint64_t t_start = monotonic_ms();
 #ifdef _WIN32
     u_long mode = 0;
     ioctlsocket(sock, FIONBIO, &mode);
@@ -3316,6 +3344,10 @@ static int send_all_blocking(sock_t sock, const char *data, size_t len)
 #endif
     size_t sent = 0;
     while (sent < len) {
+        if (monotonic_ms() - t_start > SEND_TOTAL_BUDGET_MS) {
+            ok = -1;
+            break;
+        }
         size_t want = len - sent;
         if (want > (1u << 20)) want = (1u << 20);
         int n = send(sock, data + sent, (int)want, 0);
@@ -3335,6 +3367,7 @@ static int send_all_blocking(sock_t sock, const char *data, size_t len)
 #else
     fcntl(sock, F_SETFL, flags);
 #endif
+    s_tcp_send_stall_ms += monotonic_ms() - t_start;
     return ok;
 }
 
@@ -3348,6 +3381,7 @@ void debug_server_send_line(const char *json)
          * runtime. The next poll() accepts a fresh client. */
         sock_close(s_client);
         s_client = SOCK_INVALID;
+        s_tcp_clients_dropped++;
     }
 }
 

@@ -101,6 +101,27 @@ When a recompiled-BIOS bug is suspected, the two servers let you find the **firs
 
 ---
 
+## Server send budget + serve-stall telemetry
+
+The server is pumped on the **main thread**: every millisecond it spends
+sending a response is a millisecond the emulator does not run. Inline
+responses are bounded — 2 s per zero-progress chunk and **15 s total per
+response**; a client that exceeds the budget is disconnected (the runtime
+never stalls indefinitely). Responses bigger than the budget allows must
+use the `*_dump_file` variants, which write to disk instead of the socket.
+
+Cumulative serve-stall is exported as `tcp_send_stall_ms` /
+`tcp_clients_dropped` in `psx_freeze_heartbeat.json` (plus per-tick
+`tcp_ms` in its ring) and in every wedge/fatal dump header. **Check these
+first when diagnosing slow or stalled frames** — on 2026-06-10 two
+"attract-idle degradations" turned out to be a TCP client trickle-draining
+mega-dumps, throttling the main loop to 6 fps (all 8 watchdog stack
+samples inside `WS2_32!send`). A slow-frames wedge with a large
+`tcp_send_stall_ms` delta over the same window is observer interference,
+not a guest bug.
+
+---
+
 ## Rule when the server can't answer your question
 
 If an inspection need isn't covered by the existing commands, **do not fall back to printf or log files**. Instead:

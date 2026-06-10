@@ -122,6 +122,7 @@ typedef struct {
     uint8_t  in_exception;
     uint8_t  mc_max_state;
     long long wall_clock;
+    uint64_t tcp_stall_ms;
 } HbRingEntry;
 static HbRingEntry s_ring[RING_CAP];
 static uint32_t    s_ring_head = 0;
@@ -300,6 +301,8 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         "  \"tx_writes\":%d,\n"
         "  \"dirty_ram_blocks\":%llu,\n"
         "  \"dirty_ram_insns\":%llu,\n"
+        "  \"tcp_send_stall_ms\":%llu,\n"
+        "  \"tcp_clients_dropped\":%u,\n"
         "  \"present_slow_count\":%u,\n"
         "  \"present_vsync_disabled\":%d,\n"
         "  \"wedge_kind\":%u,\n"
@@ -320,6 +323,8 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         mc_max, tx_writes,
         (unsigned long long)g_dirty_ram_blocks_run,
         (unsigned long long)g_dirty_ram_insns_run,
+        (unsigned long long)debug_server_get_tcp_stall_ms(),
+        debug_server_get_tcp_drops(),
         g_present_slow_count,
         g_present_vsync_disabled,
         s_last_wedge_kind,
@@ -346,7 +351,8 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
             "\"exc_re\":%llu,\"dirty_insns\":%llu,"
             "\"cur_fn\":\"0x%08X\",\"store_pc\":\"0x%08X\","
             "\"i_stat\":\"0x%08X\",\"sio_stat\":\"0x%04X\","
-            "\"sio_ctrl\":\"0x%04X\",\"in_exc\":%u,\"mc_max\":%u}%s\n",
+            "\"sio_ctrl\":\"0x%04X\",\"in_exc\":%u,\"mc_max\":%u,"
+            "\"tcp_ms\":%llu}%s\n",
             e->wall_clock,
             (unsigned long long)e->frame_count,
             (unsigned long long)e->psx_cycle_count,
@@ -355,6 +361,7 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
             e->current_func, e->last_store_pc,
             e->i_stat, (unsigned)e->sio_stat, (unsigned)e->sio_ctrl,
             (unsigned)e->in_exception, (unsigned)e->mc_max_state,
+            (unsigned long long)e->tcp_stall_ms,
             (i + 1 < avail) ? "," : "");
     }
     fputs("  ],\n", f);
@@ -507,6 +514,7 @@ static void heartbeat_write(void) {
     re->in_exception    = (uint8_t)in_exc;
     re->mc_max_state    = (uint8_t)mc_max;
     re->wall_clock      = wall;
+    re->tcp_stall_ms    = debug_server_get_tcp_stall_ms();
     s_ring_head = (s_ring_head + 1) % RING_CAP;
     if (s_ring_count < RING_CAP) s_ring_count++;
 
@@ -584,6 +592,8 @@ static void heartbeat_write(void) {
         "  \"tx_writes\":%d,\n"
         "  \"dirty_ram_blocks\":%llu,\n"
         "  \"dirty_ram_insns\":%llu,\n"
+        "  \"tcp_send_stall_ms\":%llu,\n"
+        "  \"tcp_clients_dropped\":%u,\n"
         "  \"fatal\":%s%s%s\n"
         "}\n",
         s_backend,
@@ -608,6 +618,8 @@ static void heartbeat_write(void) {
         tx_writes,
         (unsigned long long)g_dirty_ram_blocks_run,
         (unsigned long long)g_dirty_ram_insns_run,
+        (unsigned long long)debug_server_get_tcp_stall_ms(),
+        debug_server_get_tcp_drops(),
         g_psx_fatal_reason ? "\"" : "",
         g_psx_fatal_reason ? g_psx_fatal_reason : "null",
         g_psx_fatal_reason ? "\"" : "");
@@ -635,7 +647,8 @@ static void heartbeat_write(void) {
             "\"exc_re\":%llu,\"dirty_insns\":%llu,"
             "\"cur_fn\":\"0x%08X\",\"store_pc\":\"0x%08X\","
             "\"i_stat\":\"0x%08X\",\"sio_stat\":\"0x%04X\","
-            "\"sio_ctrl\":\"0x%04X\",\"in_exc\":%u,\"mc_max\":%u}%s\n",
+            "\"sio_ctrl\":\"0x%04X\",\"in_exc\":%u,\"mc_max\":%u,"
+            "\"tcp_ms\":%llu}%s\n",
             e->wall_clock,
             (unsigned long long)e->frame_count,
             (unsigned long long)e->psx_cycle_count,
@@ -644,6 +657,7 @@ static void heartbeat_write(void) {
             e->current_func, e->last_store_pc,
             e->i_stat, (unsigned)e->sio_stat, (unsigned)e->sio_ctrl,
             (unsigned)e->in_exception, (unsigned)e->mc_max_state,
+            (unsigned long long)e->tcp_stall_ms,
             (i + 1 < avail) ? "," : "");
         if (m <= 0 || (size_t)(n + m) >= sizeof(buf)) break;
         n += m;

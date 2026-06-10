@@ -87,6 +87,13 @@ void debug_server_init(int port);
  * Call once per vblank. */
 void debug_server_poll(void);
 
+/* TCP serve-stall telemetry: cumulative main-thread ms spent inside
+ * bounded TCP sends, and clients dropped for exceeding the send budget.
+ * Surfaced in the freeze heartbeat / wedge dumps so a TCP-throttled run
+ * is never misattributed to a guest-side stall. */
+uint64_t debug_server_get_tcp_stall_ms(void);
+uint32_t debug_server_get_tcp_drops(void);
+
 /* Record the current frame's state into the ring buffer.
  * Call after vblank processing. */
 void debug_server_record_frame(void);
