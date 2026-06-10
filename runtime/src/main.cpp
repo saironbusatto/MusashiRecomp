@@ -14,6 +14,7 @@
 #include "overlay_loader.h"
 #include "autocompile.h"
 #include "gpu.h"
+#include "frame_pacing.h"
 #include "sio.h"
 #include "spu.h"
 #include "memcard.h"
@@ -90,6 +91,15 @@ static SDL_GameController* sdl_controller;
 static SDL_JoystickID      sdl_controller_instance = -1;
 static uint32_t      sdl_pixel_buf[640 * 512]; /* ARGB8888 staging buffer */
 static int           s_fast_boot_active = 0;  /* cleared when game entry PC fires */
+
+/* Vsync self-heal state (see SDL_RenderPresent wrapper in
+ * sdl_vblank_present). C linkage: freeze_heartbeat.c includes both in
+ * the freeze dump so a slow-frames wedge can be attributed to driver
+ * present backpressure from the dump alone. */
+extern "C" {
+uint32_t g_present_slow_count = 0;     /* presents that blocked >250ms */
+int      g_present_vsync_disabled = 0; /* 1 once self-heal tripped */
+}
 
 /* Turbo-through-loads (step 4). C linkage: debug_server.c reads/toggles the
  * enable and reports the frame counter. Enabled by game.toml [runtime]
@@ -1011,30 +1021,13 @@ static void sdl_vblank_present(void) {
 
     /* Wall-clock pacing: always runs once fast_boot has ended, even when the
      * display is still disabled (e.g. game crt0 setup). Skipped only by the
-     * turbo and fast_boot early-returns above. */
+     * turbo and fast_boot early-returns above. frame_pacer_wait is the
+     * race-free replacement for the old open-coded loop whose double
+     * counter read could underflow into a ~24.7-day SDL_Delay (Bug B
+     * hard freeze). */
     {
-        static Uint64 next_deadline = 0;
-        Uint64 freq = SDL_GetPerformanceFrequency();
-        Uint64 period = (Uint64)((double)freq * (PSX_FRAME_PERIOD_MS / 1000.0));
-        Uint64 now = SDL_GetPerformanceCounter();
-        if (next_deadline == 0 || now >= next_deadline + period) {
-            next_deadline = now + period;  /* first frame, or fell behind */
-        } else {
-            while (SDL_GetPerformanceCounter() < next_deadline) {
-                Uint64 remaining_ticks = next_deadline - SDL_GetPerformanceCounter();
-                Uint64 remaining_ms = (remaining_ticks * 1000) / freq;
-                if (remaining_ms >= 2) {
-                    SDL_Delay((Uint32)(remaining_ms - 1));
-                } else {
-                    /* Final spin for sub-ms accuracy. */
-                    break;
-                }
-            }
-            while (SDL_GetPerformanceCounter() < next_deadline) {
-                /* spin */
-            }
-            next_deadline += period;
-        }
+        static FramePacer pacer = { 0 };
+        frame_pacer_wait(&pacer, PSX_FRAME_PERIOD_MS);
     }
 
     /* ---- Display from our VRAM ---- */
@@ -1074,7 +1067,30 @@ static void sdl_vblank_present(void) {
     SDL_Rect dst = { 0, 0, 640, 480 };
     SDL_RenderClear(sdl_renderer);
     SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
-    SDL_RenderPresent(sdl_renderer);
+
+    /* Vsync self-heal. The renderer is created with PRESENTVSYNC for
+     * tear-free output, but the wall-clock pacer above already holds
+     * 59.94 Hz, so driver vsync is redundant for timing. Under some
+     * driver states (observed: NVIDIA GL with the swap queue wedged)
+     * SwapBuffers blocks ~1.5 s per present, dragging the whole
+     * emulation to ~0.7 fps for minutes (freeze dump 1781045865:
+     * 8/8 main-thread samples inside wglSwapBuffers). If presents
+     * block pathologically several times in a row, drop driver vsync
+     * for the rest of the session; our own pacing keeps the rate. */
+    {
+        const Uint64 t0 = SDL_GetPerformanceCounter();
+        SDL_RenderPresent(sdl_renderer);
+        const Uint64 t1 = SDL_GetPerformanceCounter();
+        const Uint64 freq = SDL_GetPerformanceFrequency();
+        const Uint64 present_ms = (t1 >= t0 && freq) ? ((t1 - t0) * 1000u) / freq : 0;
+        if (!g_present_vsync_disabled && present_ms > 250) {
+            g_present_slow_count++;
+            if (g_present_slow_count >= 3 &&
+                SDL_RenderSetVSync(sdl_renderer, 0) == 0) {
+                g_present_vsync_disabled = 1;
+            }
+        }
+    }
 #endif
 }
 
