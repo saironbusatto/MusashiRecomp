@@ -230,23 +230,31 @@ static void h_read_ram(int id, const char *json) {
     uint32_t addr = hex_to_u32(addr_s);
     int len = json_get_int(json, "len", 16);
     if (len < 1) len = 1;
-    if (len > 65536) len = 65536;
+    /* Match the native server: whole 2 MB RAM in one response if asked. */
+    if (len > 0x200000) len = 0x200000;
 
     uint8_t *buf = (uint8_t*)malloc(len);
     if (!buf) { send_err(id, "alloc"); return; }
     for (int i = 0; i < len; i++) buf[i] = beetle_read_byte((addr + i) & 0x1FFFFFFFu);
 
-    char *hex = (char*)malloc(len * 2 + 1);
-    if (!hex) { free(buf); send_err(id, "alloc"); return; }
-    static const char H[] = "0123456789ABCDEF";
+    /* Build the whole response line on the heap: send_fmt's 128 KB static
+     * buffer would silently truncate a large read into broken JSON. */
+    size_t env = 96;
+    char *out = (char*)malloc((size_t)len * 2 + env);
+    if (!out) { free(buf); send_err(id, "alloc"); return; }
+    int hdr = snprintf(out, env,
+                       "{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"len\":%d,\"hex\":\"",
+                       id, addr, len);
+    char *hex = out + hdr;
+    static const char H[] = "0123456789abcdef";
     for (int i = 0; i < len; i++) {
         hex[i*2]   = H[(buf[i] >> 4) & 0xF];
         hex[i*2+1] = H[buf[i] & 0xF];
     }
-    hex[len*2] = 0;
-    send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"len\":%d,\"hex\":\"%s\"}\n",
-             id, addr, len, hex);
-    free(hex); free(buf);
+    char *tail = hex + (size_t)len * 2;
+    memcpy(tail, "\"}\n", 3);
+    send_raw(out, (int)(hdr + (size_t)len * 2 + 3));
+    free(out); free(buf);
 }
 
 static void h_press(int id, const char *json) {
@@ -264,7 +272,8 @@ static void h_set_input(int id, const char *json) {
         send_err(id, "missing buttons"); return;
     }
     s_input_override = (int)hex_to_u32(val);
-    s_input_frames   = json_get_int(json, "frames", 1);
+    /* 0 = hold until clear_input — matches psx-runtime semantics. */
+    s_input_frames   = json_get_int(json, "frames", 0);
     send_ok(id);
 }
 
@@ -328,7 +337,7 @@ static void h_screenshot_file(int id, const char *json) {
     }
     free(row);
     fclose(f);
-    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"w\":%u,\"h\":%u}\n",
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,\"height\":%u}\n",
              id, path, w, h);
 }
 
@@ -548,18 +557,30 @@ static void h_wtrace_dump(int id, const char *json) {
     int cap = beetle_wtrace_capacity();
     uint32_t avail = (total < (uint64_t)cap) ? (uint32_t)total : (uint32_t)cap;
 
-    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
+    /* Heap-build the whole response and send via send_raw — the per-entry
+     * send_fmt path drops chunks on multi-MB responses (same failure mode
+     * as the old read_ram truncation). ~400 bytes/entry worst case. */
+    size_t out_cap = 256 + (size_t)got * 400u;
+    char *out = (char *)malloc(out_cap);
+    if (!out) {
+        free(seqs); free(addrs); free(vals); free(pcs); free(ras); free(sps);
+        free(v0s); free(v1s); free(a0s); free(a1s); free(a2s); free(a3s);
+        free(t0s); free(t1s); free(frames); free(slots); free(sizes);
+        send_err(id, "alloc"); return;
+    }
+    size_t pos = (size_t)snprintf(out, out_cap,
+             "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
              id, (unsigned long long)total, avail);
     uint32_t emitted = 0;
-    for (uint32_t i = 0; i < got; i++) {
+    for (uint32_t i = 0; i < got && pos < out_cap - 512; i++) {
         uint32_t phys = addrs[i] & 0x1FFFFFFFu;
         if (phys < flo || phys >= fhi) continue;
-        if (emitted > 0) send_fmt(",");
         /* Field names match runtime's handle_wtrace_dump exactly: addr,
          * new, ra, pc, cpu_pc, sp, v0/v1/a0..a3/t0/t1, frame, w.
          * Beetle-only extras: slot. Runtime-only fields (old, func) are
          * absent — tools must use .get(). */
-        send_fmt("{\"seq\":%llu,\"addr\":\"0x%08X\","
+        pos += (size_t)snprintf(out + pos, out_cap - pos,
+                 "%s{\"seq\":%llu,\"addr\":\"0x%08X\","
                  "\"new\":\"0x%08X\",\"ra\":\"0x%08X\","
                  "\"pc\":\"0x%08X\",\"cpu_pc\":\"0x%08X\",\"sp\":\"0x%08X\","
                  "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
@@ -567,6 +588,7 @@ static void h_wtrace_dump(int id, const char *json) {
                  "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
                  "\"t0\":\"0x%08X\",\"t1\":\"0x%08X\","
                  "\"frame\":%u,\"w\":%u,\"slot\":%u}",
+                 (emitted == 0) ? "" : ",",
                  (unsigned long long)seqs[i], addrs[i],
                  vals[i], ras[i],
                  pcs[i], pcs[i], sps[i],
@@ -576,7 +598,9 @@ static void h_wtrace_dump(int id, const char *json) {
                  frames[i], (unsigned)sizes[i], (unsigned)slots[i]);
         emitted++;
     }
-    send_fmt("],\"emitted\":%u}\n", emitted);
+    pos += (size_t)snprintf(out + pos, out_cap - pos, "],\"emitted\":%u}\n", emitted);
+    send_raw(out, (int)pos);
+    free(out);
 
     free(seqs); free(addrs); free(vals); free(pcs); free(ras); free(sps);
     free(v0s); free(v1s); free(a0s); free(a1s); free(a2s); free(a3s);
@@ -1054,11 +1078,13 @@ typedef struct { const char *name; cmd_handler handler; } CmdEntry;
 static const CmdEntry CMDS[] = {
     { "ping",                  h_ping },
     { "read_ram",              h_read_ram },
+    { "dump_ram",              h_read_ram },        /* alias, parity with native */
     { "press",                 h_press },
     { "set_input",             h_set_input },
     { "clear_input",           h_clear_input },
     { "pad_status",            h_pad_status },
-    { "screenshot_file",       h_screenshot_file },
+    { "screenshot",            h_screenshot_file },
+    { "screenshot_file",       h_screenshot_file },  /* alias */
     { "sio_trace_reset",       h_sio_trace_reset },
     { "sio_trace",             h_sio_trace },
     { "sio_write_window",      h_sio_write_window },
@@ -1221,8 +1247,11 @@ void beetle_debug_server_shutdown(void) {
 }
 
 int beetle_debug_server_get_input_override(void) {
+    int cur = s_input_override;
+    /* s_input_frames == 0 means hold until clear_input (psx-runtime
+     * semantics). A finite count delivers exactly that many frames. */
     if (s_input_override >= 0 && s_input_frames > 0) {
         if (--s_input_frames == 0) s_input_override = -1;
     }
-    return s_input_override;
+    return cur;
 }

@@ -1021,6 +1021,7 @@ static void sdl_vblank_present(void) {
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_QUIT) {
+            psx_crash_trace_set_exit_origin("sdl_window_close");
             shutdown_runtime();
             std::exit(0);
         } else if (ev.type == SDL_CONTROLLERDEVICEADDED && controller_enabled) {

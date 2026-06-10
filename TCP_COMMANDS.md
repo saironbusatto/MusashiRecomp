@@ -17,9 +17,15 @@ The `debug_client.py` CLI can target either, or `compare` two at once to diff st
 
 ```bash
 python tools/debug_client.py <cmd> [args]           # native (port 4370)
+python tools/debug_client.py --port 4380 <cmd>      # psx-beetle
 python tools/debug_client.py --ds <cmd> [args]      # duckstation (port 4371)
 python tools/debug_client.py compare <cmd>          # run on both, diff results
 ```
+
+Commands without a bespoke CLI mapping pass through generically: extra
+args of the form `key=value` become JSON fields (ints when numeric, else
+strings), so every server command is reachable, e.g.
+`debug_client.py --port 4370 gpu_frame_dump frame=14528 count=65536`.
 
 ---
 
@@ -31,9 +37,8 @@ Columns: **N** = native, **D** = DuckStation oracle.
 |---|---|---|---|---|
 | `ping` / `frame` | ✓ | ✓ | — | Heartbeat + current frame number |
 | `get_registers` (`regs`) | ✓ | ✓ | — | All 32 GPRs + PC + HI + LO (native also: COP0 SR/Cause/EPC, I_STAT, I_MASK) |
-| `read_ram` | ✓ | ✓ | `addr`, `len` | Read bytes from PS1 address space as hex string |
+| `read_ram` | ✓ | ✓ | `addr`, `len` | Read bytes from PS1 address space as hex string — up to the full 2 MB in ONE response line. `dump_ram` is an alias (the old chunked multi-line variant is gone: it broke the one-request/one-response protocol and wedged the server) |
 | `write_ram` | ✓ | ✓ | `addr`, `hex` | Write bytes to PS1 address space |
-| `dump_ram` | ✓ | ✓ | `addr`, `len` | Chunked RAM read (up to 64 KB) |
 | `read_scratch` |   | ✓ | `addr`, `len` | Read PS1 scratchpad (0x1F800000 region) |
 | `read_vram` / `vram_peek` | ✓¹ | ✓ | `x`, `y`, `w`, `h` | Read 16-bit VRAM pixels (max 128×128) |
 | `gpu_state` | ✓ | ✓ | — | Display area, display depth, draw offset, GPUSTAT, clip rect, xfer state |
@@ -47,7 +52,7 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `cdrom_sector_history_clear` | ✓ |   | — | Reset the CD-ROM sector history ring |
 | `watch` | ✓ | ✓ | `addr` | Set byte-level memory watchpoint (fires per-frame on change) |
 | `unwatch` | ✓ | ✓ | `addr` | Remove memory watchpoint |
-| `set_input` | ✓ | ✓ | `buttons`, optional `lx`, `ly`, `rx`, `ry` | Override pad1 buttons and optional analog axes (PS1 inverted bitmask, 0 = pressed; axes 0-255) |
+| `set_input` | ✓ | ✓ | `buttons`, optional `frames`, optional `lx`, `ly`, `rx`, `ry` | Override pad1 buttons and optional analog axes (PS1 inverted bitmask, 0 = pressed; axes 0-255). Holds until `clear_input` on both backends; pass `frames=N` (beetle) to auto-release after N frames |
 | `clear_input` | ✓ | ✓ | — | Remove input and analog axis overrides |
 | `turbo` | ✓ |   | `enabled` | Enable/disable TCP-controlled frontend turbo for fast-forward validation |
 | `turbo_state` | ✓ |   | — | Query TCP-controlled turbo state |
@@ -61,11 +66,11 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `frame_timeseries` | ✓ | ✓ | `start`, `end` | Compact timeseries, max 200 frames |
 | `set_snapshot` | ✓ | ✓ | `slot`, `addr`, `size` | Configure per-frame RAM snapshot region (slots 0-3) |
 | `get_snapshots` | ✓ | ✓ | — | Show snapshot config |
-| `screenshot` | ✓ | ✓ | `path` | Save display to PNG/file; native row dumps report `rgb555` or `rgb888` to match display depth |
+| `screenshot` | ✓ | ✓ | `path` (optional) | Write a 24-bit BMP of the current display to `path` (default `psx_screenshot.bmp` in the runtime cwd); single metadata response `{path,width,height}`. `screenshot_file` is an alias; the old inline-hex-row `screenshot` is gone (it streamed h+1 response lines per request and poisoned the connection) |
 | `first_failure` | ✓ |   | — | Find first divergence point between runs (native-side tracking) |
 | `read_frame_ram` | ✓ |   | `addr`, `len`, `frame` | Read RAM **as of a specific frame** (from ring buffer) |
 | `wtrace_range` | ✓ |   | `lo`, `hi` | Set RAM-write trace range (ring of 1024 writes with RA) |
-| `wtrace_dump` | ✓ |   | — | Dump RAM-write trace entries as JSON |
+| `wtrace_dump` | ✓ | beetle | optional `addr_lo`, `addr_hi`, `count`, `newest` | Dump RAM-write trace entries as JSON. The address filter is applied server-side over the FULL ring before the emit cap — always pass it when hunting a specific buffer, otherwise you only see the oldest `count` entries of the whole ring |
 | `wtrace_clear` | ✓ |   | — | Reset the trace ring |
 | `pc_break` |   | ✓² | `addr` | DS execute breakpoint, state captured on hit (via `pc_hit_last`) |
 | `pc_unbreak` |   | ✓² | `addr` | Remove an execute breakpoint |

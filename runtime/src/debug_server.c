@@ -24,6 +24,7 @@
 #include "dirty_ram_interp.h"
 #include "card_read_summary.h"
 #include "card_data_writes.h"
+#include "crash_trace.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -3968,22 +3969,42 @@ static int json_get_axis_u8(const char *json, const char *key, uint8_t *out)
 
 /* ---- Send helpers ---- */
 
-static void send_all_blocking(sock_t sock, const char *data, size_t len)
+/* Bounded blocking send. Returns 0 on success, -1 on failure/timeout.
+ *
+ * The server is pumped on the main thread, so an unbounded send to a
+ * client that has stopped draining stalls the emulator until the
+ * starvation watchdog (4 s) kills the whole process. Each chunk gets a
+ * 2 s send timeout and a watchdog heartbeat, so a healthy-but-slow
+ * client can take as long as it likes (progress = heartbeats), while a
+ * wedged client costs at most one timeout and then loses its
+ * connection — never the runtime. */
+static int send_all_blocking(sock_t sock, const char *data, size_t len)
 {
+    int ok = 0;
 #ifdef _WIN32
     u_long mode = 0;
     ioctlsocket(sock, FIONBIO, &mode);
+    DWORD tmo = 2000;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tmo, sizeof(tmo));
 #else
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
+    struct timeval tmo = { 2, 0 };
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tmo, sizeof(tmo));
 #endif
-    /* send() takes int on Win32; chunk so we can transmit > 2 GB payloads. */
     size_t sent = 0;
     while (sent < len) {
         size_t want = len - sent;
-        if (want > (1u << 30)) want = (1u << 30);
+        if (want > (1u << 20)) want = (1u << 20);
         int n = send(sock, data + sent, (int)want, 0);
-        if (n > 0) { sent += (size_t)n; continue; }
+        if (n > 0) {
+            sent += (size_t)n;
+            /* Legitimate debug traffic in flight — not starvation. */
+            extern void starvation_watchdog_heartbeat(void);
+            starvation_watchdog_heartbeat();
+            continue;
+        }
+        ok = -1;
         break;
     }
 #ifdef _WIN32
@@ -3992,14 +4013,20 @@ static void send_all_blocking(sock_t sock, const char *data, size_t len)
 #else
     fcntl(sock, F_SETFL, flags);
 #endif
+    return ok;
 }
 
 void debug_server_send_line(const char *json)
 {
     if (s_client == SOCK_INVALID) return;
     size_t len = strlen(json);
-    send_all_blocking(s_client, json, len);
-    send_all_blocking(s_client, "\n", 1);
+    if (send_all_blocking(s_client, json, len) != 0 ||
+        send_all_blocking(s_client, "\n", 1) != 0) {
+        /* Client stopped draining — drop the connection, keep the
+         * runtime. The next poll() accepts a fresh client. */
+        sock_close(s_client);
+        s_client = SOCK_INVALID;
+    }
 }
 
 void debug_server_send_fmt(const char *fmt, ...)
@@ -4125,37 +4152,26 @@ static void handle_read_ram(int id, const char *json)
                        "{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"len\":%d,\"hex\":\"",
                        id, addr, len);
     char *hex = out + hdr;
-    for (int i = 0; i < len; i++)
-        snprintf(hex + (size_t)i * 2, 3, "%02x", psx_read_byte(addr + (uint32_t)i));
+    /* Nibble-table encode: snprintf per byte costs seconds for a 2 MB
+     * read, which stalls the main-thread-pumped server (and the SDL
+     * event loop) long enough to look like a wedge. */
+    static const char H[] = "0123456789abcdef";
+    for (int i = 0; i < len; i++) {
+        uint8_t b = psx_read_byte(addr + (uint32_t)i);
+        hex[(size_t)i * 2]     = H[b >> 4];
+        hex[(size_t)i * 2 + 1] = H[b & 0xF];
+    }
     char *tail = hex + (size_t)len * 2;
     memcpy(tail, "\"}", 3);
     debug_server_send_line(out);
     free(out);
 }
 
-static void handle_dump_ram(int id, const char *json)
-{
-    char addr_str[32];
-    if (!json_get_str(json, "addr", addr_str, sizeof(addr_str))) {
-        send_err(id, "missing addr"); return;
-    }
-    uint32_t addr = hex_to_u32(addr_str);
-    int len = json_get_int(json, "len", 256);
-    if (len < 1) len = 1;
-    if (len > 4096) len = 4096;
-
-    int offset = 0;
-    while (offset < len) {
-        int chunk = len - offset;
-        if (chunk > 256) chunk = 256;
-        char hex[513];
-        for (int i = 0; i < chunk; i++)
-            snprintf(hex + i * 2, 3, "%02x", psx_read_byte(addr + offset + i));
-        send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"offset\":%d,\"len\":%d,\"hex\":\"%s\"}",
-                 id, addr + offset, offset, chunk, hex);
-        offset += chunk;
-    }
-}
+/* "dump_ram" is an alias of "read_ram".  The old implementation answered a
+ * single request with one response line per 256-byte chunk; any client that
+ * follows the one-request/one-response protocol left the extra lines unread,
+ * the socket send buffer filled, the main-thread-pumped server blocked, and
+ * the freeze watchdog killed the process.  One request, one response. */
 
 static void handle_write_ram(int id, const char *json)
 {
@@ -6560,6 +6576,12 @@ static void handle_get_snapshots(int id, const char *json)
              s_snapshot_addrs[3], s_snapshot_active[3]);
 }
 
+/* Unified screenshot: writes a 24-bit BMP of the current display to "path"
+ * (default psx_screenshot.bmp in the runtime cwd) and answers with a single
+ * metadata line.  Registered as both "screenshot" and "screenshot_file";
+ * the old "screenshot" inline-hex-row variant streamed h+1 response lines
+ * per request, which violated the one-request/one-response protocol and
+ * poisoned every client connection that used it. */
 static void handle_screenshot_file(int id, const char *json)
 {
     GpuDisplayInfo di;
@@ -6623,65 +6645,29 @@ static void handle_screenshot_file(int id, const char *json)
              id, path, w, h);
 }
 
-static void handle_screenshot(int id, const char *json)
-{
-    (void)json;
-    /* Read display area from GPU and encode as display-format hex rows. */
-    GpuDisplayInfo di;
-    gpu_get_display_info(&di);
-
-    if (di.disabled || di.width == 0 || di.height == 0) {
-        send_err(id, "display disabled"); return;
-    }
-
-    uint32_t w = di.width;
-    uint32_t h = di.height;
-    if (w > 640) w = 640;
-    if (h > 512) h = 512;
-
-    /* Send metadata first */
-    send_fmt("{\"id\":%d,\"ok\":true,\"width\":%u,\"height\":%u,\"format\":\"%s\"}",
-             id, w, h, di.depth24 ? "rgb888" : "rgb555");
-
-    /* Send rows as hex lines */
-    uint32_t chars_per_pixel = di.depth24 ? 6u : 4u;
-    char *hex = (char *)malloc((size_t)w * chars_per_pixel + 32u);
-    if (!hex) return;
-
-    for (uint32_t y = 0; y < h; y++) {
-        for (uint32_t x = 0; x < w; x++) {
-            if (di.depth24) {
-                uint8_t r, g, b;
-                gpu_display_pixel_rgb(&di, x, y, &r, &g, &b);
-                snprintf(hex + x * 6, 7, "%02x%02x%02x", r, g, b);
-            } else {
-                uint16_t pixel = gpu_vram_peek((int)(di.display_x + x), (int)(di.display_y + y));
-                snprintf(hex + x * 4, 5, "%04x", pixel);
-            }
-        }
-        send_fmt("{\"row\":%u,\"hex\":\"%s\"}", y, hex);
-    }
-    free(hex);
-}
-
 static void handle_vram_peek(int id, const char *json)
 {
     int x = json_get_int(json, "x", 0);
     int y = json_get_int(json, "y", 0);
     int w = json_get_int(json, "w", 8);
     int h = json_get_int(json, "h", 1);
-    if (w > 64) w = 64;
-    if (h > 64) h = 64;
-    char hex[64*64*4+1];
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (w > 128) w = 128;
+    if (h > 128) h = 128;
+    size_t hex_len = (size_t)w * h * 4 + 1;
+    char *hex = (char *)malloc(hex_len);
+    if (!hex) { send_err(id, "alloc failed"); return; }
     int pos = 0;
     for (int row = 0; row < h; row++) {
         for (int col = 0; col < w; col++) {
             uint16_t p = gpu_vram_peek(x + col, y + row);
-            pos += snprintf(hex + pos, sizeof(hex) - pos, "%04x", p);
+            pos += snprintf(hex + pos, hex_len - pos, "%04x", p);
         }
     }
     send_fmt("{\"id\":%d,\"ok\":true,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"hex\":\"%s\"}",
              id, x, y, w, h, hex);
+    free(hex);
 }
 
 /* ---- Write trace: hook + handlers (Tier 1 reverse debugger) ---- */
@@ -8052,6 +8038,7 @@ static void handle_quit(int id, const char *json)
 {
     (void)json;
     send_ok(id);
+    psx_crash_trace_set_exit_origin("tcp_quit");
     debug_server_shutdown();
     exit(0);
 }
@@ -9763,7 +9750,7 @@ static const CmdEntry s_commands[] = {
     { "frame",             handle_frame },
     { "get_registers",     handle_get_registers },
     { "read_ram",          handle_read_ram },
-    { "dump_ram",          handle_dump_ram },
+    { "dump_ram",          handle_read_ram },   /* alias: one request, one response */
     { "write_ram",         handle_write_ram },
     { "gpu_state",         handle_gpu_state },
     { "mem_words",         handle_mem_words },
@@ -9906,8 +9893,8 @@ static const CmdEntry s_commands[] = {
     { "read_frame_ram",    handle_read_frame_ram },
     { "set_snapshot",      handle_set_snapshot },
     { "get_snapshots",     handle_get_snapshots },
-    { "screenshot",        handle_screenshot },
-    { "screenshot_file",   handle_screenshot_file },
+    { "screenshot",        handle_screenshot_file },
+    { "screenshot_file",   handle_screenshot_file },   /* alias */
     { "gpu_opcodes",       handle_gpu_opcodes },
     { "gpu_ring_stats",    handle_gpu_ring_stats },
     { "gpu_frame_dump",    handle_gpu_frame_dump },

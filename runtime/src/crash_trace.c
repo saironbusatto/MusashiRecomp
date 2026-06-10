@@ -113,6 +113,18 @@ static void hex32(char *out, uint32_t v) {
     snprintf(out, 16, "\"0x%08X\"", v);
 }
 
+/* ── Exit origin ─────────────────────────────────────────────────────── */
+
+/* Deliberate exit() callers tag themselves here so an "atexit" report can
+ * distinguish a TCP quit from an SDL window close from an unexplained
+ * exit.  "unknown" in a report means NOBODY tagged — main returned or an
+ * untagged exit() fired; that is a finding, not noise. */
+static const char *s_exit_origin = "unknown";
+
+void psx_crash_trace_set_exit_origin(const char *origin) {
+    if (origin) s_exit_origin = origin;
+}
+
 /* ── Main entry ──────────────────────────────────────────────────────── */
 
 void psx_crash_trace_dump(const char *reason, void *seh_info) {
@@ -131,11 +143,13 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
     append_fmt(buf, sizeof(buf), &pos,
         "{\n"
         "  \"reason\": \"%s\",\n"
+        "  \"exit_origin\": \"%s\",\n"
         "  \"timestamp\": \"%s\",\n"
         "  \"frame\": %llu,\n"
         "  \"last_func_addr\": \"0x%08X\",\n"
         "  \"last_store_pc\": \"0x%08X\",\n",
         reason ? reason : "(unknown)",
+        s_exit_origin,
         ts,
         (unsigned long long)s_frame_count,
         g_debug_current_func_addr,
