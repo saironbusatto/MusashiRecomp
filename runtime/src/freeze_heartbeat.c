@@ -146,6 +146,9 @@ static uint32_t s_last_wedge_kind = 0;  /* informational, last detected kind */
 static void freeze_dump_main_stack_json(FILE *f) {
     if (!f) return;
     if (!s_main_thread) { fputs("[]", f); return; }
+    /* Never suspend self: a dump running ON the main thread (fatal path)
+     * must not walk the main thread — SuspendThread(self) parks forever. */
+    if (GetCurrentThreadId() == s_main_thread_id) { fputs("[]", f); return; }
 
     if (!s_sym_initialized) {
         SymSetOptions(SYMOPT_LOAD_LINES | SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
@@ -249,6 +252,8 @@ static void freeze_dump_main_stack_json(FILE *f) {
  * array of per-sample frame arrays: [[...],[...],...]. */
 static void freeze_dump_main_stack_samples_json(FILE *f, int n) {
     if (!f) return;
+    /* Never suspend self (see freeze_dump_main_stack_json). */
+    if (GetCurrentThreadId() == s_main_thread_id) { fputs("[]", f); return; }
     fputc('[', f);
     for (int i = 0; i < n; i++) {
         if (i) fputc(',', f);
@@ -259,6 +264,14 @@ static void freeze_dump_main_stack_samples_json(FILE *f, int n) {
 }
 #endif /* _WIN32 */
 
+/* One dump at a time. The watchdog (heartbeat thread) and psx_fatal_halt
+ * (main thread) can both reach freeze_dump_write concurrently; they share
+ * the static io_buf via setvbuf and the stack walkers suspend the main
+ * thread — racing them corrupted BOTH dump files and self-suspended the
+ * main thread mid-dump (2026-06-10 chest-freeze postmortem). First dump
+ * in wins; the loser skips (same rings either way). */
+static volatile long s_dump_in_progress = 0;
+
 static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
                               uint64_t exc_reentry, uint32_t cur_fn,
                               uint32_t last_store, uint32_t i_stat_v,
@@ -268,12 +281,25 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
                               uint16_t sio_stat_v, uint16_t sio_ctrl_v,
                               int sio_card_active, int mc_max, int tx_writes)
 {
+    /* Snapshot the kind at entry — the global can be flipped mid-write by
+     * the other thread, which is what sent the fatal (kind 4) path into
+     * the SuspendThread stack walkers on the main thread. */
+    uint32_t wedge_kind = s_last_wedge_kind;
+
+#ifdef _WIN32
+    if (InterlockedCompareExchange((volatile LONG *)&s_dump_in_progress, 1, 0) != 0)
+        return;
+#else
+    if (__sync_lock_test_and_set(&s_dump_in_progress, 1) != 0)
+        return;
+#endif
+
     char path[128];
     snprintf(path, sizeof(path),
              "psx_freeze_dump_%s_%lld.json", s_backend, wall);
 
     FILE *f = fopen(path, "wb");
-    if (!f) return;
+    if (!f) { s_dump_in_progress = 0; return; }
 
     /* Large stdio buffer so multi-MB JSON arrays write efficiently. */
     static char io_buf[1 << 16];
@@ -327,11 +353,11 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         debug_server_get_tcp_drops(),
         g_present_slow_count,
         g_present_vsync_disabled,
-        s_last_wedge_kind,
-        (s_last_wedge_kind == 1) ? "hard_freeze" :
-        (s_last_wedge_kind == 2) ? "reentry_storm" :
-        (s_last_wedge_kind == 3) ? "slow_frames" :
-        (s_last_wedge_kind == 4) ? "fatal" : "unknown",
+        wedge_kind,
+        (wedge_kind == 1) ? "hard_freeze" :
+        (wedge_kind == 2) ? "reentry_storm" :
+        (wedge_kind == 3) ? "slow_frames" :
+        (wedge_kind == 4) ? "fatal" : "unknown",
         (unsigned)DUMP_CAP_WTRACE_ALL,
         (unsigned)DUMP_CAP_WTRACE,
         (unsigned)DUMP_CAP_FRAME_HISTORY,
@@ -405,13 +431,13 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
      * samples in `main_stack_samples` to expose the recurring wait (the
      * dispatch/handler chain, or a driver present block). */
     fputs("  \"main_stack\":", f);
-    if (s_last_wedge_kind == 1) {
+    if (wedge_kind == 1) {
         freeze_dump_main_stack_json(f);
     } else {
         fputs("[]", f);
     }
     fputs(",\n  \"main_stack_samples\":", f);
-    if (s_last_wedge_kind == 2 || s_last_wedge_kind == 3) {
+    if (wedge_kind == 2 || wedge_kind == 3) {
         freeze_dump_main_stack_samples_json(f, 8);
     } else {
         fputs("[]", f);
