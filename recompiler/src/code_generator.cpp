@@ -1646,7 +1646,8 @@ std::string CodeGenerator::generate_file(
     // Include the generic PSX runtime header.
     // This provides CPUState, GTE/trap declarations, and call_by_address().
     ss << "#include \"psx_runtime.h\"\n\n";
-    ss << "extern void debug_server_log_call_entry_cpu(uint32_t func_addr, CPUState *cpu);\n\n";
+    ss << "extern void debug_server_log_call_entry_cpu(uint32_t func_addr, CPUState *cpu);\n";
+    ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n\n";
 
     // Emit reference implementations for unaligned memory helpers.
     // These implement the MIPS lwl/lwr/swl/swr semantics.
