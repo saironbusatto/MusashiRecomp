@@ -26,8 +26,19 @@ extern "C" {
  * ran a basic block at that PC.  Returns 0 if `addr` is clean (caller must
  * fall back to the static dispatch table).  On return with 1, cpu->pc is
  * either 0 (block ended on jr $ra style return) or the target of a tail
- * jump that the dispatch trampoline should re-enter. */
-int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);
+ * jump that the dispatch trampoline should re-enter.
+ *
+ * `stop_addr` is the dispatch loop's return contract (psx_dispatch_call's
+ * return_addr; 0 for plain tail dispatches).  The interpreter's overlay
+ * local-flow chaining MUST NOT run past it: when a transfer (or fall-
+ * through) reaches stop_addr, the interpreter exits with cpu->pc ==
+ * stop_addr so the dispatch loop returns into the suspended native
+ * caller.  Skipping this check lets the interp execute the native
+ * caller's tail itself; the suspended native host frame then resumes and
+ * double-executes that tail against a moved guest stack, restoring
+ * garbage callee-saved registers (the pig-throw blue-screen/MMIO-fatal
+ * corruption, 2026-06-10). */
+int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
 
 /* Overlay-cache windows — the address ranges eligible for capture, offline
  * recompilation, and per-entry-validated native execution (Rule 18 code that
