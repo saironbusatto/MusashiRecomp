@@ -1072,7 +1072,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "    return phys;\n";
     out += "}\n\n";
 
-    out += "extern int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);\n";
+    out += "extern int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr);\n";
     out += "extern int dirty_ram_is_dirty(uint32_t phys);\n";
     out += "extern void fntrace_record(CPUState* cpu, uint32_t target);\n";
     out += "extern uint64_t g_dispatch_static_hits;\n";
@@ -1100,7 +1100,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "         * path before normalizing it to shell ROM. */\n";
     out += "        uint32_t game_phys = addr & 0x1FFFFFFFu;\n";
     out += "        if (psx_game_address_in_text(addr) && dirty_ram_is_dirty(game_phys)) {\n";
-    out += "            found = dirty_ram_dispatch(cpu, addr);\n";
+    out += "            found = dirty_ram_dispatch(cpu, addr, stop_addr);\n";
     out += "        }\n";
     out += "#endif\n";
     out += "        uint32_t phys = normalize(addr);\n";
@@ -1127,7 +1127,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "         * boot, interpret the basic block on cpu state.  Falls back to\n";
     out += "         * psx_unknown_dispatch for genuinely unmapped PCs. */\n";
     out += "        if (!found) {\n";
-    out += "            if (dirty_ram_dispatch(cpu, addr)) {\n";
+    out += "            if (dirty_ram_dispatch(cpu, addr, stop_addr)) {\n";
     out += "                found = 1;\n";
     out += "            } else {\n";
     out += "                psx_unknown_dispatch(cpu, addr, phys);\n";

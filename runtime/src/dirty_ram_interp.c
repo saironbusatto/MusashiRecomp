@@ -812,7 +812,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     return 0;
 }
 
-static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr);
+static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
 
 /* Public entry point.  Caller (psx_dispatch) has translated `addr` to a
  * KSEG-stripped form already in some cases, so accept any address and
@@ -824,15 +824,15 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr);
  * event-timeline ring can tag events as INTERP vs STATIC. The EPC-sentinel
  * branch inside can longjmp out (not restoring here); psx_check_interrupts
  * clears the flag at its longjmp landing to cover that case. */
-int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
+int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     int prev = g_dirty_interp_active;
     g_dirty_interp_active = 1;
-    int r = dirty_ram_dispatch_inner(cpu, addr);
+    int r = dirty_ram_dispatch_inner(cpu, addr, stop_addr);
     g_dirty_interp_active = prev;
     return r;
 }
 
-static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr) {
+static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (addr == 0x80000048u) {
@@ -999,6 +999,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr) {
 #endif
             uint32_t target_phys = target & 0x1FFFFFFFu;
             if (allow_local_dirty_flow && target != 0 &&
+                target != stop_addr &&
                 target_phys >= OVERLAY_REGION_FLOOR &&
                 dirty_ram_is_dirty(target_phys)) {
                 /* Capture freeze gates ONLY the ring write — never flow. */
@@ -1031,6 +1032,16 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr) {
             OV_FPLOG_RET1();
         }
         pc = next_pc;
+        /* Straight-line flow reaching the dispatch return contract — exit
+         * so the loop returns into the suspended native caller (same
+         * hazard as a transfer to stop_addr). */
+        if (stop_addr != 0 && pc == stop_addr) {
+            cpu->pc = pc;
+            g_dirty_ram_blocks_run++;
+            if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+            g_dirty_interp_chain_target = pc;
+            OV_FPLOG_RET1();
+        }
         /* Straight-line code that left the dirty page — hand back to
          * static dispatch by setting cpu->pc and returning. */
         uint32_t next_phys = pc & 0x1FFFFFFFu;

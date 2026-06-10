@@ -826,7 +826,7 @@ void overlay_loader_set_diff_mode(int on) { s_diff_mode = on ? 1 : 0; }
 static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     extern uint8_t *memory_get_ram_ptr(void);
     extern uint8_t *memory_get_scratchpad_ptr(void);
-    extern int dirty_ram_dispatch(CPUState *cpu, uint32_t addr);
+    extern int dirty_ram_dispatch(CPUState *cpu, uint32_t addr, uint32_t stop_addr);
     uint8_t *ram  = memory_get_ram_ptr();
     uint8_t *spad = memory_get_scratchpad_ptr();
 
@@ -853,7 +853,9 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     memcpy(spad, s_spad0, SHADOW_SPAD_SIZE);
     int sv = s_native_exec;
     s_native_exec = 0;
-    dirty_ram_dispatch(cpu, addr);      /* runs interp for addr (guarded)    */
+    /* Shadow run executes the candidate to its return: the entry $ra is the
+     * stop contract, same as the live dispatch path. */
+    dirty_ram_dispatch(cpu, addr, cpu->gpr[31]);  /* runs interp (guarded) */
     s_native_exec = sv;
 
     s_shadow_calls++;
