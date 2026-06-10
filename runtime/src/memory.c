@@ -106,6 +106,70 @@ void dirty_ram_set_bitmap_words(const uint32_t* words, uint32_t count) {
         dirty_ram_bitmap[i] = words[i];
 }
 
+/* ---- Inc3: watched overlay pages + per-page generation counters ---------
+ * Pages covered by a registered overlay function's code range. The store path
+ * (the single, audited RAM-write chokepoint — all CPU + DMA stores funnel
+ * here) tests the watch bitmap and, on a hit, bumps that page's generation
+ * counter. It does NOT eagerly invalidate (Inc1-D did): validity is now decided
+ * lazily, per compiled entry, at dispatch time (overlay_loader.c §8). The
+ * generation counter lets the loader cheaply detect "did any page covering this
+ * entry's code change since I last validated it?" without hashing on the store
+ * path. Monotonic: gen only increases, so a sum over an entry's pages is a
+ * perfect change detector (no aliasing).
+ *
+ * The bitmap is almost always empty, so the per-store cost on the common path
+ * is a single bitmap lookup.
+ */
+static uint32_t overlay_watch_bitmap[DIRTY_RAM_BITMAP_WORDS];
+static uint32_t overlay_page_gen[DIRTY_RAM_PAGE_COUNT];
+
+void overlay_watch_set_range(uint32_t phys, uint32_t len) {
+    if (len == 0 || phys >= RAM_SIZE) return;
+    uint32_t end = phys + len - 1u;
+    if (end >= RAM_SIZE || end < phys) end = RAM_SIZE - 1u;
+    uint32_t fp = phys >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t lp = end  >> DIRTY_RAM_PAGE_SHIFT;
+    for (uint32_t pg = fp; pg <= lp; pg++)
+        overlay_watch_bitmap[pg >> 5] |= (1u << (pg & 31u));
+}
+
+void overlay_watch_clear_range(uint32_t phys, uint32_t len) {
+    if (len == 0 || phys >= RAM_SIZE) return;
+    uint32_t end = phys + len - 1u;
+    if (end >= RAM_SIZE || end < phys) end = RAM_SIZE - 1u;
+    uint32_t fp = phys >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t lp = end  >> DIRTY_RAM_PAGE_SHIFT;
+    for (uint32_t pg = fp; pg <= lp; pg++)
+        overlay_watch_bitmap[pg >> 5] &= ~(1u << (pg & 31u));
+}
+
+/* Sum of generation counters over the pages spanning [phys, phys+len). The
+ * loader stores this at validation time and compares on dispatch; any change
+ * means a watched page in the range was written. */
+uint32_t overlay_watch_pagegen_sum(uint32_t phys, uint32_t len) {
+    if (len == 0 || phys >= RAM_SIZE) return 0;
+    uint32_t end = phys + len - 1u;
+    if (end >= RAM_SIZE || end < phys) end = RAM_SIZE - 1u;
+    uint32_t fp = phys >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t lp = end  >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t sum = 0;
+    for (uint32_t pg = fp; pg <= lp; pg++) sum += overlay_page_gen[pg];
+    return sum;
+}
+
+static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
+    uint32_t pg = phys >> DIRTY_RAM_PAGE_SHIFT;
+    if (pg >= DIRTY_RAM_PAGE_COUNT) return;
+    if ((overlay_watch_bitmap[pg >> 5] >> (pg & 31u)) & 1u) {
+        overlay_page_gen[pg]++;
+        /* Self-modification of a currently-executing native entry cannot be
+         * recovered lazily (the next dispatch is too late) — the loader
+         * blacklists that entry. Everything else is handled at dispatch. */
+        extern void overlay_loader_active_write_check(uint32_t phys, uint32_t size);
+        overlay_loader_active_write_check(phys, size);
+    }
+}
+
 /* Memory control registers: 0x1F801000..0x1F80103F (16 words) + 0x1F801060 (RAM size).
  * Includes expansion base/size, COM_DELAY, SPU_DELAY, CDROM_DELAY etc. */
 static uint32_t mem_ctrl[16];   /* indices 0..15 → addresses 0x1F801000..0x1F80103C */
@@ -591,6 +655,7 @@ void psx_write_word(uint32_t addr, uint32_t val) {
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
         card_data_writes_check(phys, val, 4);
         dirty_ram_mark_kernel_write(phys);
+        overlay_watch_note_write(phys, 4);
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         ram[phys + 2] = (uint8_t)(val >> 16);
@@ -655,6 +720,7 @@ void psx_write_half(uint32_t addr, uint16_t val) {
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
         card_data_writes_check(phys, (uint32_t)val, 2);
         dirty_ram_mark_kernel_write(phys);
+        overlay_watch_note_write(phys, 2);
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         return;
@@ -708,6 +774,7 @@ void psx_write_byte(uint32_t addr, uint8_t val) {
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
         card_data_writes_check(phys, (uint32_t)val, 1);
         dirty_ram_mark_kernel_write(phys);
+        overlay_watch_note_write(phys, 1);
         ram[phys] = val;
         return;
     }

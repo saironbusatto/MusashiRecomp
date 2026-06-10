@@ -3,6 +3,7 @@
  * Beetle's framebuffer, keyboard input, TCP debug server on port 4380. */
 
 #include <SDL.h>
+#include "frame_pacing.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -170,21 +171,7 @@ int main(int argc, char** argv) {
         const Uint8* keys = SDL_GetKeyboardState(NULL);
         if (keys && keys[SDL_SCANCODE_TAB]) continue;
         constexpr double FRAME_MS = 1000.0 / 59.94;
-        static Uint64 deadline = 0;
-        Uint64 freq = SDL_GetPerformanceFrequency();
-        Uint64 period = (Uint64)((double)freq * (FRAME_MS / 1000.0));
-        Uint64 now = SDL_GetPerformanceCounter();
-        if (deadline == 0 || now >= deadline + period) {
-            deadline = now + period;
-        } else {
-            while (SDL_GetPerformanceCounter() < deadline) {
-                Uint64 left = deadline - SDL_GetPerformanceCounter();
-                Uint64 ms = (left * 1000) / freq;
-                if (ms >= 2) SDL_Delay((Uint32)(ms - 1));
-                else break;
-            }
-            while (SDL_GetPerformanceCounter() < deadline) { /* spin */ }
-            deadline += period;
-        }
+        static FramePacer pacer = { 0 };
+        frame_pacer_wait(&pacer, FRAME_MS);
     }
 }

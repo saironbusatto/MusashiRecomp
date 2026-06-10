@@ -8,6 +8,8 @@
  * so TCP.md and DEBUG.md are reusable across projects.
  */
 #include "debug_server.h"
+#include "overlay_loader.h"
+#include "overlay_capture.h"
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
@@ -1961,6 +1963,16 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
     exception_trace_record(0, func_addr, debug_cpu_ptr);
     card_mgr_trace_record(func_addr, 1);
 
+    {
+        uint32_t vphys = func_addr & 0x1FFFFFFFu;
+        if ((vphys == 0xA0u || vphys == 0xB0u || vphys == 0xC0u) && debug_cpu_ptr) {
+            psx_bioscall_record(vphys, debug_cpu_ptr->gpr[9], 0,
+                                debug_cpu_ptr->gpr[4], debug_cpu_ptr->gpr[5],
+                                debug_cpu_ptr->gpr[6], debug_cpu_ptr->gpr[7],
+                                debug_cpu_ptr->gpr[31]);
+        }
+    }
+
     /* Function entry/exit rings (always-on, hooked here so every dispatch
      * is recorded with args and a return value when the call unwinds). */
     function_trace_record(func_addr);
@@ -2100,11 +2112,13 @@ static void handle_dirty_ram_stats(int id, const char *json)
         DirtyRamPcEntry *e = &g_dirty_ram_pc_table[i];
         if (e->pc == 0 || e->hits == 0) continue;
         n += snprintf(buf + n, sizeof(buf) - n,
-                      "%s{\"pc\":\"0x%08X\",\"hits\":%llu,\"insns\":%llu}",
+                      "%s{\"pc\":\"0x%08X\",\"hits\":%llu,\"insns\":%llu,"
+                      "\"entries\":%llu}",
                       first ? "" : ",",
                       (unsigned)e->pc,
                       (unsigned long long)e->hits,
-                      (unsigned long long)e->insns);
+                      (unsigned long long)e->insns,
+                      (unsigned long long)e->entry_hits);
         first = 0;
         if (n >= (int)sizeof(buf) - 128) break;
     }
@@ -2517,6 +2531,81 @@ static void handle_dirty_insn_ranges(int id, const char *json)
     pos += snprintf(out + pos, BUF_SZ - pos, "]}");
     debug_server_send_line(out);
     free(out);
+}
+
+/* dirty_block_dump_file: write the WHOLE live block-log window (oldest->newest)
+ * to a file. Inline dumps above ~2MB wedge the single-threaded server (seen
+ * twice); file dumps are the only safe path for full-ring extraction. */
+static void handle_dirty_block_dump_file(int id, const char *json)
+{
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        snprintf(path, sizeof(path), "dirty_block_log.json");
+    FILE *f = fopen(path, "w");
+    if (!f) { send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"open failed\"}\n", id); return; }
+    uint64_t total = g_dirty_ram_block_log_seq;
+    uint64_t avail = (total < DIRTY_RAM_BLOCK_LOG_CAP) ? total : DIRTY_RAM_BLOCK_LOG_CAP;
+    fputc('[', f);
+    int first = 1, count = 0;
+    for (uint64_t s = total - avail; s < total; s++) {
+        DirtyRamBlockLogEntry *e =
+            &g_dirty_ram_block_log[s & (DIRTY_RAM_BLOCK_LOG_CAP - 1u)];
+        fprintf(f,
+            "%s{\"seq\":%llu,\"target\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+            "\"t0\":\"0x%08X\",\"t1\":\"0x%08X\",\"t2\":\"0x%08X\","
+            "\"sp\":\"0x%08X\",\"frame\":%u}",
+            first ? "" : ",\n",
+            (unsigned long long)e->seq, e->target, e->ra,
+            e->a0, e->a1, e->a2, e->a3, e->t0, e->t1, e->t2,
+            e->sp, e->frame);
+        first = 0; count++;
+    }
+    fputs("]\n", f);
+    fclose(f);
+    send_fmt("{\"id\":%d,\"ok\":true,\"file\":\"%s\",\"entries\":%d}\n",
+             id, path, count);
+}
+
+/* dirty_insn_dump_file: write the WHOLE live insn-log window (oldest->newest)
+ * as a JSON array to a file. The inline dirty_insn_log path serializes into a
+ * bounded TCP buffer and wedges the server on multi-MB dumps — file dumps have
+ * no size limit and leave the server responsive. */
+static void handle_dirty_insn_dump_file(int id, const char *json)
+{
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        snprintf(path, sizeof(path), "dirty_insn_log.json");
+    FILE *f = fopen(path, "w");
+    if (!f) { send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"open failed\"}\n", id); return; }
+    uint64_t total = g_dirty_ram_insn_log_seq;
+    uint64_t avail = (total < DIRTY_RAM_INSN_LOG_CAP) ? total : DIRTY_RAM_INSN_LOG_CAP;
+    fputc('[', f);
+    int first = 1, count = 0;
+    for (uint64_t s = total - avail; s < total; s++) {
+        DirtyRamInsnLogEntry *e =
+            &g_dirty_ram_insn_log[s & (DIRTY_RAM_INSN_LOG_CAP - 1u)];
+        fprintf(f,
+            "%s{\"seq\":%llu,\"pc\":\"0x%08X\",\"insn\":\"0x%08X\","
+            "\"next_pc\":\"0x%08X\",\"target\":\"0x%08X\","
+            "\"before_s0\":\"0x%08X\",\"after_s0\":\"0x%08X\","
+            "\"sp\":\"0x%08X\",\"ra\":\"0x%08X\","
+            "\"v0\":\"0x%08X\",\"v1\":\"0x%08X\","
+            "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+            "\"t0\":\"0x%08X\",\"t1\":\"0x%08X\",\"t2\":\"0x%08X\","
+            "\"frame\":%u,\"transferred\":%u}",
+            first ? "" : ",\n",
+            (unsigned long long)e->seq,
+            e->pc, e->insn, e->next_pc, e->target,
+            e->before_s0, e->after_s0, e->sp, e->ra,
+            e->v0, e->v1, e->a0, e->a1, e->a2, e->a3,
+            e->t0, e->t1, e->t2, e->frame, (unsigned)e->transferred);
+        first = 0; count++;
+    }
+    fputs("]\n", f);
+    fclose(f);
+    send_fmt("{\"id\":%d,\"ok\":true,\"file\":\"%s\",\"entries\":%d}\n",
+             id, path, count);
 }
 
 /* ---- fntrace: always-on psx_dispatch call ring ----
@@ -8299,6 +8388,448 @@ static void handle_fn_exit_dump(int id, const char *json) {
     free(buf);
 }
 
+/* cd_read_log: dump the CD DMA transfer ring.  Each entry records the
+ * setloc LBA, destination RAM address, and byte count for one forward
+ * channel-3 DMA transfer.  Use with overlay_dump to map overlay regions
+ * back to their disc positions for the extract_overlays.py disc scanner.
+ *
+ * Parameters: "tail" (int, default 256) — how many recent entries to return.
+ */
+static void handle_cd_read_log(int id, const char *json)
+{
+    extern uint32_t cd_dma_log_get_total(void);
+    extern void     cd_dma_log_get_entry(uint32_t idx, int *lba,
+                                         uint32_t *dest, uint32_t *size);
+
+    int tail = json_get_int(json, "tail", 256);
+    uint32_t total = cd_dma_log_get_total();
+    uint32_t cap   = 65536;
+    uint32_t avail = total < cap ? total : cap;
+    if ((uint32_t)tail > avail) tail = (int)avail;
+
+    uint32_t start_idx = total > (uint32_t)tail ? total - (uint32_t)tail : 0;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"count\":%d,\"entries\":[",
+             id, total, tail);
+    int first = 1;
+    for (uint32_t i = start_idx; i < total; i++) {
+        int lba; uint32_t dest, size;
+        cd_dma_log_get_entry(i, &lba, &dest, &size);
+        if (lba < 0) continue;
+        send_fmt("%s{\"lba\":%d,\"dest\":\"0x%08X\",\"size\":%u}",
+                 first ? "" : ",", lba, dest, size);
+        first = 0;
+    }
+    send_fmt("]}\n");
+}
+
+/* cdrom_instant_rate: get/set the 'instant' per-frame sector-IRQ budget
+ * (step 3 tunable). Param "n" (optional int): new budget, clamped by
+ * cdrom_set_instant_rate. Always returns the current value, so a no-arg
+ * call is a pure query. */
+static void handle_cdrom_instant_rate(int id, const char *json)
+{
+    int n = json_get_int(json, "n", 0);
+    if (n > 0) cdrom_set_instant_rate(n);
+    send_fmt("{\"id\":%d,\"ok\":true,\"instant_max_per_frame\":%d}\n",
+             id, cdrom_get_instant_rate());
+}
+
+/* turbo_loads: get/set the turbo-through-loads enable (step 4). Param "n"
+ * (optional: 0/1). Reports the enable, whether the load predicate holds RIGHT
+ * NOW, and how many vblanks have run unpaced. */
+static void handle_turbo_loads(int id, const char *json)
+{
+    extern int      g_turbo_loads_enabled;
+    extern uint64_t g_turbo_loads_frames;
+    extern int      fntrace_is_game_started(void);
+    int n = json_get_int(json, "n", -1);
+    if (n == 0 || n == 1) g_turbo_loads_enabled = n;
+    send_fmt("{\"id\":%d,\"ok\":true,\"enabled\":%d,\"load_active\":%d,"
+             "\"game_started\":%d,\"turbo_frames\":%llu}\n",
+             id, g_turbo_loads_enabled, cdrom_load_in_progress(),
+             fntrace_is_game_started(),
+             (unsigned long long)g_turbo_loads_frames);
+}
+
+/* cdrom_bursts: dump the always-on CD load-burst ring, newest first. Each
+ * record is one gap-separated run of delivered data sectors — i.e. one load.
+ * Param "count" (optional, default 32, max 128). */
+static void handle_cdrom_bursts(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 32);
+    if (count < 1)   count = 1;
+    if (count > 128) count = 128;
+    CdBurstRecord recs[128];
+    int n = cdrom_get_bursts(recs, count);
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,"
+             "\"instant_max_per_frame\":%d,\"bursts\":[",
+             id, cdrom_get_burst_total(), cdrom_get_instant_rate());
+    for (int i = 0; i < n; i++) {
+        CdBurstRecord *b = &recs[i];
+        send_fmt("%s{\"start_frame\":%u,\"end_frame\":%u,"
+                 "\"frames\":%u,\"ms\":%llu,\"sectors\":%u,"
+                 "\"rate\":%u,\"divisor\":%u}",
+                 i ? "," : "", b->start_frame, b->end_frame,
+                 b->end_frame - b->start_frame + 1u,
+                 (unsigned long long)(b->end_ms - b->start_ms),
+                 b->sectors, b->rate, b->divisor);
+    }
+    send_fmt("]}\n");
+}
+
+/* autocompile_status: variant-capture automation state — autocapture
+ * enable/trigger counters + the background compile's state and output tail
+ * (in-memory ring; no log files). */
+static void handle_autocompile_status(int id, const char *json)
+{
+    extern int  autocompile_status_json(char *out, int cap);
+    extern void overlay_autocapture_get_status(int *enabled,
+                                               uint32_t *triggers,
+                                               uint64_t *last_delta);
+    (void)json;
+    int      ac_en = 0;
+    uint32_t trig = 0;
+    uint64_t delta = 0;
+    overlay_autocapture_get_status(&ac_en, &trig, &delta);
+    char comp[4096];
+    autocompile_status_json(comp, sizeof(comp));
+    send_fmt("{\"id\":%d,\"ok\":true,\"autocapture_enabled\":%d,"
+             "\"triggers\":%u,\"last_pressure\":%llu,\"compile\":%s}\n",
+             id, ac_en, trig, (unsigned long long)delta, comp);
+}
+
+/* autocompile_run: manually kick the configured background compile. */
+static void handle_autocompile_run(int id, const char *json)
+{
+    extern int autocompile_request(void);
+    (void)json;
+    int started = autocompile_request();
+    send_fmt("{\"id\":%d,\"ok\":true,\"started\":%d}\n", id, started);
+}
+
+/* overlay_rescan: re-scan the DLL cache and clear the checked-regions memo
+ * so newly compiled DLLs load on the next dispatch. */
+static void handle_overlay_rescan(int id, const char *json)
+{
+    extern void overlay_loader_rescan(void);
+    (void)json;
+    overlay_loader_rescan();
+    send_fmt("{\"id\":%d,\"ok\":true}\n", id);
+}
+
+/* overlay_capture_dump: flush overlay_captures.json on demand (does not require
+ * a clean window-close). Use after roaming through areas so a freeze/kill can't
+ * lose the captured overlays. Writes next to the runtime exe. */
+static void handle_overlay_capture_dump(int id, const char *json)
+{
+    (void)json;
+    overlay_capture_write_json();
+    send_fmt("{\"id\":%d,\"ok\":true,\"capture_entries\":%d}\n",
+             id, overlay_capture_count());
+}
+
+/* overlay_loader_status: report the dynamic overlay DLL loader state —
+ * whether active, how many functions are registered, which regions have
+ * been checked, and the most recent load event. Rule-3 inspection path for
+ * the loader (it does no stderr logging). */
+static void handle_overlay_loader_status(int id, const char *json)
+{
+    (void)json;
+    int      active = 0, registered = 0, nchecked = 0, nwritten = 0;
+    int      file_found = 0;
+    uint32_t last_crc = 0;
+    char     cache_dir[512] = {0}, game_id[64] = {0};
+    uint32_t checked[8]     = {0};
+    overlay_loader_get_status(&active, &registered, &nchecked,
+                              cache_dir, sizeof(cache_dir),
+                              game_id,   sizeof(game_id),
+                              checked, 8, &nwritten,
+                              &last_crc, &file_found);
+    /* Escape backslashes in cache_dir for JSON */
+    char esc_dir[768] = {0};
+    for (int si = 0, di = 0; cache_dir[si] && di < (int)sizeof(esc_dir)-2; si++) {
+        if (cache_dir[si] == '\\') esc_dir[di++] = '\\';
+        esc_dir[di++] = cache_dir[si];
+    }
+    const char *msg = overlay_loader_last_msg();
+    char esc_msg[512] = {0};
+    for (int si = 0, di = 0; msg[si] && di < (int)sizeof(esc_msg)-2; si++) {
+        if (msg[si] == '\\' || msg[si] == '"') esc_msg[di++] = '\\';
+        esc_msg[di++] = msg[si];
+    }
+    char buf[1536];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"id\":%d,\"ok\":true,\"active\":%d,\"registered\":%d,"
+        "\"regions_checked\":%d,\"last_crc\":\"0x%08X\",\"file_found\":%d,"
+        "\"cache_dir\":\"%s\",\"game_id\":\"%s\",\"last_msg\":\"%s\"",
+        id, active, registered, nchecked, last_crc, file_found,
+        esc_dir, game_id, esc_msg);
+    if (nwritten > 0) {
+        n += snprintf(buf + n, sizeof(buf) - n, ",\"checked\":[");
+        for (int i = 0; i < nwritten; i++)
+            n += snprintf(buf + n, sizeof(buf) - n,
+                          "%s\"0x%08X\"", i ? "," : "", checked[i]);
+        n += snprintf(buf + n, sizeof(buf) - n, "]");
+    }
+    /* Inc1-D registration-lifetime counters. */
+    {
+        uint32_t loads=0, invs=0, unreg=0, lw_pc=0, lw_addr=0, lw_size=0, reval=0;
+        uint64_t dnat=0, dint=0, stale=0; int regions=0;
+        overlay_loader_get_counters(&loads, &invs, &unreg, &dnat, &dint,
+                                    &stale, &lw_pc, &lw_addr, &lw_size, &regions,
+                                    &reval);
+        n += snprintf(buf + n, sizeof(buf) - n,
+            ",\"regions\":%d,\"loads\":%u,\"invalidations\":%u,"
+            "\"revalidations\":%u,\"unregistered_funcs\":%u,\"dispatch_native\":%llu,"
+            "\"dispatch_interp_fallback\":%llu,\"stale_blocked\":%llu,"
+            "\"last_write_pc\":\"0x%08X\",\"last_write_addr\":\"0x%08X\","
+            "\"last_write_size\":%u",
+            regions, loads, invs, reval, unreg,
+            (unsigned long long)dnat, (unsigned long long)dint,
+            (unsigned long long)stale, lw_pc, lw_addr, lw_size);
+        int r0v=0; uint32_t r0w=0, r0lo=0, r0hi=0, r0crc=0, ratt=0, rmiss=0, rlast=0;
+        overlay_loader_get_reload_debug(&r0v, &r0w, &r0lo, &r0hi, &r0crc,
+                                        &ratt, &rmiss, &rlast);
+        n += snprintf(buf + n, sizeof(buf) - n,
+            ",\"r0_valid\":%d,\"r0_writes_since_invalid\":%u,"
+            "\"r0_fn_lo\":\"0x%08X\",\"r0_fn_hi\":\"0x%08X\",\"r0_crc_live\":\"0x%08X\","
+            "\"reval_attempts\":%u,\"reval_crc_miss\":%u,\"last_reval_crc\":\"0x%08X\"",
+            r0v, r0w, r0lo, r0hi, r0crc, ratt, rmiss, rlast);
+    }
+    snprintf(buf + n, sizeof(buf) - n, "}\n");
+    send_fmt("%s", buf);
+}
+
+/* overlay_candidates: dump the per-entry candidate table (addr, state, stored
+ * vs live code hash, generation) so reload-on-return can be inspected directly. */
+static void handle_overlay_candidates(int id, const char *json)
+{
+    (void)json;
+    extern int overlay_loader_dump_candidates(char *out, int cap);
+    static char cbuf[65536];
+    int len = overlay_loader_dump_candidates(cbuf, (int)sizeof(cbuf));
+    if (len < 0) len = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"candidates\":%s}\n", id, cbuf);
+}
+
+/* overlay_native_ring: dump the always-on ring of native overlay calls + the
+ * in-progress entry (freeze-inside-native detector). Measurement surface for
+ * the native↔interpreter parity investigation. */
+static void handle_overlay_native_ring(int id, const char *json)
+{
+    (void)json;
+    extern int overlay_loader_dump_native_ring(char *out, int cap);
+    static char rbuf[16384];
+    int len = overlay_loader_dump_native_ring(rbuf, (int)sizeof(rbuf));
+    if (len < 0) len = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"ring\":%s}\n", id, rbuf);
+}
+
+/* overlay_diff_on/off: same-state native↔interp differential. With it on, each
+ * matched overlay function runs both ways from identical CPU+RAM state; the
+ * interp result is kept (game stays correct) and computation divergences are
+ * logged. overlay_shadow_dump returns the divergence records. */
+static void handle_overlay_diff_on(int id, const char *json)
+{
+    (void)json;
+    extern void overlay_loader_set_diff_mode(int on);
+    overlay_loader_set_diff_mode(1);
+    send_fmt("{\"id\":%d,\"ok\":true,\"diff_mode\":1}\n", id);
+}
+static void handle_overlay_diff_off(int id, const char *json)
+{
+    (void)json;
+    extern void overlay_loader_set_diff_mode(int on);
+    overlay_loader_set_diff_mode(0);
+    send_fmt("{\"id\":%d,\"ok\":true,\"diff_mode\":0}\n", id);
+}
+static void handle_overlay_shadow_dump(int id, const char *json)
+{
+    (void)json;
+    extern int overlay_loader_dump_shadow(char *out, int cap);
+    static char sbuf[1 << 18];
+    int len = overlay_loader_dump_shadow(sbuf, (int)sizeof(sbuf));
+    if (len < 0) len = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"shadow\":%s}\n", id, sbuf);
+}
+static void handle_overlay_shadow_detail(int id, const char *json)
+{
+    (void)json;
+    extern int overlay_loader_dump_shadow_detail(char *out, int cap);
+    static char dbuf[8192];
+    int len = overlay_loader_dump_shadow_detail(dbuf, (int)sizeof(dbuf));
+    if (len < 0) len = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"detail\":%s}\n", id, dbuf);
+}
+
+/* overlay_irq_suppress_on/off: drop native overlay code's per-block interrupt
+ * checks (cadence ~ interpreter) to test whether the parity divergence is
+ * interrupt-delivery timing rather than codegen. */
+static void handle_overlay_irq_suppress_on(int id, const char *json)
+{
+    (void)json;
+    extern void overlay_loader_set_irq_suppress(int mode, uint32_t ratelimit);
+    overlay_loader_set_irq_suppress(1, 0);
+    send_fmt("{\"id\":%d,\"ok\":true,\"irq_suppress\":1}\n", id);
+}
+static void handle_overlay_irq_suppress_off(int id, const char *json)
+{
+    (void)json;
+    extern void overlay_loader_set_irq_suppress(int mode, uint32_t ratelimit);
+    extern void overlay_loader_get_irq_suppress(int *mode, uint32_t *rl, uint64_t *supp);
+    int m=0; uint32_t rl=0; uint64_t supp=0;
+    overlay_loader_get_irq_suppress(&m,&rl,&supp);
+    overlay_loader_set_irq_suppress(0, 0);
+    send_fmt("{\"id\":%d,\"ok\":true,\"irq_suppress\":0,\"was_suppressed\":%llu}\n",
+             id, (unsigned long long)supp);
+}
+/* overlay_irq_ratelimit <n>: arm native per-block interrupt checks at a
+ * rate-limited cadence — the real check fires every Nth block, the rest are
+ * dropped. N=1 == normal native cadence (every block); larger N approaches the
+ * interpreter's coarse cadence. This is the decisive Priority-1 A/B knob; full
+ * suppression (overlay_irq_suppress_on) is too blunt to be conclusive. */
+static void handle_overlay_irq_ratelimit(int id, const char *json)
+{
+    extern void overlay_loader_set_irq_suppress(int mode, uint32_t ratelimit);
+    int n = json_get_int(json, "n", 1);
+    if (n < 1) n = 1;
+    overlay_loader_set_irq_suppress(1, (uint32_t)n);
+    send_fmt("{\"id\":%d,\"ok\":true,\"irq_suppress\":1,\"ratelimit\":%d}\n", id, n);
+}
+/* overlay_native_event_granularity <conservative|normal>: when conservative,
+ * psx_advance_cycles splits a batched (N>1) cycle advance into N single-cycle
+ * steps so device events fire at their true due-cycle in order — replicating
+ * the interpreter's fine event timeline for native execution. Decisive test:
+ * if the village->overworld blue screen clears with this on, the cause is
+ * per-block event-ordering (root #2/#3), and the real fix is a due-cycle event
+ * scheduler. */
+static void handle_overlay_native_event_granularity(int id, const char *json)
+{
+    extern int g_event_step_conservative;
+    char mode[32];
+    if (!json_get_str(json, "mode", mode, sizeof(mode))) {
+        send_err(id, "missing mode (conservative|normal)"); return;
+    }
+    int conservative = (strcmp(mode, "conservative") == 0);
+    g_event_step_conservative = conservative;
+    send_fmt("{\"id\":%d,\"ok\":true,\"event_granularity\":\"%s\"}\n",
+             id, conservative ? "conservative" : "normal");
+}
+
+/* overlay_fp_dump: dump the native↔interp execution-fingerprint log (per
+ * candidate function: in/out register CRC, native flag) for offline diffing. */
+static void handle_overlay_fp_dump(int id, const char *json)
+{
+    extern int overlay_loader_write_fp_file(const char *path);
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        snprintf(path, sizeof(path), "overlay_fp.json");
+    int count = overlay_loader_write_fp_file(path);
+    send_fmt("{\"id\":%d,\"ok\":true,\"file\":\"%s\",\"entries\":%d}\n",
+             id, path, count);
+}
+
+/* dirty_insn_gate <lo> <hi>: extra phys PC range the per-insn interp log
+ * records (on top of the hardwired kernel ranges). hi=0 disables. */
+static void handle_dirty_insn_gate(int id, const char *json)
+{
+    extern uint32_t g_insn_gate_lo, g_insn_gate_hi;
+    char buf[32];
+    if (json_get_str(json, "lo", buf, sizeof(buf))) g_insn_gate_lo = hex_to_u32(buf);
+    if (json_get_str(json, "hi", buf, sizeof(buf))) g_insn_gate_hi = hex_to_u32(buf);
+    send_fmt("{\"id\":%d,\"ok\":true,\"gate_lo\":\"0x%08X\",\"gate_hi\":\"0x%08X\"}\n",
+             id, g_insn_gate_lo, g_insn_gate_hi);
+}
+
+/* insn_freeze <addr> <nth>: freeze the insn ring immediately BEFORE the Nth
+ * candidate dispatch of phys <addr>, preserving the pre-divergence window.
+ * addr=0 disarms and unfreezes. */
+static void handle_insn_freeze(int id, const char *json)
+{
+    extern uint32_t g_insn_freeze_addr, g_insn_freeze_nth, g_insn_freeze_count;
+    extern int g_insn_log_frozen;
+    char buf[32];
+    if (json_get_str(json, "addr", buf, sizeof(buf)))
+        g_insn_freeze_addr = hex_to_u32(buf) & 0x1FFFFFFFu;
+    g_insn_freeze_nth   = (uint32_t)json_get_int(json, "nth", 1);
+    g_insn_freeze_count = 0;
+    g_insn_log_frozen   = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"freeze_addr\":\"0x%08X\",\"nth\":%u}\n",
+             id, g_insn_freeze_addr, g_insn_freeze_nth);
+}
+
+static void handle_insn_freeze_status(int id, const char *json)
+{
+    (void)json;
+    extern uint32_t g_insn_freeze_addr, g_insn_freeze_nth, g_insn_freeze_count;
+    extern int g_insn_log_frozen;
+    extern uint64_t g_dirty_ram_insn_log_seq;
+    send_fmt("{\"id\":%d,\"ok\":true,\"freeze_addr\":\"0x%08X\",\"nth\":%u,"
+             "\"count\":%u,\"frozen\":%d,\"insn_log_seq\":%llu}\n",
+             id, g_insn_freeze_addr, g_insn_freeze_nth, g_insn_freeze_count,
+             g_insn_log_frozen, (unsigned long long)g_dirty_ram_insn_log_seq);
+}
+
+/* event_ring_dump: write the whole live event-timeline ring (IRQ deliver/gate,
+ * I_STAT raises/changes, DMA kick/done, each tagged cycle/pc/func/mode/overlay)
+ * to a JSON file for offline diffing of native-OFF vs native-ON runs. Optional
+ * "path" param (default event_ring.json in CWD). */
+static void handle_event_ring_dump(int id, const char *json)
+{
+    extern int event_ring_dump_file(const char *path);
+    char path[256];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        snprintf(path, sizeof(path), "event_ring.json");
+    int count = event_ring_dump_file(path);
+    if (count < 0) { send_err(id, "event_ring file open failed"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"file\":\"%s\",\"entries\":%d}\n",
+             id, path, count);
+}
+/* event_ring_tail: inline JSON tail of the most-recent N events for a quick
+ * eyeball / first-output validation (default 64). */
+static void handle_event_ring_tail(int id, const char *json)
+{
+    extern int event_ring_dump_json(char *out, int cap, int max_entries);
+    int n = json_get_int(json, "n", 64);
+    if (n < 1) n = 1;
+    if (n > 4000) n = 4000;
+    int cap = n * 256 + 512;
+    char *out = (char *)malloc((size_t)cap);
+    if (!out) { send_err(id, "alloc failed"); return; }
+    int w = snprintf(out, cap, "{\"id\":%d,\"ok\":true,\"ring\":", id);
+    w += event_ring_dump_json(out + w, cap - w, n);
+    snprintf(out + w, cap - w, "}");
+    debug_server_send_line(out);
+    free(out);
+}
+/* event_ring_clear: reset the ring to isolate a fresh capture window. */
+static void handle_event_ring_clear(int id, const char *json)
+{
+    (void)json;
+    extern void event_ring_clear(void);
+    event_ring_clear();
+    send_fmt("{\"id\":%d,\"ok\":true,\"cleared\":true}\n", id);
+}
+
+/* overlay_native_on / overlay_native_off: toggle native overlay EXECUTION at
+ * runtime (validity tracking still runs). A/B to prove whether native execution
+ * is the cause without a rebuild. */
+static void handle_overlay_native_on(int id, const char *json)
+{
+    (void)json;
+    extern void overlay_loader_set_native_exec(int on);
+    overlay_loader_set_native_exec(1);
+    send_fmt("{\"id\":%d,\"ok\":true,\"native_exec\":1}\n", id);
+}
+static void handle_overlay_native_off(int id, const char *json)
+{
+    (void)json;
+    extern void overlay_loader_set_native_exec(int on);
+    overlay_loader_set_native_exec(0);
+    send_fmt("{\"id\":%d,\"ok\":true,\"native_exec\":0}\n", id);
+}
+
 /* overlay_dump: extract RAM regions that dirty_ram has marked executable
  * above a threshold physical address. Writes <crc32>.bin files to a
  * caller-supplied directory and returns a JSON manifest.
@@ -9293,6 +9824,8 @@ static const CmdEntry s_commands[] = {
     { "dirty_insn_add_range", handle_dirty_insn_add_range },
     { "dirty_insn_clear_ranges", handle_dirty_insn_clear_ranges },
     { "dirty_insn_ranges", handle_dirty_insn_ranges },
+    { "dirty_insn_dump_file", handle_dirty_insn_dump_file },
+    { "dirty_block_dump_file", handle_dirty_block_dump_file },
     { "fntrace_arm",       handle_fntrace_arm },
     { "fntrace_arm_clear", handle_fntrace_arm_clear },
     { "fntrace_armed",     handle_fntrace_armed },
@@ -9397,6 +9930,34 @@ static const CmdEntry s_commands[] = {
     { "fn_entry_tail",     handle_fn_entry_tail },
     { "fn_exit_dump",      handle_fn_exit_dump },
     { "overlay_dump",      handle_overlay_dump },
+    { "cd_read_log",       handle_cd_read_log },
+    { "overlay_loader_status", handle_overlay_loader_status },
+    { "overlay_candidates",   handle_overlay_candidates },
+    { "overlay_native_ring",  handle_overlay_native_ring },
+    { "overlay_irq_suppress_on",  handle_overlay_irq_suppress_on },
+    { "overlay_irq_suppress_off", handle_overlay_irq_suppress_off },
+    { "overlay_irq_ratelimit",    handle_overlay_irq_ratelimit },
+    { "overlay_native_event_granularity", handle_overlay_native_event_granularity },
+    { "event_ring_dump",          handle_event_ring_dump },
+    { "event_ring_tail",          handle_event_ring_tail },
+    { "event_ring_clear",         handle_event_ring_clear },
+    { "overlay_diff_on",      handle_overlay_diff_on },
+    { "overlay_diff_off",     handle_overlay_diff_off },
+    { "overlay_shadow_dump",  handle_overlay_shadow_dump },
+    { "overlay_shadow_detail", handle_overlay_shadow_detail },
+    { "overlay_fp_dump",      handle_overlay_fp_dump },
+    { "dirty_insn_gate",      handle_dirty_insn_gate },
+    { "insn_freeze",          handle_insn_freeze },
+    { "insn_freeze_status",   handle_insn_freeze_status },
+    { "overlay_native_on",    handle_overlay_native_on },
+    { "overlay_native_off",   handle_overlay_native_off },
+    { "overlay_capture_dump", handle_overlay_capture_dump },
+    { "cdrom_instant_rate",   handle_cdrom_instant_rate },
+    { "cdrom_bursts",         handle_cdrom_bursts },
+    { "turbo_loads",          handle_turbo_loads },
+    { "autocompile_status",   handle_autocompile_status },
+    { "autocompile_run",      handle_autocompile_run },
+    { "overlay_rescan",       handle_overlay_rescan },
     { NULL, NULL }
 };
 

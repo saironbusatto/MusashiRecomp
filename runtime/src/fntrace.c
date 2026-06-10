@@ -54,6 +54,10 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
         }
     }
     if (!armed_match(target)) return;
+    /* Honor the one-shot capture freeze (insn_freeze): once latched, the ring
+     * preserves the pre-divergence window instead of evicting it. */
+    extern int g_insn_log_frozen;
+    if (g_insn_log_frozen) return;
     uint64_t idx = g_fntrace_seq++ & (FNTRACE_RING_CAP - 1);
     FntraceEntry* e = &g_fntrace_ring[idx];
     e->frame  = (uint32_t)s_frame_count;

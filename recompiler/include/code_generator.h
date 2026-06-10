@@ -35,6 +35,7 @@ struct CodeGenConfig {
     bool emit_line_numbers;       // Include original address as comments
     bool optimize_zero_reg;       // Optimize away $zero assignments
     bool use_switch_for_blocks;   // Use switch instead of goto labels
+    bool split_mid_function_targets; // Split branch targets into funcs for legacy main-EXE analysis
     std::string indent;           // Indentation string (default: "    ")
 
     CodeGenConfig()
@@ -42,6 +43,7 @@ struct CodeGenConfig {
         , emit_line_numbers(true)
         , optimize_zero_reg(true)
         , use_switch_for_blocks(false)
+        , split_mid_function_targets(true)
         , indent("    ") {}
 };
 
@@ -73,8 +75,29 @@ public:
         const std::vector<Function>& functions,
         const std::map<uint32_t, ControlFlowGraph>& cfgs);
 
+    // Generate a group of overlapping-alias entries that share one host
+    // function: ONE static body holding the host-range blocks (restricted to
+    // the union of blocks reachable from the entries) with an entry switch,
+    // plus a dispatchable wrapper per entry. Returns one GeneratedFunction per
+    // entry; the first carries the shared body.
+    std::vector<GeneratedFunction> generate_alias_group(
+        const std::vector<const Function*>& aliases,
+        const ControlFlowGraph& cfg,
+        const std::string& fallthrough_name);
+
     // Generate complete C file with all functions
     std::string generate_file(
+        const std::vector<Function>& functions,
+        const std::map<uint32_t, ControlFlowGraph>& cfgs);
+
+    // Generate the per-function code-range manifest consumed by the overlay
+    // loader's per-entry validity hash (design §8). For each function, emits its
+    // compiled code byte-ranges (union of basic-block extents), coalesced;
+    // interleaved jump tables / constant pools fall in the gaps and are
+    // excluded — which is what makes the runtime hash stable across reloads.
+    //   F <entry_hex>          one per function (virtual entry address)
+    //   R <lo_hex> <len_hex>   one per coalesced code range (virtual addr)
+    std::string generate_ranges_manifest(
         const std::vector<Function>& functions,
         const std::map<uint32_t, ControlFlowGraph>& cfgs);
 
@@ -111,6 +134,13 @@ private:
     std::string translate_basic_block(
         const BasicBlock& block,
         const ControlFlowGraph& cfg);
+
+    // Detect jr jump tables across all blocks of a CFG. Fills extra_labels_
+    // (mid-block table targets needing inline labels) and out_edges
+    // (jr block -> in-range rom targets), used for alias reachability.
+    void scan_jr_tables(
+        const ControlFlowGraph& cfg,
+        std::map<uint32_t, std::vector<uint32_t>>& out_edges);
 
     // Control flow translation
     std::string generate_branch_condition(uint32_t instr);

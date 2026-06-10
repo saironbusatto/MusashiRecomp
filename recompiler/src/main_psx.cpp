@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <algorithm>
@@ -16,6 +17,42 @@
 #include "config_loader.h"
 #include "rabbitizer.hpp"
 #include "fmt/format.h"
+
+namespace {
+
+struct AliasEntry { uint32_t addr, host_start, host_end; };
+
+// Materialize alias entries as overlapping functions, grouped by host. Each
+// group shares one emitted body (entry switch + host-range blocks); every
+// member lists its siblings so all group CFGs carry identical block leaders.
+// Host functions are emitted unchanged — aliases never cap or truncate them.
+void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
+                              const std::vector<AliasEntry>& alias_entries) {
+    std::map<uint32_t, std::vector<const AliasEntry*>> by_host;
+    for (const auto& ae : alias_entries) {
+        by_host[ae.host_start].push_back(&ae);
+    }
+    for (const auto& [host_start, group] : by_host) {
+        std::vector<uint32_t> entries;
+        for (const AliasEntry* ae : group) entries.push_back(ae->addr);
+        for (const AliasEntry* ae : group) {
+            PSXRecomp::Function af;
+            af.start_addr = ae->addr;
+            af.end_addr = ae->host_end;
+            af.size = af.end_addr - af.start_addr;
+            af.has_prologue = false;
+            af.has_epilogue = false;
+            af.stack_frame_size = 0;
+            af.name = fmt::format("func_{:08X}", ae->addr);
+            af.is_data_section = false;
+            af.alias_walk_lo = ae->host_start;
+            af.alias_group_entries = entries;
+            result.functions.push_back(af);
+        }
+    }
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
     fmt::print("PSXRecomp - PlayStation 1 Static Recompiler\n");
@@ -41,6 +78,7 @@ int main(int argc, char** argv) {
     std::string           extra_funcs_storage;  // lifetime anchor for the .c_str() below
     const char*           extra_funcs_path = nullptr;
     bool                  inspect_mode = false;
+    bool                  overlay_mode = false;
     std::filesystem::path out_dir = "generated";
 
     if (!config_path.empty()) {
@@ -73,6 +111,13 @@ int main(int argc, char** argv) {
                  * with psxrecomp-bios and project scripts. */
             } else if (arg == "--inspect") {
                 inspect_mode = true;
+            } else if (arg == "--overlay") {
+                /* Overlay-compilation contract: this input is a runtime-captured
+                 * overlay with execution evidence, so discovery is evidence-scoped
+                 * (no whole-byte sweep) and branch/jump-table targets stay as
+                 * in-parent labels. Set unconditionally by compile_overlays.py for
+                 * every overlay input — never a human toggle. */
+                overlay_mode = true;
             }
         }
     }
@@ -197,34 +242,253 @@ int main(int argc, char** argv) {
     // Function boundary detection
     fmt::print("Performing function analysis...\n");
 
-    PSXRecomp::FunctionAnalyzer analyzer(*exe);
-    analyzer.add_forced_entry(exe->header.initial_pc);
+    std::vector<uint32_t> exact_entries;
+    exact_entries.push_back(exe->header.initial_pc);
 
-    // Forced entry points: functions called from the dispatch table but not
+    // Explicit entry points: functions called through pointers but not
     // automatically detected by the heuristic-based function analysis.
     // Pass game-specific entry points via --extra-funcs file.
 
-    /* Load extra function addresses from a file (one hex address per line) */
+    /* Load extra function addresses from a file (one hex address per line).
+     * Lines of the form `interior 0xXXXXXXXX` mark dispatch-proven interior
+     * addresses: alias candidates, never walk roots. Lines of the form
+     * `dispatch_root 0xXXXXXXXX` mark classifier-proven dispatch roots
+     * WITHOUT a callable boundary (the kernel install-slot class, e.g. RAM
+     * 0xCF0): the static recompiler's install-slot hooks tail-dispatch into
+     * exactly these PCs, so they are real execution roots even though no
+     * prologue / preceding jr $ra exists. They are trusted walk roots and
+     * exempt from the overlay-mode boundary re-check below.
+     *
+     * Seeds are accepted within the loaded image's own bounds — overlay mode
+     * wraps arbitrary regions (kernel RAM at 0x80000000, overlays at
+     * 0x800E7000, ...), so a hardcoded game-RAM window would silently drop
+     * valid seeds. */
+    std::vector<uint32_t> file_seeds;
+    std::vector<uint32_t> interior_seeds;
+    std::set<uint32_t>    trusted_root_seeds;
     if (extra_funcs_path) {
         std::ifstream ef(extra_funcs_path);
         if (ef.is_open()) {
+            const uint32_t seed_lo = exe->header.load_address;
+            const uint32_t seed_hi = exe->end_address();
             std::string line;
-            int extra_count = 0;
             while (std::getline(ef, line)) {
                 if (line.empty() || line[0] == '#') continue;
-                uint32_t addr = (uint32_t)std::strtoul(line.c_str(), nullptr, 16);
-                if (addr >= 0x80010000u && addr < 0x80200000u) {
-                    analyzer.add_forced_entry(addr);
-                    extra_count++;
+                bool interior = false;
+                bool trusted_root = false;
+                const char* p = line.c_str();
+                if (line.rfind("interior", 0) == 0) {
+                    interior = true;
+                    p += 8;
+                } else if (line.rfind("dispatch_root", 0) == 0) {
+                    trusted_root = true;
+                    p += 13;
+                }
+                uint32_t addr = (uint32_t)std::strtoul(p, nullptr, 16);
+                if (addr >= seed_lo && addr < seed_hi) {
+                    if (interior) {
+                        interior_seeds.push_back(addr);
+                    } else {
+                        if (trusted_root) trusted_root_seeds.insert(addr);
+                        file_seeds.push_back(addr);
+                        exact_entries.push_back(addr);
+                    }
                 }
             }
-            fmt::print("Loaded {} extra function addresses from {}\n", extra_count, extra_funcs_path);
+            fmt::print("Loaded {} extra function addresses ({} interior, "
+                       "{} dispatch-root) from {}\n",
+                       file_seeds.size() + interior_seeds.size(),
+                       interior_seeds.size(), trusted_root_seeds.size(),
+                       extra_funcs_path);
         } else {
             fmt::print("WARNING: Cannot open extra-funcs file: {}\n", extra_funcs_path);
         }
     }
 
-    auto analysis_result = analyzer.analyze();
+    PSXRecomp::FunctionAnalysisResult analysis_result;
+
+    if (overlay_mode) {
+        // ── Overlay exact mode: partition seeds into walk roots and interior
+        // alias candidates. `interior`-marked seeds (classifier-proven
+        // dispatch targets without a callable boundary) are NEVER walk roots —
+        // a root inside a host function hard-caps (truncates) it, the
+        // mid-function-seed softlock class. Unmarked seeds are re-verified
+        // against the same boundary rule as defense in depth.
+        const uint32_t exe_lo = exe->header.load_address;
+        auto read_w = [&](uint32_t a) -> uint32_t {
+            auto w = exe->read_word(a);
+            return w.has_value() ? *w : 0u;
+        };
+        auto callable_boundary = [&](uint32_t a) -> bool {
+            uint32_t w = read_w(a);
+            if (!PSXRecomp::FunctionAnalyzer::is_valid_mips_word(w)) return false;
+            if (a == exe_lo) return true;
+            if (a >= exe_lo + 8 && read_w(a - 8) == 0x03E00008u) return true;
+            int32_t frame = 0;
+            return PSXRecomp::FunctionAnalyzer::is_prologue(w, frame) &&
+                   !(a >= exe_lo + 4 &&
+                     PSXRecomp::FunctionAnalyzer::is_branch_or_jump(read_w(a - 4)));
+        };
+
+        std::set<uint32_t> roots;
+        std::set<uint32_t> interior;
+        for (uint32_t a : exact_entries) {
+            if (trusted_root_seeds.count(a)) {
+                /* Classifier-proven dispatch root (install-slot class): the
+                 * static code tail-dispatches into this PC, so it is a real
+                 * execution root despite having no callable boundary. */
+                fmt::print("  seed 0x{:08X} accepted as dispatch root "
+                           "(install-slot class, no boundary evidence)\n", a);
+                roots.insert(a);
+            } else if (callable_boundary(a)) {
+                roots.insert(a);
+            } else {
+                fmt::print("  seed 0x{:08X} fails the boundary check — "
+                           "treating as interior alias candidate\n", a);
+                interior.insert(a);
+            }
+        }
+        for (uint32_t a : interior_seeds) interior.insert(a);
+
+        auto containing = [&](uint32_t a) -> const PSXRecomp::Function* {
+            const PSXRecomp::Function* best = nullptr;
+            for (const auto& f : analysis_result.functions) {
+                if (a >= f.start_addr && a < f.end_addr) { best = &f; break; }
+            }
+            return best;
+        };
+
+        // Interior candidates attach only to functions the EVIDENCE-walked
+        // root set already owns. No backward-boundary guessing: a false
+        // prologue/jr-ra in embedded data mints a root that decodes data as
+        // code (audit-fatal). Orphans stay with the interpreter — it
+        // self-heals via recapture once real call evidence appears.
+        {
+            PSXRecomp::FunctionAnalyzer analyzer(*exe);
+            std::vector<uint32_t> roots_vec(roots.begin(), roots.end());
+            analysis_result = analyzer.analyze_exact_entries(roots_vec);
+        }
+
+        std::vector<AliasEntry> alias_entries;
+        for (uint32_t a : interior) {
+            const PSXRecomp::Function* host = containing(a);
+            if (host && a == host->start_addr) continue;  // became a real entry
+            if (host) {
+                alias_entries.push_back({a, host->start_addr, host->end_addr});
+            } else {
+                fmt::print("  WARNING: interior seed 0x{:08X} has no host "
+                           "function — left to the interpreter\n", a);
+            }
+        }
+        materialize_alias_groups(analysis_result, alias_entries);
+        fmt::print("Overlay alias entries emitted: {}\n\n", alias_entries.size());
+    } else {
+        // ── Iterative discovery: seed classification + static data-table scan ──
+        //
+        // Every candidate entry (explicit seed or scanned data pointer) is
+        // classified against the current function set:
+        //   * matches a function start            → already covered
+        //   * INSIDE a function's range           → ALIAS entry (overlapping
+        //     emission; the host is never capped/truncated — forcing such an
+        //     entry is the mid-function-seed softlock class)
+        //   * in a gap between functions          → forced entry (explicit
+        //     seeds are trusted; scanned pointers additionally need boundary
+        //     evidence: a jr $ra two slots earlier or a non-delay-slot
+        //     prologue)
+        //
+        // The data scan walks every word of the image OUTSIDE code-function
+        // ranges (pointer tables live in data regions) and collects words that
+        // point at valid instructions inside code-function ranges. Promotions
+        // change function boundaries, so iterate to a fixed point.
+        std::vector<AliasEntry> alias_entries;
+
+        std::set<uint32_t> forced;
+        forced.insert(exe->header.initial_pc);
+        const uint32_t exe_lo = exe->header.load_address;
+        const uint32_t exe_hi = exe->end_address();
+        auto read_w = [&](uint32_t a) -> uint32_t {
+            auto w = exe->read_word(a);
+            return w.has_value() ? *w : 0u;
+        };
+
+        const int kMaxDiscoveryIters = 6;
+        for (int iter = 0; iter < kMaxDiscoveryIters; ++iter) {
+            PSXRecomp::FunctionAnalyzer analyzer(*exe);
+            for (uint32_t a : forced) analyzer.add_forced_entry(a);
+            analysis_result = analyzer.analyze();
+
+            std::vector<const PSXRecomp::Function*> code_funcs;
+            for (const auto& f : analysis_result.functions) {
+                if (!f.is_data_section) code_funcs.push_back(&f);
+            }
+            auto containing = [&](uint32_t a) -> const PSXRecomp::Function* {
+                auto it = std::upper_bound(code_funcs.begin(), code_funcs.end(), a,
+                    [](uint32_t v, const PSXRecomp::Function* f) { return v < f->start_addr; });
+                if (it == code_funcs.begin()) return nullptr;
+                --it;
+                return (a >= (*it)->start_addr && a < (*it)->end_addr) ? *it : nullptr;
+            };
+
+            struct Candidate { uint32_t addr; bool trusted; bool table_evidence; };
+            std::vector<Candidate> candidates;
+            for (uint32_t s : file_seeds) candidates.push_back({s, true, true});
+            for (uint32_t s : interior_seeds) candidates.push_back({s, true, true});
+            uint32_t scanned_words = 0;
+            auto is_text_ptr = [&](uint32_t v) {
+                return (v & 3u) == 0 && v >= exe_lo && v < exe_hi && containing(v) != nullptr;
+            };
+            for (uint32_t p = exe_lo; p + 4 <= exe_hi; p += 4) {
+                if (containing(p)) continue;  // instruction word, not a data word
+                uint32_t w = read_w(p);
+                if ((w & 3u) || w < exe_lo || w >= exe_hi) continue;
+                // Table evidence: an adjacent data word that is also a text
+                // pointer. Interior handler entries live in dense pointer
+                // tables; a lone pointer-shaped data word is too weak to mint
+                // an alias from (random data aliases into loose code ranges).
+                bool table_evidence =
+                    (p >= exe_lo + 4 && is_text_ptr(read_w(p - 4))) ||
+                    (p + 8 <= exe_hi && is_text_ptr(read_w(p + 4)));
+                candidates.push_back({w, false, table_evidence});
+                scanned_words++;
+            }
+
+            alias_entries.clear();
+            std::set<uint32_t> alias_seen;
+            bool promoted_new = false;
+            for (const auto& [a, trusted, table_evidence] : candidates) {
+                if ((a & 3u) || a < exe_lo || a >= exe_hi) continue;
+                const PSXRecomp::Function* host = containing(a);
+                if (host && a == host->start_addr) continue;  // already an entry
+                uint32_t w = read_w(a);
+                if (!PSXRecomp::FunctionAnalyzer::is_valid_mips_word(w)) continue;
+                if (host) {
+                    if ((trusted || table_evidence) && alias_seen.insert(a).second) {
+                        alias_entries.push_back({a, host->start_addr, host->end_addr});
+                    }
+                    continue;
+                }
+                bool promote = trusted;
+                if (!promote) {
+                    bool after_ret = (a >= exe_lo + 8) && (read_w(a - 8) == 0x03E00008u);
+                    int32_t frame = 0;
+                    bool prologue =
+                        PSXRecomp::FunctionAnalyzer::is_prologue(w, frame) &&
+                        !(a >= exe_lo + 4 &&
+                          PSXRecomp::FunctionAnalyzer::is_branch_or_jump(read_w(a - 4)));
+                    promote = after_ret || prologue;
+                }
+                if (promote && forced.insert(a).second) promoted_new = true;
+            }
+
+            fmt::print("Discovery iteration {}: {} data pointers scanned, "
+                       "{} forced entries, {} alias entries\n",
+                       iter + 1, scanned_words, forced.size(), alias_entries.size());
+            if (!promoted_new) break;
+        }
+
+        materialize_alias_groups(analysis_result, alias_entries);
+        fmt::print("Alias entries emitted: {}\n\n", alias_entries.size());
+    }
 
     // Print summary statistics
     fmt::print("\n=== Function Analysis Summary ===\n\n");
@@ -346,6 +610,7 @@ int main(int argc, char** argv) {
     PSXRecomp::CodeGenConfig codegen_config;
     codegen_config.emit_comments = true;
     codegen_config.emit_line_numbers = true;
+    codegen_config.split_mid_function_targets = !overlay_mode;
 
     // Load per-game annotations: annotations/<exe_stem>_annotations.csv
     // Silently skipped if the file doesn't exist.
@@ -420,6 +685,22 @@ int main(int argc, char** argv) {
                   output_filename.string());
     } else {
         fmt::print(stderr, "⚠ Failed to write output file\n\n");
+    }
+
+    // Per-function code-range manifest (design §8): consumed by the overlay
+    // loader's per-entry validity hash. Emitted alongside _full.c for every
+    // build; only the overlay path actually loads it.
+    {
+        std::filesystem::path ranges_filename = out_dir / (exe_stem + "_full.ranges");
+        std::string ranges = codegen.generate_ranges_manifest(
+            analysis_result.functions, all_cfgs);
+        std::ofstream rf(ranges_filename);
+        if (rf.is_open()) {
+            rf << ranges;
+            rf.close();
+            fmt::print("✓ Saved code-range manifest to {}\n\n",
+                      ranges_filename.string());
+        }
     }
 
     // Generate dispatch table (tomba_dispatch.c)

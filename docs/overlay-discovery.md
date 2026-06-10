@@ -1,7 +1,6 @@
 # Overlay Discovery
 
-**Date:** 2026-05-29  
-**Branch:** `overlay-discovery`  
+**Updated:** 2026-05-30
 **Phase gate:** Phase 5+ (game EXE loaded, dirty-RAM hits observed in game address space)
 
 ---
@@ -24,133 +23,141 @@ interpretation of overlay code.
 BIOS dirty-RAM (Rule 18 in CLAUDE.md) is code the BIOS *assembles in-place* at boot — e.g. the
 4-instruction SIO handler written to RAM 0xCF0. That code never existed on disc.
 
-Game overlays are different: they are complete compiled MIPS modules on the disc filesystem,
-loaded to fixed RAM addresses. Their bytes are known ahead of time; the recompiler just hasn't
-seen them yet. This system fixes that.
+Game overlays are different: they are compiled MIPS modules loaded to fixed RAM addresses. Their
+bytes are known after they land in RAM; the recompiler just hasn't seen them yet. This system
+fixes that.
 
 Missed heuristics (static-EXE functions the recompiler failed to identify) are orthogonal: they
-exist in the main EXE at build time and will not match any disc file hash. The overlay system
-ignores them and they fall through to dirty-RAM as today. Fix missed heuristics by improving
-heuristics; fix overlays by this system.
+exist in the main EXE at build time. Fix missed heuristics by improving heuristics; fix overlays
+by this system.
+
+---
+
+## Why disc extraction is not used
+
+The naive approach — scan the disc image for overlay bytes by CRC — does not work for Tomba and
+many other PSX titles. Investigation confirmed that Tomba stores overlays in a **scatter-load
+format**: each disc sector is a `(12-byte block descriptor, 2048-byte data block)` pair, where
+the descriptor tells the loader which RAM address to write the data block to. The resulting RAM
+content is not present anywhere on disc as a contiguous byte range, so no CRC or brute-force scan
+can find it.
+
+The universal correct primitive is to capture bytes **at DMA time** — intercepting them as they
+land in RAM, after all scatter-reassembly and decompression. This works for:
+
+- Scatter-load formats (Tomba, others)
+- Game-specific LZ or RLE compression (bytes arrive decompressed via DMA)
+- Direct file loads (trivially captured)
 
 ---
 
 ## Architecture
 
 Two layers, composing. As Layer B grows, Layer A fires less. Eventually Layer A goes silent.
+Layer B is a manifest of Layer A's output: the same `(load_addr, bytes, seeds)` data, committed
+to the repo and baked into the binary ahead of time.
 
-### Layer B — Persistent map → static precompilation
+### Layer B — Build-time pre-compilation
 
-**Runtime side:** whenever CD DMA completes a load into RAM, record `(disc_file_hash, load_addr,
-size)` to a per-game log file on disk. This is cheap — a hash computation and a file append.
+**Runtime side (capture):** on every CD DMA completion into game-code RAM, the runtime appends
+`(load_addr, size, bytes)` to a ring buffer. On process exit it writes
+`overlay_captures.json` automatically — no user action required. The user discovers the file
+exists and can attach it to a GitHub issue.
 
-**Build-time side:** `recompiler/recomp.py` reads the log file. For each entry, it locates the
-matching file on the disc image by hash, disassembles it at the recorded load address, and
-emits a compiled C function set alongside the main EXE output. The overlay's functions are added
-to the static dispatch table at their load addresses.
+**Build-time side:** `psxrecomp-game` reads `game.toml [[overlays]]` entries, each pointing to
+a captured `.bin` file and a list of seed entry points. It disassembles the MIPS bytes at
+`load_addr`, emits C functions, and adds them to the static dispatch table. The shipped binary
+has those overlays pre-compiled at zero runtime cost.
 
-**Result:** any overlay logged in a previous run is statically compiled into the next build. No
-runtime overhead on subsequent loads.
+**Coverage grows** with every release as developer playthroughs and user contributions feed new
+captures into the build.
 
 ### Layer A — Runtime background compilation with persistent cache
 
-**On CD DMA completion:**
-1. Hash the written bytes.
-2. Check the on-disk compiled cache (`cache/<SCUS_ID>/<hash>.dll`).
-   - Cache hit → `LoadLibrary` the cached DLL, register its functions in the live dispatch table
-     for `[load_addr, load_addr + size)`. No interpretation ever needed.
-   - Cache miss → fall through to dirty-RAM interpretation. Queue a background thread to compile
-     this overlay (emit C for the bytes at `load_addr`, invoke the C compiler, write the DLL to
-     cache). On the *next* load of this overlay (next room visit, next level reload), the cache
-     hit path fires instead.
+**On CD DMA completion into game-code RAM:**
 
-**Result:** within a single playthrough, each overlay compiles once on first encounter. Every
-subsequent encounter in that session, and in all future sessions, hits the cache.
+1. Hash the written bytes.
+2. Check `cache/<SCUS_ID>/<hash>.dll`.
+   - **Cache hit** → `LoadLibrary` the DLL, register its functions in the live dispatch table
+     for `[load_addr, load_addr + size)`. Interpreter never fires for this overlay.
+   - **Cache miss** → fall through to dirty-RAM interpretation. Enqueue a background thread to
+     compile this overlay: emit C for the bytes at `load_addr`, invoke the C compiler, write the
+     DLL to cache. On the *next* load of this overlay the cache hit fires.
+
+**Result:** within a single session, each new overlay is interpreted once and compiled once.
+Every subsequent encounter — same session or future sessions — dispatches to native code.
+
+A user who plays through the entire game accumulates a complete cache. From that point forward
+the game runs entirely as compiled native code, never touching the interpreter.
 
 ### How they compose
 
 ```
-Dispatch path (on branch to overlay address):
-  1. Static dispatch table (Layer B) → precompiled function    [zero runtime cost]
-  2. Compiled cache (Layer A)        → LoadLibrary'd function  [one-time per session after first]
-  3. Dirty-RAM interpreter            → fallback               [first-ever encounter only]
+Dispatch (branch to overlay address):
+  1. Static dispatch table  [Layer B]  → precompiled function     zero runtime cost
+  2. Compiled cache         [Layer A]  → LoadLibrary'd function   one-time per session after first
+  3. Dirty-RAM interpreter             → fallback                 first-ever encounter only
 ```
 
 Layer B coverage grows with every rebuild. Layer A covers the gap within a session before the
-rebuild happens. Dirty-RAM is the last-resort fallback that fires exactly once per undiscovered
-overlay.
+rebuild happens. Dirty-RAM fires exactly once per undiscovered overlay.
 
 ---
 
 ## Game identification
 
-Cache and log files are namespaced by SCUS/SLUS/SCES product code, read from `SYSTEM.CNF` on the
-disc image at startup (`BOOT=cdrom:\SCUS_941.60;1` → key `SCUS-94160`).
+Cache and capture files are namespaced by SCUS/SLUS/SCES product code, read from `SYSTEM.CNF`:
 
 ```
 cache/
-  SCUS-94160/          ← Tomba (NTSC-U)
+  SCUS-94236/          ← Tomba (NTSC-U)
     <hash>.dll
-    <hash>.dll
-  SCES-01234/          ← different region, separate cache
-    ...
-
 logs/
-  SCUS-94160/
-    overlay_map.jsonl  ← append-only: {hash, load_addr, size, disc_file}
+  SCUS-94236/
+    overlay_map.jsonl
+overlay_captures.json  ← written at exit, next to the executable
 ```
-
-Different regional versions get separate caches automatically, which is correct since overlay
-load addresses may differ between regions.
 
 ---
 
 ## Cache invalidation
 
-A cached DLL is keyed by the hash of the overlay bytes. The hash IS the identity. If a disc file
-changes (different dump, different region), the hash changes and the old cache entry is simply
-never matched — it sits unused. No explicit invalidation needed.
+A cached DLL is keyed by the hash of the overlay bytes. The hash IS the identity. If a disc dump
+differs between users or regions, the hash differs and the old cache entry is simply never
+matched. No explicit invalidation needed.
 
 When Layer B statically compiles an overlay, Layer A's cached DLL for that hash becomes
 unreachable (static dispatch wins at step 1). It can be pruned post-build but is benign if left.
 
 ---
 
-## Integration point
-
-The natural hook is the CD-ROM DMA completion callback in `runtime/src/cdrom.c`. This is where
-bytes land in RAM. After the DMA write:
-1. Compute hash of the destination range.
-2. Log `(hash, load_addr, size, source_file)` for Layer B.
-3. Check Layer A cache. If hit, register the DLL's functions in the live dispatch table.
-4. If miss, mark the range dirty (existing dirty-RAM path) and enqueue background compilation.
-
----
-
 ## Implementation phases
 
-| Phase | Work |
-|---|---|
-| B-1 | CD DMA completion hook logs `(hash, load_addr, size)` to `logs/<SCUS_ID>/overlay_map.jsonl` |
-| B-2 | `recomp.py` reads the log and emits overlay functions alongside the main EXE; adds entries to dispatch table |
-| B-3 | Build-time validation: for each log entry, verify disc file hash matches before compiling |
-| A-1 | On DMA completion, check `cache/<SCUS_ID>/<hash>.dll`; if present, `LoadLibrary` + register |
-| A-2 | Background thread: emit C for newly-seen overlay, compile to DLL, write to cache |
-| A-3 | On next load of same overlay, Layer A cache hit fires instead of dirty-RAM |
+| Phase | Work | Status |
+|---|---|---|
+| — | Dirty-RAM interpreter (Layer A last-resort fallback) | Done |
+| B-1 | CD DMA byte capture ring (always-on, retail-safe, `dest < 0x1C0000` filter) | To build |
+| B-1 | Automatic `overlay_captures.json` written at process exit | To build |
+| B-2 | `game.toml [[overlays]]` + `psxrecomp-game` overlay compilation | To build |
+| B-3 | Contribution ingestion script: JSON → `.bin` + `game.toml` entries | To build |
+| A-1 | On DMA completion, check cache DLL; if present, `LoadLibrary` + register | To build |
+| A-2 | Background thread: emit C, compile to DLL, write to cache | To build |
+| A-3 | On next overlay encounter, A-1 fires instead of dirty-RAM | Follows from A-1/A-2 |
 
-B-1 through B-3 can ship before A-1. The system is useful with only Layer B (just requires a
-rebuild after each new playthrough). Layer A is the quality-of-life layer that eliminates the
-"rebuild required" friction.
+B-1 through B-3 ship before A-1. The system is useful with only Layer B (requires a rebuild
+after each new playthrough contribution). Layer A eliminates the "rebuild required" friction and
+makes the game self-healing for any user.
 
 ---
 
-## Open questions
+## Scatter-load discovery (Tomba)
 
-- Does Tomba use named disc files (ISO 9660) or raw LBA sector reads for overlay loads? Named
-  files make Layer B trivial (hash the file, record the name). Raw LBA reads require tracing the
-  sector number through to the ISO to recover the file identity. Determine by inspecting
-  dirty-RAM dispatch miss addresses: if they cluster at 2-3 fixed load addresses, it's classic
-  file-based overlays. If they scatter, it may be more ad-hoc.
+Tomba's CD DMA log (captured 2026-05-30) confirmed the scatter-load format:
 
-- `LoadLibrary` / `dlopen` infrastructure does not currently exist in the runtime. Layer A
-  requires it. Layer B does not. Implement B first; defer A until B has real coverage data.
+- Every sector pair: `12-byte block descriptor` (always to a header buffer at `0x973C0`) +
+  `2048-byte data block` (scattered to the address the descriptor specifies).
+- A single ISO file load produces DMA entries with non-contiguous destination addresses.
+- The 12-byte descriptor encodes the block's destination; the loader dispatches accordingly.
+
+This format is game-specific but the DMA capture approach handles it transparently: the captured
+bytes are the post-scatter RAM contents, which is exactly the execution form the recompiler needs.

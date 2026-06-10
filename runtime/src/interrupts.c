@@ -32,9 +32,30 @@
 #include "cdrom.h"
 #include "cpu_state.h"
 #include "debug_server.h"
+#include "event_ring.h"
+#include "psx_cycles.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <setjmp.h>
+
+/* Event-timeline ring: execution-mode flag owned by dirty_ram_interp.c. The
+ * static BIOS exception handler is NOT interp code, so we clear it around the
+ * handler dispatch (see psx_check_interrupts). */
+extern int g_dirty_interp_active;
+
+/* Record an interrupt-delivery decision into the event ring. GATE outcomes are
+ * edge-suppressed (they repeat every block while blocked); DELIVER is always
+ * recorded (once per interrupt); the not-pending (idle) case emits nothing but
+ * still updates the edge key so the next gate/deliver is captured. */
+static void irq_record_outcome(uint8_t kind, uint8_t detail) {
+    static uint16_t s_last = 0xFFFFu;
+    uint16_t key = ((uint16_t)kind << 8) | detail;
+    int repeat = (key == s_last);
+    s_last = key;
+    if (kind == EV_NONE) return;                 /* idle: update key only */
+    if (kind == EV_IRQ_DELIVER) { event_ring_record(EV_IRQ_DELIVER, detail); return; }
+    if (!repeat) event_ring_record(kind, detail);/* GATE: edge only */
+}
 
 /* COP0 register indices */
 #define COP0_SR    12
@@ -110,6 +131,15 @@ static void irq_check_trace_log(CPUState* cpu, uint32_t resume_pc, uint32_t reas
     e->call_depth = (uint32_t)g_psx_call_depth;
     e->reason = reason;
 }
+
+/* Blocks of guaranteed main-code forward progress imposed after a CLAIMED
+ * non-SIO interrupt (DMA/VBLANK/timer/...). With cooldown 0 (the prior blanket
+ * policy, commit 6d2cb65) the block leader at the interrupted PC re-takes the
+ * exception before the block body executes, so under a fast-disc DMA flood the
+ * main code is pinned at one PC forever (reentry-storm freeze). A few blocks
+ * guarantee the interrupted block — and the field loop — advance between
+ * deliveries. SIO is exempt (card reads need immediate back-to-back IRQs). */
+#define CLAIMED_PROGRESS_QUANTUM 8
 
 /* setjmp target for ReturnFromException during handler dispatch.
  *
@@ -311,7 +341,14 @@ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
                  * blocks from rounding multiple VBlanks together. */
                 cycles_since_vblank -= VBLANK_CYCLES;
                 dispatch_count = 0;
+                /* DEQUEUE: this VBlank fired. ENQUEUE: next VBlank scheduled
+                 * one period out. */
+                event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK,
+                                      (uint32_t)psx_get_cycle_count());
+                event_ring_record_aux(EV_ENQ, (uint8_t)SRC_VBLANK,
+                                      (uint32_t)(psx_get_cycle_count() + VBLANK_CYCLES));
                 i_stat |= (1 << IRQ_VBLANK);
+                event_ring_record(EV_ISTAT_RAISE, IRQ_VBLANK);
                 gpu_vblank_tick();  /* Toggle LCF (GPUSTAT bit 31) */
 #ifndef PSX_ENABLE_BLOCK_CYCLES
                 timers_tick(33868); /* ~1 NTSC frame worth of cycles */
@@ -321,14 +358,27 @@ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
         }
     }
 
+    /* Event ring: generic i_stat-edge backstop. Catches raises from sites we
+     * don't instrument precisely (memory.c MMIO acks, SIO, SPU). Bounded by
+     * actual transitions, not by check frequency. */
+    {
+        static uint32_t s_last_istat = 0;
+        if (i_stat != s_last_istat) {
+            s_last_istat = i_stat;
+            event_ring_record(EV_ISTAT_CHANGE, 0);
+        }
+    }
+
     /* Check if any interrupts are pending. */
-    if ((i_stat & i_mask) == 0) return;
+    if ((i_stat & i_mask) == 0) { irq_record_outcome(EV_NONE, 0); return; }
     if (in_exception) {
         exception_reentry_blocks++;
+        irq_record_outcome(EV_IRQ_GATE, GATE_IN_EXCEPTION);
         irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_IN_EXCEPTION);
         return;
     }
     if (g_psx_call_depth > 0) {
+        irq_record_outcome(EV_IRQ_GATE, GATE_CALL_DEPTH);
         irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_CALL_DEPTH);
         return;
     }
@@ -336,6 +386,7 @@ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
     /* Post-exception cooldown: let at least one block execute after RFE. */
     if (post_exception_cooldown > 0) {
         post_exception_cooldown--;
+        irq_record_outcome(EV_IRQ_GATE, GATE_COOLDOWN);
         irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_COOLDOWN);
         return;
     }
@@ -343,19 +394,23 @@ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
     /* Check COP0 SR: IEc (bit 0) must be set, and IM2 (bit 10) must be set. */
     uint32_t sr = cpu->cop0[COP0_SR];
     if (!(sr & 0x01)) {
+        irq_record_outcome(EV_IRQ_GATE, GATE_SR_IE);
         irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_IE_DISABLED);
         return;    /* Interrupts globally disabled */
     }
     if (!(sr & (1 << 10))) {
+        irq_record_outcome(EV_IRQ_GATE, GATE_SR_IM2);
         irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_IM2_DISABLED);
         return; /* Hardware interrupt bit not enabled */
     }
     if (resume_pc == 0 || (resume_pc & 3u) != 0) {
+        irq_record_outcome(EV_IRQ_GATE, GATE_BAD_RESUME);
         irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_INVALID_RESUME_PC);
         return;
     }
     irq_check_trace_log(cpu, resume_pc, IRQ_CHECK_DELIVERED);
 
+    irq_record_outcome(EV_IRQ_DELIVER, 0);
     in_exception = 1;
     exception_entries_total++;
     uint32_t pre_handler_istat = i_stat;  /* snapshot for cooldown decision */
@@ -427,6 +482,12 @@ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
     int   prev_pending = g_pending_exception_longjmp;
     g_exception_owner_fiber = psx_fiber_current();
     g_pending_exception_longjmp = 0;
+    /* The static BIOS exception handler is not dirty-RAM-interp code. Clear the
+     * interp mode flag across the handler dispatch so events recorded inside it
+     * are tagged STATIC. The restore sits after the loop the longjmp lands in,
+     * so the EPC longjmp can't leave the flag wrong. */
+    int prev_interp_active = g_dirty_interp_active;
+    g_dirty_interp_active = 0;
     int returned_from_exception = 0;
     for (;;) {
         int jmp_val = setjmp(exception_jmpbuf);
@@ -457,6 +518,7 @@ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
      * if they ever arise (uncommon but harmless). */
     g_exception_owner_fiber = prev_owner_fiber;
     g_pending_exception_longjmp = prev_pending;
+    g_dirty_interp_active = prev_interp_active;
 
     /* Restore the interrupted code's registers.
      *
@@ -501,13 +563,25 @@ void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
     if ((i_stat & i_mask) != 0 && i_stat == pre_handler_istat) {
         post_exception_cooldown = 500;  /* unclaimed: give main code time */
     } else {
-        /* [CLAUDE 2026-06-05] Re-fire immediately on a claimed IRQ, matching
-         * the pre-Ape baseline. A nonzero cooldown when the card protocol is
-         * idle starves the VBlank delivery that drives Tomba's VSync counter
-         * (scratchpad 0x1F8001E8); the title-LOAD wait loop then never sees
-         * the counter reach its target → black screen. Codex's WIP had set
-         * this to 1; the card-read burst that needed 0 is the SAME branch, so
-         * unconditional 0 satisfies both. */
-        post_exception_cooldown = 0;
+        /* Claimed: the handler acknowledged at least one I_STAT bit. Per-source
+         * policy (this used to be a blanket cooldown=0 — commit 6d2cb65 — which
+         * pins main code under a fast-disc DMA flood: the interrupted block's
+         * leader re-takes the exception before its body runs):
+         *   - SIO (card reads): 128 consecutive SIO IRQs must fire within one
+         *     blocking wait; any gap stalls the card protocol → re-fire now.
+         *   - DMA/VBLANK/timer/etc: guarantee a few blocks of main-code
+         *     progress between deliveries so a flood can't starve the loop.
+         *
+         * MERGE NOTE (ape-fw, 2026-06-10): the ape branch carried an
+         * unconditional 0 here, with a 2026-06-05 note that any nonzero
+         * cooldown starved the VBlank-driven VSync counter behind Tomba's
+         * title-LOAD wait (scratchpad 0x1F8001E8). That observation predates
+         * this per-source policy, which ships on master with Tomba title-LOAD
+         * verified working. If title-LOAD regresses under the real-EPC
+         * delivery model, THIS is the first knob to A/B (quantum 8 -> 0). */
+        uint32_t claimed = pre_handler_istat & ~i_stat;            /* bits handler cleared */
+        uint32_t sio_active = (claimed | (i_stat & i_mask)) & (1u << IRQ_SIO0);
+        post_exception_cooldown = sio_active ? 0 : CLAIMED_PROGRESS_QUANTUM;
     }
 }
+

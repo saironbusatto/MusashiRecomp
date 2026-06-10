@@ -37,6 +37,7 @@
 uint64_t g_dirty_ram_blocks_run = 0;
 uint64_t g_dirty_ram_insns_run  = 0;
 uint64_t g_dirty_ram_static_text_blocks_run = 0;
+uint64_t g_dirty_window_dispatches = 0;  /* capture-window interp dispatches */
 uint64_t g_dirty_ram_aborts     = 0;
 uint64_t g_dirty_ram_guard_yields = 0;
 
@@ -54,6 +55,7 @@ uint32_t g_dirty_ram_last_unsupported_insn = 0;
 const char *g_dirty_ram_last_unsupported_reason = NULL;
 
 DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE] = {0};
+DirtyRamPcEntry g_dirty_ram_exec_pc_table[DIRTY_RAM_PC_TABLE_SIZE] = {0};
 
 DirtyRamBlockLogEntry g_dirty_ram_block_log[DIRTY_RAM_BLOCK_LOG_CAP] = {0};
 uint64_t              g_dirty_ram_block_log_seq = 0;
@@ -76,20 +78,53 @@ extern uint64_t s_frame_count;
  * the working set of install-stub PCs is tiny (handful), so this stays
  * O(1) in practice.  Returns NULL if the table is full — caller treats
  * that as "stop tracking" rather than failing. */
-static DirtyRamPcEntry *pc_table_get_or_insert(uint32_t pc) {
+static DirtyRamPcEntry *pc_table_get_or_insert_in(DirtyRamPcEntry *table, uint32_t pc) {
     uint32_t h = (pc * 2654435761u) & (DIRTY_RAM_PC_TABLE_SIZE - 1);
     for (uint32_t i = 0; i < DIRTY_RAM_PC_TABLE_SIZE; i++) {
         uint32_t idx = (h + i) & (DIRTY_RAM_PC_TABLE_SIZE - 1);
-        DirtyRamPcEntry *e = &g_dirty_ram_pc_table[idx];
+        DirtyRamPcEntry *e = &table[idx];
         if (e->pc == pc) return e;
         if (e->pc == 0) { e->pc = pc; return e; }
     }
     return NULL;
 }
 
+static DirtyRamPcEntry *pc_table_get_or_insert(uint32_t pc) {
+    return pc_table_get_or_insert_in(g_dirty_ram_pc_table, pc);
+}
+
+/* Record every PC the interpreter executes (not just block entries) so
+ * overlay_capture can report execution-verified seeds for the region. */
+static void exec_pc_table_record(uint32_t pc) {
+    DirtyRamPcEntry *e = pc_table_get_or_insert_in(g_dirty_ram_exec_pc_table,
+                                                   pc & 0x1FFFFFFFu);
+    if (e) e->hits++;
+}
+
 /* From debug_server.c — keep our outer-frame attribution coherent. */
 extern uint32_t g_debug_current_func_addr;
 extern uint32_t g_debug_last_store_pc;
+
+/* Execution-mode tag for the event-timeline ring: 1 while a dirty_ram_dispatch
+ * call is on the stack. Cleared defensively at the psx_check_interrupts longjmp
+ * landing (interrupts.c) so the EPC-sentinel longjmp at dirty_ram_dispatch
+ * can't leave it stuck on. NATIVE_OVERLAY (inprogress!=0) takes precedence in
+ * the ring's mode resolution, so this only distinguishes INTERP from STATIC. */
+int g_dirty_interp_active = 0;
+int dirty_ram_interp_is_active(void) { return g_dirty_interp_active; }
+
+/* TCP-armed instruction-window capture (native↔interp divergence drill).
+ * g_insn_gate_*: an extra runtime-settable PC range that the per-insn log
+ * records (on top of the hardwired kernel ranges). Freeze latch: on the Nth
+ * dispatch of candidate g_insn_freeze_addr the insn ring stops recording, so
+ * its tail preserves the window immediately BEFORE that dispatch — query the
+ * ring afterward at leisure (ring-first; no arm-then-hope). */
+uint32_t g_insn_gate_lo = 0;       /* extra always-log phys range [lo,hi)      */
+uint32_t g_insn_gate_hi = 0;       /* 0 = extra range disabled                 */
+uint32_t g_insn_freeze_addr  = 0;  /* candidate phys entry to watch            */
+uint32_t g_insn_freeze_nth   = 0;  /* freeze before its Nth dispatch           */
+uint32_t g_insn_freeze_count = 0;
+int      g_insn_log_frozen   = 0;
 
 #ifdef PSX_HAS_GAME_DISPATCH
 extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
@@ -171,8 +206,13 @@ static void dirty_ram_log_instruction(CPUState *cpu, uint32_t pc, uint32_t insn,
                                       const uint32_t before_s[4],
                                       uint32_t next_pc,
                                       uint32_t target, int transferred) {
+    if (g_insn_log_frozen) return;
     uint32_t phys = pc & 0x1FFFFFFFu;
-    if (!dirty_ram_trace_should_log(phys)) {
+    /* Log when either gate opens: the ape-fw configurable trace ranges
+     * (dirty_insn_add_range, which also covers the built-in windows) or
+     * the TCP-set insn gate window (dirty_insn_gate, Bug A tooling). */
+    if (!(dirty_ram_trace_should_log(phys) ||
+          (g_insn_gate_hi != 0u && phys >= g_insn_gate_lo && phys < g_insn_gate_hi))) {
         return;
     }
 
@@ -213,6 +253,22 @@ static void dirty_ram_log_instruction(CPUState *cpu, uint32_t pc, uint32_t insn,
     e->task_submode = task_ptr ? cpu->read_half(task_ptr + 74u) : 0;
     e->frame        = (uint32_t)s_frame_count;
     e->transferred  = (uint8_t)(transferred ? 1u : 0u);
+}
+
+/* Marker entries delimit NATIVE candidate executions in the insn ring (native
+ * code emits no per-insn entries; markers keep the two runs' timelines
+ * alignable). transferred: 200 = native entry, 201 = native exit. */
+void dirty_ram_log_marker(uint32_t addr, uint32_t tag, int kind) {
+    if (g_insn_log_frozen) return;
+    uint64_t s = g_dirty_ram_insn_log_seq++;
+    DirtyRamInsnLogEntry *e =
+        &g_dirty_ram_insn_log[s & (DIRTY_RAM_INSN_LOG_CAP - 1u)];
+    memset(e, 0, sizeof *e);
+    e->seq         = s;
+    e->pc          = addr;
+    e->target      = tag;
+    e->frame       = (uint32_t)s_frame_count;
+    e->transferred = (uint8_t)(200 + kind);
 }
 
 static inline uint32_t interp_lwl(CPUState *cpu, uint32_t addr, uint32_t rt_value) {
@@ -288,13 +344,20 @@ static int abort_unsupported(uint32_t pc, uint32_t insn, const char *reason) {
     return 1; /* signal "control transferred" so the caller stops */
 }
 
+/* Local-flow gate: overlay region ONLY, by design. Kernel-window code
+ * (phys < DIRTY_RAM_KERNEL_WINDOW_END) keeps the verified per-block dispatch
+ * cadence — it runs in exception context, where interrupt-check cadence and
+ * EPC handling are delicate (see dirty_ram_interp.h window note). Kernel
+ * native coverage comes from overlay_loader candidates, not interp chaining. */
 static int is_local_dirty_target(uint32_t target) {
     uint32_t phys = target & 0x1FFFFFFFu;
     if (!dirty_ram_is_dirty(phys)) return 0;
 #ifdef PSX_HAS_GAME_DISPATCH
+    /* Ape-fw (final): dirty game-text goes through dispatch (the compiled
+     * function or the continuation-entry switch), never local interp flow. */
     if (fntrace_is_game_started() && psx_game_address_in_text(target)) return 0;
 #endif
-    return phys >= 0x00098000u;
+    return phys >= OVERLAY_REGION_FLOOR;
 }
 
 static int allow_dirty_local_flow_for_addr(uint32_t addr) {
@@ -302,7 +365,7 @@ static int allow_dirty_local_flow_for_addr(uint32_t addr) {
 #ifdef PSX_HAS_GAME_DISPATCH
     if (fntrace_is_game_started() && psx_game_address_in_text(addr)) return 0;
 #endif
-    return phys >= 0x00098000u;
+    return phys >= OVERLAY_REGION_FLOOR;
 }
 
 static uint32_t dirty_ram_current_tcb(CPUState *cpu) {
@@ -357,6 +420,60 @@ static void dirty_ram_log_exit(CPUState *cpu, uint32_t entry, uint32_t pc,
     e->frame = (uint32_t)s_frame_count;
     e->handled = (uint8_t)(handled ? 1u : 0u);
     e->in_exception = (uint8_t)(psx_get_in_exception() ? 1u : 0u);
+}
+
+/* Target the last interp run handed back to the dispatch loop (chained
+ * continuation). Consumed by the next dirty dispatch to tell apart
+ * external entries (from native code) from the interpreter's own
+ * block-to-block chaining. */
+static uint32_t g_dirty_interp_chain_target = 0;
+
+/* A dirty-RAM target only deserves interpretation if its first word decodes
+ * as a plausible MIPS instruction.  A scatter-loaded overlay leaves data
+ * bytes in dirty pages; jumping into those and interpreting them as code is
+ * how the original cache build produced black/blue screens.  When the target
+ * word doesn't look like code, fall back to the normal dispatch path. */
+static int dirty_ram_word_looks_decodable(uint32_t insn) {
+    if (insn == 0xFFFFFFFFu || insn == 0xFFFFFFFDu) return 0;
+
+    uint32_t op = op_field(insn);
+    uint32_t fn = funct_field(insn);
+    uint32_t rt = rt_field(insn);
+
+    if (op == 0x00u) {
+        switch (fn) {
+        case 0x00u: case 0x02u: case 0x03u: case 0x04u:
+        case 0x06u: case 0x07u: case 0x08u: case 0x09u:
+        case 0x0Cu: case 0x0Du:
+        case 0x10u: case 0x11u: case 0x12u: case 0x13u:
+        case 0x18u: case 0x19u: case 0x1Au: case 0x1Bu:
+        case 0x20u: case 0x21u: case 0x22u: case 0x23u:
+        case 0x24u: case 0x25u: case 0x26u: case 0x27u:
+        case 0x2Au: case 0x2Bu:
+            return 1;
+        default:
+            return 0;
+        }
+    }
+    if (op == 0x01u) {
+        return rt == 0x00u || rt == 0x01u || rt == 0x10u || rt == 0x11u;
+    }
+
+    switch (op) {
+    case 0x02u: case 0x03u: case 0x04u: case 0x05u:
+    case 0x06u: case 0x07u:
+    case 0x08u: case 0x09u: case 0x0Au: case 0x0Bu:
+    case 0x0Cu: case 0x0Du: case 0x0Eu: case 0x0Fu:
+    case 0x10u: case 0x12u:
+    case 0x20u: case 0x21u: case 0x22u: case 0x23u:
+    case 0x24u: case 0x25u: case 0x26u:
+    case 0x28u: case 0x29u: case 0x2Au: case 0x2Bu:
+    case 0x2Eu:
+    case 0x30u: case 0x32u: case 0x38u: case 0x3Au:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
@@ -471,6 +588,7 @@ static int exec_delay_slot(CPUState *cpu, uint32_t pc, uint32_t branch_target) {
 }
 
 static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
+    exec_pc_table_record(pc);
     uint32_t phys = pc & 0x1FFFFFFFu;
     uint32_t insn = fetch_word(phys);
     uint32_t opc  = op_field(insn);
@@ -527,6 +645,28 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             cpu->gpr[rd ? rd : 31] = return_pc;
             cpu->gpr[0] = 0;
             if (exec_delay_slot(cpu, pc + 4, target)) return 1;
+#ifdef PSX_HAS_GAME_DISPATCH
+            cpu->pc = 0;
+            if (psx_dispatch_game_compiled(cpu, target)) {
+                if (cpu->pc != 0) return 1;
+                *next_pc_out = return_pc;
+                return 0;
+            }
+#endif
+            /* Native overlay candidates get the SAME call contract as
+             * statically-compiled callees: run as a unit, resume at
+             * return_pc. A bare pc-chain here loses the return obligation
+             * when the callee runs natively (C return, pc==0) — the dispatch
+             * loop unwinds past the suspended caller, leaking its frame. */
+            {
+                extern int overlay_loader_call_native(CPUState *cpu, uint32_t addr);
+                cpu->pc = 0;
+                if (overlay_loader_call_native(cpu, target)) {
+                    if (cpu->pc != 0) return 1;
+                    *next_pc_out = return_pc;
+                    return 0;
+                }
+            }
             if (!is_local_dirty_target(target)) {
                 return dispatch_nonlocal_call(cpu, target, return_pc, next_pc_out);
             }
@@ -642,7 +782,33 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         uint32_t return_pc = pc + 8;
         cpu->gpr[31] = return_pc;
         if (exec_delay_slot(cpu, pc + 4, target)) return 1;
+#ifdef PSX_HAS_GAME_DISPATCH
+        cpu->pc = 0;
+        if (psx_dispatch_game_compiled(cpu, target)) {
+            if (cpu->pc != 0) return 1;
+            *next_pc_out = return_pc;
+            return 0;
+        }
+#endif
+        /* Native overlay candidates get the SAME call contract as statically-
+         * compiled callees: run as a unit, resume at return_pc. A bare
+         * pc-chain here loses the return obligation when the callee runs
+         * natively (C return, pc==0) — the dispatch loop unwinds past the
+         * suspended caller, leaking its frame (dwarf->overworld root cause:
+         * F=0x800338A8's epilogue skipped, sp leaked 0x18 per entity). */
+        {
+            extern int overlay_loader_call_native(CPUState *cpu, uint32_t addr);
+            cpu->pc = 0;
+            if (overlay_loader_call_native(cpu, target)) {
+                if (cpu->pc != 0) return 1;
+                *next_pc_out = return_pc;
+                return 0;
+            }
+        }
         if (!is_local_dirty_target(target)) {
+            return dispatch_nonlocal_call(cpu, target, return_pc, next_pc_out);
+        }
+        if (!dirty_ram_word_looks_decodable(fetch_word(target & 0x1FFFFFFFu))) {
             return dispatch_nonlocal_call(cpu, target, return_pc, next_pc_out);
         }
         cpu->pc = target;
@@ -856,7 +1022,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
  * KSEG-stripped form already in some cases, so accept any address and
  * mask. Returns 1 if interpretation handled the basic block; 0 if the
  * caller should fall back (e.g. unsupported opcode at the entry, page
- * not dirty). */
+ * not dirty). Public wrappers below bracket this with
+ * g_dirty_interp_active so the event-timeline ring can tag events as
+ * INTERP vs STATIC. */
 static int dirty_ram_dispatch_until_impl(CPUState* cpu, uint32_t addr,
                                          uint32_t stop_addr,
                                          int static_text_fallback) {
@@ -890,7 +1058,53 @@ static int dirty_ram_dispatch_until_impl(CPUState* cpu, uint32_t addr,
     if (static_text_fallback) return 0;
 #endif
 
+    /* B-2: statically-compiled overlay functions (generated/overlays_static.c).
+     * Inert unless a game provides an overlays_static.c at build time. */
+#ifdef PSX_HAS_OVERLAY_DISPATCH
+    {
+        extern int psx_overlay_dispatch(CPUState *cpu, uint32_t addr);
+        if (psx_overlay_dispatch(cpu, addr)) return 1;
+    }
+#endif
+
+    /* A-1: dynamically-loaded overlay DLL functions, checked before the
+     * interpreter.  No-op (returns 0) until overlay_loader_init() runs, which
+     * only happens when the overlay cache is enabled in config. */
+    /* §5-E native↔interp fingerprint: capture entry register state for a
+     * candidate overlay function, so native and interpreted runs can be diffed
+     * by sequence. Additive only — no control-flow change. */
+    extern int      overlay_loader_is_candidate(uint32_t phys);
+    extern void     overlay_regs_snap(uint32_t out[34], const CPUState *cpu);
+    extern void     overlay_fp_log(uint32_t addr, const uint32_t *in_regs,
+                                   const CPUState *cpu, int native);
+    int      _ovfp = overlay_cache_window_contains(phys) &&
+                     overlay_loader_is_candidate(phys);
+    uint32_t _in_regs[34];
+    if (_ovfp) {
+        overlay_regs_snap(_in_regs, cpu);
+        /* One-shot insn-ring freeze BEFORE the Nth dispatch of the watched
+         * candidate — the ring tail then holds the pre-divergence window. */
+        if (g_insn_freeze_addr && phys == g_insn_freeze_addr &&
+            ++g_insn_freeze_count == g_insn_freeze_nth)
+            g_insn_log_frozen = 1;
+    }
+
+    {
+        extern int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
+        if (overlay_loader_dispatch(cpu, addr)) {
+            if (_ovfp) overlay_fp_log(addr, _in_regs, cpu, 1);
+            return 1;
+        }
+    }
+#define OV_FPLOG_RET1() do { if (_ovfp) overlay_fp_log(addr, _in_regs, cpu, 0); return 1; } while (0)
+
     if (!static_text_fallback && !dirty_ram_is_dirty(phys)) return 0;
+
+    /* Interp-pressure signal for variant-capture automation (step 2.8):
+     * counts dispatches the interpreter actually handles inside a capture
+     * window. The autocapture tick reads-and-resets this to decide whether
+     * an unseen region variant is being interp-executed right now. */
+    if (overlay_cache_window_contains(phys)) g_dirty_window_dispatches++;
 
     /* Reset soft-fail state at block entry. */
     g_unsupported_seen = 0;
@@ -900,10 +1114,19 @@ static int dirty_ram_dispatch_until_impl(CPUState* cpu, uint32_t addr,
     DirtyRamPcEntry *pc_entry = pc_table_get_or_insert(phys);
     if (pc_entry) pc_entry->hits++;
 
+    /* External-entry attribution: when the previous interp run exited by
+     * handing a target back to the dispatch loop, the very next dirty
+     * dispatch at that target is the SAME logical execution continuing —
+     * not a new entry. Anything else arrived from native code (a call or
+     * a fresh dispatch) and is real interior-entry evidence for alias
+     * seeding. */
+    if (pc_entry && addr != g_dirty_interp_chain_target) pc_entry->entry_hits++;
+    g_dirty_interp_chain_target = 0;
+
     /* Block-entry ring buffer — answers "who tried to JALR into this RAM
      * stub" by capturing cpu->gpr[31] (the caller's RA) at dispatch time.
-     * Always-on; eviction keeps memory bounded. */
-    {
+     * Always-on; eviction keeps memory bounded. Honors the capture freeze. */
+    if (!g_insn_log_frozen) {
         uint64_t s = g_dirty_ram_block_log_seq++;
         DirtyRamBlockLogEntry *e =
             &g_dirty_ram_block_log[s & (DIRTY_RAM_BLOCK_LOG_CAP - 1u)];
@@ -981,7 +1204,7 @@ static int dirty_ram_dispatch_until_impl(CPUState* cpu, uint32_t addr,
             dirty_ram_log_exit(cpu, addr, pc, 0, stop_addr,
                                DIRTY_EXIT_UNSUPPORTED_MID,
                                (uint32_t)insns_executed, 1);
-            return 1;
+            OV_FPLOG_RET1();
         }
         g_dirty_ram_insns_run++;
         insns_executed++;
@@ -995,7 +1218,7 @@ static int dirty_ram_dispatch_until_impl(CPUState* cpu, uint32_t addr,
                 dirty_ram_log_exit(cpu, addr, pc, target, stop_addr,
                                    DIRTY_EXIT_STOP_ADDR,
                                    (uint32_t)insns_executed, 1);
-                return 1;
+                OV_FPLOG_RET1();
             }
             if (static_text_fallback) {
                 g_dirty_ram_blocks_run++;
@@ -1004,23 +1227,26 @@ static int dirty_ram_dispatch_until_impl(CPUState* cpu, uint32_t addr,
                 dirty_ram_log_exit(cpu, addr, pc, target, stop_addr,
                                    DIRTY_EXIT_STATIC_TEXT_BLOCK,
                                    (uint32_t)insns_executed, 1);
-                return 1;
+                OV_FPLOG_RET1();
             }
             if (allow_local_dirty_flow && target != 0 &&
                 is_local_dirty_target(target)) {
-                uint64_t s = g_dirty_ram_flow_log_seq++;
-                DirtyRamFlowLogEntry *e =
-                    &g_dirty_ram_flow_log[s & (DIRTY_RAM_FLOW_LOG_CAP - 1u)];
-                e->seq = s;
-                e->pc = pc;
-                e->target = target;
-                e->ra = cpu->gpr[31];
-                e->a0 = cpu->gpr[4];
-                e->a1 = cpu->gpr[5];
-                e->a2 = cpu->gpr[6];
-                e->a3 = cpu->gpr[7];
-                e->sp = cpu->gpr[29];
-                e->frame = (uint32_t)s_frame_count;
+                /* Capture freeze gates ONLY the ring write — never flow. */
+                if (!g_insn_log_frozen) {
+                    uint64_t s = g_dirty_ram_flow_log_seq++;
+                    DirtyRamFlowLogEntry *e =
+                        &g_dirty_ram_flow_log[s & (DIRTY_RAM_FLOW_LOG_CAP - 1u)];
+                    e->seq = s;
+                    e->pc = pc;
+                    e->target = target;
+                    e->ra = cpu->gpr[31];
+                    e->a0 = cpu->gpr[4];
+                    e->a1 = cpu->gpr[5];
+                    e->a2 = cpu->gpr[6];
+                    e->a3 = cpu->gpr[7];
+                    e->sp = cpu->gpr[29];
+                    e->frame = (uint32_t)s_frame_count;
+                }
                 pc = target;
                 if ((insns_executed & 0xFFF) == 0) {
                     debug_server_poll();
@@ -1031,10 +1257,11 @@ static int dirty_ram_dispatch_until_impl(CPUState* cpu, uint32_t addr,
             }
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+            g_dirty_interp_chain_target = cpu->pc;
             dirty_ram_log_exit(cpu, addr, pc, target, stop_addr,
                                DIRTY_EXIT_NONLOCAL_TARGET,
                                (uint32_t)insns_executed, 1);
-            return 1;
+            OV_FPLOG_RET1();
         }
         pc = next_pc;
         /* Straight-line code that left the dirty page — hand back to
@@ -1057,10 +1284,11 @@ static int dirty_ram_dispatch_until_impl(CPUState* cpu, uint32_t addr,
             cpu->pc = pc;
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+            g_dirty_interp_chain_target = pc;
             dirty_ram_log_exit(cpu, addr, pc, pc, stop_addr,
                                DIRTY_EXIT_CLEAN_NEXT,
                                (uint32_t)insns_executed, 1);
-            return 1;
+            OV_FPLOG_RET1();
         }
     }
     g_dirty_ram_last_unsupported_pc = pc;
@@ -1070,6 +1298,7 @@ static int dirty_ram_dispatch_until_impl(CPUState* cpu, uint32_t addr,
     g_dirty_ram_blocks_run++;
     cpu->pc = pc;
     if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+    g_dirty_interp_chain_target = pc;
     dirty_ram_log_exit(cpu, addr, pc, pc, stop_addr,
                        DIRTY_EXIT_GUARD,
                        (uint32_t)insns_executed, 1);
@@ -1080,11 +1309,20 @@ static int dirty_ram_dispatch_until_impl(CPUState* cpu, uint32_t addr,
     if (cpu->pc == 0) {
         cpu->pc = pc;
     }
-    return 1;
+    OV_FPLOG_RET1();
 }
+#undef OV_FPLOG_RET1
 
+/* Public wrappers bracket the impl with g_dirty_interp_active so the
+ * event-timeline ring can tag events as INTERP vs STATIC. The EPC longjmp
+ * branch inside can escape without restoring; psx_check_interrupts clears
+ * the flag at its longjmp landing to cover that case. */
 int dirty_ram_dispatch_until(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
-    return dirty_ram_dispatch_until_impl(cpu, addr, stop_addr, 0);
+    int prev = g_dirty_interp_active;
+    g_dirty_interp_active = 1;
+    int r = dirty_ram_dispatch_until_impl(cpu, addr, stop_addr, 0);
+    g_dirty_interp_active = prev;
+    return r;
 }
 
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
@@ -1092,5 +1330,9 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr) {
 }
 
 int dirty_ram_dispatch_static_text(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
-    return dirty_ram_dispatch_until_impl(cpu, addr, stop_addr, 1);
+    int prev = g_dirty_interp_active;
+    g_dirty_interp_active = 1;
+    int r = dirty_ram_dispatch_until_impl(cpu, addr, stop_addr, 1);
+    g_dirty_interp_active = prev;
+    return r;
 }

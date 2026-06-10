@@ -40,6 +40,12 @@ extern int      sio_get_tx_writes(void);
 extern uint64_t g_dirty_ram_blocks_run;
 extern uint64_t g_dirty_ram_insns_run;
 
+/* Vsync self-heal counters — defined in main.cpp. Included in the dump
+ * so a slow_frames wedge can be attributed to driver present
+ * backpressure straight from the JSON. */
+extern uint32_t g_present_slow_count;
+extern int      g_present_vsync_disabled;
+
 static int s_started = 0;
 static char s_backend[32] = "psx-runtime";
 
@@ -55,22 +61,37 @@ static int    s_sym_initialized = 0;
 
 /* Wedge detection.
  *
- * Two failure modes to catch:
+ * Three failure modes to catch:
  *   A. HARD freeze — main thread is fully wedged; frame_count stops
  *      advancing entirely. Detected by zero frame_delta over the window.
- *   B. SOFT freeze / reentry storm — frame_count may keep advancing
- *      because VBlank is still being serviced, but game execution is
- *      starved by exception-handler reentry. Detected by a high
- *      exc_reentry_blocks delta only when the heartbeat progress counters
- *      are also stalled or near-stalled. Legitimate streaming workloads
- *      such as FMV/XA playback can have high reentry rates while CD, MDEC,
- *      audio, cycle, and dirty-RAM execution still advance.
+ *      (Bug B root cause was this kind: the old pacing loop's double
+ *      counter read underflowed into a ~24.7-day SDL_Delay.) Gated on
+ *      ALL progress counters stalling (frame, cycle, dirty-RAM) so a
+ *      paused-but-alive state isn't mislabeled.
+ *   B. REENTRY storm — frames advance but exception-handler reentry
+ *      per frame is far above the chronic baseline. The baseline is
+ *      ~2K reentry blocks per frame (the whole VSync callback chain
+ *      runs in exception context, every block leader checks), so the
+ *      storm test must be normalized PER FRAME, not per second. The
+ *      old absolute threshold (10K per 2s window = 5K/sec) was below
+ *      the healthy baseline (~2K/frame x 30-60 fps = 60-120K/sec) and
+ *      labeled normal play, boots, and host-side slowdowns all as
+ *      "reentry_storm" — which twice sent freeze investigations down
+ *      the wrong path. (Ape-fw independently hit the same false
+ *      positives on FMV/XA playback and added progress-counter gating;
+ *      both refinements are kept.)
+ *   C. SLOW frames — frames advance but pathologically slowly while
+ *      per-frame PSX work is normal: the wall clock is being eaten
+ *      outside the simulation (observed: NVIDIA GL SwapBuffers
+ *      blocking ~1.5s per present, dump 1781045865). Multi-sample
+ *      stack capture attributes the wait.
  *
- * Window = 60 ticks = 6.0 sec. Long enough that legitimate startup
- * activity (boot, FMV decode, save load, host device init) doesn't trip it;
- * short enough that real wedges still dump promptly. */
+ * Window = 60 ticks = 6.0 sec (ape-fw widening). Long enough that
+ * legitimate startup activity (boot, FMV decode, save load, host device
+ * init) doesn't trip it; short enough that real wedges dump promptly. */
 #define WEDGE_WINDOW_TICKS 60u
-#define WEDGE_EXC_REENTRY_DELTA_THRESHOLD 10000u  /* >5K/sec sustained = wedge */
+#define WEDGE_EXC_REENTRY_PER_FRAME_THRESHOLD 20000u /* ~10x chronic 2K/frame */
+#define WEDGE_SLOW_FRAMES_MAX_DELTA 30u   /* <5 fps avg over the 6s window */
 #define WEDGE_PROGRESS_MIN_FRAME_DELTA 2u
 #define WEDGE_PROGRESS_MIN_CYCLE_DELTA 100000u
 #define WEDGE_PROGRESS_MIN_DIRTY_DELTA 64u
@@ -232,6 +253,23 @@ static void freeze_dump_main_stack_json(FILE *f) {
 
     ResumeThread(s_main_thread);
 }
+
+/* Multi-sample stack capture for still-running wedges (wedge_kind 2 and 3).
+ * The main thread is still running (bouncing through the exception/VSync
+ * dispatch), so a single snapshot could land on a random recompiled block.
+ * Taking N snapshots a few ms apart reveals the RECURRING frames (the
+ * persistent dispatch/handler chain), which is what we want. Emits a JSON
+ * array of per-sample frame arrays: [[...],[...],...]. */
+static void freeze_dump_main_stack_samples_json(FILE *f, int n) {
+    if (!f) return;
+    fputc('[', f);
+    for (int i = 0; i < n; i++) {
+        if (i) fputc(',', f);
+        freeze_dump_main_stack_json(f);   /* one suspend/walk/resume snapshot */
+        Sleep(2);
+    }
+    fputc(']', f);
+}
 #endif /* _WIN32 */
 
 static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
@@ -276,6 +314,8 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         "  \"tx_writes\":%d,\n"
         "  \"dirty_ram_blocks\":%llu,\n"
         "  \"dirty_ram_insns\":%llu,\n"
+        "  \"present_slow_count\":%u,\n"
+        "  \"present_vsync_disabled\":%d,\n"
         "  \"wedge_kind\":%u,\n"
         "  \"wedge_kind_name\":\"%s\",\n"
         "  \"caps\":{\"wtrace_all\":%u,\"wtrace\":%u,\"mmio\":%u,"
@@ -300,9 +340,12 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         mc_max, tx_writes,
         (unsigned long long)g_dirty_ram_blocks_run,
         (unsigned long long)g_dirty_ram_insns_run,
+        g_present_slow_count,
+        g_present_vsync_disabled,
         s_last_wedge_kind,
         (s_last_wedge_kind == 1) ? "hard_freeze" :
-        (s_last_wedge_kind == 2) ? "reentry_storm" : "unknown",
+        (s_last_wedge_kind == 2) ? "reentry_storm" :
+        (s_last_wedge_kind == 3) ? "slow_frames" : "unknown",
         (unsigned)DUMP_CAP_WTRACE_ALL,
         (unsigned)DUMP_CAP_WTRACE,
         (unsigned)DUMP_CAP_MMIO,
@@ -426,12 +469,20 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
     fputs(",\n", f);
 
 #ifdef _WIN32
-    /* Main-thread call stack — only for hard freezes (wedge_kind==1).
-     * For reentry storms the main thread is still running; capturing its
-     * stack would just show a random recompiled-block frame. */
+    /* Main-thread call stack. Hard freeze (wedge_kind==1): one snapshot of the
+     * wedged thread in `main_stack`. Still-running wedges (kind 2 reentry
+     * storm, kind 3 slow frames): a single frame is noise — take multiple
+     * samples in `main_stack_samples` to expose the recurring wait (the
+     * dispatch/handler chain, or a driver present block). */
     fputs("  \"main_stack\":", f);
     if (s_last_wedge_kind == 1) {
         freeze_dump_main_stack_json(f);
+    } else {
+        fputs("[]", f);
+    }
+    fputs(",\n  \"main_stack_samples\":", f);
+    if (s_last_wedge_kind == 2 || s_last_wedge_kind == 3) {
+        freeze_dump_main_stack_samples_json(f, 8);
     } else {
         fputs("[]", f);
     }
@@ -499,14 +550,14 @@ static void heartbeat_write(void) {
 
     /* ---- Wedge detection: arm-once auto-dump ----
      * Walk back WEDGE_WINDOW_TICKS in the heartbeat ring (just pushed
-     * above) and compute deltas. Trigger if either:
-     *   A. frame_count delta == 0 after at least one frame has presented and
-     *      core progress is stalled
-     *   B. exc_reentry delta > threshold and progress is stalled
+     * above) and compute deltas. Trigger if any of:
+     *   A. frame delta == 0 AND core progress stalled   (hard freeze)
+     *   B. exc_reentry delta PER FRAME > threshold      (reentry storm)
+     *   C. frame delta < slow-frames floor              (host-side stall)
      *
      * Only fires once the ring has enough history. When the wedge clears
-     * (a healthy tick: frames advancing or exception reentry quiet), re-arm. */
-    uint32_t wedge_kind = 0;  /* 0=healthy, 1=hard freeze, 2=reentry storm */
+     * (a healthy tick), re-arm. */
+    uint32_t wedge_kind = 0;  /* 0=healthy 1=hard 2=reentry storm 3=slow frames */
     if (s_ring_count >= WEDGE_WINDOW_TICKS &&
         (frame != 0 || cyc != 0 || total_checks != 0)) {
         /* The just-pushed tick is at (s_ring_head - 1). The oldest in
@@ -542,8 +593,12 @@ static void heartbeat_write(void) {
             cycle_delta < WEDGE_PROGRESS_MIN_CYCLE_DELTA &&
             dirty_delta < WEDGE_PROGRESS_MIN_DIRTY_DELTA)
             wedge_kind = 1;
-        else if (excre_delta > WEDGE_EXC_REENTRY_DELTA_THRESHOLD && progress_stalled)
+        else if (frame_delta != 0 &&
+                 excre_delta / frame_delta > WEDGE_EXC_REENTRY_PER_FRAME_THRESHOLD)
             wedge_kind = 2;
+        else if (newest_frame != 0 && frame_delta < WEDGE_SLOW_FRAMES_MAX_DELTA)
+            wedge_kind = 3;
+        (void)progress_stalled; /* folded into the kind-1 condition above */
     }
 
     if (wedge_kind != 0) {

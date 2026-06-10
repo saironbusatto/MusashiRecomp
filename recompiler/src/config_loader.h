@@ -47,10 +47,39 @@ struct RuntimeConfig {
     bool                  has_disc_speed = false;
     std::string           disc_speed;      // raw string; main.cpp converts to divisor
 
+    // instant_max_per_frame: per-frame sector-IRQ budget while disc_speed =
+    // "instant" (cdrom.c floors the per-sector period to VBLANK/N). Absent =
+    // cdrom.c built-in default. Runtime-tunable via the cdrom_instant_rate
+    // TCP command; the turbo-through-loads predicate drives the same knob.
+    bool                  has_instant_max_per_frame = false;
+    int                   instant_max_per_frame = 0;
+
     // fast_boot: snapshot BIOS state at first game handoff and restore it on
     // subsequent launches, skipping BIOS execution entirely. Default off;
     // enable per-game in [runtime]. Snapshot is keyed on BIOS SHA256 + entry_pc.
     bool                  fast_boot = false;
+
+    // overlay_cache: enable the overlay DLL cache + capture (Layer A). Off by
+    // default. When true the runtime scans cache/<game_id>/ for precompiled
+    // overlay DLLs (loaded ahead of the dirty-RAM interpreter) and records
+    // overlay bytes to overlay_captures.json for offline compilation.
+    bool                  overlay_cache = false;
+
+    // turbo_loads: OPT-IN per game. While the game is loading (CD data
+    // stream active, XA/FMV excluded, post-BIOS-handoff only) the frontend
+    // skips wall-clock pacing so the guest runs at host speed — compressing
+    // load wall-time. Streaming titles (e.g. Crash) must leave this off.
+    bool                  turbo_loads = false;
+
+    // overlay_autocompile_cmd: variant-capture automation (step 2.8). A
+    // shell command (run via cmd.exe /C, cwd = project root) that compiles
+    // overlay_captures.json into the cache — normally the project's
+    // compile_overlays.py invocation. When set (and overlay_cache is on),
+    // the runtime auto-captures on sustained capture-window interp pressure
+    // and spawns this command in the background; on success the loader
+    // rescans the cache and the new variant goes native in-session.
+    bool                  has_overlay_autocompile_cmd = false;
+    std::string           overlay_autocompile_cmd;
 };
 
 // One entry from [[recompiler.bios_vectors]].

@@ -32,6 +32,31 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr);
 int dirty_ram_dispatch_until(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
 int dirty_ram_dispatch_static_text(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
 
+/* Overlay-cache windows — the address ranges eligible for capture, offline
+ * recompilation, and per-entry-validated native execution (Rule 18 code that
+ * does not exist in any compile-time image):
+ *
+ *   Kernel RAM   [0x00000, 0x10000): the BIOS part-2 image relocated to RAM
+ *     plus install-at-runtime stubs (e.g. the SIO data-byte stub at 0xCF0).
+ *     Dirty-tracked per CPU store (dirty_ram_mark_kernel_write).
+ *   Overlay region [OVERLAY_REGION_FLOOR, RAM_SIZE): game overlays loaded by
+ *     CD DMA (dirty_ram_mark_executable_range).
+ *
+ * Main-EXE text [0x10000, OVERLAY_REGION_FLOOR) is statically recompiled and
+ * is NEVER a capture/candidate window. The floor equals the main EXE text end
+ * (Tomba: load 0x10000 + text 0x88000).
+ *
+ * The interpreter's LOCAL-FLOW gates (is_local_dirty_target /
+ * allow_local_dirty_flow) intentionally use OVERLAY_REGION_FLOOR alone, NOT
+ * this window predicate: kernel-RAM code runs in exception context where the
+ * verified per-block dispatch cadence is preserved. Native coverage for the
+ * kernel window comes from the overlay loader, not from interp chaining. */
+#define DIRTY_RAM_KERNEL_WINDOW_END 0x00010000u
+#define OVERLAY_REGION_FLOOR        0x00098000u
+static inline int overlay_cache_window_contains(uint32_t phys) {
+    return phys < DIRTY_RAM_KERNEL_WINDOW_END || phys >= OVERLAY_REGION_FLOOR;
+}
+
 /* Test whether a given physical kernel-RAM address is in a page that was
  * written-to since boot.  Defined in memory.c. */
 int      dirty_ram_is_dirty(uint32_t phys);
@@ -45,6 +70,9 @@ void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
 extern uint64_t g_dirty_ram_blocks_run;     /* basic blocks interpreted */
 extern uint64_t g_dirty_ram_insns_run;      /* instructions interpreted */
 extern uint64_t g_dirty_ram_static_text_blocks_run;
+extern uint64_t g_dirty_window_dispatches;  /* interp dispatches inside a
+                                             * capture window (autocapture
+                                             * pressure signal, step 2.8) */
 extern uint64_t g_dirty_ram_aborts;         /* unsupported-opcode aborts */
 extern uint64_t g_dirty_ram_guard_yields;   /* long dirty loops yielded */
 extern uint64_t g_dirty_ram_unsupported_midblock;
@@ -60,13 +88,22 @@ extern const char *g_dirty_ram_last_unsupported_reason;
  * stubs actually fire — a single noisy spurious-dispatch site can mask
  * a legitimate handler that never runs.  This open-addressed table keys
  * on the entry PC of each interpreted block. */
-#define DIRTY_RAM_PC_TABLE_SIZE 64
+#define DIRTY_RAM_PC_TABLE_SIZE 65536
 typedef struct {
-    uint32_t pc;        /* entry PC, 0 = empty slot */
-    uint64_t hits;      /* number of times dispatched here */
-    uint64_t insns;     /* total instructions executed across hits */
+    uint32_t pc;         /* entry PC, 0 = empty slot */
+    uint64_t hits;       /* number of times dispatched here */
+    uint64_t insns;      /* total instructions executed across hits */
+    uint64_t entry_hits; /* dispatches that arrived from NATIVE code (call /
+                          * dispatch loop), not from the interpreter's own
+                          * block-to-block chaining. `hits` conflates the two:
+                          * below the local-flow floor every taken branch
+                          * re-dispatches, so chain blocks dominate. entry_hits
+                          * is the evidence stream for interior-alias seeds. */
 } DirtyRamPcEntry;
 extern DirtyRamPcEntry g_dirty_ram_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
+/* Companion table: every PC the interpreter actually executes (not just block
+ * entries). overlay_capture uses both to report execution-verified seeds. */
+extern DirtyRamPcEntry g_dirty_ram_exec_pc_table[DIRTY_RAM_PC_TABLE_SIZE];
 
 /* Block-entry ring buffer. Records every dispatch into dirty RAM with the
  * caller's RA at entry, plus argument context — answers

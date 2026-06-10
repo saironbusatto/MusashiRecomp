@@ -72,6 +72,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/mdec.c
     ${PSXRECOMP_ROOT}/runtime/src/timers.c
     ${PSXRECOMP_ROOT}/runtime/src/interrupts.c
+    ${PSXRECOMP_ROOT}/runtime/src/frame_pacing.c
     ${PSXRECOMP_ROOT}/runtime/src/psx_fiber.c
     ${PSXRECOMP_ROOT}/runtime/src/sio.c
     ${PSXRECOMP_ROOT}/runtime/src/memcard.c
@@ -92,6 +93,10 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/starvation_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/card_read_summary.c
     ${PSXRECOMP_ROOT}/runtime/src/card_data_writes.c
+    ${PSXRECOMP_ROOT}/runtime/src/overlay_capture.c
+    ${PSXRECOMP_ROOT}/runtime/src/overlay_loader.c
+    ${PSXRECOMP_ROOT}/runtime/src/autocompile.c
+    ${PSXRECOMP_ROOT}/runtime/src/event_ring.c
     ${PSXRECOMP_ROOT}/recompiler/src/config_loader.cpp
 )
 
@@ -112,6 +117,7 @@ function(psxrecomp_add_runtime_target target)
     set(oneValueArgs
         GAME_GENERATED_FULL_C
         GAME_GENERATED_DISPATCH_C
+        GAME_OVERLAY_STATIC_C
         DEBUG_PORT
         WINDOW_TITLE
         DEFAULT_BIOS_PATH
@@ -146,6 +152,13 @@ function(psxrecomp_add_runtime_target target)
         set_source_files_properties("${PSXRT_GAME_GENERATED_DISPATCH_C}" PROPERTIES GENERATED TRUE)
         list(APPEND generated_sources "${PSXRT_GAME_GENERATED_DISPATCH_C}")
         set(has_game_dispatch TRUE)
+    endif()
+    # Layer B: statically-compiled overlay dispatch. Inert unless a game
+    # provides a generated overlays_static.c — no target sets this yet.
+    if(PSXRT_GAME_OVERLAY_STATIC_C AND EXISTS "${PSXRT_GAME_OVERLAY_STATIC_C}")
+        set_source_files_properties("${PSXRT_GAME_OVERLAY_STATIC_C}" PROPERTIES GENERATED TRUE)
+        list(APPEND generated_sources "${PSXRT_GAME_OVERLAY_STATIC_C}")
+        set(has_overlay_dispatch TRUE)
     endif()
 
     if(PSXRT_ORACLE)
@@ -200,6 +213,9 @@ function(psxrecomp_add_runtime_target target)
     endif()
     if(has_game_dispatch)
         target_compile_definitions(${target} PRIVATE PSX_HAS_GAME_DISPATCH=1)
+    endif()
+    if(has_overlay_dispatch)
+        target_compile_definitions(${target} PRIVATE PSX_HAS_OVERLAY_DISPATCH=1)
     endif()
 
     # PSX_DEBUG_TOOLS option declared at the top of runtime.cmake so it's

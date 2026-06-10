@@ -15,6 +15,34 @@ void cdrom_set_speed(int divisor);
 void cdrom_set_game_speed(int divisor);
 /* Called by fntrace on first game-range dispatch; switches to game speed. */
 void cdrom_notify_game_started(void);
+/* LBA of the most recent SetLoc command (-1 if none yet). Used by the DMA
+ * ring buffer to correlate each sector transfer with its disc position. */
+int  cdrom_get_setloc_lba(void);
+
+/* 'instant' per-frame sector-IRQ budget (step 3). Clamped to [1, 4096];
+ * the per-sector period additionally floors at CDROM_MIN_DELAY. Writers:
+ * game.toml [runtime] instant_max_per_frame, the cdrom_instant_rate TCP
+ * command, and the turbo-through-loads predicate (step 4). */
+void cdrom_set_instant_rate(int per_frame);
+int  cdrom_get_instant_rate(void);
+
+/* CD load-burst ring (always-on). One record per gap-separated run of
+ * delivered data sectors. `out` receives up to `max` records, newest first
+ * (layout matches cdrom.c's CdBurst — consumed by debug_server.c only). */
+typedef struct CdBurstRecord {
+    uint32_t start_frame, end_frame;
+    uint64_t start_ms, end_ms;
+    uint32_t sectors;
+    uint32_t rate;
+    uint32_t divisor;
+} CdBurstRecord;
+int      cdrom_get_bursts(void *out, int max);
+uint32_t cdrom_get_burst_total(void);
+
+/* True while a data-sector load is in progress (read stream active or a
+ * data sector delivered within the burst-gap window). XA streaming is never
+ * a load. Drives turbo-through-loads (step 4). */
+int cdrom_load_in_progress(void);
 
 /* MMIO read/write (0x1F801800-0x1F801803) */
 uint32_t cdrom_read(uint32_t addr);

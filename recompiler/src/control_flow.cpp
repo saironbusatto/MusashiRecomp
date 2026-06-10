@@ -352,21 +352,35 @@ std::vector<std::pair<uint32_t, uint32_t>> ControlFlowAnalyzer::detect_loops(
 
 ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
     ControlFlowGraph cfg;
-    cfg.function_start = func.start_addr;
+    // Alias entries cover their HOST's full range so backward branches, shared
+    // epilogues, and jr jump tables (whose setup may precede the alias entry)
+    // all stay intra-function. The emitted alias enters via goto to its
+    // start_addr block; walk_lo is the host's start.
+    uint32_t walk_lo = func.alias_walk_lo ? func.alias_walk_lo : func.start_addr;
+    cfg.function_start = walk_lo;
     cfg.function_end = func.end_addr;
 
     // Simplified single-pass analysis: scan instructions to find block boundaries
     // without building full CFG. This avoids the crash in build_basic_blocks.
     std::vector<uint32_t> boundary_vec;
-    boundary_vec.push_back(func.start_addr);
+    boundary_vec.push_back(walk_lo);
+    if (func.alias_walk_lo) {
+        // Every alias entry point of this host must be a block leader so the
+        // shared body's entry switch has labels to land on — and so sibling
+        // aliases produce identical CFGs.
+        boundary_vec.push_back(func.start_addr);
+        for (uint32_t e : func.alias_group_entries) {
+            if (e >= walk_lo && e < func.end_addr) boundary_vec.push_back(e);
+        }
+    }
     auto add_boundary = [&](uint32_t target) {
-        if (target >= func.start_addr && target < func.end_addr) {
+        if (target >= walk_lo && target < func.end_addr) {
             boundary_vec.push_back(target);
         }
     };
 
     // Scan instructions for branches/jumps to find block starts
-    for (uint32_t addr = func.start_addr; addr < func.end_addr; addr += 4) {
+    for (uint32_t addr = walk_lo; addr < func.end_addr; addr += 4) {
         auto instr_opt = exe_.read_word(addr);
         if (!instr_opt) continue;
         uint32_t instr = *instr_opt;
@@ -374,7 +388,7 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
         if (is_control_flow(instr)) {
             ControlFlowInstr cf = analyze_instruction(addr, instr);
 
-            if (cf.target != 0 && cf.target >= func.start_addr && cf.target < func.end_addr) {
+            if (cf.target != 0 && cf.target >= walk_lo && cf.target < func.end_addr) {
                 add_boundary(cf.target);
             }
 
@@ -397,7 +411,7 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
         if (block.end_addr < block.start_addr) continue;
 
         block.instruction_count = (block.end_addr - block.start_addr) / 4 + 1;
-        block.is_entry = (block.start_addr == func.start_addr);
+        block.is_entry = (block.start_addr == walk_lo);
         block.is_exit = false;
         block.is_loop_header = false;
 
@@ -428,7 +442,7 @@ ControlFlowGraph ControlFlowAnalyzer::analyze_function(const Function& func) {
 
         // Add successors — only targets within this function's block set
         auto in_func = [&](uint32_t addr) {
-            return addr >= func.start_addr &&
+            return addr >= walk_lo &&
                    addr < func.end_addr &&
                    std::binary_search(boundary_vec.begin(), boundary_vec.end(), addr);
         };

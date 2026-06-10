@@ -13,8 +13,15 @@
 #include "cdrom.h"
 #include "dma.h"
 #include "spu.h"
+#include "event_ring.h"
 #include <string.h>
 #include <stdlib.h>
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <time.h>
+#endif
 
 /* C wrappers for the C++ ISOReader (defined in iso_reader_c.cpp) */
 extern void* iso_open(const char* path);
@@ -79,6 +86,7 @@ static uint64_t command_history_seq;
 
 /* Seek target */
 static uint8_t seek_min, seek_sec, seek_sect;
+static int     s_setloc_lba = -1;  /* LBA captured at SetLoc time */
 
 /* Read state */
 static int reading;
@@ -142,21 +150,108 @@ void cdrom_notify_game_started(void) {
     g_disc_speed_divisor = g_game_divisor;
 }
 
+int cdrom_get_setloc_lba(void) { return s_setloc_lba; }
+
 /* Minimum cycles between CD-ROM IRQs in fast modes. Must be enough for the
  * interrupt handler to save state, check the IRQ flag, process data, and
  * return. Too low → interrupt fires before the previous one is processed →
  * game hangs. 500 cycles ≈ 15µs at 33MHz, still ~900x faster than authentic. */
 #define CDROM_MIN_DELAY 500
 
+/* 'instant' disc speed (divisor 0): as fast as the engine can absorb WITHOUT
+ * starving the 60Hz VBLANK or the main loop. A flat CDROM_MIN_DELAY collapses
+ * every sector read to 500cy, so a multi-sector load fires ~1100 DMA-completion
+ * IRQs per VBLANK frame (564480/500). That buries VBLANK and the main loop
+ * under a DMA-IRQ storm — the field loop is pinned and the watchdog reports a
+ * freeze. Floor the per-response period so at most ~CDROM_INSTANT_MAX_PER_FRAME
+ * sector IRQs land per frame. At 32/frame this is still ~3x faster than 4x
+ * (sector ≈ 17640cy vs 56448cy) so loads stay near-instant in wall-clock, but
+ * frames always advance. Paired with the per-source exception-progress
+ * guarantee in interrupts.c (the real anti-starvation fix); this floor keeps
+ * the exception VOLUME sane so the framerate doesn't collapse. Tunable via the
+ * MAX_PER_FRAME knob. */
+#define VBLANK_CYCLES_NTSC          564480   /* 33.8688 MHz / 60 Hz; matches interrupts.c */
+#define CDROM_INSTANT_MAX_PER_FRAME_DEFAULT 32
+
+/* Runtime-tunable 'instant' budget (step 3). One knob drives three writers:
+ * game.toml [runtime] instant_max_per_frame, the cdrom_instant_rate TCP
+ * command (in-session A/B without rebuilds), and — step 4 — the
+ * turbo-through-loads predicate. Period floors at CDROM_MIN_DELAY, so the
+ * effective ceiling is VBLANK_CYCLES_NTSC/CDROM_MIN_DELAY ≈ 1128/frame. */
+static int g_instant_max_per_frame = CDROM_INSTANT_MAX_PER_FRAME_DEFAULT;
+
+void cdrom_set_instant_rate(int per_frame) {
+    if (per_frame < 1)    per_frame = 1;
+    if (per_frame > 4096) per_frame = 4096;
+    g_instant_max_per_frame = per_frame;
+}
+int cdrom_get_instant_rate(void) { return g_instant_max_per_frame; }
+
+static int instant_period(void) {
+    int p = VBLANK_CYCLES_NTSC / g_instant_max_per_frame;
+    return p < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : p;
+}
+
 static int apply_speed(int delay) {
     /* XA streaming (FMV / CDDA background music): preserve authentic timing.
      * FMVs interleave XA audio + MDEC video — speeding up sector delivery
      * would cause both to play faster than the display refresh rate. */
     if (xa_stream_active) return delay;
-    if (g_disc_speed_divisor == 0) return CDROM_MIN_DELAY;
+    if (g_disc_speed_divisor == 0) return instant_period(); /* bounded 'instant' */
     int d = delay / g_disc_speed_divisor;
     return d < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : d;
 }
+
+/* ---- CD load-burst ring (always-on; CLAUDE.md ring-buffer rule) ----------
+ * A "burst" is a run of delivered sectors with no gap longer than
+ * CD_BURST_GAP_FRAMES — i.e. one load. Records make "load duration" a
+ * measured quantity (frames + host wall ms + sectors + the instant rate in
+ * effect), queried via the cdrom_bursts TCP command. */
+#define CD_BURST_CAP        128
+#define CD_BURST_GAP_FRAMES 30
+typedef CdBurstRecord CdBurst;       /* layout shared with cdrom.h consumers */
+static CdBurst  s_bursts[CD_BURST_CAP];
+static uint32_t s_burst_count = 0;   /* monotonic; slot = (count-1) % CAP */
+
+static uint64_t host_ms(void) {
+#ifdef _WIN32
+    return (uint64_t)GetTickCount64();
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+#endif
+}
+
+static void burst_note_sector(void) {
+    uint32_t f  = (uint32_t)s_frame_count;
+    uint64_t ms = host_ms();
+    CdBurst *b = (s_burst_count > 0)
+               ? &s_bursts[(s_burst_count - 1u) % CD_BURST_CAP] : NULL;
+    if (!b || f > b->end_frame + CD_BURST_GAP_FRAMES) {
+        b = &s_bursts[s_burst_count++ % CD_BURST_CAP];
+        b->start_frame = f;
+        b->start_ms    = ms;
+        b->sectors     = 0;
+    }
+    b->end_frame = f;
+    b->end_ms    = ms;
+    b->sectors++;
+    b->rate    = (uint32_t)g_instant_max_per_frame;
+    b->divisor = (uint32_t)g_disc_speed_divisor;
+}
+
+/* Copy out the most recent `max` bursts, newest first. Returns count. */
+int cdrom_get_bursts(void *out, int max) {
+    CdBurst *dst = (CdBurst *)out;
+    int n = 0;
+    for (uint32_t k = 0; k < CD_BURST_CAP && n < max; k++) {
+        if (k >= s_burst_count) break;
+        dst[n++] = s_bursts[(s_burst_count - 1u - k) % CD_BURST_CAP];
+    }
+    return n;
+}
+uint32_t cdrom_get_burst_total(void) { return s_burst_count; }
 
 static int sector_delay_cycles(void) {
     /* PS1 CPU is 33.8688 MHz. CD-ROM sectors arrive at 75 Hz in 1x
@@ -345,12 +440,15 @@ static void response_push(uint8_t val) {
 static void set_irq(int type) {
     irq_flag = (uint8_t)type;
     trace_cdrom('I', 0, (uint32_t)type, 0);
+    /* DEQUEUE: CD response/data event fired (aux = CD irq type). */
+    event_ring_record_aux(EV_DEQ, (uint8_t)SRC_CD_IRQ, (uint32_t)type);
 }
 
 /* Fire CDROM IRQ into the interrupt controller */
 static void fire_cdrom_irq(void) {
     if (irq_flag && (irq_enable & (1 << (irq_flag - 1)))) {
         i_stat |= (1u << 2); /* IRQ_CDROM */
+        event_ring_record(EV_ISTAT_RAISE, 2 /* IRQ_CDROM bit */);
         trace_cdrom('F', 0, irq_flag, 0);
     } else {
         trace_cdrom('f', 0, irq_flag, 0);
@@ -619,6 +717,7 @@ static int read_sector_at(int min, int sec, int sect) {
     sector_available = delivery.data_delivered ? 1 : 0;
     if (delivery.data_delivered) {
         memcpy(last_sector_buffer, sector_buffer, (size_t)sector_size);
+        burst_note_sector();
     } else {
         uint32_t copy_size = history_size < SECTOR_BUFFER_SIZE ? (uint32_t)history_size
                                                                : SECTOR_BUFFER_SIZE;
@@ -677,6 +776,10 @@ static void start_read_stream(uint8_t cmd) {
     read_delay = sector_delay_cycles();
     reading = 1;
     stat_reg |= CDSTAT_READ;
+    /* ENQUEUE: sector-read stream scheduled (due in read_delay cycles). A
+     * content load that happens in OFF but not ON shows up as a missing
+     * SRC_CD_READ enqueue here. */
+    event_ring_record_aux(EV_ENQ, (uint8_t)SRC_CD_READ, (uint32_t)read_delay);
 }
 
 static void stop_read_stream(void) {
@@ -746,6 +849,10 @@ static void queue_or_exec_command(uint8_t cmd) {
 
 static void exec_command(uint8_t cmd) {
     trace_cdrom('C', 0, cmd, 0);
+    /* ENQUEUE: a CD command was issued (aux = command byte). */
+    event_ring_record_aux(EV_ENQ, (uint8_t)SRC_CD_CMD, (uint32_t)cmd);
+    /* Snapshot the param FIFO before handlers consume it, so the
+     * command-history record at the end sees the original params. */
     uint8_t cmd_params[PARAM_FIFO_SIZE];
     int cmd_param_count = param_count;
     if (cmd_param_count < 0) cmd_param_count = 0;
@@ -769,6 +876,7 @@ static void exec_command(uint8_t cmd) {
             seek_min = bcd_to_bin(param_fifo[0]);
             seek_sec = bcd_to_bin(param_fifo[1]);
             seek_sect = bcd_to_bin(param_fifo[2]);
+            s_setloc_lba = msf_to_lba(seek_min, seek_sec, seek_sect);
         }
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
@@ -1391,4 +1499,20 @@ uint32_t cdrom_debug_copy_last_sector(uint32_t offset, uint32_t len,
     if (len > avail) len = avail;
     memcpy(out, last_sector_buffer + offset, len);
     return len;
+}
+
+/* Load-in-progress predicate for turbo-through-loads (step 4). True while a
+ * data-sector read stream is active or a data sector was delivered within
+ * the burst-gap window (bridges the per-file Setloc/seek gaps inside one
+ * logical load). XA streaming (FMV / CD audio) is NEVER a load — its pacing
+ * must stay authentic. */
+int cdrom_load_in_progress(void) {
+    if (xa_stream_active) return 0;
+    if (reading) return 1;
+    if (s_burst_count > 0) {
+        const CdBurst *b = &s_bursts[(s_burst_count - 1u) % CD_BURST_CAP];
+        if ((uint32_t)s_frame_count <= b->end_frame + CD_BURST_GAP_FRAMES)
+            return 1;
+    }
+    return 0;
 }

@@ -77,6 +77,7 @@ if(NOT MSVC AND EXISTS "${BEETLE_LIB}")
         src/beetle_main.cpp
         src/beetle_libretro.cpp
         src/beetle_debug_server.c
+        src/frame_pacing.c
         ${LIBRETRO_COMMON_SOURCES}
     )
 

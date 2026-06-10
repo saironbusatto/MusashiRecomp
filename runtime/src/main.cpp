@@ -10,7 +10,11 @@
 #include "cdrom.h"
 #include "fntrace.h"
 #include "boot_state.h"
+#include "overlay_capture.h"
+#include "overlay_loader.h"
+#include "autocompile.h"
 #include "gpu.h"
+#include "frame_pacing.h"
 #include "sio.h"
 #include "spu.h"
 #include "memcard.h"
@@ -101,6 +105,23 @@ static void write_startup_stage(const char* stage) {
                  (long long)std::time(nullptr));
     std::fclose(f);
 }
+
+/* Vsync self-heal state (see SDL_RenderPresent wrapper in
+ * sdl_vblank_present). C linkage: freeze_heartbeat.c includes both in
+ * the freeze dump so a slow-frames wedge can be attributed to driver
+ * present backpressure from the dump alone. */
+extern "C" {
+uint32_t g_present_slow_count = 0;     /* presents that blocked >250ms */
+int      g_present_vsync_disabled = 0; /* 1 once self-heal tripped */
+}
+
+/* Turbo-through-loads (step 4). C linkage: debug_server.c reads/toggles the
+ * enable and reports the frame counter. Enabled by game.toml [runtime]
+ * turbo_loads (opt-in per game) or the turbo_loads TCP command. */
+extern "C" {
+int      g_turbo_loads_enabled = 0;
+uint64_t g_turbo_loads_frames  = 0;   /* vblanks run unpaced (observability) */
+}
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
 
@@ -181,6 +202,17 @@ static void launcher_warning(const char* title, const std::string& msg) {
     MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONWARNING);
 #endif
 }
+
+static void launcher_info(const char* title, const std::string& msg) {
+    std::fprintf(stderr, "%s: %s\n", title, msg.c_str());
+#ifdef _WIN32
+    MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONINFORMATION);
+#endif
+}
+
+/* Game display name for picker dialogs ("Tomba!"); set after the game
+ * config loads, before any interactive file resolution. */
+static std::string s_picker_game_name = "PSXRecomp";
 
 static bool pick_runtime_file(const char* title, const char* filter,
                               std::filesystem::path& out) {
@@ -392,10 +424,23 @@ static std::filesystem::path resolve_bios_for_runtime(const char* requested,
         return cached;
     }
 
+    /* Interactive pick. Be explicit about WHICH of the two user-supplied
+     * files is being requested — first-time users see two pickers in a
+     * row and the difference between "BIOS" and "disc image" is not
+     * obvious to non-technical players. */
+    launcher_info((s_picker_game_name + " — PlayStation BIOS needed").c_str(),
+        s_picker_game_name + " does not include any Sony or game files.\n\n"
+        "Step 1 of 2 — PlayStation BIOS\n\n"
+        "In the next window, select your PlayStation BIOS dump. The file is "
+        "usually named SCPH1001.BIN and is exactly 512 KB. You must dump it "
+        "from your own console or otherwise legally obtain it.\n\n"
+        "(This is NOT the game disc — that is asked for next.)");
+    std::string bios_title =
+        s_picker_game_name + " — Step 1 of 2: select PlayStation BIOS (SCPH1001.BIN)";
     for (;;) {
         std::filesystem::path picked;
         if (!pick_runtime_file(
-                "Select SCPH1001.BIN BIOS",
+                bios_title.c_str(),
                 "PlayStation BIOS (*.bin)\0*.bin\0All Files (*.*)\0*.*\0",
                 picked)) {
             return {};
@@ -427,10 +472,21 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
         return cached;
     }
 
+    launcher_info((s_picker_game_name + " — game disc image needed").c_str(),
+        "Step 2 of 2 — game disc image\n\n"
+        "In the next window, select your " + s_picker_game_name +
+        (game_id.empty() ? std::string() : " (" + game_id + ")") +
+        " disc image ripped from your own disc.\n\n"
+        "Accepted formats: .cue (preferred, with its .bin next to it), "
+        ".bin, or .iso.\n\n"
+        "(This is NOT the BIOS — the BIOS was already chosen.)");
+    std::string disc_title =
+        s_picker_game_name + " — Step 2 of 2: select " + s_picker_game_name +
+        " disc image (.cue / .bin / .iso)";
     for (;;) {
         std::filesystem::path picked;
         if (!pick_runtime_file(
-                "Select PlayStation Disc Image",
+                disc_title.c_str(),
                 "PS1 Disc Images (*.cue;*.bin;*.iso)\0*.cue;*.bin;*.iso\0All Files (*.*)\0*.*\0",
                 picked)) {
             return {};
@@ -482,6 +538,7 @@ static void close_controller(void);
 
 static void shutdown_runtime(void) {
     memcard_flush_all();
+    overlay_capture_write_json();
     if (sdl_audio_device) {
         SDL_ClearQueuedAudio(sdl_audio_device);
         SDL_CloseAudioDevice(sdl_audio_device);
@@ -954,6 +1011,12 @@ static void sdl_vblank_present(void) {
     int override = -1;
 #endif
 
+    /* Step 2.8 automation ticks — BEFORE the turbo/fast-boot early returns
+     * below, so capture detection and compile pickup keep running while the
+     * frontend is skipping presents. Both are cheap and emu-thread-only. */
+    overlay_autocapture_tick();
+    autocompile_poll_main();
+
     /* Pump SDL events to prevent window freeze. */
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
@@ -1042,32 +1105,34 @@ static void sdl_vblank_present(void) {
         s_fast_boot_active = 0;
     }
 
+    /* Turbo-through-loads (step 4, OPT-IN via game.toml [runtime]
+     * turbo_loads): while the game is loading — CD data stream active,
+     * XA/FMV excluded, post-BIOS-handoff only — skip wall-clock pacing and
+     * most presents so the guest runs at host speed. Step-3 measurement
+     * showed loads are paced by the game's own per-sector processing at
+     * real time (2.2-4.8 sectors/frame against a 32-256 IRQ budget), so
+     * host-speed execution is the lever that compresses load wall-time.
+     * Presents 1-in-30 so visual progress stays visible. */
+    if (g_turbo_loads_enabled) {
+        extern int fntrace_is_game_started(void);
+        if (fntrace_is_game_started() && cdrom_load_in_progress()) {
+            g_turbo_loads_frames++;
+            static int tl_skip = 0;
+            const int TL_PRESENT_EVERY = 30;
+            tl_skip = (tl_skip + 1) % TL_PRESENT_EVERY;
+            if (tl_skip != 0) return;
+        }
+    }
+
     /* Wall-clock pacing: always runs once fast_boot has ended, even when the
      * display is still disabled (e.g. game crt0 setup). Skipped only by the
-     * turbo and fast_boot early-returns above. */
+     * turbo and fast_boot early-returns above. frame_pacer_wait is the
+     * race-free replacement for the old open-coded loop whose double
+     * counter read could underflow into a ~24.7-day SDL_Delay (Bug B
+     * hard freeze). */
     {
-        static Uint64 next_deadline = 0;
-        Uint64 freq = SDL_GetPerformanceFrequency();
-        Uint64 period = (Uint64)((double)freq * (PSX_FRAME_PERIOD_MS / 1000.0));
-        Uint64 now = SDL_GetPerformanceCounter();
-        if (next_deadline == 0 || now >= next_deadline + period) {
-            next_deadline = now + period;  /* first frame, or fell behind */
-        } else {
-            while (SDL_GetPerformanceCounter() < next_deadline) {
-                Uint64 remaining_ticks = next_deadline - SDL_GetPerformanceCounter();
-                Uint64 remaining_ms = (remaining_ticks * 1000) / freq;
-                if (remaining_ms >= 2) {
-                    SDL_Delay((Uint32)(remaining_ms - 1));
-                } else {
-                    /* Final spin for sub-ms accuracy. */
-                    break;
-                }
-            }
-            while (SDL_GetPerformanceCounter() < next_deadline) {
-                /* spin */
-            }
-            next_deadline += period;
-        }
+        static FramePacer pacer = { 0 };
+        frame_pacer_wait(&pacer, PSX_FRAME_PERIOD_MS);
     }
 
     /* ---- Display from our VRAM ---- */
@@ -1107,7 +1172,30 @@ static void sdl_vblank_present(void) {
     SDL_Rect dst = { 0, 0, 640, 480 };
     SDL_RenderClear(sdl_renderer);
     SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
-    SDL_RenderPresent(sdl_renderer);
+
+    /* Vsync self-heal. The renderer is created with PRESENTVSYNC for
+     * tear-free output, but the wall-clock pacer above already holds
+     * 59.94 Hz, so driver vsync is redundant for timing. Under some
+     * driver states (observed: NVIDIA GL with the swap queue wedged)
+     * SwapBuffers blocks ~1.5 s per present, dragging the whole
+     * emulation to ~0.7 fps for minutes (freeze dump 1781045865:
+     * 8/8 main-thread samples inside wglSwapBuffers). If presents
+     * block pathologically several times in a row, drop driver vsync
+     * for the rest of the session; our own pacing keeps the rate. */
+    {
+        const Uint64 t0 = SDL_GetPerformanceCounter();
+        SDL_RenderPresent(sdl_renderer);
+        const Uint64 t1 = SDL_GetPerformanceCounter();
+        const Uint64 freq = SDL_GetPerformanceFrequency();
+        const Uint64 present_ms = (t1 >= t0 && freq) ? ((t1 - t0) * 1000u) / freq : 0;
+        if (!g_present_vsync_disabled && present_ms > 250) {
+            g_present_slow_count++;
+            if (g_present_slow_count >= 3 &&
+                SDL_RenderSetVSync(sdl_renderer, 0) == 0) {
+                g_present_vsync_disabled = 1;
+            }
+        }
+    }
 #endif
 }
 
@@ -1164,6 +1252,7 @@ int main(int argc, char** argv) {
     std::string game_id;
     std::string disc_speed;   /* "1x" | "2x" | "4x" | "instant" */
     std::string controller_model = "digital";
+    int        instant_rate  = 0;   /* 0 = cdrom.c built-in default */
     uint32_t   game_entry_pc = 0;
     bool       fast_boot     = false;
 
@@ -1179,8 +1268,38 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
             if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
             if (gc.runtime.has_controller)   controller_model = gc.runtime.controller;
+            if (gc.runtime.has_instant_max_per_frame)
+                instant_rate = gc.runtime.instant_max_per_frame;
+            if (gc.runtime.turbo_loads) {
+                g_turbo_loads_enabled = 1;
+                std::fprintf(stdout, "psxrecomp: turbo_loads enabled (opt-in)\n");
+            }
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
+            /* Overlay DLL cache (Layer A). Off unless enabled in [runtime];
+             * when on, capture overlay bytes and scan cache/<game_id>/ for
+             * precompiled overlay DLLs. */
+            if (gc.runtime.overlay_cache) {
+                std::filesystem::path exe_dir = exe_dir_from_argv(argv[0]);
+                std::string cache_dir = (exe_dir / "cache").string();
+                overlay_capture_set_out_dir(exe_dir.string().c_str());
+                overlay_capture_set_enabled(1);
+                overlay_loader_init(cache_dir.c_str(), game_id.c_str());
+                /* Step 2.8 variant-capture automation. Autocapture is ON
+                 * whenever the cache is on: it writes the player-shareable
+                 * overlay_captures.json (the contribution file the README
+                 * promises) even on machines with no compile toolchain.
+                 * The background compile additionally needs a configured
+                 * command; autocompile_request() no-ops without one. */
+                overlay_autocapture_set_enabled(1);
+                if (gc.runtime.has_overlay_autocompile_cmd) {
+                    autocompile_configure(
+                        gc.runtime.overlay_autocompile_cmd.c_str(),
+                        gc.project_root.string().c_str());
+                    std::fprintf(stdout,
+                        "psxrecomp: overlay autocompile enabled\n");
+                }
+            }
             std::fprintf(stdout, "psxrecomp: loaded game config %s (%s, %s)\n",
                          game_config_path, game_name.c_str(), game_id.c_str());
             write_startup_stage("game_config_loaded");
@@ -1190,6 +1309,8 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+
+    if (!game_name.empty()) s_picker_game_name = game_name;
 
     std::filesystem::path resolved_bios = resolve_bios_for_runtime(bios_path, argv[0]);
     if (resolved_bios.empty()) {
@@ -1239,9 +1360,11 @@ int main(int argc, char** argv) {
         /* Store for post-BIOS application; boot always runs at 1x so the
          * BIOS disc-init sequence sees correct timing. */
         cdrom_set_game_speed(divisor);
+        if (instant_rate > 0) cdrom_set_instant_rate(instant_rate);
         if (divisor != 1)
-            std::fprintf(stdout, "psxrecomp: disc_speed=%s (applied post-BIOS)\n",
-                         disc_speed.c_str());
+            std::fprintf(stdout, "psxrecomp: disc_speed=%s (applied post-BIOS, "
+                         "instant budget %d/frame)\n",
+                         disc_speed.c_str(), cdrom_get_instant_rate());
     }
     memcard_init(memcard_dir_str.c_str());
     std::atexit(memcard_flush_all);

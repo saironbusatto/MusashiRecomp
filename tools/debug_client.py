@@ -299,6 +299,84 @@ def build_cmd(args):
         return d, pretty_json
     elif cmd == "mmio_clear":
         return {"cmd": "mmio_clear"}, pretty_json
+    elif cmd == "overlay_irq_ratelimit":
+        # Arm native per-block IRQ checks at a rate-limited cadence (every Nth
+        # block). N=1 == normal native cadence; larger N ~ interpreter cadence.
+        n = int(args[1]) if len(args) > 1 else 1
+        return {"cmd": "overlay_irq_ratelimit", "n": n}, pretty_json
+    elif cmd == "event_ring_dump":
+        # Write the whole event-timeline ring to a JSON file. Optional path arg.
+        d = {"cmd": "event_ring_dump"}
+        if len(args) > 1:
+            d["path"] = args[1]
+        return d, pretty_json
+    elif cmd == "event_ring_tail":
+        # Inline JSON tail of the most-recent N events (default 64).
+        n = int(args[1]) if len(args) > 1 else 64
+        return {"cmd": "event_ring_tail", "n": n}, pretty_json
+    elif cmd == "event_ring_clear":
+        return {"cmd": "event_ring_clear"}, pretty_json
+    elif cmd == "overlay_native_event_granularity":
+        # <conservative|normal>: split batched cycle advances into 1-cycle steps
+        # so device events fire in true due-cycle order (interp-equivalent).
+        mode = args[1] if len(args) > 1 else "conservative"
+        return {"cmd": "overlay_native_event_granularity", "mode": mode}, pretty_json
+    elif cmd == "overlay_fp_dump":
+        # Write the fingerprint ring (full entry/exit reg files) to a JSON file.
+        d = {"cmd": "overlay_fp_dump"}
+        if len(args) > 1:
+            d["path"] = args[1]
+        return d, pretty_json
+    elif cmd == "dirty_insn_gate":
+        # <lo> <hi>: extra phys PC range recorded by the per-insn interp log.
+        return {"cmd": "dirty_insn_gate", "lo": args[1], "hi": args[2]}, pretty_json
+    elif cmd == "insn_freeze":
+        # <addr> <nth>: freeze the insn ring before the Nth dispatch of <addr>.
+        d = {"cmd": "insn_freeze", "addr": args[1] if len(args) > 1 else "0"}
+        if len(args) > 2:
+            d["nth"] = int(args[2])
+        return d, pretty_json
+    elif cmd == "fntrace_arm":
+        # <target_hex|0xFFFFFFFF=all|0=clear>
+        return {"cmd": "fntrace_arm", "target": args[1]}, pretty_json
+    elif cmd == "fntrace_dump":
+        # [count] [target_lo] [target_hi]
+        d = {"cmd": "fntrace_dump"}
+        if len(args) > 1:
+            d["count"] = int(args[1])
+        if len(args) > 2:
+            d["target_lo"] = args[2]
+        if len(args) > 3:
+            d["target_hi"] = args[3]
+        return d, pretty_json
+    elif cmd == "dirty_block_log":
+        # [count]
+        d = {"cmd": "dirty_block_log"}
+        if len(args) > 1:
+            d["count"] = int(args[1])
+        return d, pretty_json
+    elif cmd == "dirty_insn_dump_file":
+        # [path]: write the whole insn-log window to a JSON file (no TCP limit).
+        d = {"cmd": "dirty_insn_dump_file"}
+        if len(args) > 1:
+            d["path"] = args[1]
+        return d, pretty_json
+    elif cmd == "dirty_block_dump_file":
+        # [path]: write the whole block-log window to a JSON file (no TCP limit).
+        d = {"cmd": "dirty_block_dump_file"}
+        if len(args) > 1:
+            d["path"] = args[1]
+        return d, pretty_json
+    elif cmd == "dirty_insn_log":
+        # [count] [pc_lo] [pc_hi]: most-recent insn-log entries (newest first).
+        d = {"cmd": "dirty_insn_log"}
+        if len(args) > 1:
+            d["count"] = int(args[1])
+        if len(args) > 2:
+            d["pc_lo"] = args[2]
+        if len(args) > 3:
+            d["pc_hi"] = args[3]
+        return d, pretty_json
     else:
         # Pass through as raw command
         return {"cmd": cmd}, pretty_json
