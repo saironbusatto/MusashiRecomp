@@ -6,6 +6,7 @@
 
 #include "cpu_state.h"
 #include "debug_server.h"
+#include "crash_trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,9 +20,10 @@ void psx_exception_longjmp(void);
 static void trap_crash(const char* msg) {
     FILE* cf = fopen("psx_crash.txt", "w");
     if (cf) { fprintf(cf, "%s\n", msg); fclose(cf); }
-    /* Also dump the structured crash trace with rings + cpu state. */
-    extern void psx_crash_trace_dump(const char *reason, void *seh_info);
-    psx_crash_trace_dump("trap_crash", NULL);
+    /* Full ring dump, then halt-and-serve (debug builds) / exit(1)
+     * (release). Never returns — call sites' trailing exit(1) are
+     * unreachable belt-and-braces. */
+    psx_fatal_halt(msg);
 }
 
 static int psx_is_valid_tcb(CPUState* cpu, uint32_t tcb)

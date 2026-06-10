@@ -21,6 +21,21 @@ void psx_crash_trace_dump(const char *reason, void *seh_info);
  * exit_origin is still "unknown" means an untagged exit fired. */
 void psx_crash_trace_set_exit_origin(const char *origin);
 
+/* Terminal stop for deliberate fatal sites (unhandled MMIO access,
+ * trap_crash, fail-fast unknown dispatch). Writes the structured crash
+ * report AND a full freeze-style ring dump, then:
+ *   - debug-tools builds: halts emulation but keeps pumping the TCP
+ *     debug server forever so every ring buffer stays queryable
+ *     post-mortem (ring-buffer-first: the crash state is interrogated,
+ *     not just snapshotted).
+ *   - PSX_NO_DEBUG_TOOLS builds: exit(1) as before.
+ * Never returns. */
+void psx_fatal_halt(const char *reason);
+
+/* Set when psx_fatal_halt fires; the freeze heartbeat includes it so an
+ * external reader can tell a fatal halt from a wedge. NULL = healthy. */
+extern const char *g_psx_fatal_reason;
+
 #ifdef __cplusplus
 }
 #endif

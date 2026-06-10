@@ -259,6 +259,48 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
     }
 }
 
+/* ── Fatal halt ──────────────────────────────────────────────────────── */
+
+const char *g_psx_fatal_reason = NULL;
+
+/* freeze_heartbeat.c — full ring dump with wedge_kind "fatal". */
+extern void freeze_heartbeat_fatal_dump(const char *reason);
+
+void psx_fatal_halt(const char *reason) {
+    /* Re-entry guard: a post-mortem TCP command served from the halt
+     * loop below can itself trip a fatal site. Don't re-dump (the first
+     * fatal is the real one) and don't recurse another serve loop. */
+    static int s_halted = 0;
+    if (!s_halted) {
+        s_halted = 1;
+        g_psx_fatal_reason = reason ? reason : "(fatal)";
+        psx_crash_trace_dump(g_psx_fatal_reason, NULL);
+        freeze_heartbeat_fatal_dump(g_psx_fatal_reason);
+    }
+#ifndef PSX_NO_DEBUG_TOOLS
+    /* Halt-and-serve: emulation is dead but the rings are not. Keep the
+     * TCP debug server pumping on this (main) thread so a post-mortem
+     * client can run wtrace_dump / read_ram / screenshot / etc. against
+     * the exact crash state. */
+    extern void debug_server_poll(void);
+    fprintf(stderr,
+            "FATAL: %s — emulation halted; TCP debug server stays live "
+            "for post-mortem ring queries.\n", g_psx_fatal_reason);
+    fflush(stderr);
+    for (;;) {
+        debug_server_poll();
+#ifdef _WIN32
+        Sleep(1);
+#else
+        struct timespec req = {0, 1000000};
+        nanosleep(&req, NULL);
+#endif
+    }
+#else
+    exit(1);
+#endif
+}
+
 /* ── Crash handlers ──────────────────────────────────────────────────── */
 
 #include <signal.h>

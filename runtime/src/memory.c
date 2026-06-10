@@ -10,6 +10,7 @@
 
 #include "cpu_state.h"
 #include "cdrom.h"
+#include "crash_trace.h"
 #include "dma.h"
 #include "gpu.h"
 #include "mdec.h"
@@ -284,23 +285,24 @@ void memory_init(const char* bios_path) {
 }
 
 static void mmio_fatal(uint32_t vaddr, uint32_t phys, const char* op) {
-    fprintf(stderr, "MMIO %s @ 0x%08X (phys 0x%08X)\n", op, vaddr, phys);
+    static char reason[96];
+    snprintf(reason, sizeof(reason), "MMIO %s @ 0x%08X (phys 0x%08X)", op, vaddr, phys);
+    fprintf(stderr, "%s\n", reason);
     fflush(stderr);
     FILE* cf = fopen("psx_crash.txt", "w");
-    if (cf) { fprintf(cf, "MMIO %s @ 0x%08X (phys 0x%08X)\n", op, vaddr, phys); fclose(cf); }
-    exit(1);
+    if (cf) { fprintf(cf, "%s\n", reason); fclose(cf); }
+    psx_fatal_halt(reason);
 }
 
 static void mmio_unimplemented(uint32_t addr, const char* op) {
-    fprintf(stderr, "UNIMPLEMENTED MMIO %s @ 0x%08X\n", op, addr);
+    static char reason[96];
+    snprintf(reason, sizeof(reason), "UNIMPLEMENTED MMIO %s @ 0x%08X", op, addr);
+    fprintf(stderr, "%s\n", reason);
     fflush(stderr);
     /* Also write to a crash file for capture when stderr is lost. */
     FILE* cf = fopen("psx_crash.txt", "w");
-    if (cf) {
-        fprintf(cf, "UNIMPLEMENTED MMIO %s @ 0x%08X\n", op, addr);
-        fclose(cf);
-    }
-    exit(1);
+    if (cf) { fprintf(cf, "%s\n", reason); fclose(cf); }
+    psx_fatal_halt(reason);
 }
 
 static void unmapped_fatal(uint32_t vaddr, uint32_t phys, const char* op) {
