@@ -14,6 +14,7 @@
 
 #include "dma.h"
 #include "cdrom.h"
+#include "crash_trace.h"
 #include "dirty_ram_interp.h"
 #include "gpu.h"
 #include "mdec.h"
@@ -177,6 +178,30 @@ static uint32_t transfer_word_count(int ch) {
     return block_size;
 }
 
+/* A single DMA kick can never legitimately move more data than the larger
+ * of RAM (2 MB) or VRAM (1 MB): 0x80000 words. A bigger count means the
+ * MADR/BCR/CHCR the guest programmed are corrupt; executing it would grind
+ * through billions of masked-wrap accesses feeding garbage to the device
+ * sinks. Halt diagnosably with rings intact instead. Linked-list GPU
+ * transfers (ch2 sync mode 2) don't use BCR, so length isn't checked there
+ * (the node walker has its own MAX_NODES cycle cap). */
+#define DMA_MAX_TRANSFER_WORDS 0x80000u
+
+static void validate_transfer_length(int ch) {
+    uint32_t sync_mode = (channels[ch].chcr >> 9) & 3u;
+    if (ch == 2 && sync_mode == 2) return;
+    uint32_t words = transfer_word_count(ch);
+    if (words > DMA_MAX_TRANSFER_WORDS) {
+        static char reason[160];
+        snprintf(reason, sizeof(reason),
+                 "DMA ch%d insane transfer length 0x%X words "
+                 "(MADR=0x%08X BCR=0x%08X CHCR=0x%08X)",
+                 ch, words, channels[ch].madr, channels[ch].bcr,
+                 channels[ch].chcr);
+        psx_fatal_halt(reason);
+    }
+}
+
 static void complete_transfer(int ch) {
     uint32_t dicr_before = dicr;
     uint32_t i_stat_before = i_stat;
@@ -301,6 +326,11 @@ static void finish_async_cdrom_transfer(uint32_t final_addr) {
     /* Log and capture game-data transfers only.
      * Transfers to 0x1C0000+ are FMV/streaming buffers; skip them. */
     if (!step && size > 0 && load_start < 0x1C0000u) {
+        /* The DMA word loop wraps inside the 2 MB RAM mask; the capture
+         * path below takes a flat ram+offset span and must not follow the
+         * wrap past the end of host RAM. */
+        if (size > 0x200000u - load_start)
+            size = 0x200000u - load_start;
         int lba = cdrom_get_setloc_lba();
         if (lba >= 0) cd_dma_log_push(lba, load_start, size);
 
@@ -596,6 +626,9 @@ static void try_execute(int ch) {
     event_ring_record_aux(EV_DMA_KICK, (uint8_t)ch, channels[ch].chcr);
     event_ring_record_aux(EV_ENQ, (uint8_t)(SRC_DMA0 + ch), transfer_word_count(ch));
 
+    /* After the kick is in the rings, refuse corrupt-length transfers. */
+    validate_transfer_length(ch);
+
     switch (ch) {
         case 0:
             start_async_mdec_transfer(0);
@@ -616,11 +649,14 @@ static void try_execute(int ch) {
         case 6:
             execute_ch6_otc();
             break;
-        default:
+        default: {
             /* Other channels not implemented yet — fatal if transfer is triggered */
-            fprintf(stderr, "DMA ch%d: transfer triggered but not implemented (CHCR=0x%08X)\n", ch, chcr);
-            fflush(stderr);
-            exit(1);
+            static char reason[96];
+            snprintf(reason, sizeof(reason),
+                     "DMA ch%d: transfer triggered but not implemented (CHCR=0x%08X)",
+                     ch, chcr);
+            psx_fatal_halt(reason);
+        }
     }
 }
 
@@ -711,9 +747,11 @@ uint32_t dma_read(uint32_t addr) {
     }
 
 bad:
-    fprintf(stderr, "DMA read from unknown address 0x%08X\n", addr);
-    fflush(stderr);
-    exit(1);
+    {
+        static char reason[64];
+        snprintf(reason, sizeof(reason), "DMA read from unknown address 0x%08X", addr);
+        psx_fatal_halt(reason);
+    }
     return 0;
 }
 
@@ -772,9 +810,12 @@ void dma_write_masked(uint32_t addr, uint32_t val, uint32_t mask) {
     }
 
 bad:
-    fprintf(stderr, "DMA write to unknown address 0x%08X = 0x%08X\n", addr, val);
-    fflush(stderr);
-    exit(1);
+    {
+        static char reason[80];
+        snprintf(reason, sizeof(reason),
+                 "DMA write to unknown address 0x%08X = 0x%08X", addr, val);
+        psx_fatal_halt(reason);
+    }
 }
 
 void dma_write(uint32_t addr, uint32_t val) {

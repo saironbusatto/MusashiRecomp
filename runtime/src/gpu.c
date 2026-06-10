@@ -12,6 +12,7 @@
 
 #include "gpu.h"
 #include "gpu_sw_renderer.h"
+#include "crash_trace.h"
 #include "debug_server.h"
 #include "cpu_state.h"
 #include "event_ring.h"
@@ -1531,16 +1532,15 @@ static void gp0_execute_command(void) {
             }
 
             /* Any other command (drawing, VRAM-to-VRAM, etc.) is not yet
-             * implemented. Fatal exit so we know exactly what's needed next. */
+             * implemented. Fatal halt so we know exactly what's needed next,
+             * with all rings queryable post-mortem. */
             {
-                FILE* cf = fopen("psx_crash.txt", "w");
-                if (cf) {
-                    fprintf(cf, "GPU GP0 unimplemented command 0x%02X (word 0x%08X)\n",
-                            opcode, gp0_cmd_buf[0]);
-                    fclose(cf);
-                }
+                static char reason[96];
+                snprintf(reason, sizeof(reason),
+                         "GPU GP0 unimplemented command 0x%02X (word 0x%08X)",
+                         opcode, gp0_cmd_buf[0]);
+                psx_fatal_halt(reason);
             }
-            exit(1);
     }
 }
 
@@ -1683,13 +1683,11 @@ void gpu_write_gp0(uint32_t val) {
     int word_count = gp0_command_word_count(opcode);
 
     if (word_count == 0) {
-        /* Unknown command — fatal */
-        FILE* cf = fopen("psx_crash.txt", "w");
-        if (cf) {
-            fprintf(cf, "GPU GP0 unknown command 0x%02X (word 0x%08X)\n", opcode, val);
-            fclose(cf);
-        }
-        exit(1);
+        /* Unknown command — fatal halt with rings queryable post-mortem */
+        static char reason[96];
+        snprintf(reason, sizeof(reason),
+                 "GPU GP0 unknown command 0x%02X (word 0x%08X)", opcode, val);
+        psx_fatal_halt(reason);
     }
 
     if (word_count < 0) {
@@ -1850,9 +1848,11 @@ void gpu_write_gp1(uint32_t val) {
         case 0x18: case 0x19: case 0x1A: case 0x1B:
         case 0x1C: case 0x1D: case 0x1E: case 0x1F:
             gp1_get_info(val); break;
-        default:
-            fprintf(stderr, "GPU GP1 unknown command 0x%02X (word 0x%08X)\n", cmd, val);
-            fflush(stderr);
-            exit(1);
+        default: {
+            static char reason[96];
+            snprintf(reason, sizeof(reason),
+                     "GPU GP1 unknown command 0x%02X (word 0x%08X)", cmd, val);
+            psx_fatal_halt(reason);
+        }
     }
 }
