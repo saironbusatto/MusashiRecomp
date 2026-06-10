@@ -2,6 +2,7 @@
 
 #include "freeze_heartbeat.h"
 #include "debug_server.h"
+#include "crash_trace.h"   /* g_psx_fatal_reason */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -321,7 +322,8 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         s_last_wedge_kind,
         (s_last_wedge_kind == 1) ? "hard_freeze" :
         (s_last_wedge_kind == 2) ? "reentry_storm" :
-        (s_last_wedge_kind == 3) ? "slow_frames" : "unknown",
+        (s_last_wedge_kind == 3) ? "slow_frames" :
+        (s_last_wedge_kind == 4) ? "fatal" : "unknown",
         (unsigned)DUMP_CAP_WTRACE_ALL,
         (unsigned)DUMP_CAP_WTRACE,
         (unsigned)DUMP_CAP_FRAME_HISTORY,
@@ -411,6 +413,42 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
 
     fputs("}\n", f);
     fclose(f);
+}
+
+/* Full ring dump for deliberate fatal sites (psx_fatal_halt). Runs ON the
+ * faulting (main) thread, unlike the watchdog path — wedge kind 4 keeps
+ * freeze_dump_write away from the SuspendThread-based stack walkers,
+ * which would self-suspend here. Gathers the same diag snapshot the
+ * heartbeat tick does so the dump is self-contained. */
+void freeze_heartbeat_fatal_dump(const char *reason) {
+    (void)reason;  /* reason travels via g_psx_fatal_reason in the heartbeat */
+
+    uint64_t total_checks = 0;
+    uint32_t dispatch_count = 0;
+    int in_exc = 0;
+    int post_cool = 0;
+    uint64_t exc_entries = 0;
+    uint64_t exc_reentry = 0;
+    psx_get_freeze_diag(&total_checks, &dispatch_count, &in_exc,
+                        &post_cool, &exc_entries, &exc_reentry);
+
+    int sio_irq_pending = 0;
+    int sio_irq_countdown = 0;
+    uint16_t sio_stat = 0;
+    uint16_t sio_ctrl = 0;
+    int card_active = 0;
+    sio_get_freeze_diag(&sio_irq_pending, &sio_irq_countdown,
+                        &sio_stat, &sio_ctrl, &card_active);
+
+    s_last_wedge_kind = 4;
+    s_dump_armed = 0;  /* the watchdog must not overwrite the fatal dump */
+    freeze_dump_write((long long)time(NULL), s_frame_count,
+                      psx_get_cycle_count(), exc_reentry,
+                      g_debug_current_func_addr, g_debug_last_store_pc,
+                      i_stat, i_mask, in_exc, total_checks,
+                      dispatch_count, exc_entries,
+                      sio_stat, sio_ctrl, card_active,
+                      sio_get_mc_max_state(), sio_get_tx_writes());
 }
 
 static void heartbeat_write(void) {
@@ -535,7 +573,8 @@ static void heartbeat_write(void) {
         "  \"mc_max_state\":%d,\n"
         "  \"tx_writes\":%d,\n"
         "  \"dirty_ram_blocks\":%llu,\n"
-        "  \"dirty_ram_insns\":%llu\n"
+        "  \"dirty_ram_insns\":%llu,\n"
+        "  \"fatal\":%s%s%s\n"
         "}\n",
         s_backend,
         wall,
@@ -558,7 +597,10 @@ static void heartbeat_write(void) {
         mc_max,
         tx_writes,
         (unsigned long long)g_dirty_ram_blocks_run,
-        (unsigned long long)g_dirty_ram_insns_run);
+        (unsigned long long)g_dirty_ram_insns_run,
+        g_psx_fatal_reason ? "\"" : "",
+        g_psx_fatal_reason ? g_psx_fatal_reason : "null",
+        g_psx_fatal_reason ? "\"" : "");
 
     if (n <= 0 || n >= (int)sizeof(buf)) return;
 

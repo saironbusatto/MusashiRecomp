@@ -72,6 +72,9 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `wtrace_range` | ✓ |   | `lo`, `hi` | Set RAM-write trace range (ring of 1024 writes with RA) |
 | `wtrace_dump` | ✓ | beetle | optional `addr_lo`, `addr_hi`, `count`, `newest` | Dump RAM-write trace entries as JSON. The address filter is applied server-side over the FULL ring before the emit cap — always pass it when hunting a specific buffer, otherwise you only see the oldest `count` entries of the whole ring |
 | `wtrace_clear` | ✓ |   | — | Reset the trace ring |
+| `mmio_dump` | ✓ |   | optional `addr`, `count`, `newest` | Dump the always-on MMIO write ring (256K entries, ALL 0x1F801xxx writes — SPU/DMA traffic rolls it in well under a minute of gameplay; for display history use `gp1_dump`) |
+| `mmio_clear` | ✓ |   | — | Reset the MMIO write ring |
+| `gp1_dump` | ✓ |   | optional `frame_lo`, `frame_hi`, `count`, `newest` | Dump the dedicated ALWAYS-ON GP1 (0x1F801814 display control) ring — 512K entries ≈ 15 min of gameplay (Tomba writes ~10 GP1/frame), survives the general MMIO ring's eviction. Frame filter is server-side over the full ring. Each entry: val + func/pc/cpu_pc/ra/sp/a0/a1/sr/epc/frame |
 | `pc_break` |   | ✓² | `addr` | DS execute breakpoint, state captured on hit (via `pc_hit_last`) |
 | `pc_unbreak` |   | ✓² | `addr` | Remove an execute breakpoint |
 | `pc_break_list` |   | ✓² | — | List active execute breakpoints |

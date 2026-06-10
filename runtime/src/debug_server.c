@@ -3223,6 +3223,19 @@ static MmioTraceEntry *s_mmio_trace = NULL;
 static uint64_t s_mmio_trace_seq  = 0;
 static uint32_t s_mmio_trace_head = 0;
 
+/* ---- GP1 display-control trace (ALWAYS-ON, dedicated) ----
+ * The general MMIO ring rolls over in well under a minute of gameplay
+ * (SPU/DMA traffic), evicting the boot-window display history before a
+ * post-hoc probe can ask "who toggled the display during the logo?".
+ * GP1 writes are ~10/frame in-game (measured: Tomba attract ≈ 600/s),
+ * so 512K entries ≈ 15 minutes — enough to attribute a boot window from
+ * well after the title screen. ~40 MB heap.
+ * Same entry layout as the general ring; dumped via `gp1_dump`. */
+#define GP1_TRACE_CAP (1 << 19)
+static MmioTraceEntry *s_gp1_trace = NULL;
+static uint64_t s_gp1_trace_seq  = 0;
+static uint32_t s_gp1_trace_head = 0;
+
 /* ---- Platform helpers ---- */
 static void set_nonblocking(sock_t s)
 {
@@ -5828,6 +5841,15 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
     e->frame     = (uint32_t)s_frame_count;
     e->width     = width;
     s_mmio_trace_head = (s_mmio_trace_head + 1) % MMIO_TRACE_CAP;
+
+    /* Mirror GP1 (0x1F801814) writes into the dedicated long-retention
+     * display-control ring. */
+    if (addr == 0x1F801814u && s_gp1_trace) {
+        MmioTraceEntry *g = &s_gp1_trace[s_gp1_trace_head];
+        *g = *e;
+        g->seq = s_gp1_trace_seq++;
+        s_gp1_trace_head = (s_gp1_trace_head + 1) % GP1_TRACE_CAP;
+    }
 }
 
 static void handle_wtrace_range(int id, const char *json)
@@ -6840,6 +6862,65 @@ static void handle_mmio_clear(int id, const char *json)
     s_mmio_trace_head = 0;
     if (s_mmio_trace) memset(s_mmio_trace, 0, (size_t)MMIO_TRACE_CAP * sizeof(MmioTraceEntry));
     send_ok(id);
+}
+
+/* gp1_dump — dump the dedicated GP1 display-control ring. Optional
+ * `frame_lo`/`frame_hi` filter (applied server-side over the FULL ring,
+ * like wtrace_dump's address filter), optional `count` (default 4096),
+ * optional `newest` (1 = newest-first). */
+static void handle_gp1_dump(int id, const char *json)
+{
+    if (!s_gp1_trace) { send_err(id, "gp1 trace not initialized"); return; }
+
+    int frame_lo = json_get_int(json, "frame_lo", 0);
+    int frame_hi = json_get_int(json, "frame_hi", 0x7FFFFFFF);
+
+    uint64_t total = s_gp1_trace_seq;
+    uint32_t avail = (total < GP1_TRACE_CAP) ? (uint32_t)total : GP1_TRACE_CAP;
+    uint32_t start = (total < GP1_TRACE_CAP) ? 0 : s_gp1_trace_head;
+
+    int max_out = json_get_int(json, "count", 4096);
+    if (max_out < 1) max_out = 1;
+    if (max_out > (int)GP1_TRACE_CAP) max_out = (int)GP1_TRACE_CAP;
+    int newest_first = json_get_int(json, "newest", 0) != 0;
+
+    const uint32_t MAX_OUT = (uint32_t)max_out;
+    size_t BUF_SZ = 256u + (size_t)MAX_OUT * 512u;
+    if (BUF_SZ > (size_t)128 * 1024 * 1024) BUF_SZ = (size_t)128 * 1024 * 1024;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    uint32_t emitted = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
+                    id, (unsigned long long)total, avail);
+    for (uint32_t i = 0; i < avail && emitted < MAX_OUT && pos < BUF_SZ - 256; i++) {
+        uint32_t idx;
+        if (newest_first) {
+            uint32_t newest = (s_gp1_trace_head + GP1_TRACE_CAP - 1u) % GP1_TRACE_CAP;
+            idx = (newest + GP1_TRACE_CAP - (i % GP1_TRACE_CAP)) % GP1_TRACE_CAP;
+        } else {
+            idx = (start + i) % GP1_TRACE_CAP;
+        }
+        MmioTraceEntry *e = &s_gp1_trace[idx];
+        if ((int)e->frame < frame_lo || (int)e->frame > frame_hi) continue;
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"val\":\"0x%08X\","
+                        "\"func\":\"0x%08X\",\"pc\":\"0x%08X\",\"cpu_pc\":\"0x%08X\","
+                        "\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+                        "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                        "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\","
+                        "\"frame\":%u}",
+                        (emitted == 0) ? "" : ",",
+                        (unsigned long long)e->seq,
+                        e->val, e->func_addr, e->pc, e->cpu_pc,
+                        e->ra, e->sp, e->a0, e->a1,
+                        e->sr, e->epc, e->frame);
+        emitted++;
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%u}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
 }
 
 static const char *mdec_event_kind_name(uint32_t kind)
@@ -8210,6 +8291,7 @@ static const CmdEntry s_commands[] = {
     { "freeze_check",      handle_freeze_check },
     { "mmio_dump",         handle_mmio_dump },
     { "mmio_clear",        handle_mmio_clear },
+    { "gp1_dump",          handle_gp1_dump },
     { "mdec_state",        handle_mdec_state },
     { "mdec_trace",        handle_mdec_trace },
     { "mdec_trace_clear",  handle_mdec_trace_clear },
@@ -8628,6 +8710,13 @@ void debug_server_init(int port)
     }
     s_mmio_trace_seq = 0;
     s_mmio_trace_head = 0;
+
+    /* Dedicated GP1 display-control ring (long retention). */
+    if (!s_gp1_trace) {
+        s_gp1_trace = (MmioTraceEntry *)calloc(GP1_TRACE_CAP, sizeof(MmioTraceEntry));
+    }
+    s_gp1_trace_seq = 0;
+    s_gp1_trace_head = 0;
 
     memset(s_watchpoints, 0, sizeof(s_watchpoints));
     memset(s_snapshot_addrs, 0, sizeof(s_snapshot_addrs));
