@@ -785,6 +785,30 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
             vector_seed_count);
     }
 
+    // Also seed bios_alias targets — same reachability hole as vector-table
+    // entries: a fixed-target trampoline's callee may never be jal'd in ROM.
+    {
+        const uint32_t base_phys = kBiosBase & 0x1FFFFFFFu;
+        std::set<uint32_t> have;
+        for (const auto& sd : seeds) have.insert(sd.address & 0x1FFFFFFFu);
+        size_t alias_added = 0;
+        for (const auto& ba : bios_aliases) {
+            const uint32_t phys = ba.target_key & 0x1FFFFFFFu;
+            if (phys < base_phys || phys >= base_phys + (uint32_t)kBiosSize) continue;
+            if ((phys & 3u) != 0u) continue;
+            if (!have.insert(phys).second) continue;
+            seeds.push_back({kBiosBase | (phys - base_phys),
+                             fmt::format("bios_alias_{:08X}", ba.ram_addr),
+                             "ROM-resident target of configured BIOS alias"});
+            alias_added++;
+        }
+        if (alias_added != 0) {
+            std::fprintf(stdout,
+                "psxrecomp-bios: added %zu BIOS alias target seeds\n",
+                alias_added);
+        }
+    }
+
     // 3. Run discovery.
     const auto dr = PSXRecompV4::FunctionDiscovery::discover(
         rom, kBiosBase, kBiosBase + static_cast<uint32_t>(kBiosSize) - 1, seeds);

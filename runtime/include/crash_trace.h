@@ -16,6 +16,11 @@ void psx_crash_trace_install_handlers(void);
  * NULL. Writes to psx_last_run_report.json (overwrite). */
 void psx_crash_trace_dump(const char *reason, void *seh_info);
 
+/* Tag a deliberate exit() so the atexit report can attribute it
+ * (e.g. "tcp_quit", "sdl_window_close"). An "atexit" report whose
+ * exit_origin is still "unknown" means an untagged exit fired. */
+void psx_crash_trace_set_exit_origin(const char *origin);
+
 #ifdef __cplusplus
 }
 #endif
