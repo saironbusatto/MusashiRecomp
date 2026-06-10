@@ -30,6 +30,7 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -716,9 +717,53 @@ int run_emit_full(const fs::path& bios_path, const fs::path& out_dir,
     const std::string sha = sha256_hex(rom);
 
     // 2. Load seeds.
-    const auto seeds = load_seeds(seed_path);
+    auto seeds = load_seeds(seed_path);
     std::fprintf(stdout, "psxrecomp-bios: loaded %zu seeds from %s\n",
                  seeds.size(), seed_path.string().c_str());
+
+    // 2b. Seed every BIOS vector-table entry and alias target as a discovery
+    // root. Vector-table targets (A0/B0/C0 kernel functions) are reached only
+    // through the RAM-installed dispatch stubs — never by a direct in-ROM jal —
+    // so JAL-transitive discovery cannot find ones nothing else calls
+    // (e.g. A0:0x16 strncat at 0xBFC03200). Without a root here the dispatch
+    // generator emits "not in dispatch table, skipped" and the kernel call
+    // silently becomes a no-op at runtime.
+    {
+        const uint32_t base_phys = kBiosBase & 0x1FFFFFFFu;
+        std::set<uint32_t> have;
+        for (const auto& sd : seeds) have.insert(sd.address & 0x1FFFFFFFu);
+        size_t added = 0;
+        auto add_rom_seed = [&](uint32_t entry, std::string label) {
+            const uint32_t phys = entry & 0x1FFFFFFFu;
+            if (phys < base_phys || phys >= base_phys + (uint32_t)kBiosSize) return;
+            if ((phys & 3u) != 0u) return;
+            if (!have.insert(phys).second) return;
+            seeds.push_back({kBiosBase | (phys - base_phys),
+                             std::move(label), "bios vector/alias target"});
+            added++;
+        };
+        for (const auto& bvt : bios_vectors) {
+            const uint32_t table_phys = bvt.table_rom_addr & 0x1FFFFFFFu;
+            if (table_phys < base_phys ||
+                table_phys + bvt.table_count * 4u > base_phys + (uint32_t)kBiosSize)
+                continue;
+            const uint32_t off = table_phys - base_phys;
+            for (uint32_t i = 0; i < bvt.table_count; i++) {
+                const uint32_t entry =
+                    (uint32_t)rom[off + i*4] | ((uint32_t)rom[off + i*4 + 1] << 8) |
+                    ((uint32_t)rom[off + i*4 + 2] << 16) | ((uint32_t)rom[off + i*4 + 3] << 24);
+                if (entry == 0u) continue;
+                add_rom_seed(entry, fmt::format("bios_vec_{:02X}[0x{:02X}]",
+                                                bvt.ram_addr, i));
+            }
+        }
+        for (const auto& ba : bios_aliases)
+            add_rom_seed(ba.target_key,
+                         fmt::format("bios_alias_{:08X}", ba.ram_addr));
+        std::fprintf(stdout,
+            "psxrecomp-bios: seeded %zu additional bios vector/alias targets\n",
+            added);
+    }
 
     // 3. Run discovery.
     const auto dr = PSXRecompV4::FunctionDiscovery::discover(
