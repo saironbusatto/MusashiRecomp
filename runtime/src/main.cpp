@@ -1000,8 +1000,22 @@ static void sdl_vblank_present(void) {
         pad_buttons_this_frame = merge_controller_pad(pad_from_keyboard());
     }
     sio_set_pad_state(pad_buttons_this_frame);
+
+    /* Turbo-active test, shared by the audio mute here and the pacing/
+     * present gate below. During turbo the guest runs at host speed, so
+     * rendered SPU audio is time-compressed garble — queueing it is what
+     * players hear as load-time stutter. Muting = stop queueing: the SDL
+     * device drains the last real-time samples and underruns to silence;
+     * SPU voice positions freeze with the pump, so music resumes from
+     * where it left off when pacing returns. */
+    int turbo_loads_active = 0;
+    if (g_turbo_loads_enabled) {
+        extern int fntrace_is_game_started(void);
+        if (fntrace_is_game_started() && cdrom_load_in_progress())
+            turbo_loads_active = 1;
+    }
 #ifndef PSX_SDL_NO_AUDIO
-    sdl_audio_pump();
+    if (!turbo_loads_active) sdl_audio_pump();
 #endif
 
     /* TCP turbo is for automated validation and trace capture. It keeps the
@@ -1044,15 +1058,12 @@ static void sdl_vblank_present(void) {
      * real time (2.2-4.8 sectors/frame against a 32-256 IRQ budget), so
      * host-speed execution is the lever that compresses load wall-time.
      * Presents 1-in-30 so visual progress stays visible. */
-    if (g_turbo_loads_enabled) {
-        extern int fntrace_is_game_started(void);
-        if (fntrace_is_game_started() && cdrom_load_in_progress()) {
-            g_turbo_loads_frames++;
-            static int tl_skip = 0;
-            const int TL_PRESENT_EVERY = 30;
-            tl_skip = (tl_skip + 1) % TL_PRESENT_EVERY;
-            if (tl_skip != 0) return;
-        }
+    if (turbo_loads_active) {
+        g_turbo_loads_frames++;
+        static int tl_skip = 0;
+        const int TL_PRESENT_EVERY = 30;
+        tl_skip = (tl_skip + 1) % TL_PRESENT_EVERY;
+        if (tl_skip != 0) return;
     }
 
     /* Wall-clock pacing: always runs once fast_boot has ended, even when the
