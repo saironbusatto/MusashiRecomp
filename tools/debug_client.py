@@ -59,6 +59,7 @@ REPL commands:
 """
 
 import json
+import re
 import socket
 import sys
 import argparse
@@ -89,35 +90,54 @@ def connect(host=DEFAULT_HOST, port=NATIVE_PORT, timeout=10.0):
 def send_cmd(sock, cmd_dict):
     line = json.dumps(cmd_dict) + "\n"
     sock.sendall(line.encode())
-    buf = b""
-    # Server may emit one large JSON object across many TCP chunks, with raw
-    # newlines inside arrays. Track brace/bracket balance (string-aware) and
-    # parse once balance returns to zero.
-    depth_curly = 0
-    depth_sq = 0
+    # One complete JSON object = one response. Track brace balance
+    # (string-aware) with a persistent state machine and fast-skips so a
+    # multi-megabyte response costs O(n), not O(n^2) — the old per-byte
+    # loop took minutes on a 2 MB read_ram, the server's blocking send
+    # backed up, and the runtime's starvation watchdog killed the process.
+    buf = bytearray()
+    pos = 0
+    depth = 0
     in_str = False
     esc = False
     started = False
     while True:
-        chunk = sock.recv(65536)
+        chunk = sock.recv(1 << 20)
         if not chunk:
             break
-        for b in chunk:
-            buf += bytes([b])
-            c = chr(b)
+        buf.extend(chunk)
+        n = len(buf)
+        while pos < n:
             if in_str:
-                if esc: esc = False
-                elif c == "\\": esc = True
-                elif c == '"': in_str = False
+                if esc:
+                    esc = False
+                    pos += 1
+                    continue
+                # Fast-skip to the next quote or backslash (C-speed find;
+                # hex payloads are one giant string with neither).
+                q = buf.find(b'"', pos)
+                bs = buf.find(b"\\", pos)
+                if q == -1 and bs == -1:
+                    pos = n
+                    break
+                if bs != -1 and (q == -1 or bs < q):
+                    esc = True
+                    pos = bs + 1
+                    continue
+                in_str = False
+                pos = q + 1
                 continue
-            if c == '"': in_str = True
-            elif c == "{": depth_curly += 1; started = True
-            elif c == "}": depth_curly -= 1
-            elif c == "[": depth_sq += 1
-            elif c == "]": depth_sq -= 1
-            if started and depth_curly == 0 and depth_sq == 0:
-                # Message complete.
-                return json.loads(buf.decode().strip())
+            c = buf[pos]
+            if c == 0x22:        # '"'
+                in_str = True
+            elif c == 0x7B:      # '{'
+                depth += 1
+                started = True
+            elif c == 0x7D:      # '}'
+                depth -= 1
+                if started and depth == 0:
+                    return json.loads(buf[:pos + 1].decode())
+            pos += 1
     return json.loads(buf.decode().strip())
 
 
@@ -378,8 +398,20 @@ def build_cmd(args):
             d["pc_hi"] = args[3]
         return d, pretty_json
     else:
-        # Pass through as raw command
-        return {"cmd": cmd}, pretty_json
+        # Pass through as raw command. Extra args of the form key=value
+        # become JSON fields (ints when numeric, else strings), so every
+        # server command is reachable without a bespoke CLI mapping.
+        d = {"cmd": cmd}
+        for a in args[1:]:
+            key, sep, val = a.partition("=")
+            if not sep:
+                return None, lambda _, a=a: (
+                    f"Unrecognized arg '{a}' for raw command; use key=value")
+            if re.fullmatch(r"-?\d+", val):
+                d[key] = int(val)
+            else:
+                d[key] = val
+        return d, pretty_json
 
 
 # ---------------------------------------------------------------------------
