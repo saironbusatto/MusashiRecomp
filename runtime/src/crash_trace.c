@@ -306,9 +306,14 @@ void psx_fatal_halt(const char *reason) {
 #include <signal.h>
 
 static void psx_signal_handler(int sig) {
-    char reason[64];
+    static char reason[64];
     snprintf(reason, sizeof(reason), "signal_%d", sig);
     psx_crash_trace_dump(reason, NULL);
+    /* Involuntary death: dump the full freeze-style rings too, so the
+     * crash doesn't take every ring with it. freeze_heartbeat_fatal_dump
+     * guards against overwriting an earlier fatal dump. */
+    if (!g_psx_fatal_reason) g_psx_fatal_reason = reason;
+    freeze_heartbeat_fatal_dump(reason);
     /* Reraise default handler so debugger / OS can also act. */
     signal(sig, SIG_DFL);
     raise(sig);
@@ -317,6 +322,9 @@ static void psx_signal_handler(int sig) {
 #ifdef _WIN32
 static LONG WINAPI psx_seh_handler(EXCEPTION_POINTERS *info) {
     psx_crash_trace_dump("seh", info);
+    /* Same as the signal path: keep the rings on involuntary death. */
+    if (!g_psx_fatal_reason) g_psx_fatal_reason = "seh";
+    freeze_heartbeat_fatal_dump("seh");
     return EXCEPTION_EXECUTE_HANDLER;
 }
 #endif

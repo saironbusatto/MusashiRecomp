@@ -90,16 +90,19 @@ static int    s_sym_initialized = 0;
 #define WEDGE_EXC_REENTRY_PER_FRAME_THRESHOLD 20000u /* ~10x chronic 2K/frame */
 #define WEDGE_SLOW_FRAMES_MAX_DELTA 10u   /* <5 fps avg over the 2s window */
 
-/* Per-ring caps for auto-dump. Newest-first window. Sized so the total
- * dump fits in ~10-15 MB JSON even when every ring is full. */
-#define DUMP_CAP_WTRACE_ALL    16384u
-#define DUMP_CAP_WTRACE         8192u
-#define DUMP_CAP_FRAME_HISTORY   600u
-#define DUMP_CAP_SIO_PC         8192u
-#define DUMP_CAP_THREAD_TRACE   4096u
-#define DUMP_CAP_RESTORE_TRACE  4096u
-#define DUMP_CAP_FN_ENTRY       4096u
-#define DUMP_CAP_DIRTY_BLOCK   16384u
+/* Per-ring caps for auto-dump. Newest-first window. The old 4-16K caps
+ * spanned well under a second of activity — too short to cross a
+ * degradation transition (attract-idle investigation, 2026-06-10). The
+ * underlying rings hold far more (wtrace_all / dirty-block: 4M entries);
+ * dump a window that covers minutes, at the cost of a ~50-80 MB JSON. */
+#define DUMP_CAP_WTRACE_ALL   262144u
+#define DUMP_CAP_WTRACE        65536u
+#define DUMP_CAP_FRAME_HISTORY  3600u
+#define DUMP_CAP_SIO_PC        65536u
+#define DUMP_CAP_THREAD_TRACE  65536u
+#define DUMP_CAP_RESTORE_TRACE 65536u
+#define DUMP_CAP_FN_ENTRY      65536u
+#define DUMP_CAP_DIRTY_BLOCK  262144u
 
 /* Pre-freeze history ring. Each entry = a snapshot taken at one heartbeat
  * tick (~100 ms). When the runtime freezes, all the "now" values stop
@@ -422,6 +425,13 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
  * heartbeat tick does so the dump is self-contained. */
 void freeze_heartbeat_fatal_dump(const char *reason) {
     (void)reason;  /* reason travels via g_psx_fatal_reason in the heartbeat */
+
+    /* First dump wins. A post-mortem TCP command served from the fatal
+     * halt loop can trip a host fault whose SEH handler also calls this;
+     * the original fatal state is the one worth keeping. */
+    static int s_fatal_dumped = 0;
+    if (s_fatal_dumped) return;
+    s_fatal_dumped = 1;
 
     uint64_t total_checks = 0;
     uint32_t dispatch_count = 0;
