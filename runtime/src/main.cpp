@@ -16,6 +16,7 @@
 #include "gpu.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
+#include "gpu_gl_renderer.h"
 #include "frame_pacing.h"
 #include "sio.h"
 #include "spu.h"
@@ -101,7 +102,8 @@ static int           s_fast_boot_active = 0;  /* cleared when game entry PC fire
 static int           g_video_scale = 1;     /* internal-resolution SSAA factor */
 static bool          g_video_aa    = true;  /* linear present filtering */
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
-static int           g_video_renderer = 0;  /* 0=software, 1=opengl */
+static int           g_video_renderer = 0;  /* 0=software, 1=opengl (requested) */
+static bool          g_gl_active = false;    /* GL context live -> GL present path */
 
 /* Vsync self-heal state (see SDL_RenderPresent wrapper in
  * sdl_vblank_present). C linkage: freeze_heartbeat.c includes both in
@@ -1099,9 +1101,13 @@ static void sdl_vblank_present(void) {
 #ifndef PSX_SDL_NO_RENDER
             if (!disabled_frame_presented) {
                 disabled_frame_presented = true;
-                SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
-                SDL_RenderClear(sdl_renderer);
-                SDL_RenderPresent(sdl_renderer);
+                if (g_gl_active) {
+                    gl_renderer_present_blank();
+                } else {
+                    SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
+                    SDL_RenderClear(sdl_renderer);
+                    SDL_RenderPresent(sdl_renderer);
+                }
             }
 #endif
             return;
@@ -1135,6 +1141,12 @@ static void sdl_vblank_present(void) {
 #ifndef PSX_SDL_NO_RENDER
     int src_w = (int)w * active_scale;
     int src_h = (int)h * active_scale;
+    if (g_gl_active) {
+        /* OpenGL present: upload the active display rect and draw a full-screen
+         * quad. SDL_GL_SwapWindow handles vsync; the wall-clock pacer above
+         * still owns timing. */
+        gl_renderer_present(sdl_pixel_buf, src_w, src_h, g_video_aa ? 1 : 0);
+    } else {
     SDL_Rect src = { 0, 0, src_w, src_h };
     SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf,
                       (int)(src_w * sizeof(uint32_t)));
@@ -1165,6 +1177,7 @@ static void sdl_vblank_present(void) {
                 g_present_vsync_disabled = 1;
             }
         }
+    }
     }
 #endif
 }
@@ -1390,15 +1403,25 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+    if (g_video_renderer == 1) win_flags |= SDL_WINDOW_OPENGL;
     sdl_window = SDL_CreateWindow(
         window_title.c_str(),
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         640, 480,
-        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
+        win_flags
     );
     if (!sdl_window) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;
+    }
+
+    /* OpenGL backend: create the GL context now. On failure, relabel the
+     * facade back to software (rasterization already runs through software in
+     * this phase) and fall through to the SDL_Renderer present path below. */
+    if (g_video_renderer == 1) {
+        g_gl_active = (gl_renderer_init_context(sdl_window) != 0);
+        if (!g_gl_active) gr_set_backend(GR_BACKEND_SOFTWARE);
     }
 
     /* Force OpenGL renderer.
@@ -1428,6 +1451,7 @@ int main(int argc, char** argv) {
      * presentation hang; macOS/Linux have no GDI path, so let SDL choose its
      * native backend (Metal on Apple Silicon). PRESENTVSYNC removes tearing;
      * fall back progressively if a driver can't provide vsync/accel. */
+  if (!g_gl_active) {
 #ifdef _WIN32
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
 #endif
@@ -1446,6 +1470,7 @@ int main(int argc, char** argv) {
      * default window when supersampling is off, so native rendering is
      * unchanged. */
     SDL_RenderSetLogicalSize(sdl_renderer, 640 * g_video_scale, 480 * g_video_scale);
+  }
 
     /* Staging buffer + backing texture are sized for the internal resolution
      * (640x512 native, times the supersampling factor). */
@@ -1456,6 +1481,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+  if (!g_gl_active) {
     sdl_texture = SDL_CreateTexture(
         sdl_renderer,
         SDL_PIXELFORMAT_ARGB8888,
@@ -1468,6 +1494,7 @@ int main(int argc, char** argv) {
     }
     SDL_SetTextureScaleMode(sdl_texture,
                             g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+  }
 
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
@@ -1604,8 +1631,9 @@ int main(int argc, char** argv) {
     std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
 
     shutdown_runtime();
-    SDL_DestroyTexture(sdl_texture);
-    SDL_DestroyRenderer(sdl_renderer);
+    if (g_gl_active) gl_renderer_shutdown();
+    SDL_DestroyTexture(sdl_texture);   /* NULL-safe in GL mode */
+    SDL_DestroyRenderer(sdl_renderer); /* NULL-safe in GL mode */
     SDL_DestroyWindow(sdl_window);
     SDL_Quit();
 
