@@ -408,6 +408,11 @@ static void init_callbacks(void) {
     s_callbacks.psx_unknown_dispatch = psx_unknown_dispatch;
     s_callbacks.log_call_entry       = debug_server_log_call_entry;
     s_callbacks.psx_restore_state_escape = psx_restore_state_escape;
+    /* Call-contract state (ABI v2): DLL code shares the runtime's bail
+     * flag and counters through these pointers. */
+    s_callbacks.call_bail_flag = &g_psx_call_bail;
+    s_callbacks.bail_first     = &g_psx_bail_first;
+    s_callbacks.bail_resolved  = &g_psx_bail_resolved;
 }
 
 /* ---- DLL loading and export enumeration -------------------------------- */
@@ -417,6 +422,21 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
     HMODULE h = LoadLibraryA(dll_path);
     if (!h) {
         loader_log("LoadLibrary(%s) failed: %lu", dll_path, GetLastError());
+        return 0;
+    }
+    /* ABI gate: reject any DLL whose contract ABI doesn't match this
+     * runtime (pre-versioning DLLs lack the export entirely).  Delete the
+     * stale file so the autocompile path regenerates it with the current
+     * emitter. */
+    typedef int (*AbiFn)(void);
+    AbiFn abi_fn = (AbiFn)GetProcAddress(h, "overlay_abi");
+    int abi = abi_fn ? abi_fn() : 0;
+    if (abi != PSX_OVERLAY_ABI_VERSION) {
+        loader_log("ABI mismatch in %s: dll=%d runtime=%d — rejecting and "
+                   "deleting stale cache entry", dll_path, abi,
+                   PSX_OVERLAY_ABI_VERSION);
+        FreeLibrary(h);
+        DeleteFileA(dll_path);
         return 0;
     }
     typedef void (*InitFn)(const OverlayCallbacks *);
@@ -472,6 +492,18 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
     (void)man; (void)man_n; (void)dll;
     void *h = dlopen(dll_path, RTLD_NOW | RTLD_LOCAL);
     if (!h) { loader_log("dlopen(%s) failed: %s", dll_path, dlerror()); return 0; }
+    /* ABI gate (see the _WIN32 branch). */
+    typedef int (*AbiFn)(void);
+    AbiFn abi_fn = (AbiFn)dlsym(h, "overlay_abi");
+    int abi = abi_fn ? abi_fn() : 0;
+    if (abi != PSX_OVERLAY_ABI_VERSION) {
+        loader_log("ABI mismatch in %s: dll=%d runtime=%d — rejecting and "
+                   "deleting stale cache entry", dll_path, abi,
+                   PSX_OVERLAY_ABI_VERSION);
+        dlclose(h);
+        remove(dll_path);
+        return 0;
+    }
     typedef void (*InitFn)(const OverlayCallbacks *);
     InitFn init_fn = (InitFn)dlsym(h, "overlay_init");
     if (!init_fn) { loader_log("no overlay_init in %s", dll_path); dlclose(h); return 0; }

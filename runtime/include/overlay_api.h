@@ -10,6 +10,15 @@
 #include "cpu_state.h"
 #include <stdint.h>
 
+/* ABI version exported by every overlay DLL as `overlay_abi()`.  The loader
+ * rejects (and deletes, so autocompile regenerates) any DLL whose version
+ * doesn't match — including all pre-versioning DLLs, which lack the export.
+ *
+ * v2: dispatch call-contract (Bug D family) — DLL call sites carry (ra, sp)
+ *     contract checks and share the runtime's bail state via the appended
+ *     callback pointers below. */
+#define PSX_OVERLAY_ABI_VERSION 2
+
 typedef struct {
     /* Core dispatch: routes call_by_address() and out-of-overlay jal */
     void (*dispatch_call)(CPUState *cpu, uint32_t addr, uint32_t ra);
@@ -29,6 +38,12 @@ typedef struct {
      * overlay_init copies the struct by value, so older DLLs built against
      * the shorter struct simply never read this member. */
     void (*psx_restore_state_escape)(void);
+    /* Call-contract state shared with the runtime (ABI v2; see the contract
+     * model in cpu_state.h).  DLL code reads the bail flag and bumps the
+     * counters through these pointers. */
+    int      *call_bail_flag;
+    uint64_t *bail_first;
+    uint64_t *bail_resolved;
 } OverlayCallbacks;
 
 #ifdef __cplusplus

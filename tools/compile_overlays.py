@@ -742,12 +742,33 @@ DISPATCH_PREAMBLE = """\
 /* ---- Overlay dispatch shim (inserted by compile_overlays.py) ----------- */
 static OverlayCallbacks g_cbs;
 
+/* Call-contract state (ABI v2): generated code reads/bumps the runtime's
+ * bail state through these pointers (cpu_state.h PSX_OVERLAY_DLL_BUILD
+ * branch).  They start at local dummies so a pre-init call can't fault. */
+static int      s_bail_dummy;
+static uint64_t s_ctr_dummy0, s_ctr_dummy1;
+int      *g_psx_call_bail_p    = &s_bail_dummy;
+uint64_t *g_psx_bail_first_p   = &s_ctr_dummy0;
+uint64_t *g_psx_bail_resolved_p = &s_ctr_dummy1;
+
 #ifdef _WIN32
 __declspec(dllexport)
 #else
 __attribute__((visibility("default")))
 #endif
-void overlay_init(const OverlayCallbacks *cbs) { g_cbs = *cbs; }
+int overlay_abi(void) { return PSX_OVERLAY_ABI_VERSION; }
+
+#ifdef _WIN32
+__declspec(dllexport)
+#else
+__attribute__((visibility("default")))
+#endif
+void overlay_init(const OverlayCallbacks *cbs) {
+    g_cbs = *cbs;
+    if (g_cbs.call_bail_flag) g_psx_call_bail_p    = g_cbs.call_bail_flag;
+    if (g_cbs.bail_first)     g_psx_bail_first_p   = g_cbs.bail_first;
+    if (g_cbs.bail_resolved)  g_psx_bail_resolved_p = g_cbs.bail_resolved;
+}
 
 void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra) {
     (void)ra;
@@ -1010,6 +1031,7 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
     pic_flag = [] if platform.system() == 'Windows' else ['-fPIC']
     cmd = [
         gcc, '-shared', *pic_flag, '-O2',
+        '-DPSX_OVERLAY_DLL_BUILD',
         c_path,
         '-o', out_dll,
         *includes,

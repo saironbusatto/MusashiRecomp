@@ -399,6 +399,14 @@ void psx_check_interrupts(CPUState* cpu) {
     int   prev_pending = g_pending_exception_longjmp;
     g_exception_owner_fiber = psx_fiber_current();
     g_pending_exception_longjmp = 0;
+    /* A bail unwind can never be in flight at exception entry: bail-mode
+     * returns skip every block leader, so psx_check_interrupts is never
+     * reached while g_psx_call_bail is set.  If it ever is, count the
+     * anomaly and clear so the handler dispatch isn't poisoned. */
+    if (g_psx_call_bail) {
+        g_psx_bail_anomaly++;
+        g_psx_call_bail = 0;
+    }
     /* The static BIOS exception handler is not dirty-RAM-interp code. Clear the
      * interp mode flag across the handler dispatch so events recorded inside it
      * are tagged STATIC. The restore sits after the loop the longjmp lands in,

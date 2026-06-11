@@ -3,6 +3,7 @@
 #include "freeze_heartbeat.h"
 #include "debug_server.h"
 #include "crash_trace.h"   /* g_psx_fatal_reason */
+#include "cpu_state.h"     /* g_psx_bail_* call-contract counters */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -329,6 +330,10 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         "  \"dirty_ram_insns\":%llu,\n"
         "  \"tcp_send_stall_ms\":%llu,\n"
         "  \"tcp_clients_dropped\":%u,\n"
+        "  \"bail_first\":%llu,\n"
+        "  \"bail_resolved\":%llu,\n"
+        "  \"bail_flattened\":%llu,\n"
+        "  \"bail_anomaly\":%llu,\n"
         "  \"present_slow_count\":%u,\n"
         "  \"present_vsync_disabled\":%d,\n"
         "  \"wedge_kind\":%u,\n"
@@ -351,6 +356,10 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         (unsigned long long)g_dirty_ram_insns_run,
         (unsigned long long)debug_server_get_tcp_stall_ms(),
         debug_server_get_tcp_drops(),
+        (unsigned long long)g_psx_bail_first,
+        (unsigned long long)g_psx_bail_resolved,
+        (unsigned long long)g_psx_bail_flattened,
+        (unsigned long long)g_psx_bail_anomaly,
         g_present_slow_count,
         g_present_vsync_disabled,
         wedge_kind,
@@ -620,6 +629,10 @@ static void heartbeat_write(void) {
         "  \"dirty_ram_insns\":%llu,\n"
         "  \"tcp_send_stall_ms\":%llu,\n"
         "  \"tcp_clients_dropped\":%u,\n"
+        "  \"bail_first\":%llu,\n"
+        "  \"bail_resolved\":%llu,\n"
+        "  \"bail_flattened\":%llu,\n"
+        "  \"bail_anomaly\":%llu,\n"
         "  \"fatal\":%s%s%s\n"
         "}\n",
         s_backend,
@@ -646,6 +659,10 @@ static void heartbeat_write(void) {
         (unsigned long long)g_dirty_ram_insns_run,
         (unsigned long long)debug_server_get_tcp_stall_ms(),
         debug_server_get_tcp_drops(),
+        (unsigned long long)g_psx_bail_first,
+        (unsigned long long)g_psx_bail_resolved,
+        (unsigned long long)g_psx_bail_flattened,
+        (unsigned long long)g_psx_bail_anomaly,
         g_psx_fatal_reason ? "\"" : "",
         g_psx_fatal_reason ? g_psx_fatal_reason : "null",
         g_psx_fatal_reason ? "\"" : "");
