@@ -97,6 +97,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("antialiasing")) {
             rt.video_antialiasing = toml::find<bool>(video, "antialiasing");
         }
+        if (video.contains("texture_filtering")) {
+            const auto mode = toml::find<std::string>(video, "texture_filtering");
+            if (mode == "nearest")       rt.video_texture_filter = 0;
+            else if (mode == "bilinear") rt.video_texture_filter = 1;
+            else throw std::runtime_error(fmt::format(
+                "[video] texture_filtering must be \"nearest\" or \"bilinear\": {}", mode));
+        }
     }
 
     return rt;

@@ -30,6 +30,7 @@
 #include "gpu_sw_renderer.h"
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                          */
@@ -71,6 +72,9 @@ static uint8_t g_tw_off_x, g_tw_off_y;
 /* Color modulation for textured primitives */
 static uint8_t g_mod_r, g_mod_g, g_mod_b;
 static int g_raw_texture; /* 1 = skip modulation */
+
+/* Texture filtering: 0 = nearest (native PSX), 1 = bilinear. */
+static int g_texture_filter = 0;
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -277,6 +281,50 @@ static uint16_t texel_fetch(int u, int v, uint16_t texpage,
     }
 }
 
+/* Bilinear texel sample, in RGB space (after the CLUT lookup — never
+ * interpolate palette indices). fu/fv are texel-space coordinates.
+ *
+ * Transparency-aware: returns 0x0000 (transparent) when the nearest texel is
+ * transparent, so sprite cutouts are preserved; transparent *neighbours* are
+ * replaced by the nearest texel's colour so edges don't bleed toward black.
+ * Neighbours wrap within the 256-texel page (matches the nearest path's &0xFF)
+ * which keeps the blend inside one texture instead of bleeding across pages. */
+static uint16_t texel_fetch_bilinear(float fu, float fv, uint16_t texpage,
+                                     uint16_t clut_x, uint16_t clut_y) {
+    float su = fu - 0.5f, sv = fv - 0.5f;
+    int iu = (int)floorf(su);
+    int iv = (int)floorf(sv);
+    int fx = (int)((su - (float)iu) * 256.0f);
+    int fy = (int)((sv - (float)iv) * 256.0f);
+    if (fx < 0) fx = 0; else if (fx > 256) fx = 256;
+    if (fy < 0) fy = 0; else if (fy > 256) fy = 256;
+
+    uint16_t c00 = texel_fetch(iu & 0xFF, iv & 0xFF, texpage, clut_x, clut_y);
+    if (c00 == 0x0000) return 0x0000;   /* preserve cutout */
+    uint16_t c10 = texel_fetch((iu + 1) & 0xFF, iv & 0xFF, texpage, clut_x, clut_y);
+    uint16_t c01 = texel_fetch(iu & 0xFF, (iv + 1) & 0xFF, texpage, clut_x, clut_y);
+    uint16_t c11 = texel_fetch((iu + 1) & 0xFF, (iv + 1) & 0xFF, texpage, clut_x, clut_y);
+    if (c10 == 0x0000) c10 = c00;
+    if (c01 == 0x0000) c01 = c00;
+    if (c11 == 0x0000) c11 = c00;
+
+    int r00 = c00 & 0x1F, g00 = (c00 >> 5) & 0x1F, b00 = (c00 >> 10) & 0x1F;
+    int r10 = c10 & 0x1F, g10 = (c10 >> 5) & 0x1F, b10 = (c10 >> 10) & 0x1F;
+    int r01 = c01 & 0x1F, g01 = (c01 >> 5) & 0x1F, b01 = (c01 >> 10) & 0x1F;
+    int r11 = c11 & 0x1F, g11 = (c11 >> 5) & 0x1F, b11 = (c11 >> 10) & 0x1F;
+
+    int w00 = (256 - fx) * (256 - fy);
+    int w10 = fx * (256 - fy);
+    int w01 = (256 - fx) * fy;
+    int w11 = fx * fy;
+
+    int r = (r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11) >> 16;
+    int g = (g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11) >> 16;
+    int b = (b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11) >> 16;
+
+    return (uint16_t)(r | (g << 5) | (b << 10) | (c00 & 0x8000));
+}
+
 /* ------------------------------------------------------------------ */
 /* Public API: init                                                   */
 /* ------------------------------------------------------------------ */
@@ -297,6 +345,7 @@ void sw_renderer_init(uint16_t *vram) {
     g_tw_off_x = g_tw_off_y = 0;
     g_mod_r = g_mod_g = g_mod_b = 16; /* neutral = 128/8 = 16 (no modulation) */
     g_raw_texture = 0;
+    g_texture_filter = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -327,6 +376,9 @@ void sw_renderer_set_scale(int scale) {
 }
 
 int sw_renderer_scale(void) { return g_scale; }
+
+void sw_set_texture_filter(int bilinear) { g_texture_filter = bilinear ? 1 : 0; }
+int  sw_texture_filter(void) { return g_texture_filter; }
 
 /* ------------------------------------------------------------------ */
 /* Draw state setters                                                 */
@@ -730,10 +782,12 @@ static void raster_textured_triangle(const RTarget *t,
 
         for (int x = sx; x <= ex; x++) {
             float t_val = (float)(x - xa) / (float)span;
-            int u = (int)(ua + (ub - ua) * t_val) & 0xFF;
-            int v_coord = (int)(va + (vb - va) * t_val) & 0xFF;
+            float fu = ua + (ub - ua) * t_val;
+            float fv = va + (vb - va) * t_val;
 
-            uint16_t texel = texel_fetch(u, v_coord, texpage, clut_x, clut_y);
+            uint16_t texel = g_texture_filter
+                ? texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y)
+                : texel_fetch((int)fu & 0xFF, (int)fv & 0xFF, texpage, clut_x, clut_y);
             put_textured(t, x, y, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
         }
     }
@@ -858,8 +912,8 @@ static void raster_shaded_textured_triangle(const RTarget *t,
 
         for (int x = sx; x <= ex; x++) {
             float t_val = (float)(x - xa) / (float)span;
-            int u = (int)(ua + (ub - ua) * t_val) & 0xFF;
-            int v_coord = (int)(va + (vb - va) * t_val) & 0xFF;
+            float fu = ua + (ub - ua) * t_val;
+            float fv = va + (vb - va) * t_val;
             int mr = (int)(ra + (rb - ra) * t_val);
             int mg = (int)(ga + (gb - ga) * t_val);
             int mb = (int)(ba + (bb - ba) * t_val);
@@ -867,7 +921,9 @@ static void raster_shaded_textured_triangle(const RTarget *t,
             if (mg < 0) mg = 0; if (mg > 31) mg = 31;
             if (mb < 0) mb = 0; if (mb > 31) mb = 31;
 
-            uint16_t texel = texel_fetch(u, v_coord, texpage, clut_x, clut_y);
+            uint16_t texel = g_texture_filter
+                ? texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y)
+                : texel_fetch((int)fu & 0xFF, (int)fv & 0xFF, texpage, clut_x, clut_y);
             put_textured(t, x, y, texel, mr, mg, mb, raw_texture);
         }
     }
@@ -953,13 +1009,20 @@ static void raster_textured_rect(const RTarget *t, int x, int y, int w, int h,
         int py = y + row;
         if (py < t->cy1 || py > t->cy2) continue;
         int tv = (v + row / s) & 0xFF;
+        float fv = (float)v + (float)row / (float)s;
 
         for (int col = 0; col < w; col++) {
             int px = x + col;
             if (px < t->cx1 || px > t->cx2) continue;
 
-            int tu = (u + col / s) & 0xFF;
-            uint16_t texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
+            uint16_t texel;
+            if (g_texture_filter) {
+                float fu = (float)u + (float)col / (float)s;
+                texel = texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y);
+            } else {
+                int tu = (u + col / s) & 0xFF;
+                texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
+            }
             put_textured(t, px, py, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
         }
     }
@@ -993,12 +1056,19 @@ static void raster_textured_rect_scaled(const RTarget *t, int x, int y,
         if (py < t->cy1 || py > t->cy2) continue;
 
         int tv = (int)(v0 + ((int64_t)dv * row) / h) & 0xFF;
+        float fv = (float)v0 + (float)dv * (float)row / (float)h;
         for (int col = 0; col < w; col++) {
             int px = x + col;
             if (px < t->cx1 || px > t->cx2) continue;
 
-            int tu = (int)(u0 + ((int64_t)du * col) / w) & 0xFF;
-            uint16_t texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
+            uint16_t texel;
+            if (g_texture_filter) {
+                float fu = (float)u0 + (float)du * (float)col / (float)w;
+                texel = texel_fetch_bilinear(fu, fv, texpage, clut_x, clut_y);
+            } else {
+                int tu = (int)(u0 + ((int64_t)du * col) / w) & 0xFF;
+                texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
+            }
             put_textured(t, px, py, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
         }
     }

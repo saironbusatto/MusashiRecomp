@@ -99,6 +99,7 @@ static int           s_fast_boot_active = 0;  /* cleared when game entry PC fire
 /* [video] options, resolved from the game config (defaults: native + AA). */
 static int           g_video_scale = 1;     /* internal-resolution SSAA factor */
 static bool          g_video_aa    = true;  /* linear present filtering */
+static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 
 /* Vsync self-heal state (see SDL_RenderPresent wrapper in
  * sdl_vblank_present). C linkage: freeze_heartbeat.c includes both in
@@ -1236,8 +1237,9 @@ int main(int argc, char** argv) {
                 g_turbo_loads_enabled = 1;
                 std::fprintf(stdout, "psxrecomp: turbo_loads enabled (opt-in)\n");
             }
-            g_video_scale = gc.runtime.video_supersampling;
-            g_video_aa    = gc.runtime.video_antialiasing;
+            g_video_scale     = gc.runtime.video_supersampling;
+            g_video_aa        = gc.runtime.video_antialiasing;
+            g_video_texfilter = gc.runtime.video_texture_filter;
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
             /* Overlay DLL cache (Layer A). Off unless enabled in [runtime];
@@ -1306,9 +1308,12 @@ int main(int argc, char** argv) {
     if (g_video_scale > SW_MAX_INTERNAL_SCALE) g_video_scale = SW_MAX_INTERNAL_SCALE;
     sw_renderer_set_scale(g_video_scale);
     g_video_scale = sw_renderer_scale(); /* reflect any clamp / alloc fallback */
-    if (g_video_scale > 1)
-        std::fprintf(stdout, "psxrecomp: supersampling %dx (antialiasing %s)\n",
-                     g_video_scale, g_video_aa ? "on" : "off");
+    sw_set_texture_filter(g_video_texfilter);
+    if (g_video_scale > 1 || g_video_texfilter)
+        std::fprintf(stdout,
+                     "psxrecomp: supersampling %dx (antialiasing %s, texture filter %s)\n",
+                     g_video_scale, g_video_aa ? "on" : "off",
+                     g_video_texfilter ? "bilinear" : "nearest");
     dma_init();
     mdec_init();
     timers_init();

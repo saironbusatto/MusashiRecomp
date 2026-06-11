@@ -89,6 +89,10 @@ struct RuntimeConfig {
     // downscale and any window resize). false = nearest (sharp pixels).
     // Defaults to true.
     bool                  video_antialiasing = true;
+
+    // texture_filtering: "nearest" (default, native PSX look) | "bilinear"
+    // (smooths textures and 2D backgrounds). Stored as 0/1.
+    int                   video_texture_filter = 0;
 };
 
 // One entry from [[recompiler.bios_vectors]].

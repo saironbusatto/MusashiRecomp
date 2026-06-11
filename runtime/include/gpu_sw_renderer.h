@@ -22,6 +22,12 @@ void sw_renderer_init(uint16_t* vram);
 void sw_renderer_set_scale(int scale);
 int  sw_renderer_scale(void);
 
+/* Texture filtering. 0 = nearest (native PSX look, default), 1 = bilinear
+ * (smooths textures/2D backgrounds; blends in RGB after the CLUT lookup,
+ * transparency-aware). Independent of supersampling. */
+void sw_set_texture_filter(int bilinear);
+int  sw_texture_filter(void);
+
 /* Draw state — must be set by gpu.c before each primitive */
 void sw_set_semi_transparency(int enabled, int mode);
 void sw_set_mask_bits(int set_bit, int check_bit);
