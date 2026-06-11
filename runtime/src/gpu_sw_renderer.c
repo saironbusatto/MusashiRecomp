@@ -1165,7 +1165,8 @@ static inline uint32_t rgb555_to_argb(uint16_t pix) {
     uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2));
     uint8_t g = (uint8_t)((g5 << 3) | (g5 >> 2));
     uint8_t b = (uint8_t)((b5 << 3) | (b5 >> 2));
-    return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | 0xFF000000u;
+    /* ARGB8888 (matches gpu_display_pixel_argb): A<<24 | R<<16 | G<<8 | B. */
+    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b | 0xFF000000u;
 }
 
 int sw_render_display(uint32_t *out_pixels, int out_pitch,
