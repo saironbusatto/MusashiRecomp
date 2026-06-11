@@ -81,6 +81,7 @@ typedef void   (APIENTRY *PFN_glUseProgram)(GLuint);
 typedef GLint  (APIENTRY *PFN_glGetUniformLocation)(GLuint, const char *);
 typedef void   (APIENTRY *PFN_glUniform1i)(GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform2i)(GLint, GLint, GLint);
+typedef void   (APIENTRY *PFN_glUniform4f)(GLint, GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glBlendEquation)(GLenum);
 typedef void   (APIENTRY *PFN_glBlendColor)(GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glGenVertexArrays)(GLsizei, GLuint *);
@@ -111,6 +112,7 @@ static PFN_glUseProgram        p_glUseProgram;
 static PFN_glGetUniformLocation p_glGetUniformLocation;
 static PFN_glUniform1i         p_glUniform1i;
 static PFN_glUniform2i         p_glUniform2i;
+static PFN_glUniform4f         p_glUniform4f;
 static PFN_glBlendEquation     p_glBlendEquation;
 static PFN_glBlendColor        p_glBlendColor;
 static PFN_glGenVertexArrays   p_glGenVertexArrays;
@@ -136,7 +138,7 @@ static int load_modern_gl(void) {
     LOAD(p_glLinkProgram, "glLinkProgram");     LOAD(p_glGetProgramiv, "glGetProgramiv");
     LOAD(p_glGetProgramInfoLog, "glGetProgramInfoLog"); LOAD(p_glUseProgram, "glUseProgram");
     LOAD(p_glGetUniformLocation, "glGetUniformLocation"); LOAD(p_glUniform1i, "glUniform1i");
-    LOAD(p_glUniform2i, "glUniform2i");
+    LOAD(p_glUniform2i, "glUniform2i"); LOAD(p_glUniform4f, "glUniform4f");
     LOAD(p_glBlendEquation, "glBlendEquation"); LOAD(p_glBlendColor, "glBlendColor");
     LOAD(p_glGenVertexArrays, "glGenVertexArrays"); LOAD(p_glBindVertexArray, "glBindVertexArray");
     LOAD(p_glActiveTexture, "glActiveTexture");  LOAD(p_glGenBuffers, "glGenBuffers");
@@ -160,6 +162,8 @@ static int           s_present_w = 0, s_present_h = 0;
 static int           s_modern_ok = 0;
 static GLuint        s_present_prog = 0, s_present_vao = 0;
 static GLint         s_present_uTex = -1;
+static GLuint        s_present_crop_prog = 0;
+static GLint         s_present_crop_uTex = -1, s_present_crop_uRect = -1;
 
 /* GPU rasterization target: VRAM as an RGBA8 texture + FBO. */
 static int           s_raster_ok = 0;      /* GPU geometry path available */
@@ -194,6 +198,17 @@ static const char *PRESENT_FS =
     "#version 330\n"
     "in vec2 v_uv; uniform sampler2D u_tex; out vec4 frag;\n"
     "void main(){ frag = texture(u_tex, v_uv); }\n";
+
+/* Present straight from the FBO color texture (the live VRAM render target),
+ * cropped to the display region. u_rect = (u0, v0_top, uw, vh) in 0..1 texture
+ * space; screen top maps to the display's top VRAM row (v0_top). */
+static const char *PRESENT_CROP_VS =
+    "#version 330\n"
+    "uniform vec4 u_rect;\n"
+    "out vec2 v_uv;\n"
+    "void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2);\n"
+    "  v_uv = vec2(u_rect.x + p.x*u_rect.z, u_rect.y + (1.0-p.y)*u_rect.w);\n"
+    "  gl_Position = vec4(p*2.0-1.0, 0.0, 1.0); }\n";
 
 /* Geometry: position in VRAM pixels (draw offset already applied), color in
  * 0..1. Transform to clip space over the 1024x512 VRAM; no Y flip (VRAM y=0 ->
@@ -446,6 +461,84 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     s_gpu_dirty = 1;
 }
 
+/* A flat/gouraud rectangle is two triangles; reuse the geometry path so it
+ * shares scissor/blend/offset behavior. Coords already offset by gpu.c. */
+static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
+    if (w <= 0 || h <= 0) return;
+    gpu_triangle(x,   y,   c, x+w, y,   c, x,   y+h, c, semi);
+    gpu_triangle(x+w, y,   c, x,   y+h, c, x+w, y+h, c, semi);
+}
+
+/* A textured rectangle is two textured triangles with the UV rectangle mapped
+ * to its corners. u0,v0 = top-left texel; u1,v1 = bottom-right texel. */
+static void gpu_textured_rect(int x,int y,int w,int h,
+                              int u0,int v0,int u1,int v1,
+                              uint16_t clut_x,uint16_t clut_y,uint16_t tp,int semi) {
+    if (w <= 0 || h <= 0) return;
+    float mr=s_mod_r/255.0f, mg=s_mod_g/255.0f, mb=s_mod_b/255.0f;
+    float col[9]={mr,mg,mb, mr,mg,mb, mr,mg,mb};
+    int xs1[3]={x, x+w, x},    ys1[3]={y, y, y+h};
+    int us1[3]={u0,u1,u0},     vs1[3]={v0,v0,v1};
+    gpu_textured_triangle(xs1,ys1,us1,vs1,col,tp,clut_x,clut_y,s_mod_raw,semi);
+    int xs2[3]={x+w, x, x+w},  ys2[3]={y, y+h, y+h};
+    int us2[3]={u1,u0,u1},     vs2[3]={v0,v1,v1};
+    gpu_textured_triangle(xs2,ys2,us2,vs2,col,tp,clut_x,clut_y,s_mod_raw,semi);
+}
+
+/* GP0(02h) fill: write a solid color straight into VRAM, ignoring draw area,
+ * mask, semi-transparency and offset. A scissored glClear is exactly this. */
+static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
+    if (w <= 0 || h <= 0) return;
+    ensure_gpu();
+    float r=(c&0x1F)/31.0f, g=((c>>5)&0x1F)/31.0f, b=((c>>10)&0x1F)/31.0f;
+    int sx=x, sy=y, sw=w, sh=h;
+    if (sx<0){ sw+=sx; sx=0; }  if (sy<0){ sh+=sy; sy=0; }
+    if (sw<0) sw=0; if (sh<0) sh=0;
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_fbo);
+    glViewport(0,0,VRAM_W,VRAM_H);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(sx, sy, sw, sh);
+    glDisable(GL_BLEND);
+    glClearColor(r,g,b,1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    s_gpu_dirty = 1;
+}
+
+/* 1px line via GL_LINES; coords already offset, clipped to the draw area. */
+static void gpu_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int semi) {
+    ensure_gpu();
+    float verts[2*6];
+    int xs[2]={x0,x1}, ys[2]={y0,y1}; uint16_t cs[2]={c0,c1};
+    for (int i=0;i<2;i++) {
+        verts[i*6+0]=(float)xs[i];
+        verts[i*6+1]=(float)ys[i];
+        verts[i*6+2]=((cs[i]&0x1F)<<3)/255.0f;
+        verts[i*6+3]=(((cs[i]>>5)&0x1F)<<3)/255.0f;
+        verts[i*6+4]=(((cs[i]>>10)&0x1F)<<3)/255.0f;
+        verts[i*6+5]=1.0f;
+    }
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_fbo);
+    glViewport(0,0,VRAM_W,VRAM_H);
+    glEnable(GL_SCISSOR_TEST);
+    int sw=s_area_x2-s_area_x1+1, sh=s_area_y2-s_area_y1+1;
+    if (sw<0) sw=0; if (sh<0) sh=0;
+    glScissor(s_area_x1, s_area_y1, sw, sh);
+    if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
+    p_glUseProgram(s_geo_prog);
+    p_glBindVertexArray(s_geo_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
+    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
+    glDrawArrays(GL_LINES, 0, 2);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    s_gpu_dirty = 1;
+}
+
 /* ---- backend vtable wrappers ------------------------------------------- */
 static void glb_init(uint16_t *vram) { s_vram = vram; sw_renderer_init(vram); }
 /* GPU draws write the FBO (native res), not the software SSAA hi-res mirror, so
@@ -475,8 +568,13 @@ static void glb_draw_gouraud_triangle(int x0,int y0,uint16_t c0,int x1,int y1,ui
     ensure_cpu(); sw_draw_gouraud_triangle(x0,y0,c0,x1,y1,c1,x2,y2,c2); s_cpu_dirty = 1;
 }
 
-/* Everything else: software, with the FBO read back first if it's ahead. */
-static void glb_fill_rect(int x,int y,int w,int h,uint16_t c){ ensure_cpu(); sw_fill_rect(x,y,w,h,c); s_cpu_dirty=1; }
+/* GPU-rasterized fill. copy_rect (VRAM->VRAM blit) stays on the software path
+ * for now: an in-place FBO self-blit with arbitrary overlap is the one case GL
+ * can't express with a single glBlitFramebuffer. */
+static void glb_fill_rect(int x,int y,int w,int h,uint16_t c){
+    if (s_raster_ok) { gpu_fill(x,y,w,h,c); return; }
+    ensure_cpu(); sw_fill_rect(x,y,w,h,c); s_cpu_dirty=1;
+}
 static void glb_copy_rect(int sx,int sy,int dx,int dy,int w,int h){ ensure_cpu(); sw_copy_rect(sx,sy,dx,dy,w,h); s_cpu_dirty=1; }
 static void glb_draw_textured_triangle(int x0,int y0,int u0,int v0,int x1,int y1,int u1,int v1,int x2,int y2,int u2,int v2,uint16_t cx,uint16_t cy,uint16_t tp){
     if (s_raster_ok && s_tex_prog) {
@@ -496,11 +594,26 @@ static void glb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32
     }
     ensure_cpu(); sw_draw_shaded_textured_triangle(x0,y0,u0,v0,c0,x1,y1,u1,v1,c1,x2,y2,u2,v2,c2,cx,cy,tp,raw); s_cpu_dirty=1;
 }
-static void glb_draw_flat_rect(int x,int y,int w,int h,uint16_t c){ ensure_cpu(); sw_draw_flat_rect(x,y,w,h,c); s_cpu_dirty=1; }
-static void glb_draw_textured_rect(int x,int y,int w,int h,int u,int v,uint16_t cx,uint16_t cy,uint16_t tp){ ensure_cpu(); sw_draw_textured_rect(x,y,w,h,u,v,cx,cy,tp); s_cpu_dirty=1; }
-static void glb_draw_textured_rect_scaled(int x,int y,int w,int h,int u0,int v0,int u1,int v1,uint16_t cx,uint16_t cy,uint16_t tp){ ensure_cpu(); sw_draw_textured_rect_scaled(x,y,w,h,u0,v0,u1,v1,cx,cy,tp); s_cpu_dirty=1; }
-static void glb_draw_line(int x0,int y0,int x1,int y1,uint16_t c){ ensure_cpu(); sw_draw_line(x0,y0,x1,y1,c); s_cpu_dirty=1; }
-static void glb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1){ ensure_cpu(); sw_draw_shaded_line(x0,y0,c0,x1,y1,c1); s_cpu_dirty=1; }
+static void glb_draw_flat_rect(int x,int y,int w,int h,uint16_t c){
+    if (s_raster_ok) { gpu_flat_rect(x,y,w,h,c, s_semi_en?s_semi_mode:-1); return; }
+    ensure_cpu(); sw_draw_flat_rect(x,y,w,h,c); s_cpu_dirty=1;
+}
+static void glb_draw_textured_rect(int x,int y,int w,int h,int u,int v,uint16_t cx,uint16_t cy,uint16_t tp){
+    if (s_raster_ok && s_tex_prog) { gpu_textured_rect(x,y,w,h, u,v, u+w,v+h, cx,cy,tp, s_semi_en?s_semi_mode:-1); return; }
+    ensure_cpu(); sw_draw_textured_rect(x,y,w,h,u,v,cx,cy,tp); s_cpu_dirty=1;
+}
+static void glb_draw_textured_rect_scaled(int x,int y,int w,int h,int u0,int v0,int u1,int v1,uint16_t cx,uint16_t cy,uint16_t tp){
+    if (s_raster_ok && s_tex_prog) { gpu_textured_rect(x,y,w,h, u0,v0, u1,v1, cx,cy,tp, s_semi_en?s_semi_mode:-1); return; }
+    ensure_cpu(); sw_draw_textured_rect_scaled(x,y,w,h,u0,v0,u1,v1,cx,cy,tp); s_cpu_dirty=1;
+}
+static void glb_draw_line(int x0,int y0,int x1,int y1,uint16_t c){
+    if (s_raster_ok) { gpu_line(x0,y0,c, x1,y1,c, s_semi_en?s_semi_mode:-1); return; }
+    ensure_cpu(); sw_draw_line(x0,y0,x1,y1,c); s_cpu_dirty=1;
+}
+static void glb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1){
+    if (s_raster_ok) { gpu_line(x0,y0,c0, x1,y1,c1, s_semi_en?s_semi_mode:-1); return; }
+    ensure_cpu(); sw_draw_shaded_line(x0,y0,c0,x1,y1,c1); s_cpu_dirty=1;
+}
 static int  glb_render_display(uint32_t *o,int p,int dx,int dy,int dw,int dh){ ensure_cpu(); return sw_render_display(o,p,dx,dy,dw,dh); }
 static int  glb_render_display_hires(uint32_t *o,int p,int dx,int dy,int dw,int dh){ ensure_cpu(); return sw_render_display_hires(o,p,dx,dy,dw,dh); }
 static void glb_vram_write(int x,int y,uint16_t px){ ensure_cpu(); sw_vram_write(x,y,px); s_cpu_dirty=1; }
@@ -602,6 +715,11 @@ int gl_renderer_init_context(SDL_Window *win) {
         s_present_prog = build_program(PRESENT_VS, PRESENT_FS);
         if (s_present_prog) { p_glGenVertexArrays(1, &s_present_vao); s_present_uTex = p_glGetUniformLocation(s_present_prog, "u_tex"); }
         else s_modern_ok = 0;
+        s_present_crop_prog = build_program(PRESENT_CROP_VS, PRESENT_FS);
+        if (s_present_crop_prog) {
+            s_present_crop_uTex  = p_glGetUniformLocation(s_present_crop_prog, "u_tex");
+            s_present_crop_uRect = p_glGetUniformLocation(s_present_crop_prog, "u_rect");
+        }
     }
     fprintf(stdout, "psxrecomp: GL present path = %s\n", s_modern_ok ? "shader" : "immediate(legacy)");
     if (s_modern_ok) init_gpu_raster();
@@ -645,6 +763,47 @@ void gl_renderer_present_blank(void) {
     if (!s_ctx) return;
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     glViewport(0, 0, ww, wh); glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
+    SDL_GL_SwapWindow(s_win);
+}
+
+/* True when the FBO holds the freshest VRAM (a GPU draw happened since the last
+ * CPU sync). The present path uses this to read straight from the FBO instead
+ * of forcing a full readback to CPU VRAM. */
+int gl_renderer_have_gpu_frame(void) {
+    return s_raster_ok && s_gpu_dirty;
+}
+
+/* Sync the FBO down into CPU VRAM (no-op if the CPU side is already current).
+ * Called by the software/24-bit present path before it reads CPU VRAM. */
+void gl_renderer_sync_cpu(void) {
+    ensure_cpu();
+}
+
+/* Present straight from the FBO color texture (the live VRAM render target),
+ * cropped to the display region [disp_x,disp_x+w) x [disp_y,disp_y+h). No
+ * readback — this is the fast path for GPU-rendered (15-bit) frames. */
+void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear) {
+    if (!s_ctx || !s_present_crop_prog || !s_vram_tex) return;
+    int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    glViewport(0, 0, ww, wh);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_vram_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    p_glUseProgram(s_present_crop_prog);
+    p_glUniform1i(s_present_crop_uTex, 0);
+    p_glUniform4f(s_present_crop_uRect,
+                  (float)disp_x / (float)VRAM_W, (float)disp_y / (float)VRAM_H,
+                  (float)w / (float)VRAM_W, (float)h / (float)VRAM_H);
+    p_glBindVertexArray(s_present_vao);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
     SDL_GL_SwapWindow(s_win);
 }
 

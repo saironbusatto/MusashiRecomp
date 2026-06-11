@@ -1115,6 +1115,19 @@ static void sdl_vblank_present(void) {
         disabled_frame_presented = false;
         w = di.width; h = di.height;
 
+        /* OpenGL fast path: when the GPU FBO holds the freshest VRAM (a GPU
+         * draw happened this frame) and the display is 15-bit, present straight
+         * from the FBO — no 1 MB readback. Software / 24-bit (FMV) frames fall
+         * through to the CPU readout below, after syncing the FBO down. */
+#ifndef PSX_SDL_NO_RENDER
+        if (g_gl_active && !di.depth24 && gl_renderer_have_gpu_frame()) {
+            gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
+                                     (int)w, (int)h, g_video_aa ? 1 : 0);
+            return;
+        }
+        if (g_gl_active) gl_renderer_sync_cpu();
+#endif
+
         /* The hi-res mirror is a 15-bit copy of VRAM; 24-bit display (FMV)
          * reads packed bytes the mirror can't represent, so fall back to the
          * native path for those frames (the present filter still upscales). */
