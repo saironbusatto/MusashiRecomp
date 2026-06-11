@@ -347,8 +347,10 @@ static void gpu_triangle(int x0,int y0,uint16_t c0, int x1,int y1,uint16_t c1,
                          int x2,int y2,uint16_t c2, int semi) {
     ensure_gpu();
     float verts[3*6];
-    int xs[3] = {x0+s_off_x, x1+s_off_x, x2+s_off_x};
-    int ys[3] = {y0+s_off_y, y1+s_off_y, y2+s_off_y};
+    /* gpu.c already applied the draw offset before calling the gr_* facade
+     * (see gp0_exec_* in gpu.c); coords arrive in final VRAM space. */
+    int xs[3] = {x0, x1, x2};
+    int ys[3] = {y0, y1, y2};
     uint16_t cs[3] = {c0,c1,c2};
     for (int i = 0; i < 3; i++) {
         verts[i*6+0] = (float)xs[i];
@@ -389,8 +391,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     ensure_gpu();
     float verts[3 * 8];
     for (int i = 0; i < 3; i++) {
-        verts[i*8+0] = (float)(xs[i] + s_off_x);
-        verts[i*8+1] = (float)(ys[i] + s_off_y);
+        /* coords already offset by gpu.c — do not re-apply s_off here */
+        verts[i*8+0] = (float)xs[i];
+        verts[i*8+1] = (float)ys[i];
         verts[i*8+2] = (float)us[i];
         verts[i*8+3] = (float)vs[i];
         verts[i*8+4] = col[i*3+0];
