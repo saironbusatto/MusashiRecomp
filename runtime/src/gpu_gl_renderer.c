@@ -57,6 +57,8 @@
 #define PSXGL_FUNC_ADD            0x8006
 #define PSXGL_FUNC_REVERSE_SUBTRACT 0x800B
 #define PSXGL_CONSTANT_ALPHA      0x8003
+#define PSXGL_READ_FRAMEBUFFER    0x8CA8
+#define PSXGL_DRAW_FRAMEBUFFER    0x8CA9
 
 #ifndef APIENTRY
 #define APIENTRY
@@ -96,6 +98,7 @@ typedef void   (APIENTRY *PFN_glGenFramebuffers)(GLsizei, GLuint *);
 typedef void   (APIENTRY *PFN_glBindFramebuffer)(GLenum, GLuint);
 typedef void   (APIENTRY *PFN_glFramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
 typedef GLenum (APIENTRY *PFN_glCheckFramebufferStatus)(GLenum);
+typedef void   (APIENTRY *PFN_glBlitFramebuffer)(GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLbitfield,GLenum);
 
 static PFN_glCreateShader      p_glCreateShader;
 static PFN_glShaderSource      p_glShaderSource;
@@ -127,6 +130,7 @@ static PFN_glGenFramebuffers   p_glGenFramebuffers;
 static PFN_glBindFramebuffer   p_glBindFramebuffer;
 static PFN_glFramebufferTexture2D p_glFramebufferTexture2D;
 static PFN_glCheckFramebufferStatus p_glCheckFramebufferStatus;
+static PFN_glBlitFramebuffer   p_glBlitFramebuffer;
 
 static int load_modern_gl(void) {
     int ok = 1;
@@ -148,6 +152,7 @@ static int load_modern_gl(void) {
     LOAD(p_glGenFramebuffers, "glGenFramebuffers"); LOAD(p_glBindFramebuffer, "glBindFramebuffer");
     LOAD(p_glFramebufferTexture2D, "glFramebufferTexture2D");
     LOAD(p_glCheckFramebufferStatus, "glCheckFramebufferStatus");
+    LOAD(p_glBlitFramebuffer, "glBlitFramebuffer");
 #undef LOAD
     return ok;
 }
@@ -783,27 +788,23 @@ void gl_renderer_sync_cpu(void) {
  * cropped to the display region [disp_x,disp_x+w) x [disp_y,disp_y+h). No
  * readback — this is the fast path for GPU-rendered (15-bit) frames. */
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear) {
-    if (!s_ctx || !s_present_crop_prog || !s_vram_tex) return;
+    if (!s_ctx || !s_fbo || !p_glBlitFramebuffer) return;
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
-    glViewport(0, 0, ww, wh);
+
+    /* Exact integer-rect copy of the display region from the FBO to the window
+     * (no shader, no sub-texel UV sampling). The FBO's GL y-axis equals VRAM y
+     * (GEO_VS maps VRAM y=0 -> clip y=-1 -> framebuffer row 0); the default
+     * framebuffer has y=0 at the bottom, so we flip vertically by mapping src
+     * y [disp_y, disp_y+h] to dst y [wh, 0] — display top lands at window top. */
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_BLEND);
+    glViewport(0, 0, ww, wh);
     glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
-    p_glActiveTexture(PSXGL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, s_vram_tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, linear ? GL_LINEAR : GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    p_glUseProgram(s_present_crop_prog);
-    p_glUniform1i(s_present_crop_uTex, 0);
-    p_glUniform4f(s_present_crop_uRect,
-                  (float)disp_x / (float)VRAM_W, (float)disp_y / (float)VRAM_H,
-                  (float)w / (float)VRAM_W, (float)h / (float)VRAM_H);
-    p_glBindVertexArray(s_present_vao);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    p_glBindVertexArray(0);
-    p_glUseProgram(0);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_fbo);
+    p_glBlitFramebuffer(disp_x, disp_y, disp_x + w, disp_y + h,
+                        0, wh, ww, 0,
+                        GL_COLOR_BUFFER_BIT, linear ? GL_LINEAR : GL_NEAREST);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     SDL_GL_SwapWindow(s_win);
 }
 

@@ -104,6 +104,10 @@ static bool          g_video_aa    = true;  /* linear present filtering */
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 static int           g_video_renderer = 0;  /* 0=software, 1=opengl (requested) */
 static bool          g_gl_active = false;    /* GL context live -> GL present path */
+/* Present straight from the FBO (fast, no readback). Set PSX_GL_FORCE_CPU_PRESENT=1
+ * to force the software readout path instead — a diagnostic/fallback that also
+ * keeps CPU VRAM current every frame (so screenshots reflect the screen). */
+static int           g_gl_fbo_present = 1;
 
 /* Vsync self-heal state (see SDL_RenderPresent wrapper in
  * sdl_vblank_present). C linkage: freeze_heartbeat.c includes both in
@@ -1120,7 +1124,7 @@ static void sdl_vblank_present(void) {
          * from the FBO — no 1 MB readback. Software / 24-bit (FMV) frames fall
          * through to the CPU readout below, after syncing the FBO down. */
 #ifndef PSX_SDL_NO_RENDER
-        if (g_gl_active && !di.depth24 && gl_renderer_have_gpu_frame()) {
+        if (g_gl_active && g_gl_fbo_present && !di.depth24 && gl_renderer_have_gpu_frame()) {
             gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
                                      (int)w, (int)h, g_video_aa ? 1 : 0);
             return;
@@ -1269,6 +1273,8 @@ int main(int argc, char** argv) {
             g_video_aa        = gc.runtime.video_antialiasing;
             g_video_texfilter = gc.runtime.video_texture_filter;
             g_video_renderer  = gc.runtime.video_renderer;
+            { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
+              if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
             /* Overlay DLL cache (Layer A). Off unless enabled in [runtime];

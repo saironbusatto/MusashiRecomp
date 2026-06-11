@@ -5651,6 +5651,14 @@ static int png_write_rgb(FILE *f, const uint8_t *rgb, uint32_t w, uint32_t h) {
  * poisoned every client connection that used it. */
 static void handle_screenshot_file(int id, const char *json)
 {
+    /* Under the OpenGL FBO-present path, CPU VRAM can be stale (the FBO holds
+     * the freshest frame and is presented without a readback). Sync it down so
+     * the capture reflects what's on screen. No-op for the software backend or
+     * when no GPU frame is pending. Safe here: the debug server is pumped on
+     * the main (GL-context) thread. */
+    extern void gl_renderer_sync_cpu(void);
+    gl_renderer_sync_cpu();
+
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
     if (di.disabled || di.width == 0 || di.height == 0) {
