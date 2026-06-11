@@ -25,6 +25,18 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
 
+/* True when the GPU FBO holds the freshest VRAM (a GPU draw happened since the
+ * last CPU sync). The present path reads from the FBO directly when true. */
+int  gl_renderer_have_gpu_frame(void);
+
+/* Sync the FBO down to CPU VRAM if the GPU side is ahead (else a no-op). The
+ * software / 24-bit (FMV) present path calls this before reading CPU VRAM. */
+void gl_renderer_sync_cpu(void);
+
+/* Present straight from the FBO, cropped to the display region. No readback;
+ * fast path for GPU-rendered 15-bit frames. linear = filter on upscale. */
+void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear);
+
 void gl_renderer_shutdown(void);
 
 #ifdef __cplusplus
