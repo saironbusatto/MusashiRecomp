@@ -7,6 +7,24 @@
  * Texture formats: 4-bit CLUT, 8-bit CLUT, 15-bit direct.
  * Supports: semi-transparency (4 modes), mask bit, texture window,
  *           color modulation for textured primitives.
+ *
+ * Internal-resolution supersampling (SSAA)
+ * ----------------------------------------
+ * When sw_renderer_set_scale(S>1) is active, the renderer maintains a
+ * second buffer `g_hr` that is an S*-scaled mirror of VRAM. Every drawing
+ * primitive is rasterized twice: once into native VRAM (byte-identical to
+ * the S==1 path — VRAM stays the authoritative copy that the game reads
+ * back for framebuffer effects, render-to-texture, transfers, etc.) and
+ * once into g_hr at S* the linear resolution. Block operations (fill, copy,
+ * CPU->VRAM transfer, single-pixel write) replicate/scale into g_hr so the
+ * mirror stays coherent. Textures are ALWAYS sampled from native VRAM, so
+ * texels keep their native resolution (point-sampled) while geometry edges
+ * and shading are evaluated at the higher resolution. The display reads g_hr
+ * (sw_render_display_hires) and the present path downsamples to the window,
+ * which is true ordered-grid supersampling / anti-aliasing.
+ *
+ * When scale==1 (default) g_hr is NULL and the renderer behaves exactly as
+ * it did before this feature existed.
  */
 
 #include "gpu_sw_renderer.h"
@@ -26,7 +44,13 @@
 
 static uint16_t *g_vram;
 
-/* Draw area clipping rectangle */
+/* Hi-res supersampling mirror (see file header). g_scale==1 => disabled. */
+static uint16_t *g_hr      = NULL;
+static int       g_scale   = 1;
+static int       g_hr_w    = VRAM_WIDTH;
+static int       g_hr_h    = VRAM_HEIGHT;
+
+/* Draw area clipping rectangle (native coordinates) */
 static int g_clip_x1, g_clip_y1, g_clip_x2, g_clip_y2;
 
 /* Draw offset */
@@ -67,9 +91,38 @@ static inline uint16_t vram_get(int x, int y) {
     return g_vram[y * VRAM_WIDTH + x];
 }
 
-static inline int inside_draw_area(int x, int y) {
-    return (x >= g_clip_x1 && x <= g_clip_x2 &&
-            y >= g_clip_y1 && y <= g_clip_y2);
+/* ------------------------------------------------------------------ */
+/* Render target — selects native VRAM or the hi-res mirror.          */
+/*                                                                    */
+/* `s` is the coordinate scale of this target (1 for native, S for    */
+/* hi-res). Clip rectangle is expressed in the target's own pixel     */
+/* space. Texture fetches never use the target: texels always come    */
+/* from native VRAM via vram_get/texel_fetch.                         */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    uint16_t *buf;
+    int       w, h;            /* buffer dimensions */
+    int       s;               /* coordinate scale */
+    int       cx1, cy1, cx2, cy2; /* clip rect (inclusive) in buffer space */
+} RTarget;
+
+static inline RTarget rt_native(void) {
+    RTarget t;
+    t.buf = g_vram; t.w = VRAM_WIDTH; t.h = VRAM_HEIGHT; t.s = 1;
+    t.cx1 = g_clip_x1; t.cy1 = g_clip_y1; t.cx2 = g_clip_x2; t.cy2 = g_clip_y2;
+    return t;
+}
+
+static inline RTarget rt_hires(void) {
+    int s = g_scale;
+    RTarget t;
+    t.buf = g_hr; t.w = g_hr_w; t.h = g_hr_h; t.s = s;
+    t.cx1 = g_clip_x1 * s;
+    t.cy1 = g_clip_y1 * s;
+    t.cx2 = g_clip_x2 * s + (s - 1);
+    t.cy2 = g_clip_y2 * s + (s - 1);
+    return t;
 }
 
 /* ------------------------------------------------------------------ */
@@ -114,44 +167,44 @@ static inline uint16_t blend_pixels(uint16_t back, uint16_t front, int mode) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Pixel write — central function with mask + semi-trans              */
+/* Pixel write — central functions with mask + semi-trans             */
 /* ------------------------------------------------------------------ */
 
 /* Write an opaque (untextured) pixel with semi-transparency if enabled */
-static inline void draw_pixel_opaque(int x, int y, uint16_t color) {
-    if (x < 0 || x >= VRAM_WIDTH || y < 0 || y >= VRAM_HEIGHT) return;
-    if (!inside_draw_area(x, y)) return;
+static inline void put_opaque(const RTarget *t, int x, int y, uint16_t color) {
+    if (x < 0 || x >= t->w || y < 0 || y >= t->h) return;
+    if (x < t->cx1 || x > t->cx2 || y < t->cy1 || y > t->cy2) return;
 
-    int idx = y * VRAM_WIDTH + x;
+    int idx = y * t->w + x;
 
     /* Mask bit check: don't overwrite if dest has bit 15 set */
-    if (g_mask_check_bit && (g_vram[idx] & 0x8000)) return;
+    if (g_mask_check_bit && (t->buf[idx] & 0x8000)) return;
 
     /* Semi-transparency: for untextured primitives, always blend when flag set */
     if (g_semi_trans_enabled) {
-        color = blend_pixels(g_vram[idx], color, g_semi_trans_mode);
+        color = blend_pixels(t->buf[idx], color, g_semi_trans_mode);
     }
 
     /* Mask bit set: force bit 15 on written pixel */
     if (g_mask_set_bit) color |= 0x8000;
 
-    g_vram[idx] = color;
+    t->buf[idx] = color;
 }
 
 /* Write a textured pixel — semi-trans only if texel bit 15 is set */
-static inline void draw_pixel_textured_modulated(int x, int y, uint16_t texel,
-                                                 int mod_r, int mod_g, int mod_b,
-                                                 int raw_texture) {
-    if (x < 0 || x >= VRAM_WIDTH || y < 0 || y >= VRAM_HEIGHT) return;
-    if (!inside_draw_area(x, y)) return;
+static inline void put_textured(const RTarget *t, int x, int y, uint16_t texel,
+                                int mod_r, int mod_g, int mod_b,
+                                int raw_texture) {
+    if (x < 0 || x >= t->w || y < 0 || y >= t->h) return;
+    if (x < t->cx1 || x > t->cx2 || y < t->cy1 || y > t->cy2) return;
 
     /* Transparent texel (0x0000) is always skipped */
     if (texel == 0x0000) return;
 
-    int idx = y * VRAM_WIDTH + x;
+    int idx = y * t->w + x;
 
     /* Mask bit check */
-    if (g_mask_check_bit && (g_vram[idx] & 0x8000)) return;
+    if (g_mask_check_bit && (t->buf[idx] & 0x8000)) return;
 
     /* Color modulation: multiply texel by vertex color unless raw texture */
     uint16_t color;
@@ -171,19 +224,13 @@ static inline void draw_pixel_textured_modulated(int x, int y, uint16_t texel,
 
     /* Semi-transparency: for textured primitives, only blend if texel has bit 15 */
     if (g_semi_trans_enabled && (texel & 0x8000)) {
-        color = blend_pixels(g_vram[idx], color, g_semi_trans_mode);
+        color = blend_pixels(t->buf[idx], color, g_semi_trans_mode);
     }
 
     /* Mask bit set */
     if (g_mask_set_bit) color |= 0x8000;
 
-    g_vram[idx] = color;
-}
-
-static inline void draw_pixel_textured(int x, int y, uint16_t texel) {
-    draw_pixel_textured_modulated(x, y, texel,
-                                  g_mod_r, g_mod_g, g_mod_b,
-                                  g_raw_texture);
+    t->buf[idx] = color;
 }
 
 /* ------------------------------------------------------------------ */
@@ -253,6 +300,35 @@ void sw_renderer_init(uint16_t *vram) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Supersampling control                                              */
+/* ------------------------------------------------------------------ */
+
+void sw_renderer_set_scale(int scale) {
+    if (scale < 1) scale = 1;
+    if (scale > SW_MAX_INTERNAL_SCALE) scale = SW_MAX_INTERNAL_SCALE;
+
+    if (g_hr) { free(g_hr); g_hr = NULL; }
+
+    g_scale = scale;
+    if (scale > 1) {
+        g_hr_w = VRAM_WIDTH * scale;
+        g_hr_h = VRAM_HEIGHT * scale;
+        g_hr = (uint16_t *)calloc((size_t)g_hr_w * (size_t)g_hr_h, sizeof(uint16_t));
+        if (!g_hr) {
+            /* Allocation failed — fall back to native rendering. */
+            g_scale = 1;
+            g_hr_w = VRAM_WIDTH;
+            g_hr_h = VRAM_HEIGHT;
+        }
+    } else {
+        g_hr_w = VRAM_WIDTH;
+        g_hr_h = VRAM_HEIGHT;
+    }
+}
+
+int sw_renderer_scale(void) { return g_scale; }
+
+/* ------------------------------------------------------------------ */
 /* Draw state setters                                                 */
 /* ------------------------------------------------------------------ */
 
@@ -275,18 +351,9 @@ void sw_set_texture_window(uint32_t raw) {
 
 void sw_set_color_modulation(int r, int g, int b, int raw_texture) {
     /* Convert 8-bit vertex color to modulation factor.
-     * PS1 formula: result = (texel_5bit * color_8bit) >> 4
-     * When color_8bit=128 (0x80, neutral gray), result = texel * 8 = texel << 3 ≈ original.
-     * We store color_8bit >> 3 so the multiply in draw_pixel_textured is >> 4.
-     * Actually: store raw 8-bit value / 8 = >> 3 to get 5-bit-range factor.
-     *
-     * Simpler approach: store the 8-bit color, shift later.
-     * result_5bit = (texel_5bit * color_8bit + 127) >> 7, clamped to 31
-     * But that's slower. Let's use: (texel * (color >> 3)) >> 4
-     * At color=128: factor=16, (31*16)>>4 = 31 — perfect.
-     * At color=255: factor=31, (31*31)>>4 = 60 → clamp 31 — saturated.
-     * At color=0: factor=0, result=0 — black.
-     */
+     * result_5bit = (texel * (color >> 3)) >> 4
+     * At color=128: factor=16, (31*16)>>4 = 31 — neutral.
+     * At color=255: factor=31, saturates. At color=0: black. */
     g_mod_r = (uint8_t)(r >> 3);
     g_mod_g = (uint8_t)(g >> 3);
     g_mod_b = (uint8_t)(b >> 3);
@@ -318,6 +385,21 @@ void sw_set_draw_offset(int x, int y) {
 /* Fill rectangle (GP0(02h) — directly in VRAM, no draw offset)       */
 /* ------------------------------------------------------------------ */
 
+static void hr_fill_block(int x, int y, int w, int h, uint16_t color) {
+    int s = g_scale;
+    int x0 = (x & (VRAM_WIDTH - 1)) * s;
+    int y0 = (y & (VRAM_HEIGHT - 1)) * s;
+    int W = w * s, H = h * s;
+    for (int row = 0; row < H; row++) {
+        int py = (y0 + row) % g_hr_h;
+        uint16_t *dst = g_hr + (size_t)py * g_hr_w;
+        for (int col = 0; col < W; col++) {
+            int px = (x0 + col) % g_hr_w;
+            dst[px] = color;
+        }
+    }
+}
+
 void sw_fill_rect(int x, int y, int w, int h, uint16_t color) {
     /* Fill rect ignores draw area, mask bits, and semi-transparency.
      * It writes directly to VRAM with coordinates wrapping. */
@@ -331,6 +413,8 @@ void sw_fill_rect(int x, int y, int w, int h, uint16_t color) {
             g_vram[py * VRAM_WIDTH + px] = color;
         }
     }
+
+    if (g_hr) hr_fill_block(x, y, w, h, color);
 }
 
 /* ------------------------------------------------------------------ */
@@ -340,6 +424,11 @@ void sw_fill_rect(int x, int y, int w, int h, uint16_t color) {
 void sw_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
     uint16_t row_buf[VRAM_WIDTH];
 
+    /* Hi-res scratch: one native row's worth of source super-rows. */
+    int s = g_scale;
+    uint16_t *hr_rows = NULL;
+    if (g_hr) hr_rows = (uint16_t *)malloc((size_t)w * s * s * sizeof(uint16_t));
+
     for (int row = 0; row < h; row++) {
         int sy = (src_y + row) & (VRAM_HEIGHT - 1);
         int dy = (dst_y + row) & (VRAM_HEIGHT - 1);
@@ -348,6 +437,24 @@ void sw_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
             int sx = (src_x + col) & (VRAM_WIDTH - 1);
             row_buf[col] = g_vram[sy * VRAM_WIDTH + sx];
         }
+
+        /* Snapshot the hi-res source super-rows for this native row before
+         * any destination write (handles overlapping copies per native row,
+         * mirroring the native row_buf approach above). */
+        if (hr_rows) {
+            for (int sr = 0; sr < s; sr++) {
+                int hsy = ((sy * s) + sr) % g_hr_h;
+                const uint16_t *src = g_hr + (size_t)hsy * g_hr_w;
+                for (int col = 0; col < w; col++) {
+                    int hsx_base = ((src_x + col) & (VRAM_WIDTH - 1)) * s;
+                    for (int sc = 0; sc < s; sc++) {
+                        int hsx = (hsx_base + sc) % g_hr_w;
+                        hr_rows[(sr * w + col) * s + sc] = src[hsx];
+                    }
+                }
+            }
+        }
+
         for (int col = 0; col < w; col++) {
             int dx = (dst_x + col) & (VRAM_WIDTH - 1);
             uint16_t pix = row_buf[col];
@@ -356,26 +463,43 @@ void sw_copy_rect(int src_x, int src_y, int dst_x, int dst_y, int w, int h) {
                 continue;
             if (g_mask_set_bit) pix |= 0x8000;
             g_vram[dy * VRAM_WIDTH + dx] = pix;
+
+            if (hr_rows) {
+                int hdx_base = dx * s;
+                for (int sr = 0; sr < s; sr++) {
+                    int hdy = ((dy * s) + sr) % g_hr_h;
+                    uint16_t *dst = g_hr + (size_t)hdy * g_hr_w;
+                    for (int sc = 0; sc < s; sc++) {
+                        int hdx = (hdx_base + sc) % g_hr_w;
+                        uint16_t hp = hr_rows[(sr * w + col) * s + sc];
+                        if (g_mask_set_bit) hp |= 0x8000;
+                        dst[hdx] = hp;
+                    }
+                }
+            }
         }
     }
+
+    if (hr_rows) free(hr_rows);
 }
 
 /* ------------------------------------------------------------------ */
 /* Flat-shaded triangle (scanline rasterization)                      */
 /* ------------------------------------------------------------------ */
 
-void sw_draw_flat_triangle(int x0, int y0, int x1, int y1,
-                           int x2, int y2, uint16_t color) {
+static void raster_flat_triangle(const RTarget *t,
+                                 int x0, int y0, int x1, int y1,
+                                 int x2, int y2, uint16_t color) {
     /* Sort vertices by Y coordinate */
-    if (y0 > y1) { int t; t=x0; x0=x1; x1=t; t=y0; y0=y1; y1=t; }
-    if (y0 > y2) { int t; t=x0; x0=x2; x2=t; t=y0; y0=y2; y2=t; }
-    if (y1 > y2) { int t; t=x1; x1=x2; x2=t; t=y1; y1=y2; y2=t; }
+    if (y0 > y1) { int tt; tt=x0; x0=x1; x1=tt; tt=y0; y0=y1; y1=tt; }
+    if (y0 > y2) { int tt; tt=x0; x0=x2; x2=tt; tt=y0; y0=y2; y2=tt; }
+    if (y1 > y2) { int tt; tt=x1; x1=x2; x2=tt; tt=y1; y1=y2; y2=tt; }
 
     int dy_total = y2 - y0;
     if (dy_total == 0) return;
 
     for (int y = y0; y <= y2; y++) {
-        if (y < g_clip_y1 || y > g_clip_y2) continue;
+        if (y < t->cy1 || y > t->cy2) continue;
 
         int second_half = (y >= y1);
         int seg_height = second_half ? (y2 - y1) : (y1 - y0);
@@ -395,14 +519,25 @@ void sw_draw_flat_triangle(int x0, int y0, int x1, int y1,
         else
             xb = x0 + (int)((float)(x1 - x0) * beta);
 
-        if (xa > xb) { int t = xa; xa = xb; xb = t; }
+        if (xa > xb) { int tt = xa; xa = xb; xb = tt; }
 
-        int sx = max_i(xa, g_clip_x1);
-        int ex = min_i(xb, g_clip_x2);
+        int sx = max_i(xa, t->cx1);
+        int ex = min_i(xb, t->cx2);
 
         for (int x = sx; x <= ex; x++) {
-            draw_pixel_opaque(x, y, color);
+            put_opaque(t, x, y, color);
         }
+    }
+}
+
+void sw_draw_flat_triangle(int x0, int y0, int x1, int y1,
+                           int x2, int y2, uint16_t color) {
+    RTarget n = rt_native();
+    raster_flat_triangle(&n, x0, y0, x1, y1, x2, y2, color);
+    if (g_hr) {
+        int s = g_scale;
+        RTarget hr = rt_hires();
+        raster_flat_triangle(&hr, x0*s, y0*s, x1*s, y1*s, x2*s, y2*s, color);
     }
 }
 
@@ -410,9 +545,10 @@ void sw_draw_flat_triangle(int x0, int y0, int x1, int y1,
 /* Gouraud-shaded triangle (scanline rasterization with color interp) */
 /* ------------------------------------------------------------------ */
 
-void sw_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
-                              int x1, int y1, uint16_t c1,
-                              int x2, int y2, uint16_t c2) {
+static void raster_gouraud_triangle(const RTarget *t,
+                                    int x0, int y0, uint16_t c0,
+                                    int x1, int y1, uint16_t c1,
+                                    int x2, int y2, uint16_t c2) {
     /* Extract 5-bit color components for each vertex */
     int r0 = (c0 >>  0) & 0x1F, g0 = (c0 >>  5) & 0x1F, b0 = (c0 >> 10) & 0x1F;
     int r1 = (c1 >>  0) & 0x1F, g1 = (c1 >>  5) & 0x1F, b1 = (c1 >> 10) & 0x1F;
@@ -420,23 +556,23 @@ void sw_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
 
     /* Sort vertices by Y coordinate, keeping colors in sync */
     if (y0 > y1) {
-        int t; t=x0; x0=x1; x1=t; t=y0; y0=y1; y1=t;
-        t=r0; r0=r1; r1=t; t=g0; g0=g1; g1=t; t=b0; b0=b1; b1=t;
+        int tt; tt=x0; x0=x1; x1=tt; tt=y0; y0=y1; y1=tt;
+        tt=r0; r0=r1; r1=tt; tt=g0; g0=g1; g1=tt; tt=b0; b0=b1; b1=tt;
     }
     if (y0 > y2) {
-        int t; t=x0; x0=x2; x2=t; t=y0; y0=y2; y2=t;
-        t=r0; r0=r2; r2=t; t=g0; g0=g2; g2=t; t=b0; b0=b2; b2=t;
+        int tt; tt=x0; x0=x2; x2=tt; tt=y0; y0=y2; y2=tt;
+        tt=r0; r0=r2; r2=tt; tt=g0; g0=g2; g2=tt; tt=b0; b0=b2; b2=tt;
     }
     if (y1 > y2) {
-        int t; t=x1; x1=x2; x2=t; t=y1; y1=y2; y2=t;
-        t=r1; r1=r2; r2=t; t=g1; g1=g2; g2=t; t=b1; b1=b2; b2=t;
+        int tt; tt=x1; x1=x2; x2=tt; tt=y1; y1=y2; y2=tt;
+        tt=r1; r1=r2; r2=tt; tt=g1; g1=g2; g2=tt; tt=b1; b1=b2; b2=tt;
     }
 
     int dy_total = y2 - y0;
     if (dy_total == 0) return;
 
     for (int y = y0; y <= y2; y++) {
-        if (y < g_clip_y1 || y > g_clip_y2) continue;
+        if (y < t->cy1 || y > t->cy2) continue;
 
         int second_half = (y >= y1);
         int seg_height = second_half ? (y2 - y1) : (y1 - y0);
@@ -474,25 +610,25 @@ void sw_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
 
         /* Ensure xa < xb, swap colors too */
         if (xa > xb) {
-            int t;
-            t = xa; xa = xb; xb = t;
-            t = ra; ra = rb; rb = t;
-            t = ga; ga = gb; gb = t;
-            t = ba; ba = bb; bb = t;
+            int tt;
+            tt = xa; xa = xb; xb = tt;
+            tt = ra; ra = rb; rb = tt;
+            tt = ga; ga = gb; gb = tt;
+            tt = ba; ba = bb; bb = tt;
         }
 
-        int sx = max_i(xa, g_clip_x1);
-        int ex = min_i(xb, g_clip_x2);
+        int sx = max_i(xa, t->cx1);
+        int ex = min_i(xb, t->cx2);
         int span = xb - xa;
 
         for (int x = sx; x <= ex; x++) {
             /* Interpolate color across the scanline */
             uint16_t color;
             if (span > 0) {
-                float t = (float)(x - xa) / (float)span;
-                int r = ra + (int)((float)(rb - ra) * t);
-                int g = ga + (int)((float)(gb - ga) * t);
-                int b = ba + (int)((float)(bb - ba) * t);
+                float tf = (float)(x - xa) / (float)span;
+                int r = ra + (int)((float)(rb - ra) * tf);
+                int g = ga + (int)((float)(gb - ga) * tf);
+                int b = ba + (int)((float)(bb - ba) * tf);
                 if (r < 0) r = 0; if (r > 31) r = 31;
                 if (g < 0) g = 0; if (g > 31) g = 31;
                 if (b < 0) b = 0; if (b > 31) b = 31;
@@ -500,8 +636,20 @@ void sw_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
             } else {
                 color = (uint16_t)(ra | (ga << 5) | (ba << 10));
             }
-            draw_pixel_opaque(x, y, color);
+            put_opaque(t, x, y, color);
         }
+    }
+}
+
+void sw_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
+                              int x1, int y1, uint16_t c1,
+                              int x2, int y2, uint16_t c2) {
+    RTarget n = rt_native();
+    raster_gouraud_triangle(&n, x0, y0, c0, x1, y1, c1, x2, y2, c2);
+    if (g_hr) {
+        int s = g_scale;
+        RTarget hr = rt_hires();
+        raster_gouraud_triangle(&hr, x0*s, y0*s, c0, x1*s, y1*s, c1, x2*s, y2*s, c2);
     }
 }
 
@@ -509,37 +657,34 @@ void sw_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
 /* Textured triangle                                                  */
 /* ------------------------------------------------------------------ */
 
-void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
-                               int x1, int y1, int u1, int v1,
-                               int x2, int y2, int u2, int v2,
-                               uint16_t clut_x, uint16_t clut_y,
-                               uint16_t texpage) {
-    int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
-                  - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
-    if (area2 == 0) return;
-
+static void raster_textured_triangle(const RTarget *t,
+                                     int x0, int y0, int u0, int v0,
+                                     int x1, int y1, int u1, int v1,
+                                     int x2, int y2, int u2, int v2,
+                                     uint16_t clut_x, uint16_t clut_y,
+                                     uint16_t texpage) {
     /* Sort by Y, keeping UV in sync */
     if (y0 > y1) {
-        int t;
-        t=x0; x0=x1; x1=t; t=y0; y0=y1; y1=t;
-        t=u0; u0=u1; u1=t; t=v0; v0=v1; v1=t;
+        int tt;
+        tt=x0; x0=x1; x1=tt; tt=y0; y0=y1; y1=tt;
+        tt=u0; u0=u1; u1=tt; tt=v0; v0=v1; v1=tt;
     }
     if (y0 > y2) {
-        int t;
-        t=x0; x0=x2; x2=t; t=y0; y0=y2; y2=t;
-        t=u0; u0=u2; u2=t; t=v0; v0=v2; v2=t;
+        int tt;
+        tt=x0; x0=x2; x2=tt; tt=y0; y0=y2; y2=tt;
+        tt=u0; u0=u2; u2=tt; tt=v0; v0=v2; v2=tt;
     }
     if (y1 > y2) {
-        int t;
-        t=x1; x1=x2; x2=t; t=y1; y1=y2; y2=t;
-        t=u1; u1=u2; u2=t; t=v1; v1=v2; v2=t;
+        int tt;
+        tt=x1; x1=x2; x2=tt; tt=y1; y1=y2; y2=tt;
+        tt=u1; u1=u2; u2=tt; tt=v1; v1=v2; v2=tt;
     }
 
     int dy_total = y2 - y0;
     if (dy_total == 0) return;
 
     for (int y = y0; y <= y2; y++) {
-        if (y < g_clip_y1 || y > g_clip_y2) continue;
+        if (y < t->cy1 || y > t->cy2) continue;
 
         int second_half = (y >= y1);
         int seg_height = second_half ? (y2 - y1) : (y1 - y0);
@@ -571,7 +716,7 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
         }
 
         if (xa > xb) {
-            int t = xa; xa = xb; xb = t;
+            int tt = xa; xa = xb; xb = tt;
             float tf;
             tf = ua; ua = ub; ub = tf;
             tf = va; va = vb; vb = tf;
@@ -580,8 +725,8 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
         int span = xb - xa;
         if (span == 0) span = 1;
 
-        int sx = max_i(xa, g_clip_x1);
-        int ex = min_i(xb, g_clip_x2);
+        int sx = max_i(xa, t->cx1);
+        int ex = min_i(xb, t->cx2);
 
         for (int x = sx; x <= ex; x++) {
             float t_val = (float)(x - xa) / (float)span;
@@ -589,8 +734,29 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
             int v_coord = (int)(va + (vb - va) * t_val) & 0xFF;
 
             uint16_t texel = texel_fetch(u, v_coord, texpage, clut_x, clut_y);
-            draw_pixel_textured(x, y, texel);
+            put_textured(t, x, y, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
         }
+    }
+}
+
+void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
+                               int x1, int y1, int u1, int v1,
+                               int x2, int y2, int u2, int v2,
+                               uint16_t clut_x, uint16_t clut_y,
+                               uint16_t texpage) {
+    int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
+                  - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
+    if (area2 == 0) return;
+
+    RTarget n = rt_native();
+    raster_textured_triangle(&n, x0, y0, u0, v0, x1, y1, u1, v1,
+                             x2, y2, u2, v2, clut_x, clut_y, texpage);
+    if (g_hr) {
+        int s = g_scale;
+        RTarget hr = rt_hires();
+        raster_textured_triangle(&hr, x0*s, y0*s, u0, v0,
+                                 x1*s, y1*s, u1, v1,
+                                 x2*s, y2*s, u2, v2, clut_x, clut_y, texpage);
     }
 }
 
@@ -600,50 +766,40 @@ static inline void color24_to_mod(uint32_t color, int *r, int *g, int *b) {
     *b = (int)((color >> 16) & 0xFF) >> 3;
 }
 
-void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
-                                      uint32_t color0,
-                                      int x1, int y1, int u1, int v1,
-                                      uint32_t color1,
-                                      int x2, int y2, int u2, int v2,
-                                      uint32_t color2,
-                                      uint16_t clut_x, uint16_t clut_y,
-                                      uint16_t texpage, int raw_texture) {
-    int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
-                  - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
-    if (area2 == 0) return;
-
-    int r0, g0, b0;
-    int r1, g1, b1;
-    int r2, g2, b2;
-    color24_to_mod(color0, &r0, &g0, &b0);
-    color24_to_mod(color1, &r1, &g1, &b1);
-    color24_to_mod(color2, &r2, &g2, &b2);
-
+static void raster_shaded_textured_triangle(const RTarget *t,
+                                            int x0, int y0, int u0, int v0,
+                                            int r0, int g0, int b0,
+                                            int x1, int y1, int u1, int v1,
+                                            int r1, int g1, int b1,
+                                            int x2, int y2, int u2, int v2,
+                                            int r2, int g2, int b2,
+                                            uint16_t clut_x, uint16_t clut_y,
+                                            uint16_t texpage, int raw_texture) {
     /* Sort by Y, keeping UV and color modulation in sync */
     if (y0 > y1) {
-        int t;
-        t=x0; x0=x1; x1=t; t=y0; y0=y1; y1=t;
-        t=u0; u0=u1; u1=t; t=v0; v0=v1; v1=t;
-        t=r0; r0=r1; r1=t; t=g0; g0=g1; g1=t; t=b0; b0=b1; b1=t;
+        int tt;
+        tt=x0; x0=x1; x1=tt; tt=y0; y0=y1; y1=tt;
+        tt=u0; u0=u1; u1=tt; tt=v0; v0=v1; v1=tt;
+        tt=r0; r0=r1; r1=tt; tt=g0; g0=g1; g1=tt; tt=b0; b0=b1; b1=tt;
     }
     if (y0 > y2) {
-        int t;
-        t=x0; x0=x2; x2=t; t=y0; y0=y2; y2=t;
-        t=u0; u0=u2; u2=t; t=v0; v0=v2; v2=t;
-        t=r0; r0=r2; r2=t; t=g0; g0=g2; g2=t; t=b0; b0=b2; b2=t;
+        int tt;
+        tt=x0; x0=x2; x2=tt; tt=y0; y0=y2; y2=tt;
+        tt=u0; u0=u2; u2=tt; tt=v0; v0=v2; v2=tt;
+        tt=r0; r0=r2; r2=tt; tt=g0; g0=g2; g2=tt; tt=b0; b0=b2; b2=tt;
     }
     if (y1 > y2) {
-        int t;
-        t=x1; x1=x2; x2=t; t=y1; y1=y2; y2=t;
-        t=u1; u1=u2; u2=t; t=v1; v1=v2; v2=t;
-        t=r1; r1=r2; r2=t; t=g1; g1=g2; g2=t; t=b1; b1=b2; b2=t;
+        int tt;
+        tt=x1; x1=x2; x2=tt; tt=y1; y1=y2; y2=tt;
+        tt=u1; u1=u2; u2=tt; tt=v1; v1=v2; v2=tt;
+        tt=r1; r1=r2; r2=tt; tt=g1; g1=g2; g2=tt; tt=b1; b1=b2; b2=tt;
     }
 
     int dy_total = y2 - y0;
     if (dy_total == 0) return;
 
     for (int y = y0; y <= y2; y++) {
-        if (y < g_clip_y1 || y > g_clip_y2) continue;
+        if (y < t->cy1 || y > t->cy2) continue;
 
         int second_half = (y >= y1);
         int seg_height = second_half ? (y2 - y1) : (y1 - y0);
@@ -685,7 +841,7 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
         }
 
         if (xa > xb) {
-            int t = xa; xa = xb; xb = t;
+            int tt = xa; xa = xb; xb = tt;
             float tf;
             tf = ua; ua = ub; ub = tf;
             tf = va; va = vb; vb = tf;
@@ -697,8 +853,8 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
         int span = xb - xa;
         if (span == 0) span = 1;
 
-        int sx = max_i(xa, g_clip_x1);
-        int ex = min_i(xb, g_clip_x2);
+        int sx = max_i(xa, t->cx1);
+        int ex = min_i(xb, t->cx2);
 
         for (int x = sx; x <= ex; x++) {
             float t_val = (float)(x - xa) / (float)span;
@@ -712,8 +868,42 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
             if (mb < 0) mb = 0; if (mb > 31) mb = 31;
 
             uint16_t texel = texel_fetch(u, v_coord, texpage, clut_x, clut_y);
-            draw_pixel_textured_modulated(x, y, texel, mr, mg, mb, raw_texture);
+            put_textured(t, x, y, texel, mr, mg, mb, raw_texture);
         }
+    }
+}
+
+void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
+                                      uint32_t color0,
+                                      int x1, int y1, int u1, int v1,
+                                      uint32_t color1,
+                                      int x2, int y2, int u2, int v2,
+                                      uint32_t color2,
+                                      uint16_t clut_x, uint16_t clut_y,
+                                      uint16_t texpage, int raw_texture) {
+    int64_t area2 = (int64_t)(x1 - x0) * (int64_t)(y2 - y0)
+                  - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
+    if (area2 == 0) return;
+
+    int r0, g0, b0, r1, g1, b1, r2, g2, b2;
+    color24_to_mod(color0, &r0, &g0, &b0);
+    color24_to_mod(color1, &r1, &g1, &b1);
+    color24_to_mod(color2, &r2, &g2, &b2);
+
+    RTarget n = rt_native();
+    raster_shaded_textured_triangle(&n,
+        x0, y0, u0, v0, r0, g0, b0,
+        x1, y1, u1, v1, r1, g1, b1,
+        x2, y2, u2, v2, r2, g2, b2,
+        clut_x, clut_y, texpage, raw_texture);
+    if (g_hr) {
+        int s = g_scale;
+        RTarget hr = rt_hires();
+        raster_shaded_textured_triangle(&hr,
+            x0*s, y0*s, u0, v0, r0, g0, b0,
+            x1*s, y1*s, u1, v1, r1, g1, b1,
+            x2*s, y2*s, u2, v2, r2, g2, b2,
+            clut_x, clut_y, texpage, raw_texture);
     }
 }
 
@@ -721,40 +911,95 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
 /* Flat rectangle                                                     */
 /* ------------------------------------------------------------------ */
 
-void sw_draw_flat_rect(int x, int y, int w, int h, uint16_t color) {
+static void raster_flat_rect(const RTarget *t, int x, int y, int w, int h,
+                             uint16_t color) {
     for (int row = 0; row < h; row++) {
         int py = y + row;
-        if (py < g_clip_y1 || py > g_clip_y2) continue;
+        if (py < t->cy1 || py > t->cy2) continue;
 
-        int sx = max_i(x, g_clip_x1);
-        int ex = min_i(x + w - 1, g_clip_x2);
+        int sx = max_i(x, t->cx1);
+        int ex = min_i(x + w - 1, t->cx2);
 
         for (int px = sx; px <= ex; px++) {
-            draw_pixel_opaque(px, py, color);
+            put_opaque(t, px, py, color);
         }
+    }
+}
+
+void sw_draw_flat_rect(int x, int y, int w, int h, uint16_t color) {
+    RTarget n = rt_native();
+    raster_flat_rect(&n, x, y, w, h, color);
+    if (g_hr) {
+        int s = g_scale;
+        RTarget hr = rt_hires();
+        raster_flat_rect(&hr, x*s, y*s, w*s, h*s, color);
     }
 }
 
 /* ------------------------------------------------------------------ */
 /* Textured rectangle                                                 */
+/*                                                                    */
+/* Hi-res variant samples one native texel per native-pixel footprint */
+/* (target coord / scale), keeping textures at native resolution while */
+/* the rectangle's footprint is rendered at the higher resolution.    */
 /* ------------------------------------------------------------------ */
+
+static void raster_textured_rect(const RTarget *t, int x, int y, int w, int h,
+                                 int u, int v,
+                                 uint16_t clut_x, uint16_t clut_y,
+                                 uint16_t texpage) {
+    int s = t->s;
+    for (int row = 0; row < h; row++) {
+        int py = y + row;
+        if (py < t->cy1 || py > t->cy2) continue;
+        int tv = (v + row / s) & 0xFF;
+
+        for (int col = 0; col < w; col++) {
+            int px = x + col;
+            if (px < t->cx1 || px > t->cx2) continue;
+
+            int tu = (u + col / s) & 0xFF;
+            uint16_t texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
+            put_textured(t, px, py, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
+        }
+    }
+}
 
 void sw_draw_textured_rect(int x, int y, int w, int h,
                            int u, int v,
                            uint16_t clut_x, uint16_t clut_y,
                            uint16_t texpage) {
+    RTarget n = rt_native();
+    raster_textured_rect(&n, x, y, w, h, u, v, clut_x, clut_y, texpage);
+    if (g_hr) {
+        int s = g_scale;
+        RTarget hr = rt_hires();
+        raster_textured_rect(&hr, x*s, y*s, w*s, h*s, u, v, clut_x, clut_y, texpage);
+    }
+}
+
+static void raster_textured_rect_scaled(const RTarget *t, int x, int y,
+                                        int w, int h,
+                                        int u0, int v0, int u1, int v1,
+                                        uint16_t clut_x, uint16_t clut_y,
+                                        uint16_t texpage) {
+    if (w <= 0 || h <= 0) return;
+
+    int du = u1 - u0;
+    int dv = v1 - v0;
+
     for (int row = 0; row < h; row++) {
         int py = y + row;
-        if (py < g_clip_y1 || py > g_clip_y2) continue;
+        if (py < t->cy1 || py > t->cy2) continue;
 
+        int tv = (int)(v0 + ((int64_t)dv * row) / h) & 0xFF;
         for (int col = 0; col < w; col++) {
             int px = x + col;
-            if (px < g_clip_x1 || px > g_clip_x2) continue;
+            if (px < t->cx1 || px > t->cx2) continue;
 
-            int tu = (u + col) & 0xFF;
-            int tv = (v + row) & 0xFF;
+            int tu = (int)(u0 + ((int64_t)du * col) / w) & 0xFF;
             uint16_t texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
-            draw_pixel_textured(px, py, texel);
+            put_textured(t, px, py, texel, g_mod_r, g_mod_g, g_mod_b, g_raw_texture);
         }
     }
 }
@@ -764,31 +1009,38 @@ void sw_draw_textured_rect_scaled(int x, int y, int w, int h,
                                   uint16_t clut_x, uint16_t clut_y,
                                   uint16_t texpage) {
     if (w <= 0 || h <= 0) return;
-
-    int du = u1 - u0;
-    int dv = v1 - v0;
-
-    for (int row = 0; row < h; row++) {
-        int py = y + row;
-        if (py < g_clip_y1 || py > g_clip_y2) continue;
-
-        int tv = (int)(v0 + ((int64_t)dv * row) / h) & 0xFF;
-        for (int col = 0; col < w; col++) {
-            int px = x + col;
-            if (px < g_clip_x1 || px > g_clip_x2) continue;
-
-            int tu = (int)(u0 + ((int64_t)du * col) / w) & 0xFF;
-            uint16_t texel = texel_fetch(tu, tv, texpage, clut_x, clut_y);
-            draw_pixel_textured(px, py, texel);
-        }
+    RTarget n = rt_native();
+    raster_textured_rect_scaled(&n, x, y, w, h, u0, v0, u1, v1,
+                                clut_x, clut_y, texpage);
+    if (g_hr) {
+        int s = g_scale;
+        RTarget hr = rt_hires();
+        /* Footprint scales by s; the destination span widens so the texel
+         * step stays per-native-pixel. */
+        raster_textured_rect_scaled(&hr, x*s, y*s, w*s, h*s, u0, v0, u1, v1,
+                                    clut_x, clut_y, texpage);
     }
 }
 
 /* ------------------------------------------------------------------ */
 /* Line (Bresenham)                                                   */
+/*                                                                    */
+/* Lines are 1px on PS1. In the hi-res mirror each visited native     */
+/* pixel is replicated as an s*s block so line thickness survives     */
+/* downsampling (re-rasterizing a 1-hires-pixel line would vanish).   */
 /* ------------------------------------------------------------------ */
 
+static inline void hr_put_block_opaque(int nx, int ny, uint16_t color) {
+    int s = g_scale;
+    RTarget hr = rt_hires();
+    int bx = nx * s, by = ny * s;
+    for (int dy = 0; dy < s; dy++)
+        for (int dx = 0; dx < s; dx++)
+            put_opaque(&hr, bx + dx, by + dy, color);
+}
+
 void sw_draw_line(int x0, int y0, int x1, int y1, uint16_t color) {
+    RTarget n = rt_native();
     int dx = abs(x1 - x0);
     int dy = -abs(y1 - y0);
     int sx = (x0 < x1) ? 1 : -1;
@@ -796,7 +1048,8 @@ void sw_draw_line(int x0, int y0, int x1, int y1, uint16_t color) {
     int err = dx + dy;
 
     for (;;) {
-        draw_pixel_opaque(x0, y0, color);
+        put_opaque(&n, x0, y0, color);
+        if (g_hr) hr_put_block_opaque(x0, y0, color);
 
         if (x0 == x1 && y0 == y1) break;
 
@@ -808,6 +1061,7 @@ void sw_draw_line(int x0, int y0, int x1, int y1, uint16_t color) {
 
 void sw_draw_shaded_line(int x0, int y0, uint16_t c0,
                          int x1, int y1, uint16_t c1) {
+    RTarget n = rt_native();
     int dx = abs(x1 - x0);
     int dy = -abs(y1 - y0);
     int sx = (x0 < x1) ? 1 : -1;
@@ -828,7 +1082,8 @@ void sw_draw_shaded_line(int x0, int y0, uint16_t c0,
         int g = g0 + (g1 - g0) * step / total;
         int b = b0 + (b1 - b0) * step / total;
         uint16_t color = (uint16_t)(r | (g << 5) | (b << 10));
-        draw_pixel_opaque(x0, y0, color);
+        put_opaque(&n, x0, y0, color);
+        if (g_hr) hr_put_block_opaque(x0, y0, color);
 
         if (x0 == x1 && y0 == y1) break;
 
@@ -847,6 +1102,15 @@ void sw_vram_write(int x, int y, uint16_t pixel) {
     x &= (VRAM_WIDTH - 1);
     y &= (VRAM_HEIGHT - 1);
     g_vram[y * VRAM_WIDTH + x] = pixel;
+
+    if (g_hr) {
+        int s = g_scale;
+        int bx = x * s, by = y * s;
+        for (int dy = 0; dy < s; dy++) {
+            uint16_t *dst = g_hr + (size_t)(by + dy) * g_hr_w + bx;
+            for (int dx = 0; dx < s; dx++) dst[dx] = pixel;
+        }
+    }
 }
 
 uint16_t sw_vram_read(int x, int y) {
@@ -859,11 +1123,22 @@ uint16_t sw_vram_read(int x, int y) {
 
 void sw_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
     int idx = 0;
+    int s = g_scale;
     for (int row = 0; row < h; row++) {
         int py = (y + row) & (VRAM_HEIGHT - 1);
         for (int col = 0; col < w; col++) {
             int px = (x + col) & (VRAM_WIDTH - 1);
-            g_vram[py * VRAM_WIDTH + px] = data[idx++];
+            uint16_t pixel = data[idx++];
+            g_vram[py * VRAM_WIDTH + px] = pixel;
+
+            if (g_hr) {
+                int bx = px * s, by = py * s;
+                for (int dy = 0; dy < s; dy++) {
+                    uint16_t *dst = g_hr + (size_t)((by + dy) % g_hr_h) * g_hr_w;
+                    for (int dx = 0; dx < s; dx++)
+                        dst[(bx + dx) % g_hr_w] = pixel;
+                }
+            }
         }
     }
 }
@@ -883,6 +1158,16 @@ void sw_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
 /* Display output — convert 15-bit VRAM to 32-bit RGBA                */
 /* ------------------------------------------------------------------ */
 
+static inline uint32_t rgb555_to_argb(uint16_t pix) {
+    int r5 = (pix >>  0) & 0x1F;
+    int g5 = (pix >>  5) & 0x1F;
+    int b5 = (pix >> 10) & 0x1F;
+    uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2));
+    uint8_t g = (uint8_t)((g5 << 3) | (g5 >> 2));
+    uint8_t b = (uint8_t)((b5 << 3) | (b5 >> 2));
+    return (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16) | 0xFF000000u;
+}
+
 int sw_render_display(uint32_t *out_pixels, int out_pitch,
                       int disp_x, int disp_y, int disp_w, int disp_h) {
     int count = 0;
@@ -893,20 +1178,35 @@ int sw_render_display(uint32_t *out_pixels, int out_pitch,
 
         for (int col = 0; col < disp_w; col++) {
             int vx = (disp_x + col) & (VRAM_WIDTH - 1);
-            uint16_t pix = g_vram[vy * VRAM_WIDTH + vx];
+            dst[col] = rgb555_to_argb(g_vram[vy * VRAM_WIDTH + vx]);
+            count++;
+        }
+    }
 
-            int r5 = (pix >>  0) & 0x1F;
-            int g5 = (pix >>  5) & 0x1F;
-            int b5 = (pix >> 10) & 0x1F;
+    return count;
+}
 
-            uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2));
-            uint8_t g = (uint8_t)((g5 << 3) | (g5 >> 2));
-            uint8_t b = (uint8_t)((b5 << 3) | (b5 >> 2));
+int sw_render_display_hires(uint32_t *out_pixels, int out_pitch,
+                            int disp_x, int disp_y, int disp_w, int disp_h) {
+    if (!g_hr || g_scale <= 1)
+        return sw_render_display(out_pixels, out_pitch, disp_x, disp_y,
+                                 disp_w, disp_h);
 
-            dst[col] = (uint32_t)r |
-                       ((uint32_t)g << 8) |
-                       ((uint32_t)b << 16) |
-                       0xFF000000u;
+    int s = g_scale;
+    int hx = disp_x * s;
+    int hy = disp_y * s;
+    int out_w = disp_w * s;
+    int out_h = disp_h * s;
+    int count = 0;
+
+    for (int row = 0; row < out_h; row++) {
+        int vy = (hy + row) % g_hr_h;
+        const uint16_t *src = g_hr + (size_t)vy * g_hr_w;
+        uint32_t *dst = (uint32_t *)((uint8_t *)out_pixels + row * out_pitch);
+
+        for (int col = 0; col < out_w; col++) {
+            int vx = (hx + col) % g_hr_w;
+            dst[col] = rgb555_to_argb(src[vx]);
             count++;
         }
     }

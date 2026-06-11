@@ -14,6 +14,7 @@
 #include "overlay_loader.h"
 #include "autocompile.h"
 #include "gpu.h"
+#include "gpu_sw_renderer.h"
 #include "frame_pacing.h"
 #include "sio.h"
 #include "spu.h"
@@ -89,8 +90,15 @@ static SDL_Renderer* sdl_renderer;
 static SDL_Texture*  sdl_texture;
 static SDL_GameController* sdl_controller;
 static SDL_JoystickID      sdl_controller_instance = -1;
-static uint32_t      sdl_pixel_buf[640 * 512]; /* ARGB8888 staging buffer */
+/* ARGB8888 staging buffer. Sized for the active internal resolution:
+ * 640*scale x 512*scale. Allocated once the supersampling scale is known
+ * (sized for the native 640x512 when supersampling is off). */
+static uint32_t*     sdl_pixel_buf = nullptr;
 static int           s_fast_boot_active = 0;  /* cleared when game entry PC fires */
+
+/* [video] options, resolved from the game config (defaults: native + AA). */
+static int           g_video_scale = 1;     /* internal-resolution SSAA factor */
+static bool          g_video_aa    = true;  /* linear present filtering */
 
 /* Vsync self-heal state (see SDL_RenderPresent wrapper in
  * sdl_vblank_present). C linkage: freeze_heartbeat.c includes both in
@@ -1079,6 +1087,7 @@ static void sdl_vblank_present(void) {
 
     /* ---- Display from our VRAM ---- */
     uint32_t w = 0, h = 0;
+    int active_scale = 1;   /* hi-res mirror used only for 15-bit display */
     {
         static bool disabled_frame_presented = false;
         GpuDisplayInfo di;
@@ -1096,22 +1105,38 @@ static void sdl_vblank_present(void) {
         }
         disabled_frame_presented = false;
         w = di.width; h = di.height;
-        for (uint32_t y = 0; y < h; y++) {
-            for (uint32_t x = 0; x < w; x++) {
-                sdl_pixel_buf[y * w + x] = gpu_display_pixel_argb(&di, x, y);
+
+        /* The hi-res mirror is a 15-bit copy of VRAM; 24-bit display (FMV)
+         * reads packed bytes the mirror can't represent, so fall back to the
+         * native path for those frames (the present filter still upscales). */
+        active_scale = (g_video_scale > 1 && !di.depth24) ? g_video_scale : 1;
+
+        if (active_scale > 1) {
+            int sw = (int)w * active_scale;
+            sw_render_display_hires(sdl_pixel_buf, (int)(sw * sizeof(uint32_t)),
+                                    (int)di.display_x, (int)di.display_y,
+                                    (int)w, (int)h);
+        } else {
+            for (uint32_t y = 0; y < h; y++) {
+                for (uint32_t x = 0; x < w; x++) {
+                    sdl_pixel_buf[y * w + x] = gpu_display_pixel_argb(&di, x, y);
+                }
             }
         }
     }
 
-    /* Update only the active display rectangle. The backing texture is fixed
-     * at 640x512, while games can switch to smaller modes such as 320x224 for
-     * FMV; presenting the full texture would leave the active image stuck in
-     * the upper-left portion of the window. */
+    /* Update only the active display rectangle. The backing texture is sized
+     * 640x512 (times the supersampling factor), while games can switch to
+     * smaller modes such as 320x224 for FMV; presenting the full texture would
+     * leave the active image stuck in the upper-left portion of the window. */
 #ifndef PSX_SDL_NO_RENDER
-    SDL_Rect src = { 0, 0, (int)w, (int)h };
-    SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf, (int)(w * sizeof(uint32_t)));
+    int src_w = (int)w * active_scale;
+    int src_h = (int)h * active_scale;
+    SDL_Rect src = { 0, 0, src_w, src_h };
+    SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf,
+                      (int)(src_w * sizeof(uint32_t)));
 
-    SDL_Rect dst = { 0, 0, 640, 480 };
+    SDL_Rect dst = { 0, 0, 640 * g_video_scale, 480 * g_video_scale };
     SDL_RenderClear(sdl_renderer);
     SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
 
@@ -1211,6 +1236,8 @@ int main(int argc, char** argv) {
                 g_turbo_loads_enabled = 1;
                 std::fprintf(stdout, "psxrecomp: turbo_loads enabled (opt-in)\n");
             }
+            g_video_scale = gc.runtime.video_supersampling;
+            g_video_aa    = gc.runtime.video_antialiasing;
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
             /* Overlay DLL cache (Layer A). Off unless enabled in [runtime];
@@ -1272,6 +1299,16 @@ int main(int argc, char** argv) {
     std::fprintf(stdout, "psxrecomp runtime: loading BIOS from %s\n", bios_path_str.c_str());
     memory_init(bios_path_str.c_str());
     gpu_init();
+    /* Internal-resolution supersampling (SSAA). Must follow gpu_init (which
+     * runs sw_renderer_init). scale==1 is a no-op; >1 allocates the hi-res
+     * VRAM mirror. */
+    if (g_video_scale < 1) g_video_scale = 1;
+    if (g_video_scale > SW_MAX_INTERNAL_SCALE) g_video_scale = SW_MAX_INTERNAL_SCALE;
+    sw_renderer_set_scale(g_video_scale);
+    g_video_scale = sw_renderer_scale(); /* reflect any clamp / alloc fallback */
+    if (g_video_scale > 1)
+        std::fprintf(stdout, "psxrecomp: supersampling %dx (antialiasing %s)\n",
+                     g_video_scale, g_video_aa ? "on" : "off");
     dma_init();
     mdec_init();
     timers_init();
@@ -1309,7 +1346,10 @@ int main(int argc, char** argv) {
         fntrace_set_game_range(game_entry_pc, 0);
 
     /* ---- SDL init ---- */
-    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
+    /* Scale quality governs SDL's logical-size -> window scaling. Linear when
+     * antialiasing is on so the (super)sampled frame stays smooth when the
+     * window is resized; nearest preserves crisp pixels otherwise. */
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, g_video_aa ? "1" : "0");
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     /* Prefer SDL's own HIDAPI driver over platform-native so Steam's virtual
      * Xbox controller (injected by Steam Input / Remote Play) is enumerated
@@ -1388,22 +1428,34 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* Present in a fixed 640x480 logical space; SDL scales (and, in
-     * fullscreen, letterboxes) it to the real output. Identity in the
-     * default 640x480 window, so windowed rendering is unchanged. */
-    SDL_RenderSetLogicalSize(sdl_renderer, 640, 480);
+    /* Present in a 640x480 logical space (scaled by the supersampling factor
+     * so the full internal resolution reaches a large/fullscreen window; SDL
+     * still scales and letterboxes to the real output). Identity in the
+     * default window when supersampling is off, so native rendering is
+     * unchanged. */
+    SDL_RenderSetLogicalSize(sdl_renderer, 640 * g_video_scale, 480 * g_video_scale);
+
+    /* Staging buffer + backing texture are sized for the internal resolution
+     * (640x512 native, times the supersampling factor). */
+    sdl_pixel_buf = (uint32_t*)std::malloc(
+        (size_t)640 * g_video_scale * 512 * g_video_scale * sizeof(uint32_t));
+    if (!sdl_pixel_buf) {
+        std::fprintf(stderr, "failed to allocate %dx staging buffer\n", g_video_scale);
+        return 1;
+    }
 
     sdl_texture = SDL_CreateTexture(
         sdl_renderer,
         SDL_PIXELFORMAT_ARGB8888,
         SDL_TEXTUREACCESS_STREAMING,
-        640, 512
+        640 * g_video_scale, 512 * g_video_scale
     );
     if (!sdl_texture) {
         std::fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
         return 1;
     }
-    SDL_SetTextureScaleMode(sdl_texture, SDL_ScaleModeNearest);
+    SDL_SetTextureScaleMode(sdl_texture,
+                            g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
 
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);

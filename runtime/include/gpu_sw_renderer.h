@@ -7,8 +7,20 @@
 extern "C" {
 #endif
 
+/* Maximum internal-resolution supersampling factor (linear, per axis). */
+#define SW_MAX_INTERNAL_SCALE 4
+
 /* Initialize software renderer */
 void sw_renderer_init(uint16_t* vram);
+
+/* Internal-resolution supersampling (SSAA).
+ * scale == 1 : disabled, renderer behaves exactly as native VRAM only.
+ * scale  > 1 : maintain an S*-scaled mirror of VRAM; the display reads the
+ *              mirror (sw_render_display_hires) and the present path
+ *              downsamples to the window. Clamped to SW_MAX_INTERNAL_SCALE.
+ * Must be called once after sw_renderer_init, before drawing begins. */
+void sw_renderer_set_scale(int scale);
+int  sw_renderer_scale(void);
 
 /* Draw state — must be set by gpu.c before each primitive */
 void sw_set_semi_transparency(int enabled, int mode);
@@ -54,6 +66,12 @@ void sw_draw_shaded_line(int x0, int y0, uint16_t c0,
    Returns number of pixels written. */
 int sw_render_display(uint32_t* out_pixels, int out_pitch,
                       int disp_x, int disp_y, int disp_w, int disp_h);
+
+/* Like sw_render_display, but reads the hi-res mirror and emits the region
+   at (disp_w*scale x disp_h*scale). Falls back to sw_render_display when
+   supersampling is disabled. Returns number of pixels written. */
+int sw_render_display_hires(uint32_t* out_pixels, int out_pitch,
+                            int disp_x, int disp_y, int disp_w, int disp_h);
 
 /* VRAM transfer (CPU->VRAM, VRAM->CPU) */
 void sw_vram_write(int x, int y, uint16_t pixel);

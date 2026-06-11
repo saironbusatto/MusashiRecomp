@@ -81,6 +81,24 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             toml::find<std::string>(runtime, "overlay_autocompile_cmd");
         rt.has_overlay_autocompile_cmd = !rt.overlay_autocompile_cmd.empty();
     }
+
+    // Optional [video] block — visual enhancement options. Kept on the same
+    // RuntimeConfig so main.cpp consumes them alongside the other knobs.
+    if (cfg.contains("video")) {
+        const toml::value& video = toml::find(cfg, "video");
+        if (video.contains("supersampling")) {
+            const auto n = toml::find<int64_t>(video, "supersampling");
+            if (n < 1 || n > 4) {
+                throw std::runtime_error(fmt::format(
+                    "[video] supersampling out of range (1..4): {}", n));
+            }
+            rt.video_supersampling = static_cast<int>(n);
+        }
+        if (video.contains("antialiasing")) {
+            rt.video_antialiasing = toml::find<bool>(video, "antialiasing");
+        }
+    }
+
     return rt;
 }
 

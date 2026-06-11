@@ -945,14 +945,10 @@ static void gp0_exec_fill_rect(void) {
     uint32_t width = ((gp0_cmd_buf[2] & 0x3FFu) + 0xFu) & ~0xFu;  /* round up to 16 */
     uint32_t height = (gp0_cmd_buf[2] >> 16) & 0x1FFu;
 
-    /* Fill ignores draw area, mask bits, and draw offset — writes directly to VRAM */
-    for (uint32_t row = 0; row < height; row++) {
-        uint32_t y = (dst_y + row) % 512;
-        for (uint32_t col = 0; col < width; col++) {
-            uint32_t x = (dst_x + col) % 1024;
-            vram[y * 1024 + x] = color16;
-        }
-    }
+    /* Fill ignores draw area, mask bits, and draw offset — writes directly to
+     * VRAM. Routed through the renderer so it also fills the hi-res
+     * supersampling mirror (no-op cost when supersampling is off). */
+    sw_fill_rect((int)dst_x, (int)dst_y, (int)width, (int)height, color16);
 }
 
 static void gp0_exec_draw_mode(void) {
@@ -1591,7 +1587,9 @@ void gpu_write_gp0(uint32_t val) {
             if (set_mask_bit)
                 pixel |= 0x8000;
 
-            vram[wy * 1024 + wx] = pixel;
+            /* Route through the renderer so the hi-res supersampling mirror
+             * is kept coherent (writes native VRAM identically when off). */
+            sw_vram_write((int)wx, (int)wy, pixel);
 
         next_pixel:
             if (++vram_write_col == vram_write_w) {

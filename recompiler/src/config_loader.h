@@ -76,6 +76,19 @@ struct RuntimeConfig {
     // rescans the cache and the new variant goes native in-session.
     bool                  has_overlay_autocompile_cmd = false;
     std::string           overlay_autocompile_cmd;
+
+    // ---- [video] block — visual enhancement options ----
+    // supersampling: internal-resolution SSAA factor (per axis). 1 = native
+    // (default, behaves exactly as before). 2..4 render geometry/shading into
+    // an N*-scaled mirror of VRAM and downsample on present — true ordered-grid
+    // supersampling + edge anti-aliasing. Cost scales ~N^2 in fill rate.
+    int                   video_supersampling = 1;
+
+    // antialiasing: when true the present path uses linear filtering when
+    // scaling the framebuffer to the window (smooths the supersample
+    // downscale and any window resize). false = nearest (sharp pixels).
+    // Defaults to true.
+    bool                  video_antialiasing = true;
 };
 
 // One entry from [[recompiler.bios_vectors]].
