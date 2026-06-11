@@ -1423,6 +1423,9 @@ int main(int argc, char** argv) {
         g_gl_active = (gl_renderer_init_context(sdl_window) != 0);
         if (!g_gl_active) gr_set_backend(GR_BACKEND_SOFTWARE);
     }
+    /* Make the active renderer visible in the title bar (no guessing). */
+    SDL_SetWindowTitle(sdl_window,
+        (window_title + (g_gl_active ? "  [OpenGL]" : "  [Software]")).c_str());
 
     /* Force OpenGL renderer.
      *
