@@ -240,25 +240,25 @@ and converts them to fast native code in the background — often within a
 minute, while you keep playing. The more places you visit, the faster the
 game gets. This happens automatically; you don't have to do anything.
 
-**Make your discoveries permanent for everyone.** Your discoveries are saved
-in a small file written next to the game called `overlay_captures.json`.
-After a play session — especially if you visited areas nobody has explored
-yet — open a GitHub issue on the game's repository and attach that file.
-The project maintainer will work to fold your discoveries back into the
-project, and every player gets your areas at full speed from the first
-moment they arrive. No technical knowledge needed: play, find the file,
-attach it to an issue.
+**Your discoveries persist for you.** They are saved in a file written next
+to the game called `overlay_captures.json`, and your local cache is rebuilt
+from it automatically — areas you have visited stay fast on every later
+session.
 
-What's safe to know:
-- The file contains only game code snapshots and addresses — no personal
-  data, no save files, no settings.
-- Sharing is optional. Your own copy still benefits either way.
-- Re-visiting an area someone already contributed is harmless — duplicates
-  are detected and skipped automatically.
+**Please do not post `overlay_captures.json` publicly.** The file contains
+verbatim snapshots of the game's code read from your disc, which is
+copyrighted material — keep it on your own machine, alongside your disc
+image. A metadata-only contribution format (addresses and checksums, no
+game code) is planned so discoveries can be shared safely in the future.
 
 ## License
 
 PolyForm Noncommercial 1.0.0. See `LICENSE`.
 
 The PSX BIOS and game disc images remain copyrighted by their respective
-owners. This project distributes neither.
+owners. This project distributes no BIOS images, no disc images, and no
+game assets — those are always supplied by the user from their own
+collection. Release executables (and per-game overlay caches) contain
+statically recompiled (machine-translated) builds of the original code,
+the same distribution model used by other static recompilation projects
+such as N64: Recompiled.
