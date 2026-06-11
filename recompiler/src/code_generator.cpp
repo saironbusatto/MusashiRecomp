@@ -1199,13 +1199,20 @@ std::string CodeGenerator::translate_basic_block(
                         ss << config_.indent << "return;\n";
                     }
                 } else if (block.exit_instr.type == ControlFlowType::JumpLink) {
-                    // Function call (jal)
+                    // Function call (jal).  The call contract (Bug D family)
+                    // guards the continuation: it may only run if the guest
+                    // actually returned here with the caller's $sp.
+                    ss << config_.indent << "{ uint32_t _csp = cpu->gpr[29];\n";
                     ss << config_.indent << "cpu->gpr[31] = " << fmt::format("0x{:08X};  /* return address */\n", addr + 8);
                     uint32_t target = block.exit_instr.target;
                     if (known_functions_.count(target) > 0) {
                         ss << config_.indent << fmt::format("func_{:08X}(cpu);  /* jal */\n", target);
+                        ss << config_.indent << fmt::format("if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n", addr + 8);
                     } else {
                         ss << config_.indent << fmt::format("call_by_address(cpu, 0x{:08X}u);  /* external jal */\n", target);
+                        /* psx_dispatch_call validated the (ra, sp) contract;
+                         * only propagate an active bail unwind here. */
+                        ss << config_.indent << "if (g_psx_call_bail) return; (void)_csp; }\n";
                     }
                     if (!block.successors.empty()) {
                         ss << config_.indent
@@ -1234,6 +1241,9 @@ std::string CodeGenerator::translate_basic_block(
                     // Dispatch indirect call — target is a runtime register value
                     ss << config_.indent << fmt::format("call_by_address(cpu, {});  /* jalr {} */\n",
                                                         reg_name(rs), reg_name(rs));
+                    /* psx_dispatch_call validated the (ra, sp) contract;
+                     * only propagate an active bail unwind here. */
+                    ss << config_.indent << "if (g_psx_call_bail) return;\n";
 
                     // Continue to successor block (instruction at return address)
                     if (!block.successors.empty()) {

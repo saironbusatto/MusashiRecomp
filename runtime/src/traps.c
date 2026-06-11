@@ -17,6 +17,13 @@
 int psx_get_in_exception(void);
 void psx_exception_longjmp(void);
 
+/* Dispatch call contract state (see cpu_state.h for the model). */
+int      g_psx_call_bail      = 0;
+uint64_t g_psx_bail_first     = 0;
+uint64_t g_psx_bail_resolved  = 0;
+uint64_t g_psx_bail_flattened = 0;
+uint64_t g_psx_bail_anomaly   = 0;
+
 static void trap_crash(const char* msg) {
     FILE* cf = fopen("psx_crash.txt", "w");
     if (cf) { fprintf(cf, "%s\n", msg); fclose(cf); }

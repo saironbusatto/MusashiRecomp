@@ -120,6 +120,26 @@ samples inside `WS2_32!send`). A slow-frames wedge with a large
 `tcp_send_stall_ms` delta over the same window is observer interference,
 not a guest bug.
 
+## Call-contract (bail) telemetry
+
+The dispatch call contract (Bug D family fix, 2026-06-10) guards every
+generated continuation: it may only run if the guest actually returned to
+the call site ($ra == site return address, $sp == caller's sp at the
+call). Violations begin a "bail" unwind that abandons stale C frames and
+re-dispatches the guest's true target. Counters in
+`psx_freeze_heartbeat.json` and dump headers:
+
+- `bail_first` — contract violations detected (wild returns). Nonzero
+  during gameplay means the game executed a wild control transfer (e.g.
+  Tomba's dead jumptable case `jal 0x80120B3C`, the chest freeze). A
+  small count with the game continuing normally is the fix working.
+- `bail_resolved` — unwinds that resolved at an enclosing call site whose
+  contract matched (multi-level return).
+- `bail_flattened` — unwinds that reached the outermost dispatch loop and
+  re-dispatched the wild target on a clean host stack.
+- `bail_anomaly` — bail flag observed at exception entry (must stay 0;
+  anything else is a runtime bug).
+
 ---
 
 ## Rule when the server can't answer your question

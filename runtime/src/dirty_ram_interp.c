@@ -350,6 +350,9 @@ static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
                                   uint32_t *next_pc_out) {
     cpu->pc = 0;
     psx_dispatch_call(cpu, target, return_pc);
+    /* psx_dispatch_call validated the (return_pc, sp) contract; a bail
+     * unwind in progress surfaces with cpu->pc = the guest's true target. */
+    if (g_psx_call_bail) return 1;
     if (cpu->pc != 0) return 1;
     *next_pc_out = return_pc;
     return 0;
@@ -445,10 +448,15 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             cpu->gpr[rd ? rd : 31] = return_pc;
             cpu->gpr[0] = 0;
             exec_delay_slot(cpu, pc + 4);
+            uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
 #ifdef PSX_HAS_GAME_DISPATCH
             cpu->pc = 0;
             if (psx_dispatch_game_compiled(cpu, target)) {
+                if (g_psx_call_bail) return 1;  /* wild unwind: cpu->pc = true target */
                 if (cpu->pc != 0) return 1;
+                if (rd == 0 || rd == 31) {
+                    if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
+                }
                 *next_pc_out = return_pc;
                 return 0;
             }
@@ -462,7 +470,11 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                 extern int overlay_loader_call_native(CPUState *cpu, uint32_t addr);
                 cpu->pc = 0;
                 if (overlay_loader_call_native(cpu, target)) {
+                    if (g_psx_call_bail) return 1;
                     if (cpu->pc != 0) return 1;
+                    if (rd == 0 || rd == 31) {
+                        if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
+                    }
                     *next_pc_out = return_pc;
                     return 0;
                 }
@@ -582,10 +594,13 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         uint32_t return_pc = pc + 8;
         cpu->gpr[31] = return_pc;
         exec_delay_slot(cpu, pc + 4);
+        uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
 #ifdef PSX_HAS_GAME_DISPATCH
         cpu->pc = 0;
         if (psx_dispatch_game_compiled(cpu, target)) {
+            if (g_psx_call_bail) return 1;  /* wild unwind: cpu->pc = true target */
             if (cpu->pc != 0) return 1;
+            if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
             *next_pc_out = return_pc;
             return 0;
         }
@@ -600,7 +615,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             extern int overlay_loader_call_native(CPUState *cpu, uint32_t addr);
             cpu->pc = 0;
             if (overlay_loader_call_native(cpu, target)) {
+                if (g_psx_call_bail) return 1;
                 if (cpu->pc != 0) return 1;
+                if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
                 *next_pc_out = return_pc;
                 return 0;
             }
@@ -989,12 +1006,29 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         g_dirty_ram_insns_run++;
         insns_executed++;
         if (transferred) {
-            uint32_t target = cpu->pc;
-#ifdef PSX_HAS_GAME_DISPATCH
-            if (target != 0 && psx_dispatch_game_compiled(cpu, target)) {
+            if (g_psx_call_bail) {
+                /* A bail unwind began inside a surfaced call: stop the interp
+                 * run and hand the wild target (cpu->pc) up to the dispatch
+                 * loop's bail handling. */
                 g_dirty_ram_blocks_run++;
                 if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
                 OV_FPLOG_RET1();
+            }
+            uint32_t target = cpu->pc;
+#ifdef PSX_HAS_GAME_DISPATCH
+            if (target != 0) {
+                /* Tail transfer into compiled code: run with pc cleared so a
+                 * plain C return surfaces as a genuine return (pc==0) to the
+                 * dispatch loop's contract checks, instead of leaving the
+                 * stale target in pc (which would re-dispatch — and re-run —
+                 * the same function). */
+                cpu->pc = 0;
+                if (psx_dispatch_game_compiled(cpu, target)) {
+                    g_dirty_ram_blocks_run++;
+                    if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                    OV_FPLOG_RET1();
+                }
+                cpu->pc = target;  /* not compiled: restore surfaced target */
             }
 #endif
             uint32_t target_phys = target & 0x1FFFFFFFu;

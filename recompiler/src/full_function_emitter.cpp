@@ -521,8 +521,11 @@ bool FullFunctionEmitter::emit_function(
                     }
                     uint32_t target = relocate_j_target(addr, tr.terminator_target);
                     uint32_t return_addr = relocate_ra(addr + 8);
+                    out += "    { uint32_t _csp = cpu->gpr[29];\n";
                     out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
                     out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
+                    out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
+                                       return_addr);
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", return_addr);
                 } else if (kind == "jalr") {
                     uint32_t ds_addr = addr + 4;
@@ -542,12 +545,20 @@ bool FullFunctionEmitter::emit_function(
                     uint8_t rs = (raw >> 21) & 0x1F;
                     uint8_t rd = (raw >> 11) & 0x1F;
                     uint32_t return_addr = relocate_ra(addr + 8);
+                    out += "    { uint32_t _csp = cpu->gpr[29];\n";
                     if (rd != 0) {
                         out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
                                            static_cast<int>(rd), return_addr);
                     }
                     out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
                                        static_cast<int>(rs));
+                    if (rd == 31) {
+                        out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
+                                           return_addr);
+                    } else {
+                        /* Return register isn't $ra: only propagate an active bail. */
+                        out += "    if (g_psx_call_bail) return; (void)_csp; }\n";
+                    }
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", return_addr);
                 }
             }
@@ -652,6 +663,7 @@ bool FullFunctionEmitter::emit_function(
             } else if (kind == "jal") {
                 uint32_t target = pb.target;
                 uint32_t return_addr = relocate_ra(pb.terminator_addr + 8);
+                out += "    { uint32_t _csp = cpu->gpr[29];\n";
                 out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
                 // Regular call: always go through psx_dispatch (handles tail-call loop).
                 if (target == 0x00006380u) {
@@ -663,6 +675,8 @@ bool FullFunctionEmitter::emit_function(
                     out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
                                        pb.terminator_addr + 1);
                 }
+                out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
+                                   return_addr);
                 // Safety net: if continuation falls outside this function, tail-call to it.
                 if (!addr_to_raw.count(pb.terminator_addr + 8)) {
                     out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jal cont: outside func */\n", return_addr);
@@ -683,12 +697,20 @@ bool FullFunctionEmitter::emit_function(
                 uint8_t rs = (pb.raw >> 21) & 0x1F;
                 uint8_t rd = (pb.raw >> 11) & 0x1F;
                 uint32_t return_addr = relocate_ra(pb.terminator_addr + 8);
+                out += "    { uint32_t _csp = cpu->gpr[29];\n";
                 if (rd != 0) {
                     out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
                                        static_cast<int>(rd), return_addr);
                 }
                 out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
                                    static_cast<int>(rs));
+                if (rd == 31) {
+                    out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
+                                       return_addr);
+                } else {
+                    /* Return register isn't $ra: only propagate an active bail. */
+                    out += "    if (g_psx_call_bail) return; (void)_csp; }\n";
+                }
                 // Safety net: if continuation falls outside this function, tail-call to it.
                 if (!addr_to_raw.count(pb.terminator_addr + 8)) {
                     out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jalr cont: outside func */\n", return_addr);
@@ -1085,6 +1107,10 @@ void FullFunctionEmitter::emit_dispatch(
     out += "     * the outermost dispatch returns, so a nested callee cannot interrupt\n";
     out += "     * before its generated caller runs the post-call continuation. */\n";
     out += "    int outermost = (g_psx_dispatch_depth++ == 0);\n";
+    out += "    /* Call contract (Bug D family): the guest $sp at the call.  A C\n";
+    out += "     * continuation behind this dispatch may only run if the guest\n";
+    out += "     * actually returns here ($ra == stop_addr) with this $sp. */\n";
+    out += "    uint32_t sp_at_call = cpu->gpr[29];\n";
     out += "    for (;;) {\n";
     out += "        /* Always-on call ring: every iteration counts as a separate\n";
     out += "         * call (initial entry + each tail-call re-dispatch). a0..a3\n";
@@ -1133,7 +1159,53 @@ void FullFunctionEmitter::emit_dispatch(
     out += "                psx_unknown_dispatch(cpu, addr, phys);\n";
     out += "            }\n";
     out += "        }\n";
+    out += "        if (g_psx_call_bail) {\n";
+    out += "            /* A nested generated frame began a bail unwind; cpu->pc\n";
+    out += "             * holds the guest's true target.  Resolve here iff the\n";
+    out += "             * wild flow arrived exactly at this call's contract. */\n";
+    out += "            if (stop_addr != 0 &&\n";
+    out += "                ((cpu->pc ^ stop_addr) & 0x1FFFFFFFu) == 0 &&\n";
+    out += "                cpu->gpr[29] == sp_at_call) {\n";
+    out += "                g_psx_call_bail = 0;\n";
+    out += "                g_psx_bail_resolved++;\n";
+    out += "                cpu->pc = 0;\n";
+    out += "                --g_psx_dispatch_depth;\n";
+    out += "                if (outermost) {\n";
+    out += "                    psx_check_interrupts(cpu);\n";
+    out += "                }\n";
+    out += "                return;\n";
+    out += "            }\n";
+    out += "            if (!outermost) {\n";
+    out += "                --g_psx_dispatch_depth;\n";
+    out += "                return;  /* propagate to the enclosing call site */\n";
+    out += "            }\n";
+    out += "            /* Outermost: flatten — host stack above is clean, keep\n";
+    out += "             * executing the wild flow as a tail dispatch. */\n";
+    out += "            g_psx_call_bail = 0;\n";
+    out += "            g_psx_bail_flattened++;\n";
+    out += "            addr = cpu->pc;\n";
+    out += "            continue;\n";
+    out += "        }\n";
     out += "        if (cpu->pc == 0) {\n";
+    out += "            if (stop_addr != 0 &&\n";
+    out += "                (cpu->gpr[29] != sp_at_call ||\n";
+    out += "                 ((cpu->gpr[31] ^ stop_addr) & 0x1FFFFFFFu) != 0)) {\n";
+    out += "                /* Callee C-returned but the guest did not return to\n";
+    out += "                 * this call site ($ra holds the wild jr's target):\n";
+    out += "                 * begin the bail unwind instead of resuming the\n";
+    out += "                 * suspended C continuation. */\n";
+    out += "                g_psx_call_bail = 1;\n";
+    out += "                g_psx_bail_first++;\n";
+    out += "                cpu->pc = cpu->gpr[31];\n";
+    out += "                if (outermost) {\n";
+    out += "                    g_psx_call_bail = 0;\n";
+    out += "                    g_psx_bail_flattened++;\n";
+    out += "                    addr = cpu->pc;\n";
+    out += "                    continue;\n";
+    out += "                }\n";
+    out += "                --g_psx_dispatch_depth;\n";
+    out += "                return;\n";
+    out += "            }\n";
     out += "            --g_psx_dispatch_depth;\n";
     out += "            if (outermost) {\n";
     out += "                psx_check_interrupts(cpu);\n";
@@ -1141,6 +1213,13 @@ void FullFunctionEmitter::emit_dispatch(
     out += "            return;\n";
     out += "        }\n";
     out += "        if (stop_addr != 0 && cpu->pc == stop_addr) {\n";
+    out += "            if (cpu->gpr[29] != sp_at_call) {\n";
+    out += "                /* Same address, different frame (recursion or a wild\n";
+    out += "                 * arrival): not this call's return — keep executing\n";
+    out += "                 * via tail dispatch (interior alias route). */\n";
+    out += "                addr = cpu->pc;\n";
+    out += "                continue;\n";
+    out += "            }\n";
     out += "            cpu->pc = 0;\n";
     out += "            --g_psx_dispatch_depth;\n";
     out += "            if (outermost) {\n";
