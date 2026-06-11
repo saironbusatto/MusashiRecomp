@@ -51,6 +51,9 @@
 #define PSXGL_FRAMEBUFFER         0x8D40
 #define PSXGL_COLOR_ATTACHMENT0   0x8CE0
 #define PSXGL_FRAMEBUFFER_COMPLETE 0x8CD5
+#define PSXGL_R16UI               0x8234
+#define PSXGL_RED_INTEGER         0x8D94
+#define PSXGL_TEXTURE1            0x84C1
 
 #ifndef APIENTRY
 #define APIENTRY
@@ -74,6 +77,7 @@ typedef void   (APIENTRY *PFN_glGetProgramInfoLog)(GLuint, GLsizei, GLsizei *, c
 typedef void   (APIENTRY *PFN_glUseProgram)(GLuint);
 typedef GLint  (APIENTRY *PFN_glGetUniformLocation)(GLuint, const char *);
 typedef void   (APIENTRY *PFN_glUniform1i)(GLint, GLint);
+typedef void   (APIENTRY *PFN_glUniform2i)(GLint, GLint, GLint);
 typedef void   (APIENTRY *PFN_glGenVertexArrays)(GLsizei, GLuint *);
 typedef void   (APIENTRY *PFN_glBindVertexArray)(GLuint);
 typedef void   (APIENTRY *PFN_glActiveTexture)(GLenum);
@@ -101,6 +105,7 @@ static PFN_glGetProgramInfoLog p_glGetProgramInfoLog;
 static PFN_glUseProgram        p_glUseProgram;
 static PFN_glGetUniformLocation p_glGetUniformLocation;
 static PFN_glUniform1i         p_glUniform1i;
+static PFN_glUniform2i         p_glUniform2i;
 static PFN_glGenVertexArrays   p_glGenVertexArrays;
 static PFN_glBindVertexArray   p_glBindVertexArray;
 static PFN_glActiveTexture     p_glActiveTexture;
@@ -124,6 +129,7 @@ static int load_modern_gl(void) {
     LOAD(p_glLinkProgram, "glLinkProgram");     LOAD(p_glGetProgramiv, "glGetProgramiv");
     LOAD(p_glGetProgramInfoLog, "glGetProgramInfoLog"); LOAD(p_glUseProgram, "glUseProgram");
     LOAD(p_glGetUniformLocation, "glGetUniformLocation"); LOAD(p_glUniform1i, "glUniform1i");
+    LOAD(p_glUniform2i, "glUniform2i");
     LOAD(p_glGenVertexArrays, "glGenVertexArrays"); LOAD(p_glBindVertexArray, "glBindVertexArray");
     LOAD(p_glActiveTexture, "glActiveTexture");  LOAD(p_glGenBuffers, "glGenBuffers");
     LOAD(p_glBindBuffer, "glBindBuffer");        LOAD(p_glBufferData, "glBufferData");
@@ -152,6 +158,14 @@ static int           s_raster_ok = 0;      /* GPU geometry path available */
 static GLuint        s_vram_tex = 0;
 static GLuint        s_fbo = 0;
 static GLuint        s_geo_prog = 0, s_geo_vao = 0, s_geo_vbo = 0;
+/* Textured polys: raw 16-bit VRAM as an integer sampler + a CLUT-decoding
+ * fragment shader. The raw texture mirrors CPU VRAM (synced in ensure_gpu);
+ * sampling freshly-GPU-drawn pixels (render-to-texture within a GPU batch) is a
+ * known limitation handled later — uploaded textures (the common case) work. */
+static GLuint        s_vram_raw_tex = 0;
+static GLuint        s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
+static GLint         s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1, s_uRaw = -1;
+static uint16_t     *s_raw = NULL;         /* 1024*512 raw-uint16 staging      */
 static int           s_cpu_dirty = 0;      /* CPU VRAM has changes not in FBO */
 static int           s_gpu_dirty = 0;      /* FBO has changes not in CPU VRAM */
 static uint32_t     *s_conv = NULL;        /* 1024*512 RGBA8 staging for sync */
@@ -160,6 +174,7 @@ static uint32_t     *s_conv = NULL;        /* 1024*512 RGBA8 staging for sync */
 static int s_off_x = 0, s_off_y = 0;
 static int s_area_x1 = 0, s_area_y1 = 0, s_area_x2 = VRAM_W - 1, s_area_y2 = VRAM_H - 1;
 static int s_semi_en = 0, s_semi_mode = 0;
+static int s_mod_r = 128, s_mod_g = 128, s_mod_b = 128, s_mod_raw = 0;
 
 /* ---- shaders ----------------------------------------------------------- */
 static const char *PRESENT_VS =
@@ -179,15 +194,56 @@ static const char *GEO_VS =
     "#version 330\n"
     "layout(location=0) in vec2 a_pos;\n"
     "layout(location=1) in vec4 a_col;\n"
-    "out vec4 v_col;\n"
+    "noperspective out vec4 v_col;\n"
     "void main(){ v_col = a_col;\n"
     "  float cx = a_pos.x/512.0 - 1.0;\n"
     "  float cy = a_pos.y/256.0 - 1.0;\n"
     "  gl_Position = vec4(cx, cy, 0.0, 1.0); }\n";
 static const char *GEO_FS =
     "#version 330\n"
-    "in vec4 v_col; out vec4 frag;\n"
+    "noperspective in vec4 v_col; out vec4 frag;\n"
     "void main(){ frag = v_col; }\n";
+
+/* Textured polys: pos in VRAM px (offset applied), uv = texel coords, color =
+ * modulation. Fragment samples raw VRAM (integer), decodes per color depth
+ * with CLUT lookup, discards texel 0 (PS1 transparent), applies modulation
+ * (PS1: texel*color/128, i.e. *2 around a 0x80 identity). */
+static const char *TEX_VS =
+    "#version 330\n"
+    "layout(location=0) in vec2 a_pos;\n"
+    "layout(location=1) in vec2 a_uv;\n"
+    "layout(location=2) in vec4 a_col;\n"
+    "noperspective out vec2 v_uv; noperspective out vec4 v_col;\n"
+    "void main(){ v_uv = a_uv; v_col = a_col;\n"
+    "  gl_Position = vec4(a_pos.x/512.0 - 1.0, a_pos.y/256.0 - 1.0, 0.0, 1.0); }\n";
+static const char *TEX_FS =
+    "#version 330\n"
+    "noperspective in vec2 v_uv; noperspective in vec4 v_col; out vec4 frag;\n"
+    "uniform usampler2D u_vram;\n"
+    "uniform ivec2 u_tpage;  /* texture page base, in VRAM pixels */\n"
+    "uniform ivec2 u_clut;   /* CLUT base, in VRAM pixels */\n"
+    "uniform int u_depth;    /* 0=4bit 1=8bit 2=15bit */\n"
+    "uniform int u_raw;      /* 1 = no color modulation */\n"
+    "int vram(int x,int y){ return int(texelFetch(u_vram, ivec2(x,y), 0).r); }\n"
+    "void main(){\n"
+    "  int u = int(v_uv.x + 0.5); int v = int(v_uv.y + 0.5);\n"
+    "  int raw;\n"
+    "  if (u_depth == 0) {\n"
+    "    int px = vram(u_tpage.x + (u>>2), u_tpage.y + v);\n"
+    "    int idx = (px >> ((u & 3)*4)) & 0xF;\n"
+    "    raw = vram(u_clut.x + idx, u_clut.y);\n"
+    "  } else if (u_depth == 1) {\n"
+    "    int px = vram(u_tpage.x + (u>>1), u_tpage.y + v);\n"
+    "    int idx = (px >> ((u & 1)*8)) & 0xFF;\n"
+    "    raw = vram(u_clut.x + idx, u_clut.y);\n"
+    "  } else {\n"
+    "    raw = vram(u_tpage.x + u, u_tpage.y + v);\n"
+    "  }\n"
+    "  if (raw == 0) discard;\n"
+    "  vec3 t = vec3(float(raw&31), float((raw>>5)&31), float((raw>>10)&31)) / 31.0;\n"
+    "  if (u_raw == 0) t = clamp(t * v_col.rgb * 2.0, 0.0, 1.0);\n"
+    "  frag = vec4(t, 1.0);\n"
+    "}\n";
 
 static GLuint compile_shader(GLenum type, const char *src) {
     GLuint s = p_glCreateShader(type);
@@ -229,6 +285,10 @@ static void ensure_gpu(void) {   /* make the FBO reflect CPU VRAM */
     for (int i = 0; i < VRAM_W * VRAM_H; i++) s_conv[i] = conv_1555_to_rgba8(s_vram[i]);
     glBindTexture(GL_TEXTURE_2D, s_vram_tex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, VRAM_W, VRAM_H, GL_RGBA, GL_UNSIGNED_BYTE, s_conv);
+    /* raw 16-bit VRAM for texture sampling (upload CPU VRAM directly) */
+    glBindTexture(GL_TEXTURE_2D, s_vram_raw_tex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, VRAM_W, VRAM_H,
+                    PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, s_vram);
     s_cpu_dirty = 0;
 }
 static void ensure_cpu(void) {   /* make CPU VRAM reflect the FBO */
@@ -276,17 +336,69 @@ static void gpu_triangle(int x0,int y0,uint16_t c0, int x1,int y1,uint16_t c1,
     s_gpu_dirty = 1;
 }
 
+/* Rasterize one textured triangle on the GPU. Coords raw (offset applied here),
+ * uv = texel coords, col = per-vertex modulation RGB (0..1, 3 verts × 3). */
+static void gpu_textured_triangle(const int *xs, const int *ys,
+                                  const int *us, const int *vs,
+                                  const float *col, uint16_t texpage,
+                                  uint16_t clut_x, uint16_t clut_y, int rawtex) {
+    ensure_gpu();
+    float verts[3 * 8];
+    for (int i = 0; i < 3; i++) {
+        verts[i*8+0] = (float)(xs[i] + s_off_x);
+        verts[i*8+1] = (float)(ys[i] + s_off_y);
+        verts[i*8+2] = (float)us[i];
+        verts[i*8+3] = (float)vs[i];
+        verts[i*8+4] = col[i*3+0];
+        verts[i*8+5] = col[i*3+1];
+        verts[i*8+6] = col[i*3+2];
+        verts[i*8+7] = 1.0f;
+    }
+    int base_x = (texpage & 0xF) * 64;
+    int base_y = ((texpage >> 4) & 1) * 256;
+    int depth  = (texpage >> 7) & 3; if (depth > 2) depth = 2;
+
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_fbo);
+    glViewport(0, 0, VRAM_W, VRAM_H);
+    glEnable(GL_SCISSOR_TEST);
+    int sw = s_area_x2 - s_area_x1 + 1, sh = s_area_y2 - s_area_y1 + 1;
+    if (sw < 0) sw = 0; if (sh < 0) sh = 0;
+    glScissor(s_area_x1, s_area_y1, sw, sh);
+    glDisable(GL_BLEND);
+    p_glUseProgram(s_tex_prog);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_vram_raw_tex);
+    p_glUniform1i(s_uVram, 0);
+    p_glUniform2i(s_uTpage, base_x, base_y);
+    p_glUniform2i(s_uClut, clut_x, clut_y);
+    p_glUniform1i(s_uDepth, depth);
+    p_glUniform1i(s_uRaw, rawtex);
+    p_glBindVertexArray(s_tex_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
+    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    p_glBindVertexArray(0);
+    p_glUseProgram(0);
+    glDisable(GL_SCISSOR_TEST);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    s_gpu_dirty = 1;
+}
+
 /* ---- backend vtable wrappers ------------------------------------------- */
 static void glb_init(uint16_t *vram) { s_vram = vram; sw_renderer_init(vram); }
-static void glb_set_scale(int s) { sw_renderer_set_scale(s); }
-static int  glb_scale(void) { return sw_renderer_scale(); }
+/* GPU draws write the FBO (native res), not the software SSAA hi-res mirror, so
+ * presenting via the hi-res mirror would drop every GPU-rendered layer. Force
+ * native-res present under the GL backend; GPU-side high-res scaling is a later
+ * step (the FBO will simply be allocated larger). */
+static void glb_set_scale(int s) { (void)s; sw_renderer_set_scale(1); }
+static int  glb_scale(void) { return 1; }
 static void glb_set_texture_filter(int b) { sw_set_texture_filter(b); }
 static int  glb_texture_filter(void) { return sw_texture_filter(); }
 
 static void glb_set_semi_transparency(int e, int m) { s_semi_en = e; s_semi_mode = m; sw_set_semi_transparency(e, m); }
 static void glb_set_mask_bits(int s, int c) { sw_set_mask_bits(s, c); }
 static void glb_set_texture_window(uint32_t r) { sw_set_texture_window(r); }
-static void glb_set_color_modulation(int r,int g,int b,int raw) { sw_set_color_modulation(r,g,b,raw); }
+static void glb_set_color_modulation(int r,int g,int b,int raw) { s_mod_r=r; s_mod_g=g; s_mod_b=b; s_mod_raw=raw; sw_set_color_modulation(r,g,b,raw); }
 static void glb_set_draw_area(int x1,int y1,int x2,int y2) { s_area_x1=x1; s_area_y1=y1; s_area_x2=x2; s_area_y2=y2; sw_set_draw_area(x1,y1,x2,y2); }
 static void glb_get_draw_area(int *x1,int *y1,int *x2,int *y2) { sw_get_draw_area(x1,y1,x2,y2); }
 static void glb_set_draw_offset(int x,int y) { s_off_x=x; s_off_y=y; sw_set_draw_offset(x,y); }
@@ -304,8 +416,24 @@ static void glb_draw_gouraud_triangle(int x0,int y0,uint16_t c0,int x1,int y1,ui
 /* Everything else: software, with the FBO read back first if it's ahead. */
 static void glb_fill_rect(int x,int y,int w,int h,uint16_t c){ ensure_cpu(); sw_fill_rect(x,y,w,h,c); s_cpu_dirty=1; }
 static void glb_copy_rect(int sx,int sy,int dx,int dy,int w,int h){ ensure_cpu(); sw_copy_rect(sx,sy,dx,dy,w,h); s_cpu_dirty=1; }
-static void glb_draw_textured_triangle(int x0,int y0,int u0,int v0,int x1,int y1,int u1,int v1,int x2,int y2,int u2,int v2,uint16_t cx,uint16_t cy,uint16_t tp){ ensure_cpu(); sw_draw_textured_triangle(x0,y0,u0,v0,x1,y1,u1,v1,x2,y2,u2,v2,cx,cy,tp); s_cpu_dirty=1; }
-static void glb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32_t c0,int x1,int y1,int u1,int v1,uint32_t c1,int x2,int y2,int u2,int v2,uint32_t c2,uint16_t cx,uint16_t cy,uint16_t tp,int raw){ ensure_cpu(); sw_draw_shaded_textured_triangle(x0,y0,u0,v0,c0,x1,y1,u1,v1,c1,x2,y2,u2,v2,c2,cx,cy,tp,raw); s_cpu_dirty=1; }
+static void glb_draw_textured_triangle(int x0,int y0,int u0,int v0,int x1,int y1,int u1,int v1,int x2,int y2,int u2,int v2,uint16_t cx,uint16_t cy,uint16_t tp){
+    if (s_raster_ok && s_tex_prog && !s_semi_en) {
+        int xs[3]={x0,x1,x2}, ys[3]={y0,y1,y2}, us[3]={u0,u1,u2}, vs[3]={v0,v1,v2};
+        float mr=s_mod_r/255.0f, mg=s_mod_g/255.0f, mb=s_mod_b/255.0f;
+        float col[9]={mr,mg,mb, mr,mg,mb, mr,mg,mb};
+        gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,s_mod_raw); return;
+    }
+    ensure_cpu(); sw_draw_textured_triangle(x0,y0,u0,v0,x1,y1,u1,v1,x2,y2,u2,v2,cx,cy,tp); s_cpu_dirty=1;
+}
+static void glb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32_t c0,int x1,int y1,int u1,int v1,uint32_t c1,int x2,int y2,int u2,int v2,uint32_t c2,uint16_t cx,uint16_t cy,uint16_t tp,int raw){
+    if (s_raster_ok && s_tex_prog && !s_semi_en) {
+        int xs[3]={x0,x1,x2}, ys[3]={y0,y1,y2}, us[3]={u0,u1,u2}, vs[3]={v0,v1,v2};
+        uint32_t cc[3]={c0,c1,c2}; float col[9];
+        for (int i=0;i<3;i++){ col[i*3+0]=(cc[i]&0xFF)/255.0f; col[i*3+1]=((cc[i]>>8)&0xFF)/255.0f; col[i*3+2]=((cc[i]>>16)&0xFF)/255.0f; }
+        gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,raw); return;
+    }
+    ensure_cpu(); sw_draw_shaded_textured_triangle(x0,y0,u0,v0,c0,x1,y1,u1,v1,c1,x2,y2,u2,v2,c2,cx,cy,tp,raw); s_cpu_dirty=1;
+}
 static void glb_draw_flat_rect(int x,int y,int w,int h,uint16_t c){ ensure_cpu(); sw_draw_flat_rect(x,y,w,h,c); s_cpu_dirty=1; }
 static void glb_draw_textured_rect(int x,int y,int w,int h,int u,int v,uint16_t cx,uint16_t cy,uint16_t tp){ ensure_cpu(); sw_draw_textured_rect(x,y,w,h,u,v,cx,cy,tp); s_cpu_dirty=1; }
 static void glb_draw_textured_rect_scaled(int x,int y,int w,int h,int u0,int v0,int u1,int v1,uint16_t cx,uint16_t cy,uint16_t tp){ ensure_cpu(); sw_draw_textured_rect_scaled(x,y,w,h,u0,v0,u1,v1,cx,cy,tp); s_cpu_dirty=1; }
@@ -356,9 +484,39 @@ static void init_gpu_raster(void) {
     p_glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void *)(2 * sizeof(float)));
     p_glEnableVertexAttribArray(1);
     p_glBindVertexArray(0);
+
+    /* Textured path: raw 16-bit VRAM integer sampler + CLUT-decode program. */
+    s_tex_prog = build_program(TEX_VS, TEX_FS);
+    if (s_tex_prog) {
+        s_raw = (uint16_t *)malloc((size_t)VRAM_W * VRAM_H * sizeof(uint16_t));
+        glGenTextures(1, &s_vram_raw_tex);
+        glBindTexture(GL_TEXTURE_2D, s_vram_raw_tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, PSXGL_R16UI, VRAM_W, VRAM_H, 0,
+                     PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT, NULL);
+        s_uVram  = p_glGetUniformLocation(s_tex_prog, "u_vram");
+        s_uTpage = p_glGetUniformLocation(s_tex_prog, "u_tpage");
+        s_uClut  = p_glGetUniformLocation(s_tex_prog, "u_clut");
+        s_uDepth = p_glGetUniformLocation(s_tex_prog, "u_depth");
+        s_uRaw   = p_glGetUniformLocation(s_tex_prog, "u_raw");
+        p_glGenVertexArrays(1, &s_tex_vao);
+        p_glBindVertexArray(s_tex_vao);
+        p_glGenBuffers(1, &s_tex_vbo);
+        p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
+        p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)0);
+        p_glEnableVertexAttribArray(0);
+        p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)(2*sizeof(float)));
+        p_glEnableVertexAttribArray(1);
+        p_glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)(4*sizeof(float)));
+        p_glEnableVertexAttribArray(2);
+        p_glBindVertexArray(0);
+    }
+
     s_cpu_dirty = 1;        /* FBO empty; first GPU draw uploads current VRAM */
     s_raster_ok = 1;
-    fprintf(stdout, "psxrecomp: GPU rasterization enabled (opaque flat/gouraud polys)\n");
+    fprintf(stdout, "psxrecomp: GPU rasterization enabled (opaque flat/gouraud%s polys)\n",
+            s_tex_prog ? " + textured" : "");
 }
 
 int gl_renderer_init_context(SDL_Window *win) {
@@ -392,9 +550,11 @@ void gl_renderer_shutdown(void) {
         ensure_cpu();
         if (s_present_tex) glDeleteTextures(1, &s_present_tex);
         if (s_vram_tex) glDeleteTextures(1, &s_vram_tex);
+        if (s_vram_raw_tex) glDeleteTextures(1, &s_vram_raw_tex);
         SDL_GL_DeleteContext(s_ctx); s_ctx = NULL;
     }
     free(s_conv); s_conv = NULL;
+    free(s_raw);  s_raw  = NULL;
 }
 
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear) {
