@@ -54,6 +54,9 @@
 #define PSXGL_R16UI               0x8234
 #define PSXGL_RED_INTEGER         0x8D94
 #define PSXGL_TEXTURE1            0x84C1
+#define PSXGL_FUNC_ADD            0x8006
+#define PSXGL_FUNC_REVERSE_SUBTRACT 0x800B
+#define PSXGL_CONSTANT_ALPHA      0x8003
 
 #ifndef APIENTRY
 #define APIENTRY
@@ -78,6 +81,8 @@ typedef void   (APIENTRY *PFN_glUseProgram)(GLuint);
 typedef GLint  (APIENTRY *PFN_glGetUniformLocation)(GLuint, const char *);
 typedef void   (APIENTRY *PFN_glUniform1i)(GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform2i)(GLint, GLint, GLint);
+typedef void   (APIENTRY *PFN_glBlendEquation)(GLenum);
+typedef void   (APIENTRY *PFN_glBlendColor)(GLfloat, GLfloat, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glGenVertexArrays)(GLsizei, GLuint *);
 typedef void   (APIENTRY *PFN_glBindVertexArray)(GLuint);
 typedef void   (APIENTRY *PFN_glActiveTexture)(GLenum);
@@ -106,6 +111,8 @@ static PFN_glUseProgram        p_glUseProgram;
 static PFN_glGetUniformLocation p_glGetUniformLocation;
 static PFN_glUniform1i         p_glUniform1i;
 static PFN_glUniform2i         p_glUniform2i;
+static PFN_glBlendEquation     p_glBlendEquation;
+static PFN_glBlendColor        p_glBlendColor;
 static PFN_glGenVertexArrays   p_glGenVertexArrays;
 static PFN_glBindVertexArray   p_glBindVertexArray;
 static PFN_glActiveTexture     p_glActiveTexture;
@@ -130,6 +137,7 @@ static int load_modern_gl(void) {
     LOAD(p_glGetProgramInfoLog, "glGetProgramInfoLog"); LOAD(p_glUseProgram, "glUseProgram");
     LOAD(p_glGetUniformLocation, "glGetUniformLocation"); LOAD(p_glUniform1i, "glUniform1i");
     LOAD(p_glUniform2i, "glUniform2i");
+    LOAD(p_glBlendEquation, "glBlendEquation"); LOAD(p_glBlendColor, "glBlendColor");
     LOAD(p_glGenVertexArrays, "glGenVertexArrays"); LOAD(p_glBindVertexArray, "glBindVertexArray");
     LOAD(p_glActiveTexture, "glActiveTexture");  LOAD(p_glGenBuffers, "glGenBuffers");
     LOAD(p_glBindBuffer, "glBindBuffer");        LOAD(p_glBufferData, "glBufferData");
@@ -164,7 +172,7 @@ static GLuint        s_geo_prog = 0, s_geo_vao = 0, s_geo_vbo = 0;
  * known limitation handled later — uploaded textures (the common case) work. */
 static GLuint        s_vram_raw_tex = 0;
 static GLuint        s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
-static GLint         s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1, s_uRaw = -1;
+static GLint         s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1, s_uRaw = -1, s_uSemipass = -1;
 static uint16_t     *s_raw = NULL;         /* 1024*512 raw-uint16 staging      */
 static int           s_cpu_dirty = 0;      /* CPU VRAM has changes not in FBO */
 static int           s_gpu_dirty = 0;      /* FBO has changes not in CPU VRAM */
@@ -224,6 +232,7 @@ static const char *TEX_FS =
     "uniform ivec2 u_clut;   /* CLUT base, in VRAM pixels */\n"
     "uniform int u_depth;    /* 0=4bit 1=8bit 2=15bit */\n"
     "uniform int u_raw;      /* 1 = no color modulation */\n"
+    "uniform int u_semipass; /* 0=draw all, 1=opaque texels only, 2=semi texels only */\n"
     "int vram(int x,int y){ return int(texelFetch(u_vram, ivec2(x,y), 0).r); }\n"
     "void main(){\n"
     "  int u = int(v_uv.x + 0.5); int v = int(v_uv.y + 0.5);\n"
@@ -240,6 +249,9 @@ static const char *TEX_FS =
     "    raw = vram(u_tpage.x + u, u_tpage.y + v);\n"
     "  }\n"
     "  if (raw == 0) discard;\n"
+    "  int stp = (raw >> 15) & 1;  /* per-texel semi-transparency bit */\n"
+    "  if (u_semipass == 1 && stp == 1) discard;  /* opaque pass skips semi texels */\n"
+    "  if (u_semipass == 2 && stp == 0) discard;  /* semi pass skips opaque texels */\n"
     "  vec3 t = vec3(float(raw&31), float((raw>>5)&31), float((raw>>10)&31)) / 31.0;\n"
     "  if (u_raw == 0) t = clamp(t * v_col.rgb * 2.0, 0.0, 1.0);\n"
     "  frag = vec4(t, 1.0);\n"
@@ -300,9 +312,39 @@ static void ensure_cpu(void) {   /* make CPU VRAM reflect the FBO */
     s_gpu_dirty = 0;
 }
 
-/* Rasterize one triangle (3 verts: x,y in raw coords; colors 1555) on the GPU. */
+/* Configure fixed-function blending for a PS1 semi-transparency mode, with the
+ * incoming fragment as source (F = front) and the FBO as dest (B = back):
+ *   0: B/2 + F/2   1: B + F   2: B - F   3: B + F/4
+ * Modes are exact in 5-bit; GL blends in normalized [0,1] which is the same
+ * proportional math, and the framebuffer clamp matches the PS1 saturate. */
+static void apply_psx_blend(int mode) {
+    glEnable(GL_BLEND);
+    switch (mode & 3) {
+    case 0: /* B/2 + F/2 */
+        p_glBlendColor(0.5f, 0.5f, 0.5f, 0.5f);
+        p_glBlendEquation(PSXGL_FUNC_ADD);
+        glBlendFunc(PSXGL_CONSTANT_ALPHA, PSXGL_CONSTANT_ALPHA);
+        break;
+    case 1: /* B + F */
+        p_glBlendEquation(PSXGL_FUNC_ADD);
+        glBlendFunc(GL_ONE, GL_ONE);
+        break;
+    case 2: /* B - F  (dst*1 - src*1) */
+        p_glBlendEquation(PSXGL_FUNC_REVERSE_SUBTRACT);
+        glBlendFunc(GL_ONE, GL_ONE);
+        break;
+    case 3: /* B + F/4 */
+        p_glBlendColor(0.25f, 0.25f, 0.25f, 0.25f);
+        p_glBlendEquation(PSXGL_FUNC_ADD);
+        glBlendFunc(PSXGL_CONSTANT_ALPHA, GL_ONE);
+        break;
+    }
+}
+
+/* Rasterize one triangle (3 verts: x,y in raw coords; colors 1555) on the GPU.
+ * semi<0 = opaque; semi 0..3 = blend with that PS1 semi-transparency mode. */
 static void gpu_triangle(int x0,int y0,uint16_t c0, int x1,int y1,uint16_t c1,
-                         int x2,int y2,uint16_t c2) {
+                         int x2,int y2,uint16_t c2, int semi) {
     ensure_gpu();
     float verts[3*6];
     int xs[3] = {x0+s_off_x, x1+s_off_x, x2+s_off_x};
@@ -323,7 +365,7 @@ static void gpu_triangle(int x0,int y0,uint16_t c0, int x1,int y1,uint16_t c1,
     int sw = s_area_x2 - s_area_x1 + 1, sh = s_area_y2 - s_area_y1 + 1;
     if (sw < 0) sw = 0; if (sh < 0) sh = 0;
     glScissor(sx, sy, sw, sh);          /* FBO y matches VRAM y (no flip) */
-    glDisable(GL_BLEND);                 /* opaque only in this step */
+    if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
     p_glUseProgram(s_geo_prog);
     p_glBindVertexArray(s_geo_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
@@ -331,6 +373,7 @@ static void gpu_triangle(int x0,int y0,uint16_t c0, int x1,int y1,uint16_t c1,
     glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0);
     p_glUseProgram(0);
+    glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     s_gpu_dirty = 1;
@@ -341,7 +384,8 @@ static void gpu_triangle(int x0,int y0,uint16_t c0, int x1,int y1,uint16_t c1,
 static void gpu_textured_triangle(const int *xs, const int *ys,
                                   const int *us, const int *vs,
                                   const float *col, uint16_t texpage,
-                                  uint16_t clut_x, uint16_t clut_y, int rawtex) {
+                                  uint16_t clut_x, uint16_t clut_y, int rawtex,
+                                  int semi) {
     ensure_gpu();
     float verts[3 * 8];
     for (int i = 0; i < 3; i++) {
@@ -364,7 +408,6 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     int sw = s_area_x2 - s_area_x1 + 1, sh = s_area_y2 - s_area_y1 + 1;
     if (sw < 0) sw = 0; if (sh < 0) sh = 0;
     glScissor(s_area_x1, s_area_y1, sw, sh);
-    glDisable(GL_BLEND);
     p_glUseProgram(s_tex_prog);
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_vram_raw_tex);
@@ -376,9 +419,25 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     p_glBindVertexArray(s_tex_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
+    if (semi < 0) {
+        /* opaque primitive: every texel drawn, no blend */
+        glDisable(GL_BLEND);
+        p_glUniform1i(s_uSemipass, 0);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    } else {
+        /* semi-transparent primitive: the per-texel STP bit decides whether a
+         * texel is opaque or blended. Pass 1 lays down the opaque texels with
+         * blend off; pass 2 blends the semi texels in the requested mode. */
+        glDisable(GL_BLEND);
+        p_glUniform1i(s_uSemipass, 1);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        apply_psx_blend(semi);
+        p_glUniform1i(s_uSemipass, 2);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+    }
     p_glBindVertexArray(0);
     p_glUseProgram(0);
+    glDisable(GL_BLEND);
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     s_gpu_dirty = 1;
@@ -403,13 +462,13 @@ static void glb_set_draw_area(int x1,int y1,int x2,int y2) { s_area_x1=x1; s_are
 static void glb_get_draw_area(int *x1,int *y1,int *x2,int *y2) { sw_get_draw_area(x1,y1,x2,y2); }
 static void glb_set_draw_offset(int x,int y) { s_off_x=x; s_off_y=y; sw_set_draw_offset(x,y); }
 
-/* GPU-rasterized: opaque flat / gouraud triangles. Semi-transparent -> SW. */
+/* GPU-rasterized: flat / gouraud triangles, opaque and semi-transparent. */
 static void glb_draw_flat_triangle(int x0,int y0,int x1,int y1,int x2,int y2,uint16_t col) {
-    if (s_raster_ok && !s_semi_en) { gpu_triangle(x0,y0,col, x1,y1,col, x2,y2,col); return; }
+    if (s_raster_ok) { gpu_triangle(x0,y0,col, x1,y1,col, x2,y2,col, s_semi_en?s_semi_mode:-1); return; }
     ensure_cpu(); sw_draw_flat_triangle(x0,y0,x1,y1,x2,y2,col); s_cpu_dirty = 1;
 }
 static void glb_draw_gouraud_triangle(int x0,int y0,uint16_t c0,int x1,int y1,uint16_t c1,int x2,int y2,uint16_t c2) {
-    if (s_raster_ok && !s_semi_en) { gpu_triangle(x0,y0,c0, x1,y1,c1, x2,y2,c2); return; }
+    if (s_raster_ok) { gpu_triangle(x0,y0,c0, x1,y1,c1, x2,y2,c2, s_semi_en?s_semi_mode:-1); return; }
     ensure_cpu(); sw_draw_gouraud_triangle(x0,y0,c0,x1,y1,c1,x2,y2,c2); s_cpu_dirty = 1;
 }
 
@@ -417,20 +476,20 @@ static void glb_draw_gouraud_triangle(int x0,int y0,uint16_t c0,int x1,int y1,ui
 static void glb_fill_rect(int x,int y,int w,int h,uint16_t c){ ensure_cpu(); sw_fill_rect(x,y,w,h,c); s_cpu_dirty=1; }
 static void glb_copy_rect(int sx,int sy,int dx,int dy,int w,int h){ ensure_cpu(); sw_copy_rect(sx,sy,dx,dy,w,h); s_cpu_dirty=1; }
 static void glb_draw_textured_triangle(int x0,int y0,int u0,int v0,int x1,int y1,int u1,int v1,int x2,int y2,int u2,int v2,uint16_t cx,uint16_t cy,uint16_t tp){
-    if (s_raster_ok && s_tex_prog && !s_semi_en) {
+    if (s_raster_ok && s_tex_prog) {
         int xs[3]={x0,x1,x2}, ys[3]={y0,y1,y2}, us[3]={u0,u1,u2}, vs[3]={v0,v1,v2};
         float mr=s_mod_r/255.0f, mg=s_mod_g/255.0f, mb=s_mod_b/255.0f;
         float col[9]={mr,mg,mb, mr,mg,mb, mr,mg,mb};
-        gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,s_mod_raw); return;
+        gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,s_mod_raw, s_semi_en?s_semi_mode:-1); return;
     }
     ensure_cpu(); sw_draw_textured_triangle(x0,y0,u0,v0,x1,y1,u1,v1,x2,y2,u2,v2,cx,cy,tp); s_cpu_dirty=1;
 }
 static void glb_draw_shaded_textured_triangle(int x0,int y0,int u0,int v0,uint32_t c0,int x1,int y1,int u1,int v1,uint32_t c1,int x2,int y2,int u2,int v2,uint32_t c2,uint16_t cx,uint16_t cy,uint16_t tp,int raw){
-    if (s_raster_ok && s_tex_prog && !s_semi_en) {
+    if (s_raster_ok && s_tex_prog) {
         int xs[3]={x0,x1,x2}, ys[3]={y0,y1,y2}, us[3]={u0,u1,u2}, vs[3]={v0,v1,v2};
         uint32_t cc[3]={c0,c1,c2}; float col[9];
         for (int i=0;i<3;i++){ col[i*3+0]=(cc[i]&0xFF)/255.0f; col[i*3+1]=((cc[i]>>8)&0xFF)/255.0f; col[i*3+2]=((cc[i]>>16)&0xFF)/255.0f; }
-        gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,raw); return;
+        gpu_textured_triangle(xs,ys,us,vs,col,tp,cx,cy,raw, s_semi_en?s_semi_mode:-1); return;
     }
     ensure_cpu(); sw_draw_shaded_textured_triangle(x0,y0,u0,v0,c0,x1,y1,u1,v1,c1,x2,y2,u2,v2,c2,cx,cy,tp,raw); s_cpu_dirty=1;
 }
@@ -500,6 +559,7 @@ static void init_gpu_raster(void) {
         s_uClut  = p_glGetUniformLocation(s_tex_prog, "u_clut");
         s_uDepth = p_glGetUniformLocation(s_tex_prog, "u_depth");
         s_uRaw   = p_glGetUniformLocation(s_tex_prog, "u_raw");
+        s_uSemipass = p_glGetUniformLocation(s_tex_prog, "u_semipass");
         p_glGenVertexArrays(1, &s_tex_vao);
         p_glBindVertexArray(s_tex_vao);
         p_glGenBuffers(1, &s_tex_vbo);
