@@ -68,6 +68,8 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/memory.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_sw_renderer.c
+    ${PSXRECOMP_ROOT}/runtime/src/gpu_render.c
+    ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
     ${PSXRECOMP_ROOT}/runtime/src/dma.c
     ${PSXRECOMP_ROOT}/runtime/src/mdec.c
     ${PSXRECOMP_ROOT}/runtime/src/timers.c

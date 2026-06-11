@@ -15,6 +15,7 @@
 #include "autocompile.h"
 #include "gpu.h"
 #include "gpu_sw_renderer.h"
+#include "gpu_render.h"
 #include "frame_pacing.h"
 #include "sio.h"
 #include "spu.h"
@@ -100,6 +101,7 @@ static int           s_fast_boot_active = 0;  /* cleared when game entry PC fire
 static int           g_video_scale = 1;     /* internal-resolution SSAA factor */
 static bool          g_video_aa    = true;  /* linear present filtering */
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
+static int           g_video_renderer = 0;  /* 0=software, 1=opengl */
 
 /* Vsync self-heal state (see SDL_RenderPresent wrapper in
  * sdl_vblank_present). C linkage: freeze_heartbeat.c includes both in
@@ -1114,7 +1116,7 @@ static void sdl_vblank_present(void) {
 
         if (active_scale > 1) {
             int sw = (int)w * active_scale;
-            sw_render_display_hires(sdl_pixel_buf, (int)(sw * sizeof(uint32_t)),
+            gr_render_display_hires(sdl_pixel_buf, (int)(sw * sizeof(uint32_t)),
                                     (int)di.display_x, (int)di.display_y,
                                     (int)w, (int)h);
         } else {
@@ -1240,6 +1242,7 @@ int main(int argc, char** argv) {
             g_video_scale     = gc.runtime.video_supersampling;
             g_video_aa        = gc.runtime.video_antialiasing;
             g_video_texfilter = gc.runtime.video_texture_filter;
+            g_video_renderer  = gc.runtime.video_renderer;
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
             /* Overlay DLL cache (Layer A). Off unless enabled in [runtime];
@@ -1300,15 +1303,19 @@ int main(int argc, char** argv) {
 
     std::fprintf(stdout, "psxrecomp runtime: loading BIOS from %s\n", bios_path_str.c_str());
     memory_init(bios_path_str.c_str());
+    /* Select the renderer backend BEFORE gpu_init() (which runs gr_init ->
+     * the backend's init on the VRAM buffer). Software is the default and the
+     * fallback; an unavailable OpenGL backend reverts to software. */
+    gr_set_backend(g_video_renderer == 1 ? GR_BACKEND_OPENGL : GR_BACKEND_SOFTWARE);
     gpu_init();
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init (which
      * runs sw_renderer_init). scale==1 is a no-op; >1 allocates the hi-res
      * VRAM mirror. */
     if (g_video_scale < 1) g_video_scale = 1;
     if (g_video_scale > SW_MAX_INTERNAL_SCALE) g_video_scale = SW_MAX_INTERNAL_SCALE;
-    sw_renderer_set_scale(g_video_scale);
-    g_video_scale = sw_renderer_scale(); /* reflect any clamp / alloc fallback */
-    sw_set_texture_filter(g_video_texfilter);
+    gr_set_scale(g_video_scale);
+    g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
+    gr_set_texture_filter(g_video_texfilter);
     if (g_video_scale > 1 || g_video_texfilter)
         std::fprintf(stdout,
                      "psxrecomp: supersampling %dx (antialiasing %s, texture filter %s)\n",

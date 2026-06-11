@@ -12,6 +12,7 @@
 
 #include "gpu.h"
 #include "gpu_sw_renderer.h"
+#include "gpu_render.h"
 #include "crash_trace.h"
 #include "debug_server.h"
 #include "cpu_state.h"
@@ -166,7 +167,7 @@ static uint32_t gpustat_poll_count;
 
 void gpu_init(void) {
     memset(vram, 0, sizeof(vram));
-    sw_renderer_init(vram);
+    gr_init(vram);
 
     /* Reset GP0 state machine */
     gp0_state = GP0_IDLE;
@@ -542,8 +543,8 @@ static void gp0_exec_mono_tri(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
-    sw_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
+    gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
 }
 
 /* Execute mono quad (GP0 0x28-0x2B) — two triangles: (0,1,2) and (2,1,3) */
@@ -556,9 +557,9 @@ static void gp0_exec_mono_quad(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
-    sw_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
-    sw_draw_flat_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
+    gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    gr_draw_flat_triangle(vx[0], vy[0], vx[1], vy[1], vx[2], vy[2], color);
+    gr_draw_flat_triangle(vx[2], vy[2], vx[1], vy[1], vx[3], vy[3], color);
 }
 
 /* Execute shaded triangle (GP0 0x30-0x33) — Gouraud shaded */
@@ -573,8 +574,8 @@ static void gp0_exec_shaded_tri(void) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
     }
-    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
-    sw_draw_gouraud_triangle(vx[0], vy[0], c[0],
+    gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
                              vx[1], vy[1], c[1],
                              vx[2], vy[2], c[2]);
 }
@@ -606,11 +607,11 @@ static void gp0_exec_shaded_quad(void) {
             e->color[i] = gp0_cmd_buf[i * 2] & 0xFFFFFFu;
         }
     }
-    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
-    sw_draw_gouraud_triangle(vx[0], vy[0], c[0],
+    gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    gr_draw_gouraud_triangle(vx[0], vy[0], c[0],
                              vx[1], vy[1], c[1],
                              vx[2], vy[2], c[2]);
-    sw_draw_gouraud_triangle(vx[2], vy[2], c[2],
+    gr_draw_gouraud_triangle(vx[2], vy[2], c[2],
                              vx[1], vy[1], c[1],
                              vx[3], vy[3], c[3]);
 }
@@ -629,8 +630,8 @@ static void setup_textured_draw(uint32_t color24, int semi_trans, int raw_textur
     uint32_t r = (color24 >> 0) & 0xFF;
     uint32_t g = (color24 >> 8) & 0xFF;
     uint32_t b = (color24 >> 16) & 0xFF;
-    sw_set_color_modulation((int)r, (int)g, (int)b, raw_texture);
-    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
+    gr_set_color_modulation((int)r, (int)g, (int)b, raw_texture);
+    gr_set_semi_transparency(semi_trans, (int)semi_transparency);
 }
 
 /* Execute textured triangle (GP0 0x24-0x27) */
@@ -660,7 +661,7 @@ static void gp0_exec_textured_tri(void) {
     }
 
     setup_textured_draw(color24, semi_trans, raw_texture);
-    sw_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
+    gr_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
                               vx[1], vy[1], u[1], v[1],
                               vx[2], vy[2], u[2], v[2],
                               clut_x, clut_y, tpage);
@@ -708,22 +709,22 @@ static void gp0_exec_textured_quad(void) {
         int bot_v   = vy[0] < vy[2] ? v[2] : v[0];
         if (w > 0 && h > 0) {
             if (right_u - left_u == w && bot_v - top_v == h) {
-                sw_draw_textured_rect(x, y, w, h, left_u, top_v,
+                gr_draw_textured_rect(x, y, w, h, left_u, top_v,
                                       clut_x, clut_y, tpage);
                 return;
             }
-            sw_draw_textured_rect_scaled(x, y, w, h, left_u, top_v,
+            gr_draw_textured_rect_scaled(x, y, w, h, left_u, top_v,
                                          right_u, bot_v,
                                          clut_x, clut_y, tpage);
             return;
         }
     }
 
-    sw_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
+    gr_draw_textured_triangle(vx[0], vy[0], u[0], v[0],
                               vx[1], vy[1], u[1], v[1],
                               vx[2], vy[2], u[2], v[2],
                               clut_x, clut_y, tpage);
-    sw_draw_textured_triangle(vx[2], vy[2], u[2], v[2],
+    gr_draw_textured_triangle(vx[2], vy[2], u[2], v[2],
                               vx[1], vy[1], u[1], v[1],
                               vx[3], vy[3], u[3], v[3],
                               clut_x, clut_y, tpage);
@@ -756,8 +757,8 @@ static void gp0_exec_shaded_textured_tri(void) {
         vy[i] += draw_offset_y;
     }
 
-    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
-    sw_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
+    gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    gr_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
                                      vx[1], vy[1], u[1], v[1], c[1],
                                      vx[2], vy[2], u[2], v[2], c[2],
                                      clut_x, clut_y, tpage, raw_texture);
@@ -793,12 +794,12 @@ static void gp0_exec_shaded_textured_quad(void) {
         vy[i] += draw_offset_y;
     }
 
-    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
-    sw_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
+    gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    gr_draw_shaded_textured_triangle(vx[0], vy[0], u[0], v[0], c[0],
                                      vx[1], vy[1], u[1], v[1], c[1],
                                      vx[2], vy[2], u[2], v[2], c[2],
                                      clut_x, clut_y, tpage, raw_texture);
-    sw_draw_shaded_textured_triangle(vx[2], vy[2], u[2], v[2], c[2],
+    gr_draw_shaded_textured_triangle(vx[2], vy[2], u[2], v[2], c[2],
                                      vx[1], vy[1], u[1], v[1], c[1],
                                      vx[3], vy[3], u[3], v[3], c[3],
                                      clut_x, clut_y, tpage, raw_texture);
@@ -813,8 +814,8 @@ static void gp0_exec_mono_line(void) {
     parse_vertex(gp0_cmd_buf[2], &x1, &y1);
     x0 += draw_offset_x; y0 += draw_offset_y;
     x1 += draw_offset_x; y1 += draw_offset_y;
-    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
-    sw_draw_line(x0, y0, x1, y1, color);
+    gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    gr_draw_line(x0, y0, x1, y1, color);
 }
 
 /* Execute shaded line (GP0 0x50-0x57) */
@@ -827,8 +828,8 @@ static void gp0_exec_shaded_line(void) {
     parse_vertex(gp0_cmd_buf[3], &x1, &y1);
     x0 += draw_offset_x; y0 += draw_offset_y;
     x1 += draw_offset_x; y1 += draw_offset_y;
-    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
-    sw_draw_shaded_line(x0, y0, c0, x1, y1, c1);
+    gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    gr_draw_shaded_line(x0, y0, c0, x1, y1, c1);
 }
 
 /* Execute mono rectangle (GP0 0x60-0x63) */
@@ -842,8 +843,8 @@ static void gp0_exec_mono_rect(void) {
     int h = (gp0_cmd_buf[2] >> 16) & 0xFFFFu;
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
-    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
-    sw_draw_flat_rect(x0, y0, w, h, color);
+    gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    gr_draw_flat_rect(x0, y0, w, h, color);
 }
 
 /* Execute textured rectangle (GP0 0x64-0x67) */
@@ -865,7 +866,7 @@ static void gp0_exec_textured_rect(void) {
     if (h > 511)  h = 511;
 
     setup_textured_draw(color24, semi_trans, raw_texture);
-    sw_draw_textured_rect(x0, y0, w, h, u0, v0, clut_x, clut_y, current_texpage());
+    gr_draw_textured_rect(x0, y0, w, h, u0, v0, clut_x, clut_y, current_texpage());
 }
 
 /* Execute 1x1 dot (GP0 0x68-0x6B) */
@@ -875,8 +876,8 @@ static void gp0_exec_mono_dot(void) {
     int32_t x, y;
     parse_vertex(gp0_cmd_buf[1], &x, &y);
     x += draw_offset_x; y += draw_offset_y;
-    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
-    sw_draw_flat_rect(x, y, 1, 1, color);
+    gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    gr_draw_flat_rect(x, y, 1, 1, color);
 }
 
 /* Execute 8x8 textured sprite (GP0 0x74-0x77) */
@@ -894,7 +895,7 @@ static void gp0_exec_textured_8x8(void) {
     uint16_t clut_y = (clut >> 6) & 0x1FF;
 
     setup_textured_draw(color24, semi_trans, raw_texture);
-    sw_draw_textured_rect(x0, y0, 8, 8, u0, v0, clut_x, clut_y, current_texpage());
+    gr_draw_textured_rect(x0, y0, 8, 8, u0, v0, clut_x, clut_y, current_texpage());
 }
 
 /* Execute 8x8 sprite (GP0 0x70-0x73) */
@@ -904,8 +905,8 @@ static void gp0_exec_mono_8x8(void) {
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     x0 += draw_offset_x; y0 += draw_offset_y;
-    sw_set_semi_transparency(semi_trans, (int)semi_transparency);
-    sw_draw_flat_rect(x0, y0, 8, 8, color);
+    gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+    gr_draw_flat_rect(x0, y0, 8, 8, color);
 }
 
 /* Execute 16x16 textured sprite (GP0 0x7C-0x7F) */
@@ -923,7 +924,7 @@ static void gp0_exec_textured_16x16(void) {
     uint16_t clut_y = (clut >> 6) & 0x1FF;
 
     setup_textured_draw(color24, semi_trans, raw_texture);
-    sw_draw_textured_rect(x0, y0, 16, 16, u0, v0, clut_x, clut_y, current_texpage());
+    gr_draw_textured_rect(x0, y0, 16, 16, u0, v0, clut_x, clut_y, current_texpage());
 }
 
 /* ---- GP0 command execution ---- */
@@ -948,7 +949,7 @@ static void gp0_exec_fill_rect(void) {
     /* Fill ignores draw area, mask bits, and draw offset — writes directly to
      * VRAM. Routed through the renderer so it also fills the hi-res
      * supersampling mirror (no-op cost when supersampling is off). */
-    sw_fill_rect((int)dst_x, (int)dst_y, (int)width, (int)height, color16);
+    gr_fill_rect((int)dst_x, (int)dst_y, (int)width, (int)height, color16);
 }
 
 static void gp0_exec_draw_mode(void) {
@@ -978,7 +979,7 @@ static void gp0_exec_texture_window(void) {
      * Bits 10-14: offset X
      * Bits 15-19: offset Y */
     texture_window_value = gp0_cmd_buf[0] & 0x000FFFFFu;
-    sw_set_texture_window(texture_window_value);
+    gr_set_texture_window(texture_window_value);
 }
 
 static void gp0_exec_draw_area_tl(void) {
@@ -988,7 +989,7 @@ static void gp0_exec_draw_area_tl(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     draw_area_left = param & 0x3FF;
     draw_area_top  = (param >> 10) & 0x3FF;
-    sw_set_draw_area((int)draw_area_left, (int)draw_area_top,
+    gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
 }
 
@@ -999,7 +1000,7 @@ static void gp0_exec_draw_area_br(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     draw_area_right  = param & 0x3FF;
     draw_area_bottom = (param >> 10) & 0x3FF;
-    sw_set_draw_area((int)draw_area_left, (int)draw_area_top,
+    gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
 }
 
@@ -1010,7 +1011,7 @@ static void gp0_exec_draw_offset(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     draw_offset_x = sign_extend(param & 0x7FFu, 11);
     draw_offset_y = sign_extend((param >> 11) & 0x7FFu, 11);
-    sw_set_draw_offset(draw_offset_x, draw_offset_y);
+    gr_set_draw_offset(draw_offset_x, draw_offset_y);
 }
 
 static void gp0_exec_mask_bit(void) {
@@ -1020,7 +1021,7 @@ static void gp0_exec_mask_bit(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     set_mask_bit   = param & 1;
     check_mask_bit = (param >> 1) & 1;
-    sw_set_mask_bits((int)set_mask_bit, (int)check_mask_bit);
+    gr_set_mask_bits((int)set_mask_bit, (int)check_mask_bit);
 }
 
 /* A0 upload history for debug inspection */
@@ -1450,7 +1451,7 @@ static void gp0_execute_command(void) {
             uint16_t clut_x = (clut & 0x3F) * 16;
             uint16_t clut_y = (clut >> 6) & 0x1FF;
             setup_textured_draw(color24, semi_trans, raw_texture);
-            sw_draw_textured_rect(x0, y0, 1, 1, u0, v0, clut_x, clut_y, current_texpage());
+            gr_draw_textured_rect(x0, y0, 1, 1, u0, v0, clut_x, clut_y, current_texpage());
             break;
         }
         case 0x70: case 0x71: case 0x72: case 0x73:
@@ -1466,8 +1467,8 @@ static void gp0_execute_command(void) {
             int32_t x0, y0;
             parse_vertex(gp0_cmd_buf[1], &x0, &y0);
             x0 += draw_offset_x; y0 += draw_offset_y;
-            sw_set_semi_transparency(semi_trans, (int)semi_transparency);
-            sw_draw_flat_rect(x0, y0, 16, 16, color);
+            gr_set_semi_transparency(semi_trans, (int)semi_transparency);
+            gr_draw_flat_rect(x0, y0, 16, 16, color);
             break;
         }
         case 0x7C: case 0x7D: case 0x7E: case 0x7F:
@@ -1492,7 +1493,7 @@ static void gp0_execute_command(void) {
             int h = (gp0_cmd_buf[3] >> 16) & 0x1FF;
             if (w == 0) w = 0x400;
             if (h == 0) h = 0x200;
-            sw_copy_rect(src_x, src_y, dst_x, dst_y, w, h);
+            gr_copy_rect(src_x, src_y, dst_x, dst_y, w, h);
             break;
         }
 
@@ -1589,7 +1590,7 @@ void gpu_write_gp0(uint32_t val) {
 
             /* Route through the renderer so the hi-res supersampling mirror
              * is kept coherent (writes native VRAM identically when off). */
-            sw_vram_write((int)wx, (int)wy, pixel);
+            gr_vram_write((int)wx, (int)wy, pixel);
 
         next_pixel:
             if (++vram_write_col == vram_write_w) {
@@ -1620,7 +1621,7 @@ void gpu_write_gp0(uint32_t val) {
         parse_vertex(val, &x, &y);
         x += draw_offset_x; y += draw_offset_y;
         if (polyline_has_prev) {
-            sw_draw_line(polyline_prev_x, polyline_prev_y, x, y, polyline_color);
+            gr_draw_line(polyline_prev_x, polyline_prev_y, x, y, polyline_color);
         }
         polyline_prev_x = x; polyline_prev_y = y;
         polyline_has_prev = 1;
@@ -1657,7 +1658,7 @@ void gpu_write_gp0(uint32_t val) {
             int32_t x, y;
             parse_vertex(val, &x, &y);
             x += draw_offset_x; y += draw_offset_y;
-            sw_draw_shaded_line(polyline_prev_x, polyline_prev_y, polyline_prev_c,
+            gr_draw_shaded_line(polyline_prev_x, polyline_prev_y, polyline_prev_c,
                                 x, y, polyline_color);
             polyline_prev_x = x; polyline_prev_y = y;
             polyline_prev_c = polyline_color;
@@ -1698,7 +1699,7 @@ void gpu_write_gp0(uint32_t val) {
         polyline_color = rgb888_to_rgb555(val & 0xFFFFFFu);
         polyline_prev_c = polyline_color;
         polyline_has_prev = 0;
-        sw_set_semi_transparency(polyline_semi_trans, (int)semi_transparency);
+        gr_set_semi_transparency(polyline_semi_trans, (int)semi_transparency);
         gp0_state = shaded ? GP0_POLYLINE_SHADED : GP0_POLYLINE_MONO;
         gp0_draw_count++;
         /* Record polyline header (variable-length body not captured;
