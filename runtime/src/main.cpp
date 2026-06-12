@@ -15,6 +15,8 @@
 #include "autocompile.h"
 #include "gpu.h"
 #include "gpu_sw_renderer.h"
+#include "gpu_render.h"
+#include "gpu_gl_renderer.h"
 #include "frame_pacing.h"
 #include "sio.h"
 #include "spu.h"
@@ -100,6 +102,12 @@ static int           s_fast_boot_active = 0;  /* cleared when game entry PC fire
 static int           g_video_scale = 1;     /* internal-resolution SSAA factor */
 static bool          g_video_aa    = true;  /* linear present filtering */
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
+static int           g_video_renderer = 0;  /* 0=software, 1=opengl (requested) */
+static bool          g_gl_active = false;    /* GL context live -> GL present path */
+/* Present straight from the FBO (fast, no readback). Set PSX_GL_FORCE_CPU_PRESENT=1
+ * to force the software readout path instead — a diagnostic/fallback that also
+ * keeps CPU VRAM current every frame (so screenshots reflect the screen). */
+static int           g_gl_fbo_present = 1;
 
 /* Vsync self-heal state (see SDL_RenderPresent wrapper in
  * sdl_vblank_present). C linkage: freeze_heartbeat.c includes both in
@@ -543,6 +551,24 @@ static void shutdown_runtime(void) {
     debug_server_shutdown();
 }
 
+/* Linear gain ramp g0 -> g1 across a block of interleaved stereo frames. */
+static void sdl_audio_gain_ramp(int16_t* buf, int frames, float g0, float g1) {
+    if (frames <= 0) return;
+    const float step = (g1 - g0) / (float)frames;
+    float g = g0;
+    for (int f = 0; f < frames; f++, g += step) {
+        buf[f * 2 + 0] = (int16_t)((float)buf[f * 2 + 0] * g);
+        buf[f * 2 + 1] = (int16_t)((float)buf[f * 2 + 1] * g);
+    }
+}
+
+/* Fade-in state: samples of rising ramp still to apply after an unmute.
+ * Consumed by sdl_audio_pump across however many pump calls it spans.
+ * MUST fit sdl_audio_buf (2048 frames): the fade-out tail renders this many
+ * frames in one spu_render call. 1764 frames = 40 ms. */
+static const int sdl_audio_fade_samples = 44100 * 40 / 1000;  /* 40 ms */
+static int       sdl_audio_fadein_left  = 0;
+
 static void sdl_audio_pump(void) {
     if (!sdl_audio_device) return;
 
@@ -558,8 +584,63 @@ static void sdl_audio_pump(void) {
     if (frames > 2048) frames = 2048;
 
     spu_render(sdl_audio_buf, frames);
+    if (sdl_audio_fadein_left > 0) {
+        const float g0 = 1.0f - (float)sdl_audio_fadein_left
+                                / (float)sdl_audio_fade_samples;
+        int ramp = sdl_audio_fadein_left < frames ? sdl_audio_fadein_left : frames;
+        const float g1 = 1.0f - (float)(sdl_audio_fadein_left - ramp)
+                                / (float)sdl_audio_fade_samples;
+        sdl_audio_gain_ramp(sdl_audio_buf, ramp, g0, g1);
+        sdl_audio_fadein_left -= ramp;
+    }
     SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
                    (uint32_t)frames * bytes_per_frame);
+}
+
+/* Audio gating across turbo-loads transitions.
+ *
+ * The mute model stays: during turbo the guest runs at host speed, so
+ * rendered SPU audio is time-compressed garble — we stop pumping, the queue
+ * drains, voice positions freeze, and music resumes in place afterward.
+ * What changes is the EDGES:
+ *   - entering turbo: render one short tail of the current voice state,
+ *     ramp it to silence, and queue it — the drain ends in a fade instead
+ *     of a hard cut;
+ *   - leaving turbo: hold the mute for a short hangover first (loads often
+ *     re-trigger within a few frames; without the debounce the mute would
+ *     flicker audibly), then resume pumping with a rising ramp applied
+ *     across the first ~50 ms of samples (sdl_audio_pump above). */
+static void sdl_audio_update(int turbo_active) {
+    if (!sdl_audio_device) return;
+    const int HANGOVER_FRAMES = 8;  /* ~133 ms at 60 fps */
+    static int muted = 0;
+    static int hangover = 0;
+
+    if (turbo_active) {
+        if (!muted) {
+            int tail = sdl_audio_fade_samples;
+            const int buf_cap = (int)(sizeof(sdl_audio_buf) / (2 * sizeof(int16_t)));
+            if (tail > buf_cap) tail = buf_cap;
+            /* An unmute ramp may still be in progress; start the down-ramp
+             * from its current gain so the edge stays continuous. */
+            const float g0 = 1.0f - (float)sdl_audio_fadein_left
+                                    / (float)sdl_audio_fade_samples;
+            sdl_audio_fadein_left = 0;
+            spu_render(sdl_audio_buf, tail);
+            sdl_audio_gain_ramp(sdl_audio_buf, tail, g0, 0.0f);
+            SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
+                           (uint32_t)tail * sizeof(int16_t) * 2u);
+            muted = 1;
+        }
+        hangover = HANGOVER_FRAMES;
+        return;
+    }
+    if (muted) {
+        if (hangover > 0) { hangover--; return; }
+        muted = 0;
+        sdl_audio_fadein_left = sdl_audio_fade_samples;
+    }
+    sdl_audio_pump();
 }
 
 /* PS1 digital pad button bits (active-low: 0=pressed, 1=released).
@@ -1010,13 +1091,9 @@ static void sdl_vblank_present(void) {
     }
     sio_set_pad_state(pad_buttons_this_frame);
 
-    /* Turbo-active test, shared by the audio mute here and the pacing/
-     * present gate below. During turbo the guest runs at host speed, so
-     * rendered SPU audio is time-compressed garble — queueing it is what
-     * players hear as load-time stutter. Muting = stop queueing: the SDL
-     * device drains the last real-time samples and underruns to silence;
-     * SPU voice positions freeze with the pump, so music resumes from
-     * where it left off when pacing returns. */
+    /* Turbo-active test, shared by the audio gate here and the pacing/
+     * present gate below. sdl_audio_update owns the mute + fade-in/out +
+     * debounce across turbo transitions (see its comment). */
     int turbo_loads_active = 0;
     if (g_turbo_loads_enabled) {
         extern int fntrace_is_game_started(void);
@@ -1024,7 +1101,7 @@ static void sdl_vblank_present(void) {
             turbo_loads_active = 1;
     }
 #ifndef PSX_SDL_NO_AUDIO
-    if (!turbo_loads_active) sdl_audio_pump();
+    sdl_audio_update(turbo_loads_active);
 #endif
 
     /* TCP turbo is for automated validation and trace capture. It keeps the
@@ -1097,15 +1174,33 @@ static void sdl_vblank_present(void) {
 #ifndef PSX_SDL_NO_RENDER
             if (!disabled_frame_presented) {
                 disabled_frame_presented = true;
-                SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
-                SDL_RenderClear(sdl_renderer);
-                SDL_RenderPresent(sdl_renderer);
+                if (g_gl_active) {
+                    gl_renderer_present_blank();
+                } else {
+                    SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
+                    SDL_RenderClear(sdl_renderer);
+                    SDL_RenderPresent(sdl_renderer);
+                }
             }
 #endif
             return;
         }
         disabled_frame_presented = false;
         w = di.width; h = di.height;
+
+        /* OpenGL: 15-bit frames ALWAYS present straight from the authoritative
+         * VRAM FBO — one deterministic path (the old per-frame FBO-vs-CPU
+         * alternation caused the menu seam/jitter). 24-bit (FMV) frames and
+         * the PSX_GL_FORCE_CPU_PRESENT diagnostic sync the FBO down and use
+         * the CPU readout below. */
+#ifndef PSX_SDL_NO_RENDER
+        if (g_gl_active && g_gl_fbo_present && !di.depth24) {
+            gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
+                                     (int)w, (int)h, g_video_aa ? 1 : 0);
+            return;
+        }
+        if (g_gl_active) gl_renderer_sync_cpu();
+#endif
 
         /* The hi-res mirror is a 15-bit copy of VRAM; 24-bit display (FMV)
          * reads packed bytes the mirror can't represent, so fall back to the
@@ -1114,7 +1209,7 @@ static void sdl_vblank_present(void) {
 
         if (active_scale > 1) {
             int sw = (int)w * active_scale;
-            sw_render_display_hires(sdl_pixel_buf, (int)(sw * sizeof(uint32_t)),
+            gr_render_display_hires(sdl_pixel_buf, (int)(sw * sizeof(uint32_t)),
                                     (int)di.display_x, (int)di.display_y,
                                     (int)w, (int)h);
         } else {
@@ -1133,6 +1228,12 @@ static void sdl_vblank_present(void) {
 #ifndef PSX_SDL_NO_RENDER
     int src_w = (int)w * active_scale;
     int src_h = (int)h * active_scale;
+    if (g_gl_active) {
+        /* OpenGL present: upload the active display rect and draw a full-screen
+         * quad. SDL_GL_SwapWindow handles vsync; the wall-clock pacer above
+         * still owns timing. */
+        gl_renderer_present(sdl_pixel_buf, src_w, src_h, g_video_aa ? 1 : 0);
+    } else {
     SDL_Rect src = { 0, 0, src_w, src_h };
     SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf,
                       (int)(src_w * sizeof(uint32_t)));
@@ -1163,6 +1264,7 @@ static void sdl_vblank_present(void) {
                 g_present_vsync_disabled = 1;
             }
         }
+    }
     }
 #endif
 }
@@ -1240,6 +1342,9 @@ int main(int argc, char** argv) {
             g_video_scale     = gc.runtime.video_supersampling;
             g_video_aa        = gc.runtime.video_antialiasing;
             g_video_texfilter = gc.runtime.video_texture_filter;
+            g_video_renderer  = gc.runtime.video_renderer;
+            { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
+              if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
             /* Overlay DLL cache (Layer A). Off unless enabled in [runtime];
@@ -1300,15 +1405,19 @@ int main(int argc, char** argv) {
 
     std::fprintf(stdout, "psxrecomp runtime: loading BIOS from %s\n", bios_path_str.c_str());
     memory_init(bios_path_str.c_str());
+    /* Select the renderer backend BEFORE gpu_init() (which runs gr_init ->
+     * the backend's init on the VRAM buffer). Software is the default and the
+     * fallback; an unavailable OpenGL backend reverts to software. */
+    gr_set_backend(g_video_renderer == 1 ? GR_BACKEND_OPENGL : GR_BACKEND_SOFTWARE);
     gpu_init();
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init (which
      * runs sw_renderer_init). scale==1 is a no-op; >1 allocates the hi-res
      * VRAM mirror. */
     if (g_video_scale < 1) g_video_scale = 1;
     if (g_video_scale > SW_MAX_INTERNAL_SCALE) g_video_scale = SW_MAX_INTERNAL_SCALE;
-    sw_renderer_set_scale(g_video_scale);
-    g_video_scale = sw_renderer_scale(); /* reflect any clamp / alloc fallback */
-    sw_set_texture_filter(g_video_texfilter);
+    gr_set_scale(g_video_scale);
+    g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
+    gr_set_texture_filter(g_video_texfilter);
     if (g_video_scale > 1 || g_video_texfilter)
         std::fprintf(stdout,
                      "psxrecomp: supersampling %dx (antialiasing %s, texture filter %s)\n",
@@ -1383,16 +1492,29 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
+    if (g_video_renderer == 1) win_flags |= SDL_WINDOW_OPENGL;
     sdl_window = SDL_CreateWindow(
         window_title.c_str(),
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         640, 480,
-        SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
+        win_flags
     );
     if (!sdl_window) {
         std::fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return 1;
     }
+
+    /* OpenGL backend: create the GL context now. On failure, relabel the
+     * facade back to software (rasterization already runs through software in
+     * this phase) and fall through to the SDL_Renderer present path below. */
+    if (g_video_renderer == 1) {
+        g_gl_active = (gl_renderer_init_context(sdl_window) != 0);
+        if (!g_gl_active) gr_set_backend(GR_BACKEND_SOFTWARE);
+    }
+    /* Make the active renderer visible in the title bar (no guessing). */
+    SDL_SetWindowTitle(sdl_window,
+        (window_title + (g_gl_active ? "  [OpenGL]" : "  [Software]")).c_str());
 
     /* Force OpenGL renderer.
      *
@@ -1421,6 +1543,7 @@ int main(int argc, char** argv) {
      * presentation hang; macOS/Linux have no GDI path, so let SDL choose its
      * native backend (Metal on Apple Silicon). PRESENTVSYNC removes tearing;
      * fall back progressively if a driver can't provide vsync/accel. */
+  if (!g_gl_active) {
 #ifdef _WIN32
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
 #endif
@@ -1439,6 +1562,7 @@ int main(int argc, char** argv) {
      * default window when supersampling is off, so native rendering is
      * unchanged. */
     SDL_RenderSetLogicalSize(sdl_renderer, 640 * g_video_scale, 480 * g_video_scale);
+  }
 
     /* Staging buffer + backing texture are sized for the internal resolution
      * (640x512 native, times the supersampling factor). */
@@ -1449,6 +1573,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+  if (!g_gl_active) {
     sdl_texture = SDL_CreateTexture(
         sdl_renderer,
         SDL_PIXELFORMAT_ARGB8888,
@@ -1461,6 +1586,7 @@ int main(int argc, char** argv) {
     }
     SDL_SetTextureScaleMode(sdl_texture,
                             g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+  }
 
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
@@ -1597,8 +1723,9 @@ int main(int argc, char** argv) {
     std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
 
     shutdown_runtime();
-    SDL_DestroyTexture(sdl_texture);
-    SDL_DestroyRenderer(sdl_renderer);
+    if (g_gl_active) gl_renderer_shutdown();
+    SDL_DestroyTexture(sdl_texture);   /* NULL-safe in GL mode */
+    SDL_DestroyRenderer(sdl_renderer); /* NULL-safe in GL mode */
     SDL_DestroyWindow(sdl_window);
     SDL_Quit();
 

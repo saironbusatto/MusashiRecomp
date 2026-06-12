@@ -104,6 +104,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             else throw std::runtime_error(fmt::format(
                 "[video] texture_filtering must be \"nearest\" or \"bilinear\": {}", mode));
         }
+        if (video.contains("renderer")) {
+            const auto mode = toml::find<std::string>(video, "renderer");
+            if (mode == "software")     rt.video_renderer = 0;
+            else if (mode == "opengl")  rt.video_renderer = 1;
+            else throw std::runtime_error(fmt::format(
+                "[video] renderer must be \"software\" or \"opengl\": {}", mode));
+        }
     }
 
     return rt;

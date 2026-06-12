@@ -281,48 +281,110 @@ static uint16_t texel_fetch(int u, int v, uint16_t texpage,
     }
 }
 
+/* Per-prim uv sampling bounds (inclusive), Beetle-PSX model: bilinear
+ * neighbours clamp to the prim's own texture rect so they never blend in
+ * texels from a neighbouring sprite/tile or empty VRAM. Set by every
+ * textured prim entry point; ignored while a texture window is active
+ * (texel_fetch applies the window instead, which wraps by design). */
+static int g_uv_lim[4] = { 0, 0, 255, 255 };
+
+static uint16_t bl_fetch(int u, int v, uint16_t texpage,
+                         uint16_t clut_x, uint16_t clut_y) {
+    u &= 0xFF; v &= 0xFF;
+    if (!(g_tw_mask_x | g_tw_mask_y)) {
+        if (u < g_uv_lim[0]) u = g_uv_lim[0]; else if (u > g_uv_lim[2]) u = g_uv_lim[2];
+        if (v < g_uv_lim[1]) v = g_uv_lim[1]; else if (v > g_uv_lim[3]) v = g_uv_lim[3];
+    }
+    return texel_fetch(u, v, texpage, clut_x, clut_y);
+}
+
 /* Bilinear texel sample, in RGB space (after the CLUT lookup — never
  * interpolate palette indices). fu/fv are texel-space coordinates.
  *
- * Transparency-aware: returns 0x0000 (transparent) when the nearest texel is
- * transparent, so sprite cutouts are preserved; transparent *neighbours* are
- * replaced by the nearest texel's colour so edges don't bleed toward black.
- * Neighbours wrap within the 256-texel page (matches the nearest path's &0xFF)
- * which keeps the blend inside one texture instead of bleeding across pages. */
+ * Beetle-PSX formulation: the NEAREST texel is the base (cutout + STP
+ * authority), the neighbours lie toward the sub-texel offset and clamp to
+ * g_uv_lim, and each texel's weight is gated by its opacity with the colour
+ * renormalised — so prim edges and cutout borders keep their colour instead
+ * of dissolving into the transparent (black) neighbour and dropping whole
+ * edge columns (the v1 "-0.5 then floor" base sampled one texel OUTSIDE the
+ * prim on its top/left edges). Matches the GL TEX shader's bilinear path. */
 static uint16_t texel_fetch_bilinear(float fu, float fv, uint16_t texpage,
                                      uint16_t clut_x, uint16_t clut_y) {
-    float su = fu - 0.5f, sv = fv - 0.5f;
-    int iu = (int)floorf(su);
-    int iv = (int)floorf(sv);
-    int fx = (int)((su - (float)iu) * 256.0f);
-    int fy = (int)((sv - (float)iv) * 256.0f);
-    if (fx < 0) fx = 0; else if (fx > 256) fx = 256;
-    if (fy < 0) fy = 0; else if (fy > 256) fy = 256;
+    int iu = (int)floorf(fu);
+    int iv = (int)floorf(fv);
+    int fx = (int)((fu - (float)iu) * 256.0f) - 128;
+    int fy = (int)((fv - (float)iv) * 256.0f) - 128;
+    int su = fx < 0 ? -1 : 1, sv = fy < 0 ? -1 : 1;
+    if (fx < 0) fx = -fx;
+    if (fy < 0) fy = -fy;
+    if (fx > 128) fx = 128;
+    if (fy > 128) fy = 128;
 
-    uint16_t c00 = texel_fetch(iu & 0xFF, iv & 0xFF, texpage, clut_x, clut_y);
-    if (c00 == 0x0000) return 0x0000;   /* preserve cutout */
-    uint16_t c10 = texel_fetch((iu + 1) & 0xFF, iv & 0xFF, texpage, clut_x, clut_y);
-    uint16_t c01 = texel_fetch(iu & 0xFF, (iv + 1) & 0xFF, texpage, clut_x, clut_y);
-    uint16_t c11 = texel_fetch((iu + 1) & 0xFF, (iv + 1) & 0xFF, texpage, clut_x, clut_y);
-    if (c10 == 0x0000) c10 = c00;
-    if (c01 == 0x0000) c01 = c00;
-    if (c11 == 0x0000) c11 = c00;
+    uint16_t c00 = bl_fetch(iu, iv, texpage, clut_x, clut_y);
+    uint16_t c10 = bl_fetch(iu + su, iv, texpage, clut_x, clut_y);
+    uint16_t c01 = bl_fetch(iu, iv + sv, texpage, clut_x, clut_y);
+    uint16_t c11 = bl_fetch(iu + su, iv + sv, texpage, clut_x, clut_y);
 
-    int r00 = c00 & 0x1F, g00 = (c00 >> 5) & 0x1F, b00 = (c00 >> 10) & 0x1F;
-    int r10 = c10 & 0x1F, g10 = (c10 >> 5) & 0x1F, b10 = (c10 >> 10) & 0x1F;
-    int r01 = c01 & 0x1F, g01 = (c01 >> 5) & 0x1F, b01 = (c01 >> 10) & 0x1F;
-    int r11 = c11 & 0x1F, g11 = (c11 >> 5) & 0x1F, b11 = (c11 >> 10) & 0x1F;
+    int w00 = (c00 ? 1 : 0) * (256 - fx) * (256 - fy);
+    int w10 = (c10 ? 1 : 0) * fx * (256 - fy);
+    int w01 = (c01 ? 1 : 0) * (256 - fx) * fy;
+    int w11 = (c11 ? 1 : 0) * fx * fy;
+    int opac = w00 + w10 + w01 + w11;
+    if (opac < 32768) return 0x0000;    /* opacity < 0.5: transparent */
 
-    int w00 = (256 - fx) * (256 - fy);
-    int w10 = fx * (256 - fy);
-    int w01 = (256 - fx) * fy;
-    int w11 = fx * fy;
+    int r = ((c00 & 0x1F) * w00 + (c10 & 0x1F) * w10
+           + (c01 & 0x1F) * w01 + (c11 & 0x1F) * w11) / opac;
+    int g = (((c00 >> 5) & 0x1F) * w00 + ((c10 >> 5) & 0x1F) * w10
+           + ((c01 >> 5) & 0x1F) * w01 + ((c11 >> 5) & 0x1F) * w11) / opac;
+    int b = (((c00 >> 10) & 0x1F) * w00 + ((c10 >> 10) & 0x1F) * w10
+           + ((c01 >> 10) & 0x1F) * w01 + ((c11 >> 10) & 0x1F) * w11) / opac;
+    int stp = (((c00 >> 15) & 1) * w00 + ((c10 >> 15) & 1) * w10
+             + ((c01 >> 15) & 1) * w01 + ((c11 >> 15) & 1) * w11) * 2 >= opac;
 
-    int r = (r00 * w00 + r10 * w10 + r01 * w01 + r11 * w11) >> 16;
-    int g = (g00 * w00 + g10 * w10 + g01 * w01 + g11 * w11) >> 16;
-    int b = (b00 * w00 + b10 * w10 + b01 * w01 + b11 * w11) >> 16;
+    return (uint16_t)(r | (g << 5) | (b << 10) | (stp ? 0x8000 : 0));
+}
 
-    return (uint16_t)(r | (g << 5) | (b << 10) | (c00 & 0x8000));
+/* uv sampling bounds for a textured triangle (see g_uv_lim): min/max of the
+ * vertex uvs; for axis-aligned (2D) mappings — any zero uv derivative — the
+ * max-uv vertex is an exclusive edge whose texel the DDA never samples, so
+ * back it off by one. Crossing a 256 boundary means page wrap: widen to the
+ * full page (clamp disabled). */
+static void sw_tri_uv_limits(const int *xs, const int *ys,
+                             const int *us, const int *vs) {
+    int lo_u = us[0], hi_u = us[0], lo_v = vs[0], hi_v = vs[0];
+    for (int i = 1; i < 3; i++) {
+        if (us[i] < lo_u) lo_u = us[i]; if (us[i] > hi_u) hi_u = us[i];
+        if (vs[i] < lo_v) lo_v = vs[i]; if (vs[i] > hi_v) hi_v = vs[i];
+    }
+    long dudx = -(long)(ys[1]-ys[0])*us[2] - (long)(ys[2]-ys[1])*us[0] - (long)(ys[0]-ys[2])*us[1];
+    long dvdx = -(long)(ys[1]-ys[0])*vs[2] - (long)(ys[2]-ys[1])*vs[0] - (long)(ys[0]-ys[2])*vs[1];
+    long dudy =  (long)(xs[1]-xs[0])*us[2] + (long)(xs[2]-xs[1])*us[0] + (long)(xs[0]-xs[2])*us[1];
+    long dvdy =  (long)(xs[1]-xs[0])*vs[2] + (long)(xs[2]-xs[1])*vs[0] + (long)(xs[0]-xs[2])*vs[1];
+    if (dudx == 0 || dudy == 0 || dvdx == 0 || dvdy == 0) {
+        if (hi_u > lo_u) hi_u--;
+        if (hi_v > lo_v) hi_v--;
+    }
+    if ((lo_u >> 8) == (hi_u >> 8)) { lo_u &= 255; hi_u &= 255; }
+    else                            { lo_u = 0; hi_u = 255; }
+    if ((lo_v >> 8) == (hi_v >> 8)) { lo_v &= 255; hi_v &= 255; }
+    else                            { lo_v = 0; hi_v = 255; }
+    g_uv_lim[0] = lo_u; g_uv_lim[1] = lo_v; g_uv_lim[2] = hi_u; g_uv_lim[3] = hi_v;
+}
+
+/* uv sampling bounds for rect prims: forward mappings sample [u0, u1-1]
+ * (u1 is the exclusive edge); mirrored ones keep the full inclusive range. */
+static void sw_rect_uv_limits(int u0, int v0, int u1, int v1) {
+    int lim[4];
+    lim[0] = u0 < u1 ? u0 : u1;  lim[2] = u0 < u1 ? u1 - 1 : u0;
+    lim[1] = v0 < v1 ? v0 : v1;  lim[3] = v0 < v1 ? v1 - 1 : v0;
+    if (lim[2] < lim[0]) lim[2] = lim[0];
+    if (lim[3] < lim[1]) lim[3] = lim[1];
+    if ((lim[0] >> 8) == (lim[2] >> 8)) { lim[0] &= 255; lim[2] &= 255; }
+    else                                { lim[0] = 0; lim[2] = 255; }
+    if ((lim[1] >> 8) == (lim[3] >> 8)) { lim[1] &= 255; lim[3] &= 255; }
+    else                                { lim[1] = 0; lim[3] = 255; }
+    g_uv_lim[0] = lim[0]; g_uv_lim[1] = lim[1];
+    g_uv_lim[2] = lim[2]; g_uv_lim[3] = lim[3];
 }
 
 /* ------------------------------------------------------------------ */
@@ -802,6 +864,12 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
                   - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
     if (area2 == 0) return;
 
+    if (g_texture_filter) {
+        int xs[3] = {x0,x1,x2}, ys[3] = {y0,y1,y2};
+        int us[3] = {u0,u1,u2}, vs[3] = {v0,v1,v2};
+        sw_tri_uv_limits(xs, ys, us, vs);
+    }
+
     RTarget n = rt_native();
     raster_textured_triangle(&n, x0, y0, u0, v0, x1, y1, u1, v1,
                              x2, y2, u2, v2, clut_x, clut_y, texpage);
@@ -941,6 +1009,12 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
                   - (int64_t)(x2 - x0) * (int64_t)(y1 - y0);
     if (area2 == 0) return;
 
+    if (g_texture_filter) {
+        int xs[3] = {x0,x1,x2}, ys[3] = {y0,y1,y2};
+        int us[3] = {u0,u1,u2}, vs[3] = {v0,v1,v2};
+        sw_tri_uv_limits(xs, ys, us, vs);
+    }
+
     int r0, g0, b0, r1, g1, b1, r2, g2, b2;
     color24_to_mod(color0, &r0, &g0, &b0);
     color24_to_mod(color1, &r1, &g1, &b1);
@@ -1032,6 +1106,7 @@ void sw_draw_textured_rect(int x, int y, int w, int h,
                            int u, int v,
                            uint16_t clut_x, uint16_t clut_y,
                            uint16_t texpage) {
+    if (g_texture_filter) sw_rect_uv_limits(u, v, u + w, v + h);
     RTarget n = rt_native();
     raster_textured_rect(&n, x, y, w, h, u, v, clut_x, clut_y, texpage);
     if (g_hr) {
@@ -1079,6 +1154,7 @@ void sw_draw_textured_rect_scaled(int x, int y, int w, int h,
                                   uint16_t clut_x, uint16_t clut_y,
                                   uint16_t texpage) {
     if (w <= 0 || h <= 0) return;
+    if (g_texture_filter) sw_rect_uv_limits(u0, v0, u1, v1);
     RTarget n = rt_native();
     raster_textured_rect_scaled(&n, x, y, w, h, u0, v0, u1, v1,
                                 clut_x, clut_y, texpage);
