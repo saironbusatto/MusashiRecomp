@@ -1,0 +1,121 @@
+<rml>
+<head>
+<title>PSX Launcher</title>
+<style>
+body {
+	font-family: LatoLatin;
+	color: #e6e9ef;
+	background-color: #0d1117;
+	font-size: 16dp;
+}
+#root {
+	width: 100%;
+	height: 100%;
+	padding: 36dp;
+	display: block;
+}
+h1 {
+	font-size: 34dp;
+	font-weight: bold;
+	color: #ffffff;
+	margin-bottom: 4dp;
+}
+.subtitle { color: #7d8590; margin-bottom: 24dp; }
+.panel {
+	background-color: #161b22;
+	border: 1dp #30363d;
+	border-radius: 10dp;
+	padding: 18dp 20dp;
+	margin-bottom: 18dp;
+}
+.section-title {
+	color: #58a6ff;
+	font-size: 13dp;
+	font-weight: bold;
+	margin-bottom: 12dp;
+}
+.row {
+	display: block;
+	margin-bottom: 10dp;
+}
+.label { color: #adbac7; }
+button {
+	background-color: #21262d;
+	border: 1dp #30363d;
+	border-radius: 6dp;
+	color: #e6e9ef;
+	padding: 7dp 14dp;
+	margin-left: 8dp;
+}
+button:hover { background-color: #30363d; }
+.value { color: #ffffff; font-weight: bold; }
+.path { color: #7d8590; }
+#actions { margin-top: 8dp; }
+#launch {
+	background-color: #238636;
+	border-color: #2ea043;
+	color: #ffffff;
+	font-weight: bold;
+	padding: 10dp 28dp;
+}
+#launch:hover { background-color: #2ea043; }
+#quit { padding: 10dp 20dp; }
+</style>
+</head>
+
+<body id="root" data-model="settings">
+	<h1>{{game_name}}</h1>
+	<div class="subtitle">PSX Recomp launcher</div>
+
+	<div class="panel">
+		<div class="section-title">VIDEO</div>
+		<div class="row">
+			<span class="label">Renderer</span>
+			<button data-event-click="cycle_renderer"><span class="value">{{renderer_label}}</span></button>
+		</div>
+		<div class="row">
+			<span class="label">Supersampling</span>
+			<button data-event-click="cycle_ss"><span class="value">{{supersampling}}x</span></button>
+		</div>
+		<div class="row">
+			<span class="label">Antialiasing</span>
+			<button data-event-click="toggle_aa"><span class="value" data-if="antialiasing">On</span><span class="value" data-if="antialiasing == false">Off</span></button>
+		</div>
+		<div class="row">
+			<span class="label">Texture filtering</span>
+			<button data-event-click="cycle_texfilter"><span class="value">{{texfilter_label}}</span></button>
+		</div>
+		<div class="row">
+			<span class="label">Screen model</span>
+			<button data-event-click="cycle_crt"><span class="value">{{crt_label}}</span></button>
+		</div>
+	</div>
+
+	<div class="panel">
+		<div class="section-title">AUDIO</div>
+		<div class="row">
+			<span class="label">SPU high-quality (float shadow)</span>
+			<button data-event-click="toggle_spu"><span class="value" data-if="spu_hq">On</span><span class="value" data-if="spu_hq == false">Off</span></button>
+		</div>
+	</div>
+
+	<div class="panel">
+		<div class="section-title">SYSTEM</div>
+		<div class="row">
+			<span class="label">BIOS</span>
+			<button data-event-click="browse_bios">Browse</button>
+			<span class="path">{{bios_path}}</span>
+		</div>
+		<div class="row">
+			<span class="label">Disc</span>
+			<button data-event-click="browse_disc">Browse</button>
+			<span class="path">{{disc_path}}</span>
+		</div>
+	</div>
+
+	<div id="actions">
+		<button id="launch" data-event-click="launch">LAUNCH GAME</button>
+		<button id="quit" data-event-click="quit">Quit</button>
+	</div>
+</body>
+</rml>

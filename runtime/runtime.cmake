@@ -63,6 +63,56 @@ else()
     option(PSX_STATIC_RUNTIME "Statically link SDL2 + libgcc/libstdc++ for a self-contained exe" OFF)
 endif()
 
+# PSX_LAUNCHER: build the integrated RmlUi launcher UI (settings/disc/memcard/
+# controller front-end shown before the emulator boots). Needs the vendored
+# lib/RmlUi + lib/freetype submodules. ON by default; the oracle/beetle builds
+# never include it. Turn OFF for a launcher-less runtime (boots straight in).
+option(PSX_LAUNCHER "Build the integrated RmlUi launcher UI" ON)
+
+# Build the vendored RmlUi + FreeType once per CMake project (idempotent — the
+# rmlui_core target guards re-entry). Both are linked statically into the exe so
+# the self-contained-binary guarantee (PSX_STATIC_RUNTIME) still holds.
+function(psxrecomp_ensure_launcher_libs)
+    if(TARGET rmlui_core)
+        return()
+    endif()
+    if(NOT EXISTS "${PSXRECOMP_ROOT}/lib/RmlUi/CMakeLists.txt" OR
+       NOT EXISTS "${PSXRECOMP_ROOT}/lib/freetype/CMakeLists.txt")
+        message(FATAL_ERROR
+            "PSX_LAUNCHER=ON but lib/RmlUi or lib/freetype is missing. "
+            "Run: git submodule update --init --recursive")
+    endif()
+
+    # Static libs fold into the exe (keeps the self-contained binary intact).
+    set(BUILD_SHARED_LIBS OFF)
+
+    # FreeType — RmlUi's font engine. Disable every optional codec/dep so the
+    # only thing we pull in is the core font rasteriser.
+    set(FT_DISABLE_ZLIB     TRUE CACHE BOOL "" FORCE)
+    set(FT_DISABLE_BZIP2    TRUE CACHE BOOL "" FORCE)
+    set(FT_DISABLE_PNG      TRUE CACHE BOOL "" FORCE)
+    set(FT_DISABLE_HARFBUZZ TRUE CACHE BOOL "" FORCE)
+    set(FT_DISABLE_BROTLI   TRUE CACHE BOOL "" FORCE)
+    add_subdirectory("${PSXRECOMP_ROOT}/lib/freetype"
+                     "${CMAKE_BINARY_DIR}/_deps/freetype-build" EXCLUDE_FROM_ALL)
+    # FreeType's add_subdirectory exports the target `freetype` but not the
+    # namespaced alias (that's install-only). RmlUi's soft dependency check
+    # looks for Freetype::Freetype, so create it here.
+    if(NOT TARGET Freetype::Freetype)
+        add_library(Freetype::Freetype ALIAS freetype)
+    endif()
+
+    # RmlUi — core only, FreeType font engine, no samples/tests/PCH.
+    set(RMLUI_SAMPLES            OFF        CACHE BOOL   "" FORCE)
+    set(RMLUI_FONT_ENGINE        "freetype" CACHE STRING "" FORCE)
+    set(RMLUI_PRECOMPILED_HEADERS OFF       CACHE BOOL   "" FORCE)
+    # The bundled robin_hood hash map fails its bitness detection under MinGW
+    # GCC ("#error Unsupported bitness"); use std:: containers instead.
+    set(RMLUI_THIRDPARTY_CONTAINERS OFF     CACHE BOOL   "" FORCE)
+    add_subdirectory("${PSXRECOMP_ROOT}/lib/RmlUi"
+                     "${CMAKE_BINARY_DIR}/_deps/RmlUi-build" EXCLUDE_FROM_ALL)
+endfunction()
+
 set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/main.cpp
     ${PSXRECOMP_ROOT}/runtime/src/memory.c
@@ -227,6 +277,37 @@ function(psxrecomp_add_runtime_target target)
     # also visible to psx-beetle / non-runtime-helper targets.
     if(NOT PSX_DEBUG_TOOLS)
         target_compile_definitions(${target} PRIVATE PSX_NO_DEBUG_TOOLS=1)
+    endif()
+
+    # Integrated RmlUi launcher (not in the oracle build — that's headless).
+    if(PSX_LAUNCHER AND NOT PSXRT_ORACLE)
+        psxrecomp_ensure_launcher_libs()
+        target_sources(${target} PRIVATE
+            ${PSXRECOMP_ROOT}/runtime/launcher/launcher.cpp
+            ${PSXRECOMP_ROOT}/lib/RmlUi/Backends/RmlUi_Platform_SDL.cpp
+            ${PSXRECOMP_ROOT}/lib/RmlUi/Backends/RmlUi_Renderer_GL3.cpp
+        )
+        # The vendored GL3 backend uses std::all_of without including
+        # <algorithm>; force-include it rather than patching the pinned
+        # submodule. (GCC/Clang only; MSVC pulls it in transitively.)
+        if(NOT MSVC)
+            set_source_files_properties(
+                ${PSXRECOMP_ROOT}/lib/RmlUi/Backends/RmlUi_Renderer_GL3.cpp
+                PROPERTIES COMPILE_OPTIONS "-include;algorithm")
+        endif()
+        target_include_directories(${target} PRIVATE
+            ${PSXRECOMP_ROOT}/lib/RmlUi/Include
+            ${PSXRECOMP_ROOT}/lib/RmlUi/Backends
+            ${PSXRECOMP_ROOT}/runtime/launcher
+        )
+        target_link_libraries(${target} PRIVATE RmlUi::Core)
+        target_compile_definitions(${target} PRIVATE PSX_LAUNCHER=1)
+        # Ship the launcher assets (RML/RCSS/fonts) next to the exe.
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "${PSXRECOMP_ROOT}/runtime/launcher/assets"
+                "$<TARGET_FILE_DIR:${target}>"
+            COMMENT "Copying launcher assets next to ${target}")
     endif()
 
     if(WIN32 OR MINGW)
