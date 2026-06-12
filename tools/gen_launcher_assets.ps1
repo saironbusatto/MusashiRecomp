@@ -137,4 +137,12 @@ $g.FillRectangle((New-Object System.Drawing.SolidBrush (RGB 176 182 191)), 36, 4
 $g.FillRectangle((New-Object System.Drawing.SolidBrush (RGB 64 70 82)), 70, 210, 80, 22)
 Save $bmp "memcard.png"
 
+# ---- dropdown caret (16x16, downward triangle) ----
+$bmp,$g = New-Canvas 32 32
+$tri = New-Object System.Drawing.SolidBrush (RGB 173 186 199)
+$g.FillPolygon($tri, @((New-Object System.Drawing.PointF(7,11)),
+                       (New-Object System.Drawing.PointF(25,11)),
+                       (New-Object System.Drawing.PointF(16,22))))
+Save $bmp "caret.png"
+
 Write-Output "done"

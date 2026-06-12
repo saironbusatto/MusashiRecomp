@@ -122,10 +122,18 @@ struct LauncherModel {
     // View toggle: "dashboard" (default) | "settings".
     Rml::String view = "dashboard";
 
-    // Player cards — shell only this pass; enable toggles are real bound state
-    // so they animate, the rest is static markup until Phase 5 (controllers).
-    bool p1_enabled  = true;
-    bool p2_enabled  = false;
+    // Player cards — real device routing. Each port picks a device (None /
+    // Keyboard / a plugged-in SDL controller) and a pad type (DualShock=analog).
+    int  p1_dev_index = 1;     // index into the shared device option list
+    int  p2_dev_index = 0;
+    bool p1_analog    = false; // DualShock (analog) vs digital pad
+    bool p2_analog    = false;
+    Rml::String p1_dev_label = "Keyboard";
+    Rml::String p2_dev_label = "None";
+    Rml::String p1_status, p2_status;        // resolved status line
+    Rml::String p1_dot, p2_dot;              // "" (on) | "off"
+    Rml::String p1_options, p2_options;      // data-rml option-list markup
+    Rml::String dd_open;                     // "" | "p1" | "p2" (which list is open)
 
     // Memory cards — real introspection of the on-disk .mcd images. Each slot
     // has a resolved file path, an enable toggle, and parsed directory stats.
@@ -217,6 +225,100 @@ void refresh_memcard(LauncherModel& m, int slot /*0|1*/) {
     const std::string when = fmt_mtime(s.mtime);
     foot = when.empty() ? Rml::String("On-disk memory card.")
                         : Rml::String("Last modified — " + when);
+}
+
+// ---- input-device enumeration (None / Keyboard / plugged-in controllers) ----
+struct DeviceOption {
+    int         kind;   // 0=none, 1=keyboard, 2=controller
+    std::string guid;   // SDL joystick GUID string when kind==controller
+    std::string label;  // display name
+};
+
+std::vector<DeviceOption> enumerate_devices() {
+    std::vector<DeviceOption> opts;
+    opts.push_back({0, "", "None"});
+    opts.push_back({1, "", "Keyboard"});
+    const int n = SDL_NumJoysticks();
+    for (int i = 0; i < n; i++) {
+        if (!SDL_IsGameController(i)) continue;
+        SDL_JoystickGUID g = SDL_JoystickGetDeviceGUID(i);
+        char buf[40] = {0};
+        SDL_JoystickGetGUIDString(g, buf, sizeof(buf));
+        const char* nm = SDL_GameControllerNameForIndex(i);
+        opts.push_back({2, std::string(buf), nm ? std::string(nm) : std::string("Controller")});
+    }
+    return opts;
+}
+
+// The settings device string ("none"/"keyboard"/<guid>) for an option.
+std::string device_string(const DeviceOption& o) {
+    if (o.kind == 0) return "none";
+    if (o.kind == 1) return "keyboard";
+    return o.guid;
+}
+
+// Minimal RML/attribute text escape for injected option labels.
+std::string rml_escape(const std::string& s) {
+    std::string o;
+    for (char c : s) {
+        switch (c) {
+            case '&': o += "&amp;";  break;
+            case '<': o += "&lt;";   break;
+            case '>': o += "&gt;";   break;
+            case '"': o += "&quot;"; break;
+            case '\'':o += "&#39;";  break;
+            default:  o += c;        break;
+        }
+    }
+    return o;
+}
+
+// Resolve a saved device string to an index in opts. A saved controller GUID
+// that is not currently plugged in is appended as an "(offline)" option so the
+// user's selection survives across unplug/replug.
+int find_or_add_device_index(std::vector<DeviceOption>& opts, const std::string& dev) {
+    if (dev.empty() || dev == "none") return 0;
+    if (dev == "keyboard") return 1;
+    for (size_t i = 0; i < opts.size(); i++)
+        if (opts[i].kind == 2 && opts[i].guid == dev) return (int)i;
+    opts.push_back({2, dev, "Saved controller (offline)"});
+    return (int)opts.size() - 1;
+}
+
+// Build the data-rml option-list markup for a player's dropdown. Each row is a
+// clickable element whose data-event-click selects that option (and closes).
+std::string build_options_rml(int player, const std::vector<DeviceOption>& opts) {
+    std::string s;
+    for (size_t i = 0; i < opts.size(); i++) {
+        s += "<p class=\"dd-opt\" data-event-click=\"pick_device(";
+        s += std::to_string(player);
+        s += ",";
+        s += std::to_string(i);
+        s += ")\">";
+        s += rml_escape(opts[i].label);
+        s += "</p>";
+    }
+    return s;
+}
+
+// Recompute a player's derived display fields from its selected option index.
+void refresh_player(LauncherModel& m, int player, const std::vector<DeviceOption>& opts) {
+    int&         idx    = player == 0 ? m.p1_dev_index : m.p2_dev_index;
+    Rml::String& label  = player == 0 ? m.p1_dev_label : m.p2_dev_label;
+    Rml::String& status = player == 0 ? m.p1_status    : m.p2_status;
+    Rml::String& dot    = player == 0 ? m.p1_dot       : m.p2_dot;
+    Rml::String& options= player == 0 ? m.p1_options   : m.p2_options;
+    const bool   analog = player == 0 ? m.p1_analog    : m.p2_analog;
+
+    if (idx < 0 || idx >= (int)opts.size()) idx = 0;
+    const DeviceOption& o = opts[idx];
+    label   = o.label;
+    options = build_options_rml(player, opts);
+
+    const char* type = analog ? "DualShock (analog)" : "digital pad";
+    if (o.kind == 0)      { status = "No device — port empty"; dot = "off"; }
+    else if (o.kind == 1) { status = Rml::String("Keyboard \xE2\x80\x94 ") + type; dot = ""; }
+    else                  { status = o.label + Rml::String(" \xE2\x80\x94 ") + type; dot = ""; }
 }
 
 const char* renderer_name(int v)  { return v == 1 ? "OpenGL" : "Software"; }
@@ -458,6 +560,20 @@ Result run(SDL_Window* window, void* gl_context,
     refresh_memcard(m, 0);
     refresh_memcard(m, 1);
 
+    // ---- Seed the controller slots: enumerate devices, resolve selections ----
+    std::vector<DeviceOption> dev_opts = enumerate_devices();
+    m.p1_analog = io.has_p1_analog ? io.p1_analog : false;
+    m.p2_analog = io.has_p2_analog ? io.p2_analog : false;
+    if (io.has_p1_device) {
+        m.p1_dev_index = find_or_add_device_index(dev_opts, io.p1_device);
+    } else {
+        // Zero-config default: first plugged-in controller, else keyboard.
+        m.p1_dev_index = (dev_opts.size() > 2) ? 2 : 1;
+    }
+    m.p2_dev_index = io.has_p2_device ? find_or_add_device_index(dev_opts, io.p2_device) : 0;
+    refresh_player(m, 0, dev_opts);
+    refresh_player(m, 1, dev_opts);
+
     // ---- Data model: bind fields + action callbacks ----
     Rml::DataModelConstructor c = context->CreateDataModel("settings");
     if (!c) {
@@ -485,8 +601,17 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("verdict_detail", &m.verdict_detail);
     c.Bind("verdict_state",  &m.verdict_state);
     c.Bind("view",           &m.view);
-    c.Bind("p1_enabled",     &m.p1_enabled);
-    c.Bind("p2_enabled",     &m.p2_enabled);
+    c.Bind("p1_analog",      &m.p1_analog);
+    c.Bind("p2_analog",      &m.p2_analog);
+    c.Bind("p1_dev_label",   &m.p1_dev_label);
+    c.Bind("p2_dev_label",   &m.p2_dev_label);
+    c.Bind("p1_status",      &m.p1_status);
+    c.Bind("p2_status",      &m.p2_status);
+    c.Bind("p1_dot",         &m.p1_dot);
+    c.Bind("p2_dot",         &m.p2_dot);
+    c.Bind("p1_options",     &m.p1_options);
+    c.Bind("p2_options",     &m.p2_options);
+    c.Bind("dd_open",        &m.dd_open);
     c.Bind("mc1_enabled",    &m.mc1_enabled);
     c.Bind("mc2_enabled",    &m.mc2_enabled);
     c.Bind("mc1_name",       &m.mc1_name);
@@ -566,13 +691,43 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.view = "dashboard"; handle.DirtyVariable("view");
         });
-    c.BindEventCallback("toggle_p1",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.p1_enabled = !m.p1_enabled; handle.DirtyVariable("p1_enabled");
+    // ---- controller: device dropdown + DualShock toggle ----
+    auto dirty_player = [handle](int player) mutable {
+        const char* v0[] = {"p1_dev_label","p1_status","p1_dot","p1_options","p1_analog"};
+        const char* v1[] = {"p2_dev_label","p2_status","p2_dot","p2_options","p2_analog"};
+        for (const char* v : (player == 0 ? v0 : v1)) handle.DirtyVariable(v);
+    };
+    // dev_opts is captured by value: the device list is fixed for the launcher
+    // session (a hot-plug here would require a re-enumerate, deferred).
+    c.BindEventCallback("open_dd",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
+            const int player = args.empty() ? 0 : (int)args[0].Get<int>();
+            const char* key = player == 0 ? "p1" : "p2";
+            m.dd_open = (m.dd_open == key) ? Rml::String() : Rml::String(key);
+            handle.DirtyVariable("dd_open");
         });
-    c.BindEventCallback("toggle_p2",
+    c.BindEventCallback("close_dd",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.p2_enabled = !m.p2_enabled; handle.DirtyVariable("p2_enabled");
+            m.dd_open = Rml::String(); handle.DirtyVariable("dd_open");
+        });
+    c.BindEventCallback("pick_device",
+        [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
+            if (args.size() < 2) return;
+            const int player = (int)args[0].Get<int>();
+            const int idx    = (int)args[1].Get<int>();
+            (player == 0 ? m.p1_dev_index : m.p2_dev_index) = idx;
+            refresh_player(m, player, dev_opts);
+            m.dd_open = Rml::String();
+            dirty_player(player);
+            handle.DirtyVariable("dd_open");
+        });
+    c.BindEventCallback("toggle_ds_p1",
+        [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.p1_analog = !m.p1_analog; refresh_player(m, 0, dev_opts); dirty_player(0);
+        });
+    c.BindEventCallback("toggle_ds_p2",
+        [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.p2_analog = !m.p2_analog; refresh_player(m, 1, dev_opts); dirty_player(1);
         });
     c.BindEventCallback("toggle_mc1",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -683,6 +838,13 @@ Result run(SDL_Window* window, void* gl_context,
         io.memcard2_enabled = m.mc2_enabled; io.has_memcard2_enabled = true;
         if (!m.mc1_path.empty()) { io.memcard1_path = fs::path(std::string(m.mc1_path)); io.has_memcard1_path = true; }
         if (!m.mc2_path.empty()) { io.memcard2_path = fs::path(std::string(m.mc2_path)); io.has_memcard2_path = true; }
+
+        const int i1 = (m.p1_dev_index >= 0 && m.p1_dev_index < (int)dev_opts.size()) ? m.p1_dev_index : 0;
+        const int i2 = (m.p2_dev_index >= 0 && m.p2_dev_index < (int)dev_opts.size()) ? m.p2_dev_index : 0;
+        io.p1_device = device_string(dev_opts[i1]); io.has_p1_device = true;
+        io.p2_device = device_string(dev_opts[i2]); io.has_p2_device = true;
+        io.p1_analog = m.p1_analog; io.has_p1_analog = true;
+        io.p2_analog = m.p2_analog; io.has_p2_analog = true;
     }
 
     Rml::Shutdown();

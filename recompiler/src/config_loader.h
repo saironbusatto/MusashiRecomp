@@ -226,6 +226,17 @@ struct UserSettings {
     bool has_memcard2_path    = false; std::filesystem::path memcard2_path;
     bool has_memcard1_enabled = false; bool memcard1_enabled = true;
     bool has_memcard2_enabled = false; bool memcard2_enabled = true;
+
+    // [controller] — per-player input device + pad type. device is one of:
+    //   "none"     — no pad in this port (port not connected)
+    //   "keyboard" — driven by the keyboard map (input.ini)
+    //   "<GUID>"   — an SDL game-controller GUID (SDL_JoystickGetGUIDString)
+    // analog selects the emulated pad type: false = digital (0x41), true =
+    // DualShock/analog (0x73). Defaults: P1 keyboard/digital, P2 none/digital.
+    bool has_p1_device = false; std::string p1_device = "keyboard";
+    bool has_p2_device = false; std::string p2_device = "none";
+    bool has_p1_analog = false; bool p1_analog = false;
+    bool has_p2_analog = false; bool p2_analog = false;
 };
 
 // Load settings.toml. Returns an all-defaults (all has_*=false) struct if the

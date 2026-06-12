@@ -39,8 +39,14 @@ static void sio_debug_poll_maybe(void) {
     }
 }
 
-/* Pad state: 0=pressed, 1=released (PS1 convention) */
-static uint16_t pad_buttons = 0xFFFF; /* all released */
+/* Pad state: 0=pressed, 1=released (PS1 convention). Per slot (port). */
+static uint16_t pad_buttons[2] = { 0xFFFF, 0xFFFF }; /* all released */
+
+/* Per-slot pad type + analog stick state. analog: 0=digital pad (poll id
+ * 0x41), 1=DualShock/analog (poll id 0x73). Sticks are 0..255, 0x80 centred. */
+static uint8_t pad_analog[2]    = { 0, 0 };
+static uint8_t pad_stick[2][4]  = { { 0x80, 0x80, 0x80, 0x80 },
+                                    { 0x80, 0x80, 0x80, 0x80 } }; /* lx,ly,rx,ry */
 
 /* Which slots have devices connected */
 static uint8_t pad_connected = 0;
@@ -489,7 +495,7 @@ void sio_init(void) {
     pad_response_len = 0;
     pad_response_idx = 0;
     pad_current_cmd = 0;
-    pad_buttons = 0xFFFF;
+    pad_buttons[0] = pad_buttons[1] = 0xFFFF;
     pad_connected = 0;
     mc_state = MC_IDLE;
     for (int i = 0; i < 2; i++) {
@@ -531,12 +537,43 @@ void sio_connect_pad(int slot) {
         pad_connected |= (1 << slot);
 }
 
+void sio_set_pad_connected(int slot, int connected) {
+    if (slot < 0 || slot > 1) return;
+    if (connected) pad_connected |=  (uint8_t)(1 << slot);
+    else           pad_connected &= (uint8_t)~(1 << slot);
+}
+
 void sio_set_pad_state(uint16_t buttons) {
-    pad_buttons = buttons;
+    pad_buttons[0] = buttons;
+}
+
+void sio_set_pad_state_slot(int slot, uint16_t buttons) {
+    if (slot >= 0 && slot <= 1) pad_buttons[slot] = buttons;
+}
+
+void sio_set_pad_analog(int slot, int enabled,
+                        uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry) {
+    if (slot < 0 || slot > 1) return;
+    pad_analog[slot]   = enabled ? 1 : 0;
+    pad_stick[slot][0] = lx; pad_stick[slot][1] = ly;
+    pad_stick[slot][2] = rx; pad_stick[slot][3] = ry;
 }
 
 uint16_t sio_get_pad_buttons(void) {
-    return pad_buttons;
+    return pad_buttons[0];
+}
+
+uint16_t sio_get_pad_buttons_slot(int slot) {
+    return (slot >= 0 && slot <= 1) ? pad_buttons[slot] : 0xFFFF;
+}
+
+int sio_get_pad_connected(int slot) {
+    if (slot < 0 || slot > 1) return 0;
+    return (pad_connected & (1 << slot)) ? 1 : 0;
+}
+
+int sio_get_pad_analog(int slot) {
+    return (slot >= 0 && slot <= 1) ? pad_analog[slot] : 0;
 }
 
 static void pad_process_byte(uint8_t tx_byte) {
@@ -555,11 +592,26 @@ static void pad_process_byte(uint8_t tx_byte) {
         pad_current_cmd = tx_byte;
         pad_response_idx = 1;
         if (tx_byte == 0x42) {
-            pad_response[0] = 0x41; /* Digital pad poll */
-            pad_response[1] = 0x5A;
-            pad_response[2] = (uint8_t)(pad_buttons & 0xFF);
-            pad_response[3] = (uint8_t)(pad_buttons >> 8);
-            pad_response_len = 4;
+            const uint16_t btn = pad_buttons[selected_slot];
+            if (pad_analog[selected_slot]) {
+                /* DualShock analog poll: id 0x73, then buttons, then the four
+                 * stick axes (right X/Y, left X/Y) per the SIO pad protocol. */
+                pad_response[0] = 0x73;
+                pad_response[1] = 0x5A;
+                pad_response[2] = (uint8_t)(btn & 0xFF);
+                pad_response[3] = (uint8_t)(btn >> 8);
+                pad_response[4] = pad_stick[selected_slot][2]; /* right X */
+                pad_response[5] = pad_stick[selected_slot][3]; /* right Y */
+                pad_response[6] = pad_stick[selected_slot][0]; /* left X */
+                pad_response[7] = pad_stick[selected_slot][1]; /* left Y */
+                pad_response_len = 8;
+            } else {
+                pad_response[0] = 0x41; /* Digital pad poll */
+                pad_response[1] = 0x5A;
+                pad_response[2] = (uint8_t)(btn & 0xFF);
+                pad_response[3] = (uint8_t)(btn >> 8);
+                pad_response_len = 4;
+            }
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;

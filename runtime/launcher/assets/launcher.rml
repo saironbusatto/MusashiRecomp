@@ -14,7 +14,14 @@ body {
 /* ---- top bar ---- */
 .topbar { display: flex; flex-direction: row; align-items: center; margin-bottom: 18dp; }
 .logo { width: 46dp; height: 46dp; margin-right: 16dp; decorator: image(img/logo.png contain); }
-.title-block { display: block; }
+.title-block { display: block; flex: 1 1 auto; }
+.topbar-actions { display: flex; flex-direction: row; align-items: center; }
+.top-btn {
+	background-color: #1b2330; border: 1dp #2b3543; border-radius: 7dp;
+	color: #e6e9ef; padding: 9dp 18dp; font-size: 15dp; font-weight: bold;
+}
+.top-btn:hover { background-color: #232d3c; border-color: #3b82f6; }
+.top-btn.primary { background-color: #1e2733; }
 h1 { display: block; font-size: 27dp; font-weight: bold; color: #ffffff; }
 .subtitle { display: block; color: #7d8590; font-size: 14dp; }
 
@@ -27,7 +34,7 @@ h1 { display: block; font-size: 27dp; font-weight: bold; color: #ffffff; }
 	padding: 18dp 22dp;
 	margin-bottom: 13dp;
 }
-.cards-row { display: flex; flex-direction: row; margin-bottom: 13dp; }
+.cards-row { display: flex; flex-direction: row; align-items: stretch; margin-bottom: 13dp; }
 .card {
 	display: block;
 	flex: 1 1 auto;
@@ -41,7 +48,7 @@ h1 { display: block; font-size: 27dp; font-weight: bold; color: #ffffff; }
 .eyebrow { display: block; color: #4493f8; font-size: 12dp; font-weight: bold; margin-bottom: 8dp; }
 
 /* ---- disc verification panel ---- */
-.disc-panel { display: flex; flex-direction: row; align-items: flex-start; }
+.disc-panel { display: flex; flex-direction: row; align-items: flex-start; position: relative; }
 .disc-art { width: 216dp; height: 216dp; margin-right: 24dp; decorator: image(img/disc.png contain); flex: 0 0 216dp; }
 .disc-info { display: block; flex: 1 1 auto; }
 .disc-title { display: block; font-size: 32dp; font-weight: bold; color: #ffffff; }
@@ -92,19 +99,34 @@ button:hover { background-color: #232d3c; }
 
 .card-body { display: flex; flex-direction: row; align-items: center; }
 .card-body.disabled { opacity: 0.4; }
+/* Player card body is a fixed height so toggling the pad type never reflows. */
+.card-body.player { height: 134dp; }
 .pad-art { width: 206dp; height: 128dp; margin-right: 14dp; flex: 0 0 206dp; }
 .pad-art.digital { decorator: image(img/pad_digital.png contain); }
 .pad-art.analog  { decorator: image(img/pad_analog.png contain); }
 .card-col { display: block; flex: 1 1 auto; }
 .field-lbl { display: block; color: #8b949e; font-size: 12dp; margin-bottom: 5dp; }
+.dropdown-wrap { display: block; position: relative; margin-bottom: 12dp; }
 .dropdown {
-	display: block; background-color: #161d28; border: 1dp #2b3543; border-radius: 7dp;
-	padding: 9dp 12dp; color: #e6e9ef; margin-bottom: 12dp;
+	display: flex; flex-direction: row; align-items: center;
+	background-color: #161d28; border: 1dp #2b3543; border-radius: 7dp;
+	padding: 9dp 12dp; color: #e6e9ef;
 }
+.dropdown:hover { border-color: #3b82f6; }
+.dd-label { flex: 1 1 auto; white-space: nowrap; overflow: hidden; }
+.caret { width: 13dp; height: 13dp; margin-left: 8dp; flex: 0 0 13dp;
+	decorator: image(img/caret.png contain); }
+.dd-panel {
+	position: absolute; left: 0dp; top: 44dp; width: 100%; z-index: 50;
+	background-color: #0d131c; border: 1dp #2b3543; border-radius: 7dp; padding: 4dp;
+}
+.dd-opt { display: block; padding: 8dp 10dp; border-radius: 5dp; color: #c2c9d2; }
+.dd-opt:hover { background-color: #1b2330; color: #ffffff; }
 .status-row { display: flex; flex-direction: row; align-items: center; }
-.dot { width: 9dp; height: 9dp; border-radius: 5dp; background-color: #3fb950; margin-right: 7dp; }
+.dot { width: 9dp; height: 9dp; border-radius: 5dp; background-color: #3fb950; margin-right: 7dp; flex: 0 0 9dp; }
 .dot.off { background-color: #6e7781; }
-.status-txt { color: #9aa4b2; font-size: 13dp; flex: 1 1 auto; }
+.status-txt { color: #9aa4b2; font-size: 13dp; flex: 1 1 auto;
+	white-space: nowrap; overflow: hidden; min-width: 0dp; }
 
 /* memcard */
 .mc-art { width: 118dp; height: 132dp; margin-right: 16dp; flex: 0 0 118dp; decorator: image(img/memcard.png contain); }
@@ -153,6 +175,10 @@ button:hover { background-color: #232d3c; }
 			<h1>{{game_name}} Recomp</h1>
 			<div class="subtitle">{{game_name}} launcher</div>
 		</div>
+		<div class="topbar-actions">
+			<button class="top-btn" data-if="view == 'dashboard'" data-event-click="show_settings">Settings</button>
+			<button class="top-btn primary" data-if="view == 'settings'" data-event-click="show_dashboard">‹ Back to dashboard</button>
+		</div>
 	</div>
 
 	<!-- ================= DASHBOARD VIEW ================= -->
@@ -178,17 +204,6 @@ button:hover { background-color: #232d3c; }
 					</div>
 				</div>
 			</div>
-			<div class="disc-verdict">
-				<span class="verdict-icon"
-					data-class-ok="verdict_state == 'ok'"
-					data-class-warn="verdict_state == 'warn'"
-					data-class-bad="verdict_state == 'bad'"
-					data-class-none="verdict_state == 'none'"></span>
-				<div class="verdict-text">
-					<div class="verdict-title">{{verdict_title}}</div>
-					<div class="verdict-detail">{{verdict_detail}}</div>
-				</div>
-			</div>
 			<button class="change-iso" data-event-click="change_iso">Change ISO</button>
 		</div>
 
@@ -196,32 +211,42 @@ button:hover { background-color: #232d3c; }
 			<div class="card left">
 				<div class="card-head">
 					<span class="card-name">PLAYER 1</span>
-					<span class="enable-lbl">Enabled</span>
-					<span class="switch" data-class-on="p1_enabled" data-event-click="toggle_p1"><span class="knob"></span></span>
+					<span class="enable-lbl">DualShock</span>
+					<span class="switch" data-class-on="p1_analog" data-event-click="toggle_ds_p1"><span class="knob"></span></span>
 				</div>
-				<div class="card-body">
-					<div class="pad-art digital"></div>
+				<div class="card-body player">
+					<div class="pad-art" data-class-analog="p1_analog" data-class-digital="p1_analog == false"></div>
 					<div class="card-col">
-						<div class="field-lbl">Controller</div>
-						<div class="dropdown">PlayStation (Digital)</div>
-						<div class="status-row"><span class="dot"></span><span class="status-txt">Connected</span>
-							<button>Configure</button></div>
+						<div class="field-lbl">Device</div>
+						<div class="dropdown-wrap">
+							<div class="dropdown" data-event-click="open_dd(0)">
+								<span class="dd-label">{{p1_dev_label}}</span><span class="caret"></span>
+							</div>
+							<div class="dd-panel" data-if="dd_open == 'p1'" data-rml="p1_options"></div>
+						</div>
+						<div class="status-row"><span class="dot" data-class-off="p1_dot == 'off'"></span>
+							<span class="status-txt">{{p1_status}}</span></div>
 					</div>
 				</div>
 			</div>
 			<div class="card right">
 				<div class="card-head">
 					<span class="card-name">PLAYER 2</span>
-					<span class="enable-lbl">Enabled</span>
-					<span class="switch" data-class-on="p2_enabled" data-event-click="toggle_p2"><span class="knob"></span></span>
+					<span class="enable-lbl">DualShock</span>
+					<span class="switch" data-class-on="p2_analog" data-event-click="toggle_ds_p2"><span class="knob"></span></span>
 				</div>
-				<div class="card-body">
-					<div class="pad-art analog"></div>
+				<div class="card-body player">
+					<div class="pad-art" data-class-analog="p2_analog" data-class-digital="p2_analog == false"></div>
 					<div class="card-col">
-						<div class="field-lbl">Controller</div>
-						<div class="dropdown">DualShock (Analog)</div>
-						<div class="status-row"><span class="dot off"></span><span class="status-txt">Not connected</span>
-							<button>Configure</button></div>
+						<div class="field-lbl">Device</div>
+						<div class="dropdown-wrap">
+							<div class="dropdown" data-event-click="open_dd(1)">
+								<span class="dd-label">{{p2_dev_label}}</span><span class="caret"></span>
+							</div>
+							<div class="dd-panel" data-if="dd_open == 'p2'" data-rml="p2_options"></div>
+						</div>
+						<div class="status-row"><span class="dot" data-class-off="p2_dot == 'off'"></span>
+							<span class="status-txt">{{p2_status}}</span></div>
 					</div>
 				</div>
 			</div>

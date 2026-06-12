@@ -5158,15 +5158,25 @@ static void handle_press(int id, const char *json)
     send_ok(id);
 }
 
-/* Reports the current pad word and any active input override. */
+/* Reports the current pad word(s) and any active input override. `pad` is
+ * slot 0 (kept for back-compat); slot0/slot1 report both ports' button word. */
 extern uint16_t sio_get_pad_buttons(void);
+extern uint16_t sio_get_pad_buttons_slot(int slot);
+extern int sio_get_pad_connected(int slot);
+extern int sio_get_pad_analog(int slot);
 static void handle_pad_status(int id, const char *json)
 {
     (void)json;
-    uint16_t pad = sio_get_pad_buttons();
+    uint16_t pad0 = sio_get_pad_buttons_slot(0);
+    uint16_t pad1 = sio_get_pad_buttons_slot(1);
     send_fmt("{\"id\":%d,\"ok\":true,\"pad\":\"0x%04X\","
+             "\"slot0\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s},"
+             "\"slot1\":{\"buttons\":\"0x%04X\",\"connected\":%s,\"analog\":%s},"
              "\"override\":%d,\"override_frames\":%d}\n",
-             id, pad, s_input_override, s_input_frames);
+             id, pad0,
+             pad0, sio_get_pad_connected(0) ? "true" : "false", sio_get_pad_analog(0) ? "true" : "false",
+             pad1, sio_get_pad_connected(1) ? "true" : "false", sio_get_pad_analog(1) ? "true" : "false",
+             s_input_override, s_input_frames);
 }
 
 static void handle_clear_input(int id, const char *json)

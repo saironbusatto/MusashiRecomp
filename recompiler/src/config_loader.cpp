@@ -542,6 +542,23 @@ UserSettings load_user_settings(const fs::path& path) {
             s.memcard2_enabled = toml::find<bool>(m, "enable2"); s.has_memcard2_enabled = true;
         });
     }
+    if (doc.contains("controller")) {
+        const toml::value& ct = toml::find(doc, "controller");
+        if (ct.contains("p1_device")) try_get([&]{
+            const auto v = toml::find<std::string>(ct, "p1_device");
+            if (!v.empty()) { s.p1_device = v; s.has_p1_device = true; }
+        });
+        if (ct.contains("p2_device")) try_get([&]{
+            const auto v = toml::find<std::string>(ct, "p2_device");
+            if (!v.empty()) { s.p2_device = v; s.has_p2_device = true; }
+        });
+        if (ct.contains("p1_analog")) try_get([&]{
+            s.p1_analog = toml::find<bool>(ct, "p1_analog"); s.has_p1_analog = true;
+        });
+        if (ct.contains("p2_analog")) try_get([&]{
+            s.p2_analog = toml::find<bool>(ct, "p2_analog"); s.has_p2_analog = true;
+        });
+    }
     return s;
 }
 
@@ -597,6 +614,18 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
             f << "enable1 = " << (s.memcard1_enabled ? "true" : "false") << "\n";
         if (s.has_memcard2_enabled)
             f << "enable2 = " << (s.memcard2_enabled ? "true" : "false") << "\n";
+    }
+
+    if (s.has_p1_device || s.has_p2_device || s.has_p1_analog || s.has_p2_analog) {
+        f << "\n[controller]\n";
+        if (s.has_p1_device)
+            f << "p1_device = \"" << s.p1_device << "\"\n";
+        if (s.has_p1_analog)
+            f << "p1_analog = " << (s.p1_analog ? "true" : "false") << "\n";
+        if (s.has_p2_device)
+            f << "p2_device = \"" << s.p2_device << "\"\n";
+        if (s.has_p2_analog)
+            f << "p2_analog = " << (s.p2_analog ? "true" : "false") << "\n";
     }
 
     return f.good();

@@ -95,8 +95,17 @@ extern "C" void     psx_write_byte(uint32_t addr, uint8_t val);
 static SDL_Window*   sdl_window;
 static SDL_Renderer* sdl_renderer;
 static SDL_Texture*  sdl_texture;
-static SDL_GameController* sdl_controller;
-static SDL_JoystickID      sdl_controller_instance = -1;
+/* Per-player input device routing (PSX ports 1 & 2). Seeded from the
+ * [controller] settings the launcher writes; the runtime opens the matching
+ * SDL controller (or uses the keyboard) and feeds each PSX pad slot. */
+struct PlayerInput {
+    int   kind = 0;            /* 0=none, 1=keyboard, 2=controller */
+    char  guid[40] = {0};      /* SDL joystick GUID string when kind==controller */
+    bool  analog = false;      /* DualShock (analog) vs digital pad */
+    SDL_GameController* handle = nullptr;
+    SDL_JoystickID      instance = -1;
+};
+static PlayerInput g_players[2];
 /* ARGB8888 staging buffer. Sized for the active internal resolution:
  * 640*scale x 512*scale. Allocated once the supersampling scale is known
  * (sized for the native 640x512 when supersampling is off). */
@@ -846,56 +855,91 @@ static void load_input_config(const char* argv0) {
     }
 }
 
+static void close_player(PlayerInput& p) {
+    if (p.handle) {
+        SDL_GameControllerClose(p.handle);
+        p.handle = nullptr;
+        p.instance = -1;
+    }
+}
+
 static void close_controller(void) {
-    if (sdl_controller) {
-        SDL_GameControllerClose(sdl_controller);
-        sdl_controller = nullptr;
-        sdl_controller_instance = -1;
+    close_player(g_players[0]);
+    close_player(g_players[1]);
+}
+
+/* Open the SDL controller whose GUID matches p.guid. If no exact GUID match
+ * exists (e.g. a different physical unit of the same model, or Steam's virtual
+ * pad at an unpredictable slot), fall back to the first controller not already
+ * claimed by the other player. */
+static void open_player(PlayerInput& p, const PlayerInput& other) {
+    if (p.kind != 2 || p.handle) return;
+
+    int chosen = -1, fallback = -1;
+    const int joysticks = SDL_NumJoysticks();
+    for (int i = 0; i < joysticks; i++) {
+        if (!SDL_IsGameController(i)) continue;
+        SDL_JoystickGUID g = SDL_JoystickGetDeviceGUID(i);
+        char buf[40] = {0};
+        SDL_JoystickGetGUIDString(g, buf, sizeof(buf));
+        /* Skip a device already opened by the other player. */
+        SDL_JoystickID inst = SDL_JoystickGetDeviceInstanceID(i);
+        if (other.handle && other.instance == inst) continue;
+        if (p.guid[0] && std::strcmp(buf, p.guid) == 0) { chosen = i; break; }
+        if (fallback < 0) fallback = i;
+    }
+    if (chosen < 0) chosen = fallback;
+    if (chosen < 0) return;
+
+    p.handle = SDL_GameControllerOpen(chosen);
+    if (p.handle) {
+        SDL_Joystick* joy = SDL_GameControllerGetJoystick(p.handle);
+        p.instance = joy ? SDL_JoystickInstanceID(joy) : -1;
+        const char* name = SDL_GameControllerName(p.handle);
+        std::fprintf(stdout, "psxrecomp runtime: opened controller for slot: %s\n",
+                     name ? name : "(unnamed)");
     }
 }
 
-static void open_configured_controller(void) {
-    if (sdl_controller) return;
-
-    /* First pass: open the configured device index. Second pass: open the
-     * first available controller — covers Steam Remote Play where the virtual
-     * Xbox controller appears at an unpredictable index, and cases where the
-     * configured index is simply out of range. */
-    for (int pass = 0; pass < 2 && !sdl_controller; pass++) {
-        int seen = 0;
-        int joysticks = SDL_NumJoysticks();
-        for (int i = 0; i < joysticks; i++) {
-            if (!SDL_IsGameController(i)) continue;
-            int match = (pass == 0) ? (seen == controller_device_index) : 1;
-            seen++;
-            if (!match) continue;
-
-            sdl_controller = SDL_GameControllerOpen(i);
-            if (sdl_controller) {
-                SDL_Joystick* joy = SDL_GameControllerGetJoystick(sdl_controller);
-                sdl_controller_instance = joy ? SDL_JoystickInstanceID(joy) : -1;
-                const char* name = SDL_GameControllerName(sdl_controller);
-                std::fprintf(stdout, "psxrecomp runtime: controller %d (pass %d): %s\n",
-                             seen - 1, pass, name ? name : "(unnamed)");
-            }
-            break;
-        }
+/* Open/close SDL handles so they match g_players, and (re)assert each slot's
+ * PSX connection + pad type. Safe to call repeatedly (hotplug, boot). */
+static void refresh_player_devices(void) {
+    for (int s = 0; s < 2; s++) {
+        PlayerInput& p = g_players[s];
+        if (p.kind != 2) close_player(p);           /* keyboard/none: no handle */
+        else open_player(p, g_players[s ^ 1]);
+        sio_set_pad_connected(s, p.kind != 0 ? 1 : 0);
+        sio_set_pad_analog(s, p.analog ? 1 : 0, 0x80, 0x80, 0x80, 0x80);
     }
 }
 
-static bool controller_source_pressed(const ControllerSource& source) {
-    if (!sdl_controller) return false;
+/* Parse a [controller] device string into a player slot:
+ *   "none" -> no pad; "keyboard" -> keyboard map; otherwise an SDL GUID. */
+static void set_player_device(PlayerInput& p, const std::string& dev, bool analog) {
+    p.analog = analog;
+    p.guid[0] = '\0';
+    std::string d = lower_copy(trim_copy(dev));
+    if (d.empty() || d == "none") { p.kind = 0; }
+    else if (d == "keyboard")     { p.kind = 1; }
+    else {
+        p.kind = 2;
+        std::snprintf(p.guid, sizeof(p.guid), "%s", trim_copy(dev).c_str());
+    }
+}
+
+static bool controller_source_pressed_h(SDL_GameController* h, const ControllerSource& source) {
+    if (!h) return false;
 
     switch (source.kind) {
     case ControllerSource::Kind::Button:
         return SDL_GameControllerGetButton(
-            sdl_controller, (SDL_GameControllerButton)source.id) != 0;
+            h, (SDL_GameControllerButton)source.id) != 0;
     case ControllerSource::Kind::AxisPositive:
         return SDL_GameControllerGetAxis(
-            sdl_controller, (SDL_GameControllerAxis)source.id) > controller_deadzone;
+            h, (SDL_GameControllerAxis)source.id) > controller_deadzone;
     case ControllerSource::Kind::AxisNegative:
         return SDL_GameControllerGetAxis(
-            sdl_controller, (SDL_GameControllerAxis)source.id) < -controller_deadzone;
+            h, (SDL_GameControllerAxis)source.id) < -controller_deadzone;
     case ControllerSource::Kind::None:
     default:
         return false;
@@ -924,18 +968,43 @@ static uint16_t pad_from_keyboard(void) {
     return buttons;
 }
 
-static uint16_t merge_controller_pad(uint16_t buttons) {
-    if (!sdl_controller) return buttons;
-
+static uint16_t controller_pad_buttons(SDL_GameController* h) {
+    uint16_t buttons = 0xFFFF;  /* all released */
+    if (!h) return buttons;
     for (const auto& entry : controller_map) {
         for (const auto& source : entry.sources) {
-            if (controller_source_pressed(source)) {
+            if (controller_source_pressed_h(h, source)) {
                 buttons &= (uint16_t)~entry.bit;
                 break;
             }
         }
     }
     return buttons;
+}
+
+/* Map an SDL axis (-32768..32767) to a PSX analog byte (0..255, 0x80 centred). */
+static uint8_t axis_to_pad_byte(int16_t v) {
+    int b = ((int)v + 32768) >> 8;  /* 0..255 */
+    if (b < 0) b = 0; else if (b > 255) b = 255;
+    return (uint8_t)b;
+}
+
+/* Buttons for a player's selected device (0xFFFF = none pressed). */
+static uint16_t pad_buttons_for(const PlayerInput& p) {
+    if (p.kind == 1) return pad_from_keyboard();
+    if (p.kind == 2) return controller_pad_buttons(p.handle);
+    return 0xFFFF;
+}
+
+/* Analog stick bytes (lx,ly,rx,ry) for a player; centred if no live source. */
+static void pad_sticks_for(const PlayerInput& p, uint8_t out[4]) {
+    out[0] = out[1] = out[2] = out[3] = 0x80;
+    if (p.kind == 2 && p.handle) {
+        out[0] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTX));
+        out[1] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTY));
+        out[2] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTX));
+        out[3] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTY));
+    }
 }
 
 /* PSX native vblank cadence: NTSC ≈ 59.94 Hz. Wall-clock target keeps
@@ -978,11 +1047,12 @@ static void sdl_vblank_present(void) {
             shutdown_runtime();
             std::exit(0);
         } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
-            open_configured_controller();
+            refresh_player_devices();
         } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
-            if (ev.cdevice.which == sdl_controller_instance) {
+            if (ev.cdevice.which == g_players[0].instance ||
+                ev.cdevice.which == g_players[1].instance) {
                 close_controller();
-                open_configured_controller();
+                refresh_player_devices();
             }
         } else if (ev.type == SDL_KEYDOWN) {
             /* Fullscreen toggle: F11, Alt+Enter, or Cmd/Ctrl+F.
@@ -1000,15 +1070,22 @@ static void sdl_vblank_present(void) {
         }
     }
 
-    /* Sample keyboard state and feed into SIO controller.
-     * Debug server input override takes priority if active. */
-    uint16_t pad_buttons_this_frame;
+    /* Sample each player's device and feed the matching SIO pad slot.
+     * Debug server input override (when active) drives port 1 only. */
     if (override >= 0) {
-        pad_buttons_this_frame = (uint16_t)override;
+        sio_set_pad_state_slot(0, (uint16_t)override);
     } else {
-        pad_buttons_this_frame = merge_controller_pad(pad_from_keyboard());
+        for (int s = 0; s < 2; s++) {
+            const PlayerInput& p = g_players[s];
+            if (p.kind == 0) continue;  /* no device in this port */
+            sio_set_pad_state_slot(s, pad_buttons_for(p));
+            if (p.analog) {
+                uint8_t st[4];
+                pad_sticks_for(p, st);
+                sio_set_pad_analog(s, 1, st[0], st[1], st[2], st[3]);
+            }
+        }
     }
-    sio_set_pad_state(pad_buttons_this_frame);
 
     /* Turbo-active test, shared by the audio gate here and the pacing/
      * present gate below. sdl_audio_update owns the mute + fade-in/out +
@@ -1239,6 +1316,11 @@ int main(int argc, char** argv) {
     std::filesystem::path memcard2_path;   /* explicit slot-2 .mcd (empty => dir/card2.mcd) */
     bool memcard1_enabled = true;
     bool memcard2_enabled = true;
+    /* [controller] device routing (defaults: P1 keyboard/digital, P2 none). */
+    std::string p1_device = "keyboard";
+    std::string p2_device = "none";
+    bool p1_analog = false;
+    bool p2_analog = false;
     std::filesystem::path resolved_disc;
     std::string window_title = PSX_WINDOW_TITLE;
     uint16_t   debug_port    = (uint16_t)DEFAULT_DEBUG_PORT;
@@ -1340,6 +1422,10 @@ int main(int argc, char** argv) {
         if (us.has_memcard2_path)    memcard2_path    = us.memcard2_path;
         if (us.has_memcard1_enabled) memcard1_enabled = us.memcard1_enabled;
         if (us.has_memcard2_enabled) memcard2_enabled = us.memcard2_enabled;
+        if (us.has_p1_device) p1_device = us.p1_device;
+        if (us.has_p2_device) p2_device = us.p2_device;
+        if (us.has_p1_analog) p1_analog = us.p1_analog;
+        if (us.has_p2_analog) p2_analog = us.p2_analog;
     }
 
     /* Resolve the effective memory-card directory now (before the launcher) so
@@ -1355,7 +1441,7 @@ int main(int argc, char** argv) {
      * window is created, so the emulator boot path below is untouched. Skipped
      * via PSX_NO_LAUNCHER=1 (e.g. CI / scripted runs). */
     if (!std::getenv("PSX_NO_LAUNCHER")) {
-        if (SDL_Init(SDL_INIT_VIDEO) == 0) {
+        if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) == 0) {
             PSXRecompV4::UserSettings seed;
             seed.renderer = g_video_renderer;             seed.has_renderer = true;
             seed.supersampling = g_video_scale;           seed.has_supersampling = true;
@@ -1370,6 +1456,10 @@ int main(int argc, char** argv) {
             seed.memcard2_enabled = memcard2_enabled; seed.has_memcard2_enabled = true;
             if (!memcard1_path.empty()) { seed.memcard1_path = memcard1_path; seed.has_memcard1_path = true; }
             if (!memcard2_path.empty()) { seed.memcard2_path = memcard2_path; seed.has_memcard2_path = true; }
+            seed.p1_device = p1_device; seed.has_p1_device = true;
+            seed.p2_device = p2_device; seed.has_p2_device = true;
+            seed.p1_analog = p1_analog; seed.has_p1_analog = true;
+            seed.p2_analog = p2_analog; seed.has_p2_analog = true;
 
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -1421,6 +1511,8 @@ int main(int argc, char** argv) {
                 memcard2_enabled = seed.memcard2_enabled;
                 if (seed.has_memcard1_path) memcard1_path = seed.memcard1_path;
                 if (seed.has_memcard2_path) memcard2_path = seed.memcard2_path;
+                p1_device = seed.p1_device; p2_device = seed.p2_device;
+                p1_analog = seed.p1_analog; p2_analog = seed.p2_analog;
                 /* Persist the user's choices next to the exe. */
                 PSXRecompV4::save_user_settings(
                     exe_dir_from_argv(argv[0]) / "settings.toml", seed);
@@ -1482,7 +1574,16 @@ int main(int argc, char** argv) {
     timers_init();
     interrupts_init();
     sio_init();
-    sio_connect_pad(0);  /* Controller on port 1 */
+    /* Seed per-player device routing from the resolved [controller] config.
+     * SDL controller handles are opened later (after SDL_Init); here we only
+     * set the PSX-visible connection + pad type so the BIOS sees the right
+     * ports during early boot. */
+    set_player_device(g_players[0], p1_device, p1_analog);
+    set_player_device(g_players[1], p2_device, p2_analog);
+    for (int s = 0; s < 2; s++) {
+        sio_set_pad_connected(s, g_players[s].kind != 0 ? 1 : 0);
+        sio_set_pad_analog(s, g_players[s].analog ? 1 : 0, 0x80, 0x80, 0x80, 0x80);
+    }
     /* SPU float-shadow gate must be set before spu_init() (which runs
      * spu_shadow_reset()). Default OFF; PSX_AUDIO_SHADOW env overrides. */
     spu_shadow_set_enabled(g_audio_spu_hq ? 1 : 0);
@@ -1542,7 +1643,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     load_input_config(argv[0]);
-    open_configured_controller();
+    refresh_player_devices();  /* open SDL handles to match the player config */
 #ifndef PSX_SDL_NO_AUDIO
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
         SDL_AudioSpec want;

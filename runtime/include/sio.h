@@ -55,15 +55,29 @@ uint64_t sio_get_advance_with_work(void);
 
 /* Update pad button state. Buttons use PS1 convention: 0=pressed, 1=released.
    Bit layout: SELECT, L3, R3, START, UP, RIGHT, DOWN, LEFT,
-               L2, R2, L1, R1, TRIANGLE, CIRCLE, CROSS, SQUARE */
+               L2, R2, L1, R1, TRIANGLE, CIRCLE, CROSS, SQUARE
+   sio_set_pad_state targets port 1 (slot 0); the _slot form targets either. */
 void sio_set_pad_state(uint16_t buttons);
+void sio_set_pad_state_slot(int slot, uint16_t buttons);
 
-/* Connect a pad to a slot (0=port1, 1=port2). By default no pads are
- * connected during initial BIOS boot. */
+/* Set the analog stick state + pad type for a slot. enabled selects the
+ * emulated pad: 0 = digital (poll id 0x41), 1 = DualShock/analog (poll id
+ * 0x73, with the four 0..255 stick axes appended; 0x80 = centred). */
+void sio_set_pad_analog(int slot, int enabled,
+                        uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
+
+/* Connect / disconnect a pad on a slot (0=port1, 1=port2). By default no pads
+ * are connected during initial BIOS boot. */
 void sio_connect_pad(int slot);
+void sio_set_pad_connected(int slot, int connected);
 
-/* Return current pad button state (for debug server). */
+/* Return current pad button state (for debug server). _slot targets either. */
 uint16_t sio_get_pad_buttons(void);
+uint16_t sio_get_pad_buttons_slot(int slot);
+
+/* Debug accessors: is a pad connected on the slot, and is it in analog mode. */
+int sio_get_pad_connected(int slot);
+int sio_get_pad_analog(int slot);
 
 /* ---- SIO byte-level trace ring buffer ----
  * 1M entries × ~28 B ≈ 32 MB.  At ~600 byte/sec that's ~30 min of history. */
