@@ -93,6 +93,11 @@ struct RuntimeConfig {
     // texture_filtering: "nearest" (default, native PSX look) | "bilinear"
     // (smooths textures and 2D backgrounds). Stored as 0/1.
     int                   video_texture_filter = 0;
+
+    // renderer: "software" (default) | "opengl". Selects the rasterizer/present
+    // backend. The OpenGL backend is a hardware-accelerated alternative; the
+    // software rasterizer remains the fallback. Stored as 0=software, 1=opengl.
+    int                   video_renderer = 0;
 };
 
 // One entry from [[recompiler.bios_vectors]].

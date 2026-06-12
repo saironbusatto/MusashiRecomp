@@ -149,9 +149,58 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
             "    \"code\": \"0x%08lX\",\n"
             "    \"address\": \"%p\",\n"
             "    \"access\": \"%s\",\n"
-            "    \"fault_addr\": \"0x%p\"\n"
-            "  },\n",
+            "    \"fault_addr\": \"0x%p\",\n",
             code, addr, kind, (void *)fault_addr);
+
+        /* Module-relative location of the faulting instruction, so the
+         * address survives ASLR and feeds straight into addr2line. */
+        {
+            MEMORY_BASIC_INFORMATION mbi;
+            char mod_name[MAX_PATH] = "?";
+            void *mod_base = NULL;
+            if (VirtualQuery(addr, &mbi, sizeof(mbi))) {
+                mod_base = mbi.AllocationBase;
+                GetModuleFileNameA((HMODULE)mod_base, mod_name, sizeof(mod_name));
+            }
+            append_fmt(buf, sizeof(buf), &pos,
+                "    \"module\": \"%s\",\n"
+                "    \"module_base\": \"%p\",\n"
+                "    \"module_offset\": \"0x%llX\",\n",
+                mod_name, mod_base,
+                (unsigned long long)((char *)addr - (char *)mod_base));
+        }
+
+        /* Poor-man's backtrace: scan the faulting thread's stack for values
+         * that point into executable module regions and report them
+         * module-relative. Noisy but enough to pin the faulting call path. */
+        append_str(buf, sizeof(buf), &pos, "    \"stack_scan\": [");
+        {
+            CONTEXT *ctx = info->ContextRecord;
+            ULONG_PTR *sp = (ULONG_PTR *)ctx->Rsp;
+            int emitted = 0;
+            for (int i = 0; i < 512 && emitted < 24; i++) {
+                ULONG_PTR v;
+                MEMORY_BASIC_INFORMATION mbi;
+                if (!VirtualQuery(&sp[i], &mbi, sizeof(mbi)) ||
+                    !(mbi.State & MEM_COMMIT)) break;
+                v = sp[i];
+                if (v < 0x10000) continue;
+                if (!VirtualQuery((void *)v, &mbi, sizeof(mbi))) continue;
+                if (mbi.Type != MEM_IMAGE) continue;
+                if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                     PAGE_EXECUTE_READWRITE))) continue;
+                char mod_name[MAX_PATH] = "?";
+                GetModuleFileNameA((HMODULE)mbi.AllocationBase, mod_name,
+                                   sizeof(mod_name));
+                const char *base = strrchr(mod_name, '\\');
+                append_fmt(buf, sizeof(buf), &pos,
+                    "%s\n      {\"module\": \"%s\", \"offset\": \"0x%llX\"}",
+                    emitted ? "," : "", base ? base + 1 : mod_name,
+                    (unsigned long long)(v - (ULONG_PTR)mbi.AllocationBase));
+                emitted++;
+            }
+        }
+        append_str(buf, sizeof(buf), &pos, "\n    ]\n  },\n");
     }
 #else
     (void)seh_info;

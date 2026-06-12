@@ -7,6 +7,12 @@
  * Same function names and protocol as nesrecomp/snesrecomp versions
  * so TCP.md and DEBUG.md are reusable across projects.
  */
+/* Expose POSIX clock_gettime()/CLOCK_MONOTONIC (used by monotonic_ms) on
+ * glibc — must precede any system header. Harmless on Windows/macOS. */
+#ifndef _POSIX_C_SOURCE
+#  define _POSIX_C_SOURCE 200809L
+#endif
+#include <time.h>
 #include "debug_server.h"
 #include "overlay_loader.h"
 #include "overlay_capture.h"
@@ -25,6 +31,7 @@
 #include "card_read_summary.h"
 #include "card_data_writes.h"
 #include "crash_trace.h"
+#include "gpu_gl_renderer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +55,7 @@
 #else
 #  include <sys/socket.h>
 #  include <netinet/in.h>
+#  include <sys/time.h>     /* struct timeval — socket send/recv timeouts */
 #  include <unistd.h>
 #  include <fcntl.h>
 #  include <errno.h>
@@ -5544,14 +5552,121 @@ static void handle_get_snapshots(int id, const char *json)
              s_snapshot_addrs[3], s_snapshot_active[3]);
 }
 
-/* Unified screenshot: writes a 24-bit BMP of the current display to "path"
- * (default psx_screenshot.bmp in the runtime cwd) and answers with a single
+/* ---- Minimal self-contained PNG writer ------------------------------------
+ * Emits a valid 8-bit truecolor (RGB) PNG with zero external dependencies: the
+ * IDAT payload is a zlib stream whose DEFLATE body is "stored" (uncompressed)
+ * blocks. Bigger on disk than a compressed PNG, but a real PNG that every
+ * viewer (and the harness Read tool) accepts, and nothing new to link against
+ * — which keeps the self-contained static runtime self-contained. */
+static uint32_t s_png_crc_tbl[256];
+static int      s_png_crc_init = 0;
+static void png_crc_build(void) {
+    for (uint32_t n = 0; n < 256; n++) {
+        uint32_t c = n;
+        for (int k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+        s_png_crc_tbl[n] = c;
+    }
+    s_png_crc_init = 1;
+}
+static uint32_t png_crc_update(uint32_t crc, const uint8_t *p, size_t n) {
+    if (!s_png_crc_init) png_crc_build();
+    for (size_t i = 0; i < n; i++) crc = s_png_crc_tbl[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    return crc;
+}
+static uint32_t png_adler32(const uint8_t *p, size_t n) {
+    uint32_t a = 1, b = 0;
+    /* process in blocks so the 16-bit sums never overflow before the mod */
+    while (n) {
+        size_t k = n < 5552 ? n : 5552;
+        for (size_t i = 0; i < k; i++) { a += p[i]; b += a; }
+        a %= 65521; b %= 65521; p += k; n -= k;
+    }
+    return (b << 16) | a;
+}
+static void png_put_be32(FILE *f, uint32_t v) {
+    uint8_t b[4] = { (uint8_t)(v >> 24), (uint8_t)(v >> 16),
+                     (uint8_t)(v >> 8), (uint8_t)v };
+    fwrite(b, 1, 4, f);
+}
+static void png_chunk(FILE *f, const char *type, const uint8_t *data, size_t len) {
+    png_put_be32(f, (uint32_t)len);
+    uint32_t crc = 0xFFFFFFFFu;
+    crc = png_crc_update(crc, (const uint8_t *)type, 4);
+    crc = png_crc_update(crc, data, len);
+    fwrite(type, 1, 4, f);
+    if (len) fwrite(data, 1, len, f);
+    png_put_be32(f, crc ^ 0xFFFFFFFFu);
+}
+/* Write an RGB (3 bytes/pixel, top-down) buffer as a PNG. Returns 1 on success. */
+static int png_write_rgb(FILE *f, const uint8_t *rgb, uint32_t w, uint32_t h) {
+    static const uint8_t sig[8] = { 137,80,78,71,13,10,26,10 };
+    fwrite(sig, 1, 8, f);
+
+    uint8_t ihdr[13];
+    ihdr[0]=(uint8_t)(w>>24); ihdr[1]=(uint8_t)(w>>16); ihdr[2]=(uint8_t)(w>>8); ihdr[3]=(uint8_t)w;
+    ihdr[4]=(uint8_t)(h>>24); ihdr[5]=(uint8_t)(h>>16); ihdr[6]=(uint8_t)(h>>8); ihdr[7]=(uint8_t)h;
+    ihdr[8]=8;   /* bit depth   */
+    ihdr[9]=2;   /* color type 2 = truecolor RGB */
+    ihdr[10]=0;  /* compression */
+    ihdr[11]=0;  /* filter      */
+    ihdr[12]=0;  /* interlace   */
+    png_chunk(f, "IHDR", ihdr, sizeof ihdr);
+
+    /* Filtered raw scanlines: each row prefixed with filter byte 0 (None). */
+    size_t raw_len = (size_t)h * (1 + (size_t)w * 3);
+    uint8_t *raw = (uint8_t *)malloc(raw_len);
+    if (!raw) return 0;
+    for (uint32_t y = 0; y < h; y++) {
+        uint8_t *row = raw + (size_t)y * (1 + (size_t)w * 3);
+        row[0] = 0;
+        memcpy(row + 1, rgb + (size_t)y * w * 3, (size_t)w * 3);
+    }
+
+    /* zlib stream: 2-byte header + stored DEFLATE blocks + 4-byte Adler32. */
+    size_t nblocks = (raw_len + 65534) / 65535; if (nblocks == 0) nblocks = 1;
+    size_t z_len = 2 + nblocks * 5 + raw_len + 4;
+    uint8_t *z = (uint8_t *)malloc(z_len);
+    if (!z) { free(raw); return 0; }
+    size_t zi = 0;
+    z[zi++] = 0x78;  /* CMF: 32K window, deflate */
+    z[zi++] = 0x01;  /* FLG: check bits make 0x7801 a multiple of 31 */
+    size_t off = 0;
+    while (off < raw_len) {
+        size_t n = raw_len - off; if (n > 65535) n = 65535;
+        int final = (off + n >= raw_len);
+        z[zi++] = (uint8_t)(final ? 1 : 0);          /* BFINAL | BTYPE=00 */
+        z[zi++] = (uint8_t)(n & 0xFF); z[zi++] = (uint8_t)(n >> 8);
+        uint16_t nl = (uint16_t)~n;
+        z[zi++] = (uint8_t)(nl & 0xFF); z[zi++] = (uint8_t)(nl >> 8);
+        memcpy(z + zi, raw + off, n); zi += n; off += n;
+    }
+    uint32_t ad = png_adler32(raw, raw_len);
+    z[zi++] = (uint8_t)(ad >> 24); z[zi++] = (uint8_t)(ad >> 16);
+    z[zi++] = (uint8_t)(ad >> 8);  z[zi++] = (uint8_t)ad;
+    free(raw);
+
+    png_chunk(f, "IDAT", z, zi);
+    free(z);
+    png_chunk(f, "IEND", NULL, 0);
+    return 1;
+}
+
+/* Unified screenshot: writes an 8-bit RGB PNG of the current display to "path"
+ * (default psx_screenshot.png in the runtime cwd) and answers with a single
  * metadata line.  Registered as both "screenshot" and "screenshot_file";
  * the old "screenshot" inline-hex-row variant streamed h+1 response lines
  * per request, which violated the one-request/one-response protocol and
  * poisoned every client connection that used it. */
 static void handle_screenshot_file(int id, const char *json)
 {
+    /* Under the OpenGL FBO-present path, CPU VRAM can be stale (the FBO holds
+     * the freshest frame and is presented without a readback). Sync it down so
+     * the capture reflects what's on screen. No-op for the software backend or
+     * when no GPU frame is pending. Safe here: the debug server is pumped on
+     * the main (GL-context) thread. */
+    extern void gl_renderer_sync_cpu(void);
+    gl_renderer_sync_cpu();
+
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
     if (di.disabled || di.width == 0 || di.height == 0) {
@@ -5563,50 +5678,26 @@ static void handle_screenshot_file(int id, const char *json)
 
     char path[512];
     if (!json_get_str(json, "path", path, sizeof(path)))
-        strncpy(path, "psx_screenshot.bmp", sizeof(path) - 1);
+        strncpy(path, "psx_screenshot.png", sizeof(path) - 1);
     path[sizeof(path) - 1] = '\0';
     FILE *f = fopen(path, "wb");
     if (!f) { send_err(id, "cannot open file"); return; }
 
-    /* BMP row stride: 3 bytes/pixel, padded to 4-byte boundary */
-    uint32_t row_stride = (w * 3 + 3) & ~3u;
-    uint32_t pixel_size = row_stride * h;
-    uint32_t file_size = 14 + 40 + pixel_size;
-
-    /* BITMAPFILEHEADER (14 bytes) */
-    uint8_t bfh[14] = {0};
-    bfh[0] = 'B'; bfh[1] = 'M';
-    bfh[2] = file_size & 0xFF; bfh[3] = (file_size >> 8) & 0xFF;
-    bfh[4] = (file_size >> 16) & 0xFF; bfh[5] = (file_size >> 24) & 0xFF;
-    bfh[10] = 54; /* offset to pixel data */
-    fwrite(bfh, 1, 14, f);
-
-    /* BITMAPINFOHEADER (40 bytes) */
-    uint8_t bih[40] = {0};
-    bih[0] = 40; /* header size */
-    bih[4] = w & 0xFF; bih[5] = (w >> 8) & 0xFF;
-    /* Height negative = top-down */
-    int32_t neg_h = -(int32_t)h;
-    memcpy(bih + 8, &neg_h, 4);
-    bih[12] = 1;  /* planes */
-    bih[14] = 24; /* bits per pixel */
-    fwrite(bih, 1, 40, f);
-
-    /* Pixel data: top-down, BGR */
-    uint8_t *row = (uint8_t *)malloc(row_stride);
+    /* Gather pixels top-down, RGB. */
+    uint8_t *rgb = (uint8_t *)malloc((size_t)w * h * 3);
+    if (!rgb) { fclose(f); send_err(id, "alloc failed"); return; }
     for (uint32_t y = 0; y < h; y++) {
-        memset(row, 0, row_stride);
         for (uint32_t x = 0; x < w; x++) {
             uint8_t r, g, b;
             gpu_display_pixel_rgb(&di, x, y, &r, &g, &b);
-            row[x * 3 + 0] = b;
-            row[x * 3 + 1] = g;
-            row[x * 3 + 2] = r;
+            uint8_t *p = rgb + ((size_t)y * w + x) * 3;
+            p[0] = r; p[1] = g; p[2] = b;
         }
-        fwrite(row, 1, row_stride, f);
     }
-    free(row);
+    int ok = png_write_rgb(f, rgb, w, h);
+    free(rgb);
     fclose(f);
+    if (!ok) { send_err(id, "png encode failed"); return; }
 
     send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%u,\"height\":%u}",
              id, path, w, h);
@@ -5635,6 +5726,119 @@ static void handle_vram_peek(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"hex\":\"%s\"}",
              id, x, y, w, h, hex);
     free(hex);
+}
+
+/* GL-backend diagnostic: peek the GPU-side (FBO) VRAM for a rect, plus the
+ * coherency flags/rects — lets probes diff FBO truth against CPU truth. */
+extern int  gl_renderer_fbo_peek(int x, int y, int w, int h, uint16_t *out);
+extern void gl_renderer_diag(int *gpu_dirty, int pending[5], int pack[5]);
+
+static void handle_gl_fbo_peek(int id, const char *json)
+{
+    int x = json_get_int(json, "x", 0);
+    int y = json_get_int(json, "y", 0);
+    int w = json_get_int(json, "w", 8);
+    int h = json_get_int(json, "h", 1);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (w > 128) w = 128;
+    if (h > 128) h = 128;
+    uint16_t px[128 * 128];
+    if (!gl_renderer_fbo_peek(x, y, w, h, px)) {
+        send_err(id, "GL pipeline inactive or rect out of range"); return;
+    }
+    int gpu_dirty = 0, pend[5] = {0}, pack[5] = {0};
+    gl_renderer_diag(&gpu_dirty, pend, pack);
+    size_t hex_len = (size_t)w * h * 4 + 1;
+    char *hex = (char *)malloc(hex_len);
+    if (!hex) { send_err(id, "alloc failed"); return; }
+    int pos = 0;
+    for (int i = 0; i < w * h; i++)
+        pos += snprintf(hex + pos, hex_len - pos, "%04x", px[i]);
+    send_fmt("{\"id\":%d,\"ok\":true,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,"
+             "\"gpu_dirty\":%d,"
+             "\"pending\":[%d,%d,%d,%d,%d],\"pack\":[%d,%d,%d,%d,%d],"
+             "\"hex\":\"%s\"}",
+             id, x, y, w, h, gpu_dirty,
+             pend[0], pend[1], pend[2], pend[3], pend[4],
+             pack[0], pack[1], pack[2], pack[3], pack[4], hex);
+    free(hex);
+}
+
+extern int gl_renderer_vram_diff(uint32_t *count, int bbox[4],
+                                 int samples[8][2], uint16_t samples_px[8][2]);
+
+static void handle_gl_vram_diff(int id, const char *json)
+{
+    (void)json;
+    uint32_t n = 0;
+    int bbox[4] = {0}, samples[8][2] = {{0}};
+    uint16_t spx[8][2] = {{0}};
+    int r = gl_renderer_vram_diff(&n, bbox, samples, spx);
+    if (!r) { send_err(id, "GL pipeline inactive"); return; }
+    int ns = r - 1;
+    int gpu_dirty = 0, pend[5] = {0}, pack[5] = {0};
+    gl_renderer_diag(&gpu_dirty, pend, pack);
+    char smp[512]; int pos = 0; smp[0] = 0;
+    for (int i = 0; i < ns; i++)
+        pos += snprintf(smp + pos, sizeof(smp) - pos,
+                        "%s[%d,%d,\"0x%04X\",\"0x%04X\"]", i ? "," : "",
+                        samples[i][0], samples[i][1], spx[i][0], spx[i][1]);
+    send_fmt("{\"id\":%d,\"ok\":true,\"mismatches\":%u,"
+             "\"bbox\":[%d,%d,%d,%d],\"gpu_dirty\":%d,"
+             "\"samples_xy_fbo_cpu\":[%s]}",
+             id, n, bbox[0], bbox[1], bbox[2], bbox[3], gpu_dirty, smp);
+}
+
+/* GL-backend coherency event ring: dump the last n events (default 200),
+ * optionally only events from frame >= frame_min. Always-on capture; this
+ * just reads a window. */
+static const char *gl_coh_kind_name(int k)
+{
+    switch (k) {
+    case GL_COH_FLUSH:    return "flush";
+    case GL_COH_FILL:     return "fill";
+    case GL_COH_COPY_SRC: return "copy_src";
+    case GL_COH_COPY:     return "copy";
+    case GL_COH_DRAW:     return "draw";
+    case GL_COH_PACK:     return "pack";
+    case GL_COH_ENSURE:   return "ensure";
+    case GL_COH_PRESENT:  return "present";
+    case GL_COH_UPLOAD:   return "upload";
+    case GL_COH_PEEK:     return "peek";
+    case GL_COH_DIFF:     return "diff";
+    default:              return "?";
+    }
+}
+
+static void handle_gl_coh_ring(int id, const char *json)
+{
+    int n = json_get_int(json, "n", 200);
+    long frame_min = json_get_int(json, "frame_min", -1);
+    if (n < 1) n = 1;
+    if (n > 8192) n = 8192;
+    uint64_t total = gl_renderer_coh_total();
+    uint64_t start = total > (uint64_t)n ? total - (uint64_t)n : 0;
+    int bufsz = 64 + n * 64;
+    char *buf = (char *)malloc((size_t)bufsz);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    int pos = snprintf(buf, bufsz,
+                       "{\"id\":%d,\"ok\":true,\"total\":%llu,\"events\":[",
+                       id, (unsigned long long)total);
+    int first = 1;
+    for (uint64_t s = start; s < total && pos < bufsz - 128; s++) {
+        GlCohEvent e;
+        if (!gl_renderer_coh_get(s, &e)) continue;
+        if (frame_min >= 0 && e.frame < (uint32_t)frame_min) continue;
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s[%llu,%u,\"%s\",%d,%d,%d,%d]",
+                        first ? "" : ",", (unsigned long long)s, e.frame,
+                        gl_coh_kind_name(e.kind), e.x0, e.y0, e.x1, e.y1);
+        first = 0;
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "]}");
+    send_fmt("%s", buf);
+    free(buf);
 }
 
 /* ---- Write trace: hook + handlers (Tier 1 reverse debugger) ---- */
@@ -8222,6 +8426,9 @@ static const CmdEntry s_commands[] = {
     { "gpu_state",         handle_gpu_state },
     { "mem_words",         handle_mem_words },
     { "vram_peek",         handle_vram_peek },
+    { "gl_coh_ring",       handle_gl_coh_ring },
+    { "gl_fbo_peek",       handle_gl_fbo_peek },
+    { "gl_vram_diff",      handle_gl_vram_diff },
     { "irq_state",         handle_irq_state },
     { "timers_state",      handle_timers_state },
     { "cdrom_state",       handle_cdrom_state },

@@ -47,6 +47,13 @@ void psx_fiber_destroy(psx_fiber_t fiber) { if (fiber) DeleteFiber((LPVOID)fiber
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <signal.h>    /* SIGSTKSZ — minimum fiber stack floor */
+
+/* glibc >= 2.34 no longer exposes SIGSTKSZ as a compile-time constant under
+ * _XOPEN_SOURCE; provide a portable fallback (used only as a stack floor). */
+#ifndef SIGSTKSZ
+#  define SIGSTKSZ 16384
+#endif
 
 #if defined(__clang__) || defined(__GNUC__)
 #  pragma GCC diagnostic ignored "-Wdeprecated-declarations"
