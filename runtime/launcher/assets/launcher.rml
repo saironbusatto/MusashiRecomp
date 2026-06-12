@@ -91,6 +91,7 @@ button:hover { background-color: #232d3c; }
 .switch.on .knob { margin-left: 23dp; }
 
 .card-body { display: flex; flex-direction: row; align-items: center; }
+.card-body.disabled { opacity: 0.4; }
 .pad-art { width: 206dp; height: 128dp; margin-right: 14dp; flex: 0 0 206dp; }
 .pad-art.digital { decorator: image(img/pad_digital.png contain); }
 .pad-art.analog  { decorator: image(img/pad_analog.png contain); }
@@ -125,7 +126,7 @@ button:hover { background-color: #232d3c; }
 .toggle { width: 132dp; text-align: center; }
 .value { color: #ffffff; font-weight: bold; }
 .path { flex: 1 1 auto; min-width: 0dp; margin-left: 12dp; color: #7d8590;
-	white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
+	white-space: nowrap; overflow: hidden; }
 .path.empty { color: #f85149; }
 
 /* ---- footer ---- */
@@ -233,22 +234,17 @@ button:hover { background-color: #232d3c; }
 					<span class="enable-lbl">Enabled</span>
 					<span class="switch" data-class-on="mc1_enabled" data-event-click="toggle_mc1"><span class="knob"></span></span>
 				</div>
-				<div class="card-body">
+				<div class="card-body" data-class-disabled="mc1_enabled == false">
 					<div class="mc-art"></div>
 					<div class="card-col">
-						<div class="mc-name">card1.mcd</div>
-						<div class="mc-btns"><button>Browse</button><button>New</button></div>
+						<div class="mc-name">{{mc1_name}}</div>
+						<div class="mc-btns"><button data-event-click="browse_mc1">Browse</button><button data-event-click="new_mc1">New</button></div>
 						<div class="mc-stats">
-							<div class="mc-stat"><div class="field-lbl">Card Size</div><div class="meta-v">1 MB (15 blocks)</div></div>
-							<div class="mc-stat"><div class="field-lbl">Used Blocks</div><div class="meta-v">7 / 15</div></div>
+							<div class="mc-stat"><div class="field-lbl">Card Size</div><div class="meta-v">{{mc1_size}}</div></div>
+							<div class="mc-stat"><div class="field-lbl">Used Blocks</div><div class="meta-v">{{mc1_used}}</div></div>
 						</div>
-						<div class="blocks">
-							<span class="blk b"></span><span class="blk b"></span><span class="blk b"></span><span class="blk b"></span>
-							<span class="blk b"></span><span class="blk b"></span><span class="blk b"></span><span class="blk"></span>
-							<span class="blk"></span><span class="blk"></span><span class="blk"></span><span class="blk"></span>
-							<span class="blk"></span><span class="blk"></span><span class="blk"></span>
-						</div>
-						<div class="mc-foot">Last modified — today</div>
+						<div class="blocks" data-rml="mc1_grid"></div>
+						<div class="mc-foot">{{mc1_foot}}</div>
 					</div>
 				</div>
 			</div>
@@ -258,22 +254,17 @@ button:hover { background-color: #232d3c; }
 					<span class="enable-lbl">Enabled</span>
 					<span class="switch" data-class-on="mc2_enabled" data-event-click="toggle_mc2"><span class="knob"></span></span>
 				</div>
-				<div class="card-body">
+				<div class="card-body" data-class-disabled="mc2_enabled == false">
 					<div class="mc-art"></div>
 					<div class="card-col">
-						<div class="mc-name">card2.mcd</div>
-						<div class="mc-btns"><button>Browse</button><button>New</button></div>
+						<div class="mc-name">{{mc2_name}}</div>
+						<div class="mc-btns"><button data-event-click="browse_mc2">Browse</button><button data-event-click="new_mc2">New</button></div>
 						<div class="mc-stats">
-							<div class="mc-stat"><div class="field-lbl">Card Size</div><div class="meta-v">1 MB (15 blocks)</div></div>
-							<div class="mc-stat"><div class="field-lbl">Used Blocks</div><div class="meta-v">2 / 15</div></div>
+							<div class="mc-stat"><div class="field-lbl">Card Size</div><div class="meta-v">{{mc2_size}}</div></div>
+							<div class="mc-stat"><div class="field-lbl">Used Blocks</div><div class="meta-v">{{mc2_used}}</div></div>
 						</div>
-						<div class="blocks">
-							<span class="blk p"></span><span class="blk p"></span><span class="blk"></span><span class="blk"></span>
-							<span class="blk"></span><span class="blk"></span><span class="blk"></span><span class="blk"></span>
-							<span class="blk"></span><span class="blk"></span><span class="blk"></span><span class="blk"></span>
-							<span class="blk"></span><span class="blk"></span><span class="blk"></span>
-						</div>
-						<div class="mc-foot">Last modified — today</div>
+						<div class="blocks" data-rml="mc2_grid"></div>
+						<div class="mc-foot">{{mc2_foot}}</div>
 					</div>
 				</div>
 			</div>

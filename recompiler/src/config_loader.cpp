@@ -527,6 +527,20 @@ UserSettings load_user_settings(const fs::path& path) {
             const auto p = toml::find<std::string>(m, "dir");
             if (!p.empty()) { s.memcard_dir = fs::path(p); s.has_memcard_dir = true; }
         });
+        if (m.contains("card1")) try_get([&]{
+            const auto p = toml::find<std::string>(m, "card1");
+            if (!p.empty()) { s.memcard1_path = fs::path(p); s.has_memcard1_path = true; }
+        });
+        if (m.contains("card2")) try_get([&]{
+            const auto p = toml::find<std::string>(m, "card2");
+            if (!p.empty()) { s.memcard2_path = fs::path(p); s.has_memcard2_path = true; }
+        });
+        if (m.contains("enable1")) try_get([&]{
+            s.memcard1_enabled = toml::find<bool>(m, "enable1"); s.has_memcard1_enabled = true;
+        });
+        if (m.contains("enable2")) try_get([&]{
+            s.memcard2_enabled = toml::find<bool>(m, "enable2"); s.has_memcard2_enabled = true;
+        });
     }
     return s;
 }
@@ -570,8 +584,20 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "\n[bios]\npath = \"" << fwd(s.bios_path) << "\"\n";
     if (s.has_disc_path)
         f << "\n[disc]\npath = \"" << fwd(s.disc_path) << "\"\n";
-    if (s.has_memcard_dir)
-        f << "\n[memcard]\ndir = \"" << fwd(s.memcard_dir) << "\"\n";
+    if (s.has_memcard_dir || s.has_memcard1_path || s.has_memcard2_path ||
+        s.has_memcard1_enabled || s.has_memcard2_enabled) {
+        f << "\n[memcard]\n";
+        if (s.has_memcard_dir)
+            f << "dir     = \"" << fwd(s.memcard_dir) << "\"\n";
+        if (s.has_memcard1_path)
+            f << "card1   = \"" << fwd(s.memcard1_path) << "\"\n";
+        if (s.has_memcard2_path)
+            f << "card2   = \"" << fwd(s.memcard2_path) << "\"\n";
+        if (s.has_memcard1_enabled)
+            f << "enable1 = " << (s.memcard1_enabled ? "true" : "false") << "\n";
+        if (s.has_memcard2_enabled)
+            f << "enable2 = " << (s.memcard2_enabled ? "true" : "false") << "\n";
+    }
 
     return f.good();
 }

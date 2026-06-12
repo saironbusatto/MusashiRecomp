@@ -16,10 +16,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
-#else
-#include <sys/stat.h>
 #endif
 
 #define MAX_CARDS 2
@@ -93,7 +92,7 @@ static void memcard_ensure_dir(const char* dir) {
 #endif
 }
 
-void memcard_init(const char* dir) {
+void memcard_init_slots(const char* dir, const MemcardSlotConfig slots[2]) {
     memset(cards, 0, sizeof(cards));
     memcard_ensure_dir(dir);
 
@@ -101,31 +100,100 @@ void memcard_init(const char* dir) {
         cards[i].present = 0;
         cards[i].dirty = 0;
 
-        if (dir) {
+        const int enabled = slots ? slots[i].enabled : 1;
+        const char* path  = slots ? slots[i].path : NULL;
+        if (!enabled) continue;  /* slot empty: no card inserted */
+
+        if (path && path[0]) {
+            snprintf(cards[i].filepath, sizeof(cards[i].filepath), "%s", path);
+        } else if (dir) {
             snprintf(cards[i].filepath, sizeof(cards[i].filepath),
                      "%s/card%d.mcd", dir, i + 1);
+        } else {
+            continue;  /* no path and no dir: cannot resolve a file */
+        }
 
-            FILE* f = fopen(cards[i].filepath, "rb");
+        FILE* f = fopen(cards[i].filepath, "rb");
+        if (f) {
+            size_t n = fread(cards[i].data, 1, MEMCARD_SIZE, f);
+            fclose(f);
+            if (n == MEMCARD_SIZE) {
+                cards[i].present = 1;
+            }
+        } else {
+            memcard_format(cards[i].data);
+            f = fopen(cards[i].filepath, "wb");
             if (f) {
-                size_t n = fread(cards[i].data, 1, MEMCARD_SIZE, f);
-                fclose(f);
-                if (n == MEMCARD_SIZE) {
+                size_t n = fwrite(cards[i].data, 1, MEMCARD_SIZE, f);
+                int flush_ok = (fflush(f) == 0);
+                int close_ok = (fclose(f) == 0);
+                if (n == MEMCARD_SIZE && flush_ok && close_ok) {
                     cards[i].present = 1;
-                }
-            } else {
-                memcard_format(cards[i].data);
-                f = fopen(cards[i].filepath, "wb");
-                if (f) {
-                    size_t n = fwrite(cards[i].data, 1, MEMCARD_SIZE, f);
-                    int flush_ok = (fflush(f) == 0);
-                    int close_ok = (fclose(f) == 0);
-                    if (n == MEMCARD_SIZE && flush_ok && close_ok) {
-                        cards[i].present = 1;
-                    }
                 }
             }
         }
     }
+}
+
+void memcard_init(const char* dir) {
+    const MemcardSlotConfig both[2] = { { NULL, 1 }, { NULL, 1 } };
+    memcard_init_slots(dir, both);
+}
+
+int memcard_format_file(const char* path) {
+    if (!path || !path[0]) return -1;
+    uint8_t* data = (uint8_t*)malloc(MEMCARD_SIZE);
+    if (!data) return -1;
+    memcard_format(data);
+    FILE* f = fopen(path, "wb");
+    int ok = 0;
+    if (f) {
+        size_t n = fwrite(data, 1, MEMCARD_SIZE, f);
+        int flush_ok = (fflush(f) == 0);
+        int close_ok = (fclose(f) == 0);
+        ok = (n == MEMCARD_SIZE && flush_ok && close_ok);
+    }
+    free(data);
+    return ok ? 0 : -1;
+}
+
+int memcard_summary_path(const char* path, MemcardSummary* out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof(*out));
+    out->total_blocks = 15;
+    if (!path || !path[0]) return 0;
+
+    FILE* f = fopen(path, "rb");
+    if (!f) return 0;
+    out->exists = 1;
+
+    uint8_t* data = (uint8_t*)malloc(MEMCARD_SIZE);
+    if (!data) { fclose(f); return 0; }
+    size_t n = fread(data, 1, MEMCARD_SIZE, f);
+    fclose(f);
+    out->size_bytes = (long long)n;
+
+    if (n == MEMCARD_SIZE && data[0] == 'M' && data[1] == 'C') {
+        out->valid = 1;
+        /* Directory frames 1..15: byte 0 is the block-allocation status.
+         * 0xA0 = free; 0x51/0x52/0x53 = occupied (first/middle/last). */
+        for (int s = 1; s <= 15; s++) {
+            const uint8_t status = data[s * 128];
+            const int used = ((status & 0xF0) == 0x50);
+            out->block_used[s - 1] = (uint8_t)(used ? 1 : 0);
+            if (used) out->used_blocks++;
+        }
+    }
+    free(data);
+
+#ifdef _WIN32
+    struct _stat64 st;
+    if (_stat64(path, &st) == 0) out->mtime = (long long)st.st_mtime;
+#else
+    struct stat st;
+    if (stat(path, &st) == 0) out->mtime = (long long)st.st_mtime;
+#endif
+    return 0;
 }
 
 int memcard_read_sector(int card, int sector, uint8_t* buf) {

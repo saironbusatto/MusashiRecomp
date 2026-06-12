@@ -220,6 +220,12 @@ struct UserSettings {
     bool has_bios_path      = false; std::filesystem::path bios_path;
     bool has_disc_path      = false; std::filesystem::path disc_path;
     bool has_memcard_dir    = false; std::filesystem::path memcard_dir;
+    // Per-slot memory-card overrides. An explicit card path overrides the
+    // <dir>/card<N>.mcd default; the enable flag inserts/removes the card.
+    bool has_memcard1_path    = false; std::filesystem::path memcard1_path;
+    bool has_memcard2_path    = false; std::filesystem::path memcard2_path;
+    bool has_memcard1_enabled = false; bool memcard1_enabled = true;
+    bool has_memcard2_enabled = false; bool memcard2_enabled = true;
 };
 
 // Load settings.toml. Returns an all-defaults (all has_*=false) struct if the

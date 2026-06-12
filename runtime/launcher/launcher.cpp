@@ -10,6 +10,10 @@
 #include "config_loader.h"
 #include "disc_identity.h"
 
+extern "C" {
+#include "memcard.h"
+}
+
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Context.h>
 #include <RmlUi/Core/DataModelHandle.h>
@@ -23,8 +27,10 @@
 #include <SDL.h>
 
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -69,6 +75,22 @@ public:
     }
 };
 
+// Route RmlUi's own diagnostics to stdout. The base SystemInterface logs via
+// OutputDebugString on Windows (invisible to a normal console/redirect), which
+// hides data-binding errors; surfacing them here keeps RML issues debuggable.
+class LauncherSystemInterface : public SystemInterface_SDL {
+public:
+    bool LogMessage(Rml::Log::Type type, const Rml::String& message) override {
+        // Surface problems (warnings/errors/asserts); skip routine info spam.
+        if (type == Rml::Log::LT_INFO || type == Rml::Log::LT_DEBUG) return true;
+        const char* tag = type == Rml::Log::LT_ERROR  ? "error"
+                        : type == Rml::Log::LT_ASSERT ? "assert" : "warning";
+        std::fprintf(stdout, "launcher/rml %s: %s\n", tag, message.c_str());
+        std::fflush(stdout);
+        return true;
+    }
+};
+
 // Mirror of the user-tunable settings, in the value shapes the RML binds to.
 struct LauncherModel {
     int  renderer        = 0;  // 0=software, 1=opengl
@@ -100,17 +122,102 @@ struct LauncherModel {
     // View toggle: "dashboard" (default) | "settings".
     Rml::String view = "dashboard";
 
-    // Player / memory-card cards — shell only this pass; enable toggles are
-    // real bound state so they animate, the rest is static markup until the
-    // Phase 4 (memcard introspection) / Phase 5 (controller enumeration) wiring.
+    // Player cards — shell only this pass; enable toggles are real bound state
+    // so they animate, the rest is static markup until Phase 5 (controllers).
     bool p1_enabled  = true;
     bool p2_enabled  = false;
+
+    // Memory cards — real introspection of the on-disk .mcd images. Each slot
+    // has a resolved file path, an enable toggle, and parsed directory stats.
     bool mc1_enabled = true;
     bool mc2_enabled = true;
+    Rml::String mc1_path,  mc2_path;   // resolved absolute .mcd path
+    Rml::String mc1_name,  mc2_name;   // file name only
+    Rml::String mc1_size,  mc2_size;   // "128 KB (15 blocks)" | "—"
+    Rml::String mc1_used,  mc2_used;   // "7 / 15" | "—"
+    Rml::String mc1_foot,  mc2_foot;   // "Last modified — …" | status line
+    // 15-cell block grids, built as RML markup and injected via data-rml. (A
+    // data-for over a bound array is the natural fit, but the structural
+    // data-for view does not capture inner-xml in this build; data-rml is the
+    // robust path and the markup is fully launcher-controlled.)
+    Rml::String mc1_grid, mc2_grid;
 
     bool launch_requested = false;
     bool quit_requested   = false;
 };
+
+// Format a unix timestamp as e.g. "Jun 12, 2026". Empty for 0/unknown.
+std::string fmt_mtime(long long secs) {
+    if (secs <= 0) return std::string();
+    const std::time_t t = (std::time_t)secs;
+    std::tm tmv{};
+#if defined(_WIN32)
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    char buf[32];
+    if (std::strftime(buf, sizeof(buf), "%b %d, %Y", &tmv) == 0) return std::string();
+    return std::string(buf);
+}
+
+// Resolve a slot's effective .mcd path: explicit override, else <dir>/card<N>.mcd.
+std::string memcard_slot_path(const PSXRecompV4::UserSettings& io, int slot /*0|1*/) {
+    const bool has = slot == 0 ? io.has_memcard1_path : io.has_memcard2_path;
+    const std::filesystem::path& p = slot == 0 ? io.memcard1_path : io.memcard2_path;
+    if (has && !p.empty()) return p.generic_string();
+    fs::path dir = io.has_memcard_dir ? io.memcard_dir : fs::path();
+    if (dir.empty()) return std::string();
+    return (dir / (std::string("card") + (slot == 0 ? "1" : "2") + ".mcd")).generic_string();
+}
+
+// Parse the slot's .mcd file and fill the model's display fields for it.
+void refresh_memcard(LauncherModel& m, int slot /*0|1*/) {
+    Rml::String& path  = slot == 0 ? m.mc1_path   : m.mc2_path;
+    Rml::String& name  = slot == 0 ? m.mc1_name   : m.mc2_name;
+    Rml::String& size  = slot == 0 ? m.mc1_size   : m.mc2_size;
+    Rml::String& used  = slot == 0 ? m.mc1_used   : m.mc2_used;
+    Rml::String& foot  = slot == 0 ? m.mc1_foot   : m.mc2_foot;
+    Rml::String& grid  = slot == 0 ? m.mc1_grid   : m.mc2_grid;
+
+    auto build_grid = [](const uint8_t used[15]) {
+        Rml::String html;
+        for (int i = 0; i < 15; i++)
+            html += used[i] ? "<span class=\"blk b\"></span>" : "<span class=\"blk\"></span>";
+        return html;
+    };
+    const uint8_t empty15[15] = {0};
+    grid = build_grid(empty15);
+    name = path.empty() ? Rml::String("(no card)")
+                        : fs::path(std::string(path)).filename().generic_string();
+
+    if (path.empty()) {
+        size = used = "—";
+        foot = "No card configured.";
+        return;
+    }
+
+    MemcardSummary s;
+    memcard_summary_path(std::string(path).c_str(), &s);
+    grid = build_grid(s.block_used);
+
+    if (!s.exists) {
+        size = "128 KB (15 blocks)";
+        used = "0 / 15";
+        foot = "New blank card — created on launch.";
+        return;
+    }
+    if (!s.valid) {
+        size = used = "—";
+        foot = "Not a valid memory-card image.";
+        return;
+    }
+    size = "128 KB (15 blocks)";
+    used = std::to_string(s.used_blocks) + " / 15";
+    const std::string when = fmt_mtime(s.mtime);
+    foot = when.empty() ? Rml::String("On-disk memory card.")
+                        : Rml::String("Last modified — " + when);
+}
 
 const char* renderer_name(int v)  { return v == 1 ? "OpenGL" : "Software"; }
 const char* texfilter_name(int v) { return v == 1 ? "Bilinear" : "Nearest"; }
@@ -225,8 +332,32 @@ std::string win_pick_file(SDL_Window* parent, const char* title, const char* fil
     if (GetOpenFileNameA(&ofn)) return std::string(buf);
     return std::string();
 }
+
+// Native save-file dialog (overwrite-prompts). Returns "" if cancelled.
+std::string win_pick_save_file(SDL_Window* parent, const char* title,
+                               const char* filter, const char* default_ext,
+                               const std::string& initial) {
+    char buf[MAX_PATH] = {0};
+    if (!initial.empty()) {
+        std::snprintf(buf, sizeof(buf), "%s", initial.c_str());
+        for (char* p = buf; *p; ++p) if (*p == '/') *p = '\\';  // native sep
+    }
+    OPENFILENAMEA ofn = {0};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter = filter;
+    ofn.lpstrFile   = buf;
+    ofn.nMaxFile    = sizeof(buf);
+    ofn.lpstrTitle  = title;
+    ofn.lpstrDefExt = default_ext;  // appended if the user types no extension
+    ofn.Flags       = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    (void)parent;
+    if (GetSaveFileNameA(&ofn)) return std::string(buf);
+    return std::string();
+}
 #else
 std::string win_pick_file(SDL_Window*, const char*, const char*) { return std::string(); }
+std::string win_pick_save_file(SDL_Window*, const char*, const char*, const char*,
+                               const std::string&) { return std::string(); }
 #endif
 
 // Load at least one font face so RmlUi can render text. Tries bundled fonts in
@@ -271,7 +402,7 @@ Result run(SDL_Window* window, void* gl_context,
         return Result::Unavailable;
     }
 
-    SystemInterface_SDL system_interface;
+    LauncherSystemInterface system_interface;
     system_interface.SetWindow(window);
     LauncherRenderInterface render_interface;
     if (!render_interface) {
@@ -319,6 +450,14 @@ Result run(SDL_Window* window, void* gl_context,
     const std::string game_name_s = game.name ? game.name : "";
     refresh_disc_status(m, game_name_s, expected_serial, expected_crc, has_expected_crc);
 
+    // ---- Seed the memory-card slots from the effective settings ----
+    if (io.has_memcard1_enabled) m.mc1_enabled = io.memcard1_enabled;
+    if (io.has_memcard2_enabled) m.mc2_enabled = io.memcard2_enabled;
+    m.mc1_path = memcard_slot_path(io, 0);
+    m.mc2_path = memcard_slot_path(io, 1);
+    refresh_memcard(m, 0);
+    refresh_memcard(m, 1);
+
     // ---- Data model: bind fields + action callbacks ----
     Rml::DataModelConstructor c = context->CreateDataModel("settings");
     if (!c) {
@@ -350,6 +489,16 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("p2_enabled",     &m.p2_enabled);
     c.Bind("mc1_enabled",    &m.mc1_enabled);
     c.Bind("mc2_enabled",    &m.mc2_enabled);
+    c.Bind("mc1_name",       &m.mc1_name);
+    c.Bind("mc2_name",       &m.mc2_name);
+    c.Bind("mc1_size",       &m.mc1_size);
+    c.Bind("mc2_size",       &m.mc2_size);
+    c.Bind("mc1_used",       &m.mc1_used);
+    c.Bind("mc2_used",       &m.mc2_used);
+    c.Bind("mc1_foot",       &m.mc1_foot);
+    c.Bind("mc2_foot",       &m.mc2_foot);
+    c.Bind("mc1_grid",       &m.mc1_grid);
+    c.Bind("mc2_grid",       &m.mc2_grid);
 
     Rml::DataModelHandle handle = c.GetModelHandle();
 
@@ -433,6 +582,39 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.mc2_enabled = !m.mc2_enabled; handle.DirtyVariable("mc2_enabled");
         });
+
+    auto dirty_mc = [handle](int slot) mutable {
+        const char* v0[] = {"mc1_name","mc1_size","mc1_used","mc1_foot","mc1_grid"};
+        const char* v1[] = {"mc2_name","mc2_size","mc2_used","mc2_foot","mc2_grid"};
+        for (const char* v : (slot == 0 ? v0 : v1)) handle.DirtyVariable(v);
+    };
+    auto browse_mc = [&m, window, dirty_mc](int slot) mutable {
+        std::string p = win_pick_file(window, "Select memory-card image",
+            "Memory card (*.mcd;*.mc;*.mcr)\0*.mcd;*.mc;*.mcr\0All files (*.*)\0*.*\0\0");
+        if (p.empty()) return;
+        (slot == 0 ? m.mc1_path : m.mc2_path) = fs::path(p).generic_string();
+        refresh_memcard(m, slot);
+        dirty_mc(slot);
+    };
+    auto new_mc = [&m, window, dirty_mc](int slot) mutable {
+        Rml::String& cur = (slot == 0 ? m.mc1_path : m.mc2_path);
+        std::string p = win_pick_save_file(window, "Create new memory card",
+            "Memory card (*.mcd)\0*.mcd\0All files (*.*)\0*.*\0\0", "mcd",
+            std::string(cur));
+        if (p.empty()) return;
+        if (memcard_format_file(p.c_str()) != 0) return;  // I/O failure: leave as-is
+        cur = fs::path(p).generic_string();
+        refresh_memcard(m, slot);
+        dirty_mc(slot);
+    };
+    c.BindEventCallback("browse_mc1",
+        [browse_mc](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable { browse_mc(0); });
+    c.BindEventCallback("browse_mc2",
+        [browse_mc](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable { browse_mc(1); });
+    c.BindEventCallback("new_mc1",
+        [new_mc](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable { new_mc(0); });
+    c.BindEventCallback("new_mc2",
+        [new_mc](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable { new_mc(1); });
     c.BindEventCallback("launch",
         [&m](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { m.launch_requested = true; });
     c.BindEventCallback("quit",
@@ -496,6 +678,11 @@ Result run(SDL_Window* window, void* gl_context,
         io.spu_hq = m.spu_hq;                 io.has_spu_hq = true;
         if (!m.bios_path.empty()) { io.bios_path = fs::path(std::string(m.bios_path)); io.has_bios_path = true; }
         if (!m.disc_path.empty()) { io.disc_path = fs::path(std::string(m.disc_path)); io.has_disc_path = true; }
+
+        io.memcard1_enabled = m.mc1_enabled; io.has_memcard1_enabled = true;
+        io.memcard2_enabled = m.mc2_enabled; io.has_memcard2_enabled = true;
+        if (!m.mc1_path.empty()) { io.memcard1_path = fs::path(std::string(m.mc1_path)); io.has_memcard1_path = true; }
+        if (!m.mc2_path.empty()) { io.memcard2_path = fs::path(std::string(m.mc2_path)); io.has_memcard2_path = true; }
     }
 
     Rml::Shutdown();

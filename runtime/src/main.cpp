@@ -1235,6 +1235,10 @@ int main(int argc, char** argv) {
     }
 
     std::filesystem::path memcard_dir;
+    std::filesystem::path memcard1_path;   /* explicit slot-1 .mcd (empty => dir/card1.mcd) */
+    std::filesystem::path memcard2_path;   /* explicit slot-2 .mcd (empty => dir/card2.mcd) */
+    bool memcard1_enabled = true;
+    bool memcard2_enabled = true;
     std::filesystem::path resolved_disc;
     std::string window_title = PSX_WINDOW_TITLE;
     uint16_t   debug_port    = (uint16_t)DEFAULT_DEBUG_PORT;
@@ -1332,7 +1336,16 @@ int main(int argc, char** argv) {
         }
         if (us.has_disc_path && !disc_override_path) resolved_disc = us.disc_path;
         if (us.has_memcard_dir)                      memcard_dir   = us.memcard_dir;
+        if (us.has_memcard1_path)    memcard1_path    = us.memcard1_path;
+        if (us.has_memcard2_path)    memcard2_path    = us.memcard2_path;
+        if (us.has_memcard1_enabled) memcard1_enabled = us.memcard1_enabled;
+        if (us.has_memcard2_enabled) memcard2_enabled = us.memcard2_enabled;
     }
+
+    /* Resolve the effective memory-card directory now (before the launcher) so
+     * the launcher can introspect the real card files. The same default is used
+     * by the runtime below. */
+    if (memcard_dir.empty()) memcard_dir = default_memcard_dir(argv[0]);
 
 #if defined(PSX_LAUNCHER)
     /* Integrated launcher: shown in its own GL window before the emulator
@@ -1352,6 +1365,11 @@ int main(int argc, char** argv) {
             seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
             if (bios_path && bios_path[0]) { seed.bios_path = bios_path; seed.has_bios_path = true; }
             if (!resolved_disc.empty())    { seed.disc_path = resolved_disc; seed.has_disc_path = true; }
+            seed.memcard_dir = memcard_dir;          seed.has_memcard_dir = true;
+            seed.memcard1_enabled = memcard1_enabled; seed.has_memcard1_enabled = true;
+            seed.memcard2_enabled = memcard2_enabled; seed.has_memcard2_enabled = true;
+            if (!memcard1_path.empty()) { seed.memcard1_path = memcard1_path; seed.has_memcard1_path = true; }
+            if (!memcard2_path.empty()) { seed.memcard2_path = memcard2_path; seed.has_memcard2_path = true; }
 
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -1399,6 +1417,10 @@ int main(int argc, char** argv) {
                     bios_path = settings_bios_storage.c_str();
                 }
                 if (seed.has_disc_path) resolved_disc = seed.disc_path;
+                memcard1_enabled = seed.memcard1_enabled;
+                memcard2_enabled = seed.memcard2_enabled;
+                if (seed.has_memcard1_path) memcard1_path = seed.memcard1_path;
+                if (seed.has_memcard2_path) memcard2_path = seed.memcard2_path;
                 /* Persist the user's choices next to the exe. */
                 PSXRecompV4::save_user_settings(
                     exe_dir_from_argv(argv[0]) / "settings.toml", seed);
@@ -1420,9 +1442,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (memcard_dir.empty()) {
-        memcard_dir = default_memcard_dir(argv[0]);
-    }
+    /* memcard_dir was resolved to its default before the launcher (above). */
 
     std::string bios_path_str    = resolved_bios.string();
     std::string memcard_dir_str  = memcard_dir.string();
@@ -1484,7 +1504,15 @@ int main(int argc, char** argv) {
                          "instant budget %d/frame)\n",
                          disc_speed.c_str(), cdrom_get_instant_rate());
     }
-    memcard_init(memcard_dir_str.c_str());
+    {
+        std::string mc1 = memcard1_path.string();
+        std::string mc2 = memcard2_path.string();
+        const MemcardSlotConfig slots[2] = {
+            { mc1.empty() ? nullptr : mc1.c_str(), memcard1_enabled ? 1 : 0 },
+            { mc2.empty() ? nullptr : mc2.c_str(), memcard2_enabled ? 1 : 0 },
+        };
+        memcard_init_slots(memcard_dir_str.c_str(), slots);
+    }
     std::atexit(memcard_flush_all);
 #ifndef PSX_NO_DEBUG_TOOLS
     debug_server_init(debug_port);
