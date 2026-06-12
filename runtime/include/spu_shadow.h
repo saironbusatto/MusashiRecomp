@@ -35,8 +35,13 @@
 extern "C" {
 #endif
 
-/* Read-once env gate. Returns true if PSX_AUDIO_SHADOW is set to an on value.
- * Cached after the first call. */
+/* Config/launcher gate. Sets the enable state the feature uses when the
+ * PSX_AUDIO_SHADOW env var is NOT set (env still wins for debug). Call before
+ * spu_init() so spu_shadow_reset() records the right state. Default OFF. */
+void spu_shadow_set_enabled(int on);
+
+/* Returns true if the shadow is enabled. Precedence: PSX_AUDIO_SHADOW env
+ * (if set) overrides the config value set via spu_shadow_set_enabled(). */
 bool spu_shadow_enabled(void);
 
 /* Called once per spu_init() to (re)create verifier + per-voice resampler

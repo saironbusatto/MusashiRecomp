@@ -25,16 +25,27 @@
 /* Same normalization the SNES/GBA shadows use: map int16 full-scale to ~1.0. */
 #define SHADOW_NORM (1.0f / 32768.0f)
 
-static int            s_enabled = -1;   /* -1 = not yet read from env */
+static int            s_enabled = -1;   /* -1 = not yet resolved */
+static int            s_cfg     = 0;    /* config/launcher gate (env overrides) */
 static ShadowVerifier s_verifier;
 static SpuShadowInfo  s_info;
 
+void spu_shadow_set_enabled(int on) {
+    s_cfg     = on ? 1 : 0;
+    s_enabled = -1;  /* force re-resolution against env + new config */
+}
+
 bool spu_shadow_enabled(void) {
     if (s_enabled < 0) {
+        /* Env (debug override) wins when present; else the config value. */
         const char* e = getenv("PSX_AUDIO_SHADOW");
-        s_enabled = (e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' ||
-                           e[0] == 't' || e[0] == 'T' || e[0] == 'o' ||
-                           e[0] == 'O')) ? 1 : 0;
+        if (e) {
+            s_enabled = (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' ||
+                         e[0] == 't' || e[0] == 'T' || e[0] == 'o' ||
+                         e[0] == 'O') ? 1 : 0;
+        } else {
+            s_enabled = s_cfg ? 1 : 0;
+        }
     }
     return s_enabled != 0;
 }

@@ -20,12 +20,16 @@
 #include "frame_pacing.h"
 #include "sio.h"
 #include "spu.h"
+#include "spu_shadow.h"
 #include "memcard.h"
 #include "debug_server.h"
 #include "crash_trace.h"
 #include "freeze_heartbeat.h"
 #include "config_loader.h"
 #include "crc32.h"
+#if defined(PSX_LAUNCHER)
+#include "launcher.h"
+#endif
 #include <SDL.h>
 #include <algorithm>
 #include <cctype>
@@ -103,6 +107,8 @@ static int           g_video_scale = 1;     /* internal-resolution SSAA factor *
 static bool          g_video_aa    = true;  /* linear present filtering */
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 static int           g_video_renderer = 0;  /* 0=software, 1=opengl (requested) */
+static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
+static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
 static bool          g_gl_active = false;    /* GL context live -> GL present path */
 /* Present straight from the FBO (fast, no readback). Set PSX_GL_FORCE_CPU_PRESENT=1
  * to force the software readout path instead — a diagnostic/fallback that also
@@ -1283,6 +1289,7 @@ int main(int argc, char** argv) {
     const char* bios_path = PSX_DEFAULT_BIOS_PATH;
     const char* game_config_path = nullptr;
     const char* disc_override_path = nullptr;
+    bool        bios_from_cli = false;  /* CLI --bios/positional wins over settings.toml */
     /* Parse args.
      *   --bios <path>       override the compile-time BIOS path
      *   --game <toml>       load a game config (single source of truth for
@@ -1293,12 +1300,14 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (std::strcmp(argv[i], "--bios") == 0 && i + 1 < argc) {
             bios_path = argv[++i];
+            bios_from_cli = true;
         } else if (std::strcmp(argv[i], "--game") == 0 && i + 1 < argc) {
             game_config_path = argv[++i];
         } else if (std::strcmp(argv[i], "--disc") == 0 && i + 1 < argc) {
             disc_override_path = argv[++i];
         } else if (argv[i][0] != '-') {
             bios_path = argv[i];
+            bios_from_cli = true;
         }
     }
 
@@ -1343,6 +1352,8 @@ int main(int argc, char** argv) {
             g_video_aa        = gc.runtime.video_antialiasing;
             g_video_texfilter = gc.runtime.video_texture_filter;
             g_video_renderer  = gc.runtime.video_renderer;
+            g_video_screen    = gc.runtime.video_screen_kind;
+            g_audio_spu_hq    = gc.runtime.audio_spu_hq;
             { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
@@ -1382,6 +1393,100 @@ int main(int argc, char** argv) {
 
     if (!game_name.empty()) s_picker_game_name = game_name;
 
+    /* Layer the launcher-written settings.toml (next to the exe) over the
+     * bundled game.toml. Any field present there overrides the config value;
+     * the command line (--bios/--disc) still wins over the file. Absent =>
+     * fall through to game.toml. The file is the launcher's persistence. */
+    std::string settings_bios_storage;  /* must outlive resolve_bios_for_runtime */
+    {
+        std::filesystem::path settings_path =
+            exe_dir_from_argv(argv[0]) / "settings.toml";
+        const PSXRecompV4::UserSettings us =
+            PSXRecompV4::load_user_settings(settings_path);
+        if (us.has_renderer)       g_video_renderer  = us.renderer;
+        if (us.has_supersampling)  g_video_scale     = us.supersampling;
+        if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
+        if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
+        if (us.has_screen_kind)    g_video_screen    = us.screen_kind;
+        if (us.has_spu_hq)         g_audio_spu_hq    = us.spu_hq;
+        if (us.has_bios_path && !bios_from_cli) {
+            settings_bios_storage = us.bios_path.string();
+            bios_path = settings_bios_storage.c_str();
+        }
+        if (us.has_disc_path && !disc_override_path) resolved_disc = us.disc_path;
+        if (us.has_memcard_dir)                      memcard_dir   = us.memcard_dir;
+    }
+
+#if defined(PSX_LAUNCHER)
+    /* Integrated launcher: shown in its own GL window before the emulator
+     * boots. Seeded with the effective settings (game.toml ∪ settings.toml);
+     * on LAUNCH the user's choices are persisted to settings.toml and applied.
+     * The launcher window/context is fully torn down before the emulator's own
+     * window is created, so the emulator boot path below is untouched. Skipped
+     * via PSX_NO_LAUNCHER=1 (e.g. CI / scripted runs). */
+    if (!std::getenv("PSX_NO_LAUNCHER")) {
+        if (SDL_Init(SDL_INIT_VIDEO) == 0) {
+            PSXRecompV4::UserSettings seed;
+            seed.renderer = g_video_renderer;             seed.has_renderer = true;
+            seed.supersampling = g_video_scale;           seed.has_supersampling = true;
+            seed.antialiasing = g_video_aa;               seed.has_antialiasing = true;
+            seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
+            seed.screen_kind = g_video_screen;            seed.has_screen_kind = true;
+            seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
+            if (bios_path && bios_path[0]) { seed.bios_path = bios_path; seed.has_bios_path = true; }
+            if (!resolved_disc.empty())    { seed.disc_path = resolved_disc; seed.has_disc_path = true; }
+
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+
+            std::string lwin_title = (game_name.empty() ? std::string("PSX") : game_name)
+                                     + " \xE2\x80\x94 Launcher";
+            SDL_Window* lwin = SDL_CreateWindow(
+                lwin_title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                1100, 800, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+            psx_launcher::Result lr = psx_launcher::Result::Unavailable;
+            if (lwin) {
+                SDL_GLContext lctx = SDL_GL_CreateContext(lwin);
+                if (lctx) {
+                    SDL_GL_MakeCurrent(lwin, lctx);
+                    SDL_GL_SetSwapInterval(1);
+                    std::string assets = exe_dir_from_argv(argv[0]).string();
+                    lr = psx_launcher::run(lwin, lctx, seed,
+                                           game_name.empty() ? nullptr : game_name.c_str(),
+                                           assets.c_str());
+                    SDL_GL_DeleteContext(lctx);
+                }
+                SDL_DestroyWindow(lwin);
+            }
+            /* Reset GL attributes so the emulator window starts from defaults. */
+            SDL_GL_ResetAttributes();
+
+            if (lr == psx_launcher::Result::Quit) {
+                std::fprintf(stdout, "psxrecomp: launcher closed; exiting.\n");
+                return 0;
+            }
+            if (lr == psx_launcher::Result::Launch) {
+                g_video_renderer  = seed.renderer;
+                g_video_scale     = seed.supersampling;
+                g_video_aa        = seed.antialiasing;
+                g_video_texfilter = seed.texture_filter;
+                g_video_screen    = seed.screen_kind;
+                g_audio_spu_hq    = seed.spu_hq;
+                if (seed.has_bios_path) {
+                    settings_bios_storage = seed.bios_path.string();
+                    bios_path = settings_bios_storage.c_str();
+                }
+                if (seed.has_disc_path) resolved_disc = seed.disc_path;
+                /* Persist the user's choices next to the exe. */
+                PSXRecompV4::save_user_settings(
+                    exe_dir_from_argv(argv[0]) / "settings.toml", seed);
+            }
+        }
+    }
+#endif
+
     std::filesystem::path resolved_bios = resolve_bios_for_runtime(bios_path, argv[0]);
     if (resolved_bios.empty()) {
         std::fprintf(stderr, "psxrecomp: no BIOS selected; exiting.\n");
@@ -1409,6 +1514,8 @@ int main(int argc, char** argv) {
      * the backend's init on the VRAM buffer). Software is the default and the
      * fallback; an unavailable OpenGL backend reverts to software. */
     gr_set_backend(g_video_renderer == 1 ? GR_BACKEND_OPENGL : GR_BACKEND_SOFTWARE);
+    std::fprintf(stdout, "psxrecomp: renderer backend requested: %s\n",
+                 g_video_renderer == 1 ? "opengl" : "software");
     gpu_init();
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init (which
      * runs sw_renderer_init). scale==1 is a no-op; >1 allocates the hi-res
@@ -1418,17 +1525,29 @@ int main(int argc, char** argv) {
     gr_set_scale(g_video_scale);
     g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
     gr_set_texture_filter(g_video_texfilter);
+    /* Present-time screen-colour model (verified-enhancement LUT). Default raw
+     * is byte-identical; PSX_SCREEN env overrides this at scanout. */
+    gpu_set_screen_kind(g_video_screen);
     if (g_video_scale > 1 || g_video_texfilter)
         std::fprintf(stdout,
                      "psxrecomp: supersampling %dx (antialiasing %s, texture filter %s)\n",
                      g_video_scale, g_video_aa ? "on" : "off",
                      g_video_texfilter ? "bilinear" : "nearest");
+    if (g_video_screen != 0)
+        std::fprintf(stdout, "psxrecomp: screen-colour model %s\n",
+                     g_video_screen == 1 ? "crt" : g_video_screen == 2 ? "composite"
+                                                 : "trinitron");
     dma_init();
     mdec_init();
     timers_init();
     interrupts_init();
     sio_init();
     sio_connect_pad(0);  /* Controller on port 1 */
+    /* SPU float-shadow gate must be set before spu_init() (which runs
+     * spu_shadow_reset()). Default OFF; PSX_AUDIO_SHADOW env overrides. */
+    spu_shadow_set_enabled(g_audio_spu_hq ? 1 : 0);
+    if (g_audio_spu_hq)
+        std::fprintf(stdout, "psxrecomp: SPU float-shadow enabled (verified-enhancement)\n");
     spu_init();
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
     {

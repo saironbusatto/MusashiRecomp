@@ -111,6 +111,24 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             else throw std::runtime_error(fmt::format(
                 "[video] renderer must be \"software\" or \"opengl\": {}", mode));
         }
+        if (video.contains("crt_filter")) {
+            const auto mode = toml::find<std::string>(video, "crt_filter");
+            if      (mode == "raw")       rt.video_screen_kind = 0;
+            else if (mode == "crt")       rt.video_screen_kind = 1;
+            else if (mode == "composite") rt.video_screen_kind = 2;
+            else if (mode == "trinitron") rt.video_screen_kind = 3;
+            else throw std::runtime_error(fmt::format(
+                "[video] crt_filter must be \"raw\"|\"crt\"|\"composite\"|\"trinitron\": {}",
+                mode));
+        }
+    }
+
+    // Optional [audio] block.
+    if (cfg.contains("audio")) {
+        const toml::value& audio = toml::find(cfg, "audio");
+        if (audio.contains("spu_hq")) {
+            rt.audio_spu_hq = toml::find<bool>(audio, "spu_hq");
+        }
     }
 
     return rt;
@@ -419,6 +437,126 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*out_stem*/         out_stem,
         /*runtime*/          parse_runtime_block(cfg, root),
     };
+}
+
+// ---- UserSettings (settings.toml) — launcher-written override layer ----
+
+UserSettings load_user_settings(const fs::path& path) {
+    UserSettings s;
+    std::error_code ec;
+    if (path.empty() || !fs::exists(path, ec)) return s;
+
+    toml::value doc;
+    try {
+        doc = toml::parse(path.string());
+    } catch (const std::exception&) {
+        // Malformed file: fall back to all-defaults rather than refuse to boot.
+        return s;
+    }
+
+    // Each field guarded independently so one bad value can't blank the rest.
+    auto try_get = [](auto&& fn) { try { fn(); } catch (const std::exception&) {} };
+
+    if (doc.contains("video")) {
+        const toml::value& v = toml::find(doc, "video");
+        if (v.contains("renderer")) try_get([&]{
+            const auto m = toml::find<std::string>(v, "renderer");
+            if (m == "software") { s.renderer = 0; s.has_renderer = true; }
+            else if (m == "opengl") { s.renderer = 1; s.has_renderer = true; }
+        });
+        if (v.contains("supersampling")) try_get([&]{
+            const auto n = toml::find<int64_t>(v, "supersampling");
+            if (n >= 1 && n <= 4) { s.supersampling = (int)n; s.has_supersampling = true; }
+        });
+        if (v.contains("antialiasing")) try_get([&]{
+            s.antialiasing = toml::find<bool>(v, "antialiasing"); s.has_antialiasing = true;
+        });
+        if (v.contains("texture_filtering")) try_get([&]{
+            const auto m = toml::find<std::string>(v, "texture_filtering");
+            if (m == "nearest") { s.texture_filter = 0; s.has_texture_filter = true; }
+            else if (m == "bilinear") { s.texture_filter = 1; s.has_texture_filter = true; }
+        });
+        if (v.contains("crt_filter")) try_get([&]{
+            const auto m = toml::find<std::string>(v, "crt_filter");
+            if (m == "raw")            { s.screen_kind = 0; s.has_screen_kind = true; }
+            else if (m == "crt")       { s.screen_kind = 1; s.has_screen_kind = true; }
+            else if (m == "composite") { s.screen_kind = 2; s.has_screen_kind = true; }
+            else if (m == "trinitron") { s.screen_kind = 3; s.has_screen_kind = true; }
+        });
+    }
+    if (doc.contains("audio")) {
+        const toml::value& a = toml::find(doc, "audio");
+        if (a.contains("spu_hq")) try_get([&]{
+            s.spu_hq = toml::find<bool>(a, "spu_hq"); s.has_spu_hq = true;
+        });
+    }
+    if (doc.contains("bios")) {
+        const toml::value& b = toml::find(doc, "bios");
+        if (b.contains("path")) try_get([&]{
+            const auto p = toml::find<std::string>(b, "path");
+            if (!p.empty()) { s.bios_path = fs::path(p); s.has_bios_path = true; }
+        });
+    }
+    if (doc.contains("disc")) {
+        const toml::value& d = toml::find(doc, "disc");
+        if (d.contains("path")) try_get([&]{
+            const auto p = toml::find<std::string>(d, "path");
+            if (!p.empty()) { s.disc_path = fs::path(p); s.has_disc_path = true; }
+        });
+    }
+    if (doc.contains("memcard")) {
+        const toml::value& m = toml::find(doc, "memcard");
+        if (m.contains("dir")) try_get([&]{
+            const auto p = toml::find<std::string>(m, "dir");
+            if (!p.empty()) { s.memcard_dir = fs::path(p); s.has_memcard_dir = true; }
+        });
+    }
+    return s;
+}
+
+bool save_user_settings(const fs::path& path, const UserSettings& s) {
+    std::error_code ec;
+    if (!path.parent_path().empty())
+        fs::create_directories(path.parent_path(), ec);  // best-effort
+
+    std::ofstream f(path, std::ios::trunc);
+    if (!f.is_open()) return false;
+
+    // TOML strings use forward slashes so backslash escaping is never an issue.
+    auto fwd = [](const fs::path& p) {
+        std::string str = p.generic_string();
+        return str;
+    };
+
+    f << "# psxrecomp user settings - written by the launcher. Safe to hand-edit.\n";
+    f << "# Overrides the bundled game.toml; the command line overrides this file.\n\n";
+
+    f << "[video]\n";
+    if (s.has_renderer)
+        f << "renderer          = \"" << (s.renderer ? "opengl" : "software") << "\"\n";
+    if (s.has_supersampling)
+        f << "supersampling     = " << s.supersampling << "\n";
+    if (s.has_antialiasing)
+        f << "antialiasing      = " << (s.antialiasing ? "true" : "false") << "\n";
+    if (s.has_texture_filter)
+        f << "texture_filtering = \"" << (s.texture_filter ? "bilinear" : "nearest") << "\"\n";
+    if (s.has_screen_kind) {
+        const char* k = s.screen_kind == 1 ? "crt"
+                      : s.screen_kind == 2 ? "composite"
+                      : s.screen_kind == 3 ? "trinitron" : "raw";
+        f << "crt_filter        = \"" << k << "\"\n";
+    }
+    f << "\n[audio]\n";
+    if (s.has_spu_hq)
+        f << "spu_hq = " << (s.spu_hq ? "true" : "false") << "\n";
+    if (s.has_bios_path)
+        f << "\n[bios]\npath = \"" << fwd(s.bios_path) << "\"\n";
+    if (s.has_disc_path)
+        f << "\n[disc]\npath = \"" << fwd(s.disc_path) << "\"\n";
+    if (s.has_memcard_dir)
+        f << "\n[memcard]\ndir = \"" << fwd(s.memcard_dir) << "\"\n";
+
+    return f.good();
 }
 
 } // namespace PSXRecompV4

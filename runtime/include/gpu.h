@@ -80,6 +80,11 @@ void     gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest);
 typedef void (*gpu_vblank_cb)(void);
 void gpu_set_vblank_callback(gpu_vblank_cb cb);
 
+/* Present-time screen-colour model (see color_lut.h ScreenKind: 0=raw,
+ * 1=crt, 2=composite, 3=trinitron). Config/launcher-driven; the PSX_SCREEN
+ * env var, if set, overrides this. Default 0 (raw) is byte-identical. */
+void gpu_set_screen_kind(int kind);
+
 #ifdef __cplusplus
 }
 #endif

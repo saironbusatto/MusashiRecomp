@@ -98,6 +98,19 @@ struct RuntimeConfig {
     // backend. The OpenGL backend is a hardware-accelerated alternative; the
     // software rasterizer remains the fallback. Stored as 0=software, 1=opengl.
     int                   video_renderer = 0;
+
+    // crt_filter: present-time screen-colour model (verified-enhancement LUT).
+    // "raw" (default, byte-identical 5->8 passthrough) | "crt" | "composite" |
+    // "trinitron". Stored 0..3 to match ScreenKind in runtime/color_lut.h. The
+    // PSX_SCREEN env var overrides this at runtime (debug path).
+    int                   video_screen_kind = 0;
+
+    // ---- [audio] block ----
+    // spu_hq: enable the SPU float-shadow re-render (Catmull-Rom resample, float
+    // headroom). Verified-enhancement, default OFF — spu_render output is
+    // byte-identical to the canon hardware mix when off. The PSX_AUDIO_SHADOW
+    // env var overrides this at runtime (debug path).
+    bool                  audio_spu_hq = false;
 };
 
 // One entry from [[recompiler.bios_vectors]].
@@ -176,6 +189,40 @@ struct GameConfig {
     // [runtime] block (optional)
     RuntimeConfig         runtime;
 };
+
+// UserSettings — the launcher-written, user-editable override layer.
+//
+// Lives in a `settings.toml` next to the runtime exe (NOT in the repo). It is
+// layered on top of the bundled game.toml at startup: any field present here
+// overrides the corresponding game.toml value, and the command line overrides
+// both. Absent fields fall through to game.toml. The launcher seeds this file
+// from game.toml defaults the first time it writes.
+//
+// Unlike game.toml, paths here are stored verbatim (the user picked them); they
+// are NOT resolved against a project root.
+struct UserSettings {
+    // [video]
+    bool has_renderer       = false; int  renderer       = 0; // 0=software,1=opengl
+    bool has_supersampling  = false; int  supersampling  = 1; // 1..4
+    bool has_antialiasing   = false; bool antialiasing   = true;
+    bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
+    bool has_screen_kind    = false; int  screen_kind    = 0; // 0..3 (ScreenKind)
+    // [audio]
+    bool has_spu_hq         = false; bool spu_hq         = false;
+    // [bios] / [disc] / [memcard]
+    bool has_bios_path      = false; std::filesystem::path bios_path;
+    bool has_disc_path      = false; std::filesystem::path disc_path;
+    bool has_memcard_dir    = false; std::filesystem::path memcard_dir;
+};
+
+// Load settings.toml. Returns an all-defaults (all has_*=false) struct if the
+// file is missing or unreadable. Malformed values are skipped (best-effort:
+// the launcher must still be able to start so the user can fix them), so this
+// never throws.
+UserSettings load_user_settings(const std::filesystem::path& path);
+
+// Write settings.toml deterministically. Returns false on I/O failure.
+bool save_user_settings(const std::filesystem::path& path, const UserSettings& s);
 
 // Locate the project root by walking upward from `config_path` until a
 // directory containing `.gitignore`, `.git`, or `CMakeLists.txt` is found.

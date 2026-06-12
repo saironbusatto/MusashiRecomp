@@ -381,13 +381,26 @@ static uint8_t gpu_vram_byte(uint32_t byte_x, uint32_t y) {
  * default never even consults the LUT. */
 static ColorLut* s_screen_lut = NULL;
 static int       s_screen_lut_init = 0;
+static int       s_screen_kind_cfg = SCREEN_RAW;  /* config/launcher-set; env overrides */
+
+void gpu_set_screen_kind(int kind) {
+    if (kind < SCREEN_RAW || kind > SCREEN_TRINITRON) kind = SCREEN_RAW;
+    if (kind == s_screen_kind_cfg) return;
+    s_screen_kind_cfg = kind;
+    s_screen_lut_init = 0;  /* rebuild on next scanout */
+}
 
 static void screen_lut_ensure(void) {
     if (s_screen_lut_init) return;
     s_screen_lut_init = 1;
+    if (s_screen_lut) { color_lut_destroy(s_screen_lut); s_screen_lut = NULL; }
+    /* Precedence: PSX_SCREEN env (debug override) wins if set+valid; otherwise
+     * the config/launcher value. Default (no env, raw config) = passthrough. */
+    ScreenKind kind = (ScreenKind)s_screen_kind_cfg;
     const char* name = getenv("PSX_SCREEN");
-    ScreenKind kind = SCREEN_RAW;
-    if (!name || !screen_kind_from_name(name, &kind) || kind == SCREEN_RAW) {
+    ScreenKind envk;
+    if (name && screen_kind_from_name(name, &envk)) kind = envk;
+    if (kind == SCREEN_RAW) {
         s_screen_lut = NULL;  /* raw fast-path; passthrough */
         return;
     }
