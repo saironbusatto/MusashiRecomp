@@ -285,6 +285,7 @@ function(psxrecomp_add_runtime_target target)
         psxrecomp_ensure_launcher_libs()
         target_sources(${target} PRIVATE
             ${PSXRECOMP_ROOT}/runtime/launcher/launcher.cpp
+            ${PSXRECOMP_ROOT}/runtime/launcher/stb_image_impl.cpp
             ${PSXRECOMP_ROOT}/lib/RmlUi/Backends/RmlUi_Platform_SDL.cpp
             ${PSXRECOMP_ROOT}/lib/RmlUi/Backends/RmlUi_Renderer_GL3.cpp
         )

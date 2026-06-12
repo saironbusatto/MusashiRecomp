@@ -1362,7 +1362,7 @@ int main(int argc, char** argv) {
                                      + " \xE2\x80\x94 Launcher";
             SDL_Window* lwin = SDL_CreateWindow(
                 lwin_title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                1100, 800, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+                1280, 924, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
             psx_launcher::Result lr = psx_launcher::Result::Unavailable;
             if (lwin) {
                 SDL_GLContext lctx = SDL_GL_CreateContext(lwin);

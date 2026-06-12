@@ -18,6 +18,8 @@
 #include "RmlUi_Platform_SDL.h"
 #include "RmlUi_Renderer_GL3.h"
 
+#include "third_party/stb_image.h"
+
 #include <SDL.h>
 
 #include <cstdio>
@@ -32,6 +34,40 @@
 namespace fs = std::filesystem;
 
 namespace {
+
+// RenderInterface_GL3 only decodes uncompressed TGA. Override LoadTexture to
+// decode PNG via stb_image (falling back to the base TGA path), so the launcher
+// can use <img> with PNG art. RmlUi textures are premultiplied-alpha RGBA.
+class LauncherRenderInterface : public RenderInterface_GL3 {
+public:
+    Rml::TextureHandle LoadTexture(Rml::Vector2i& dims, const Rml::String& source) override {
+        Rml::FileInterface* fi = Rml::GetFileInterface();
+        Rml::FileHandle fh = fi ? fi->Open(source) : Rml::FileHandle(0);
+        if (!fh) return RenderInterface_GL3::LoadTexture(dims, source);
+        fi->Seek(fh, 0, SEEK_END);
+        const size_t sz = (size_t)fi->Tell(fh);
+        fi->Seek(fh, 0, SEEK_SET);
+        std::vector<unsigned char> buf(sz);
+        fi->Read(buf.data(), sz, fh);
+        fi->Close(fh);
+
+        int w = 0, h = 0, comp = 0;
+        unsigned char* px = stbi_load_from_memory(buf.data(), (int)sz, &w, &h, &comp, 4);
+        if (!px) return RenderInterface_GL3::LoadTexture(dims, source);  // maybe a TGA
+
+        const size_t n = (size_t)w * (size_t)h;
+        for (size_t i = 0; i < n; i++) {  // straight -> premultiplied alpha
+            const unsigned a = px[i * 4 + 3];
+            px[i * 4 + 0] = (unsigned char)(px[i * 4 + 0] * a / 255);
+            px[i * 4 + 1] = (unsigned char)(px[i * 4 + 1] * a / 255);
+            px[i * 4 + 2] = (unsigned char)(px[i * 4 + 2] * a / 255);
+        }
+        dims.x = w; dims.y = h;
+        Rml::TextureHandle th = GenerateTexture({px, n * 4}, dims);
+        stbi_image_free(px);
+        return th;
+    }
+};
 
 // Mirror of the user-tunable settings, in the value shapes the RML binds to.
 struct LauncherModel {
@@ -51,9 +87,26 @@ struct LauncherModel {
     Rml::String texfilter_label;
 
     // Disc verification (recomputed whenever disc_path changes).
-    Rml::String disc_status;   // headline, e.g. "Disc verified"
-    Rml::String disc_detail;   // serial / region / CRC line
-    Rml::String disc_state;    // "ok" | "warn" | "bad" | "none" — drives the badge colour
+    Rml::String disc_file;      // file name only, e.g. "tomba.cue"
+    Rml::String disc_region;    // "NTSC-U (USA)" | "PAL" | "NTSC-J" | "—"
+    Rml::String disc_serial;    // "SCUS-94236" | "—"
+    bool        v_header   = false;  // ISO9660 header present
+    bool        v_crc      = false;  // CRC/hash (or serial identity) check passed
+    bool        v_verified = false;  // overall verdict good
+    Rml::String verdict_title;  // big line, e.g. "Tomba! disc verified"
+    Rml::String verdict_detail; // sub line
+    Rml::String verdict_state;  // "ok" | "warn" | "bad" | "none" — drives colour
+
+    // View toggle: "dashboard" (default) | "settings".
+    Rml::String view = "dashboard";
+
+    // Player / memory-card cards — shell only this pass; enable toggles are
+    // real bound state so they animate, the rest is static markup until the
+    // Phase 4 (memcard introspection) / Phase 5 (controller enumeration) wiring.
+    bool p1_enabled  = true;
+    bool p2_enabled  = false;
+    bool mc1_enabled = true;
+    bool mc2_enabled = true;
 
     bool launch_requested = false;
     bool quit_requested   = false;
@@ -76,16 +129,30 @@ void refresh_labels(LauncherModel& m) {
     m.texfilter_label = texfilter_name(m.texture_filter);
 }
 
-// Re-run disc verification against m.disc_path and update the badge fields.
-// `expected_serial`/`expected_crc` come from game.toml (via GameInfo).
-void refresh_disc_status(LauncherModel& m, const std::string& expected_serial,
+std::string region_long(const std::string& r) {
+    if (r == "NTSC-U") return "NTSC-U (USA)";
+    if (r == "NTSC-J") return "NTSC-J (Japan)";
+    if (r == "PAL")    return "PAL (Europe)";
+    return r;
+}
+
+// Re-run disc verification against m.disc_path and update the panel fields.
+// `expected_serial`/`expected_crc` come from game.toml (via GameInfo);
+// `game_name` is used for the verdict headline.
+void refresh_disc_status(LauncherModel& m, const std::string& game_name,
+                         const std::string& expected_serial,
                          uint32_t expected_crc, bool has_expected_crc) {
+    m.v_header = m.v_crc = m.v_verified = false;
+    m.disc_region = m.disc_serial = "—";
+    m.disc_file = "—";
+
     if (m.disc_path.empty()) {
-        m.disc_status = "No disc selected";
-        m.disc_detail = "Pick a disc image to verify it against this build.";
-        m.disc_state  = "none";
+        m.verdict_title  = "No disc selected";
+        m.verdict_detail = "Choose a disc image to verify it against this build.";
+        m.verdict_state  = "none";
         return;
     }
+    m.disc_file = fs::path(std::string(m.disc_path)).filename().generic_string();
 
     // Only spend time hashing when there is an expected CRC to compare against.
     const PSXRecompV4::DiscIdentity id = PSXRecompV4::identify_disc(
@@ -93,54 +160,54 @@ void refresh_disc_status(LauncherModel& m, const std::string& expected_serial,
         expected_crc, has_expected_crc, /*compute_crc=*/has_expected_crc);
 
     if (!id.opened) {
-        m.disc_status = "Disc not found";
-        m.disc_detail = "Could not open the image or its CUE-referenced BIN.";
-        m.disc_state  = "bad";
+        m.verdict_title  = "Disc not found";
+        m.verdict_detail = "Could not open the image or its CUE-referenced BIN.";
+        m.verdict_state  = "bad";
         return;
     }
     if (!id.has_header) {
-        m.disc_status = "Not a PlayStation disc";
-        m.disc_detail = "No ISO9660 header at the expected sectors.";
-        m.disc_state  = "bad";
+        m.verdict_title  = "Not a PlayStation disc";
+        m.verdict_detail = "No ISO9660 header at the expected sectors.";
+        m.verdict_state  = "bad";
         return;
     }
-
-    // Build the detail line: detected serial + region (+ CRC when computed).
-    std::string detail;
-    const std::string shown_serial =
-        !id.detected_serial.empty() ? id.detected_serial : std::string("unknown serial");
-    detail = shown_serial;
-    if (!id.region.empty()) detail += "  ·  " + id.region;
-    if (id.crc_computed) {
-        char crcbuf[16];
-        std::snprintf(crcbuf, sizeof(crcbuf), "%08X", id.crc);
-        detail += "  ·  CRC ";
-        detail += crcbuf;
-    }
-    m.disc_detail = detail;
+    m.v_header = true;
+    if (!id.detected_serial.empty()) m.disc_serial = id.detected_serial;
+    else if (!expected_serial.empty()) m.disc_serial = expected_serial;
+    if (!id.region.empty()) m.disc_region = region_long(id.region);
 
     const bool serial_ok = !id.expected_serial_given || id.serial_matches;
-    const bool crc_ok    = !id.expected_crc_given || id.crc_matches;
 
-    if (id.expected_crc_given && id.crc_computed && id.crc_matches) {
-        m.disc_status = "Disc verified";   // strongest: exact CRC match
-        m.disc_state  = "ok";
-    } else if (id.expected_crc_given && id.crc_computed && !id.crc_matches) {
-        m.disc_status = "CRC mismatch";
-        m.disc_state  = "bad";
-    } else if (serial_ok && id.expected_serial_given) {
-        m.disc_status = "Serial verified";
-        m.disc_state  = "ok";
+    // Middle check: exact CRC match if we have one to compare, otherwise the
+    // serial-based identity match stands in for the hash.
+    if (id.expected_crc_given && id.crc_computed)
+        m.v_crc = id.crc_matches;
+    else
+        m.v_crc = serial_ok && id.expected_serial_given;
+
+    m.v_verified = m.v_header && serial_ok &&
+                   (!id.expected_crc_given || id.crc_matches);
+
+    const std::string nm = game_name.empty() ? std::string("Disc") : game_name;
+    if (m.v_verified) {
+        m.verdict_title  = nm + " disc verified";
+        m.verdict_detail = "Correct disc image loaded. Ready to launch.";
+        m.verdict_state  = "ok";
     } else if (!serial_ok) {
-        m.disc_status = "Wrong game?";
-        m.disc_detail = "Disc serial does not match this build (" + expected_serial + ").  " +
-                        m.disc_detail;
-        m.disc_state  = "warn";
+        m.verdict_title  = "Wrong disc?";
+        m.verdict_detail = "Serial does not match this build (expected " + expected_serial + ").";
+        m.verdict_state  = "bad";
+    } else if (id.expected_crc_given && id.crc_computed && !id.crc_matches) {
+        m.verdict_title  = "Disc image differs";
+        m.verdict_detail = "Right game, but the image hash does not match the expected dump.";
+        m.verdict_state  = "warn";
     } else {
-        m.disc_status = "PlayStation disc";  // header ok, nothing to compare against
-        m.disc_state  = "ok";
+        // Header ok, nothing authoritative to compare against.
+        m.verdict_title  = "PlayStation disc";
+        m.verdict_detail = "Recognised PlayStation disc. No reference hash configured.";
+        m.verdict_state  = "ok";
+        m.v_verified     = true;
     }
-    (void)crc_ok;
 }
 
 #if defined(_WIN32)
@@ -206,7 +273,7 @@ Result run(SDL_Window* window, void* gl_context,
 
     SystemInterface_SDL system_interface;
     system_interface.SetWindow(window);
-    RenderInterface_GL3 render_interface;
+    LauncherRenderInterface render_interface;
     if (!render_interface) {
         std::fprintf(stderr, "launcher: GL3 render interface init failed\n");
         RmlGL3::Shutdown();
@@ -249,7 +316,8 @@ Result run(SDL_Window* window, void* gl_context,
     m.bios_path      = io.has_bios_path ? io.bios_path.generic_string() : Rml::String();
     m.disc_path      = io.has_disc_path ? io.disc_path.generic_string() : Rml::String();
     refresh_labels(m);
-    refresh_disc_status(m, expected_serial, expected_crc, has_expected_crc);
+    const std::string game_name_s = game.name ? game.name : "";
+    refresh_disc_status(m, game_name_s, expected_serial, expected_crc, has_expected_crc);
 
     // ---- Data model: bind fields + action callbacks ----
     Rml::DataModelConstructor c = context->CreateDataModel("settings");
@@ -268,9 +336,20 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("texfilter_label",&m.texfilter_label);
     c.Bind("bios_path",      &m.bios_path);
     c.Bind("disc_path",      &m.disc_path);
-    c.Bind("disc_status",    &m.disc_status);
-    c.Bind("disc_detail",    &m.disc_detail);
-    c.Bind("disc_state",     &m.disc_state);
+    c.Bind("disc_file",      &m.disc_file);
+    c.Bind("disc_region",    &m.disc_region);
+    c.Bind("disc_serial",    &m.disc_serial);
+    c.Bind("v_header",       &m.v_header);
+    c.Bind("v_crc",          &m.v_crc);
+    c.Bind("v_verified",     &m.v_verified);
+    c.Bind("verdict_title",  &m.verdict_title);
+    c.Bind("verdict_detail", &m.verdict_detail);
+    c.Bind("verdict_state",  &m.verdict_state);
+    c.Bind("view",           &m.view);
+    c.Bind("p1_enabled",     &m.p1_enabled);
+    c.Bind("p2_enabled",     &m.p2_enabled);
+    c.Bind("mc1_enabled",    &m.mc1_enabled);
+    c.Bind("mc2_enabled",    &m.mc2_enabled);
 
     Rml::DataModelHandle handle = c.GetModelHandle();
 
@@ -313,19 +392,46 @@ Result run(SDL_Window* window, void* gl_context,
                 handle.DirtyVariable("bios_path");
             }
         });
-    c.BindEventCallback("browse_disc",
-        [&m, window, handle, expected_serial, expected_crc, has_expected_crc]
+    auto do_browse_disc =
+        [&m, window, handle, game_name_s, expected_serial, expected_crc, has_expected_crc]
         (Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             std::string p = win_pick_file(window, "Select disc image",
                 "Disc image (*.cue;*.bin;*.iso)\0*.cue;*.bin;*.iso\0All files (*.*)\0*.*\0\0");
             if (!p.empty()) {
                 m.disc_path = fs::path(p).generic_string();
-                refresh_disc_status(m, expected_serial, expected_crc, has_expected_crc);
-                handle.DirtyVariable("disc_path");
-                handle.DirtyVariable("disc_status");
-                handle.DirtyVariable("disc_detail");
-                handle.DirtyVariable("disc_state");
+                refresh_disc_status(m, game_name_s, expected_serial, expected_crc, has_expected_crc);
+                for (const char* v : {"disc_path", "disc_file", "disc_region", "disc_serial",
+                                      "v_header", "v_crc", "v_verified",
+                                      "verdict_title", "verdict_detail", "verdict_state"})
+                    handle.DirtyVariable(v);
             }
+        };
+    c.BindEventCallback("browse_disc", do_browse_disc);
+    c.BindEventCallback("change_iso",  do_browse_disc);
+
+    c.BindEventCallback("show_settings",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.view = "settings"; handle.DirtyVariable("view");
+        });
+    c.BindEventCallback("show_dashboard",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.view = "dashboard"; handle.DirtyVariable("view");
+        });
+    c.BindEventCallback("toggle_p1",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.p1_enabled = !m.p1_enabled; handle.DirtyVariable("p1_enabled");
+        });
+    c.BindEventCallback("toggle_p2",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.p2_enabled = !m.p2_enabled; handle.DirtyVariable("p2_enabled");
+        });
+    c.BindEventCallback("toggle_mc1",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.mc1_enabled = !m.mc1_enabled; handle.DirtyVariable("mc1_enabled");
+        });
+    c.BindEventCallback("toggle_mc2",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.mc2_enabled = !m.mc2_enabled; handle.DirtyVariable("mc2_enabled");
         });
     c.BindEventCallback("launch",
         [&m](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) { m.launch_requested = true; });
