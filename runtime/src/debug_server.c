@@ -7,6 +7,12 @@
  * Same function names and protocol as nesrecomp/snesrecomp versions
  * so TCP.md and DEBUG.md are reusable across projects.
  */
+/* Expose POSIX clock_gettime()/CLOCK_MONOTONIC (used by monotonic_ms) on
+ * glibc — must precede any system header. Harmless on Windows/macOS. */
+#ifndef _POSIX_C_SOURCE
+#  define _POSIX_C_SOURCE 200809L
+#endif
+#include <time.h>
 #include "debug_server.h"
 #include "overlay_loader.h"
 #include "overlay_capture.h"
@@ -25,6 +31,7 @@
 #include "card_read_summary.h"
 #include "card_data_writes.h"
 #include "crash_trace.h"
+#include "gpu_gl_renderer.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -48,6 +55,7 @@
 #else
 #  include <sys/socket.h>
 #  include <netinet/in.h>
+#  include <sys/time.h>     /* struct timeval — socket send/recv timeouts */
 #  include <unistd.h>
 #  include <fcntl.h>
 #  include <errno.h>
@@ -5720,6 +5728,119 @@ static void handle_vram_peek(int id, const char *json)
     free(hex);
 }
 
+/* GL-backend diagnostic: peek the GPU-side (FBO) VRAM for a rect, plus the
+ * coherency flags/rects — lets probes diff FBO truth against CPU truth. */
+extern int  gl_renderer_fbo_peek(int x, int y, int w, int h, uint16_t *out);
+extern void gl_renderer_diag(int *gpu_dirty, int pending[5], int pack[5]);
+
+static void handle_gl_fbo_peek(int id, const char *json)
+{
+    int x = json_get_int(json, "x", 0);
+    int y = json_get_int(json, "y", 0);
+    int w = json_get_int(json, "w", 8);
+    int h = json_get_int(json, "h", 1);
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (w > 128) w = 128;
+    if (h > 128) h = 128;
+    uint16_t px[128 * 128];
+    if (!gl_renderer_fbo_peek(x, y, w, h, px)) {
+        send_err(id, "GL pipeline inactive or rect out of range"); return;
+    }
+    int gpu_dirty = 0, pend[5] = {0}, pack[5] = {0};
+    gl_renderer_diag(&gpu_dirty, pend, pack);
+    size_t hex_len = (size_t)w * h * 4 + 1;
+    char *hex = (char *)malloc(hex_len);
+    if (!hex) { send_err(id, "alloc failed"); return; }
+    int pos = 0;
+    for (int i = 0; i < w * h; i++)
+        pos += snprintf(hex + pos, hex_len - pos, "%04x", px[i]);
+    send_fmt("{\"id\":%d,\"ok\":true,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,"
+             "\"gpu_dirty\":%d,"
+             "\"pending\":[%d,%d,%d,%d,%d],\"pack\":[%d,%d,%d,%d,%d],"
+             "\"hex\":\"%s\"}",
+             id, x, y, w, h, gpu_dirty,
+             pend[0], pend[1], pend[2], pend[3], pend[4],
+             pack[0], pack[1], pack[2], pack[3], pack[4], hex);
+    free(hex);
+}
+
+extern int gl_renderer_vram_diff(uint32_t *count, int bbox[4],
+                                 int samples[8][2], uint16_t samples_px[8][2]);
+
+static void handle_gl_vram_diff(int id, const char *json)
+{
+    (void)json;
+    uint32_t n = 0;
+    int bbox[4] = {0}, samples[8][2] = {{0}};
+    uint16_t spx[8][2] = {{0}};
+    int r = gl_renderer_vram_diff(&n, bbox, samples, spx);
+    if (!r) { send_err(id, "GL pipeline inactive"); return; }
+    int ns = r - 1;
+    int gpu_dirty = 0, pend[5] = {0}, pack[5] = {0};
+    gl_renderer_diag(&gpu_dirty, pend, pack);
+    char smp[512]; int pos = 0; smp[0] = 0;
+    for (int i = 0; i < ns; i++)
+        pos += snprintf(smp + pos, sizeof(smp) - pos,
+                        "%s[%d,%d,\"0x%04X\",\"0x%04X\"]", i ? "," : "",
+                        samples[i][0], samples[i][1], spx[i][0], spx[i][1]);
+    send_fmt("{\"id\":%d,\"ok\":true,\"mismatches\":%u,"
+             "\"bbox\":[%d,%d,%d,%d],\"gpu_dirty\":%d,"
+             "\"samples_xy_fbo_cpu\":[%s]}",
+             id, n, bbox[0], bbox[1], bbox[2], bbox[3], gpu_dirty, smp);
+}
+
+/* GL-backend coherency event ring: dump the last n events (default 200),
+ * optionally only events from frame >= frame_min. Always-on capture; this
+ * just reads a window. */
+static const char *gl_coh_kind_name(int k)
+{
+    switch (k) {
+    case GL_COH_FLUSH:    return "flush";
+    case GL_COH_FILL:     return "fill";
+    case GL_COH_COPY_SRC: return "copy_src";
+    case GL_COH_COPY:     return "copy";
+    case GL_COH_DRAW:     return "draw";
+    case GL_COH_PACK:     return "pack";
+    case GL_COH_ENSURE:   return "ensure";
+    case GL_COH_PRESENT:  return "present";
+    case GL_COH_UPLOAD:   return "upload";
+    case GL_COH_PEEK:     return "peek";
+    case GL_COH_DIFF:     return "diff";
+    default:              return "?";
+    }
+}
+
+static void handle_gl_coh_ring(int id, const char *json)
+{
+    int n = json_get_int(json, "n", 200);
+    long frame_min = json_get_int(json, "frame_min", -1);
+    if (n < 1) n = 1;
+    if (n > 8192) n = 8192;
+    uint64_t total = gl_renderer_coh_total();
+    uint64_t start = total > (uint64_t)n ? total - (uint64_t)n : 0;
+    int bufsz = 64 + n * 64;
+    char *buf = (char *)malloc((size_t)bufsz);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    int pos = snprintf(buf, bufsz,
+                       "{\"id\":%d,\"ok\":true,\"total\":%llu,\"events\":[",
+                       id, (unsigned long long)total);
+    int first = 1;
+    for (uint64_t s = start; s < total && pos < bufsz - 128; s++) {
+        GlCohEvent e;
+        if (!gl_renderer_coh_get(s, &e)) continue;
+        if (frame_min >= 0 && e.frame < (uint32_t)frame_min) continue;
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s[%llu,%u,\"%s\",%d,%d,%d,%d]",
+                        first ? "" : ",", (unsigned long long)s, e.frame,
+                        gl_coh_kind_name(e.kind), e.x0, e.y0, e.x1, e.y1);
+        first = 0;
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "]}");
+    send_fmt("%s", buf);
+    free(buf);
+}
+
 /* ---- Write trace: hook + handlers (Tier 1 reverse debugger) ---- */
 extern CPUState *debug_cpu_ptr;
 
@@ -8305,6 +8426,9 @@ static const CmdEntry s_commands[] = {
     { "gpu_state",         handle_gpu_state },
     { "mem_words",         handle_mem_words },
     { "vram_peek",         handle_vram_peek },
+    { "gl_coh_ring",       handle_gl_coh_ring },
+    { "gl_fbo_peek",       handle_gl_fbo_peek },
+    { "gl_vram_diff",      handle_gl_vram_diff },
     { "irq_state",         handle_irq_state },
     { "timers_state",      handle_timers_state },
     { "cdrom_state",       handle_cdrom_state },
