@@ -99,6 +99,7 @@ struct LauncherModel {
     int  texture_filter  = 0;  // 0=nearest, 1=bilinear
     int  crt             = 0;  // 0=raw,1=crt,2=composite,3=trinitron
     bool spu_hq          = false;
+    int  window_width    = 1280; // window size (4:3; height = w*3/4)
 
     Rml::String bios_path;
     Rml::String disc_path;
@@ -107,6 +108,7 @@ struct LauncherModel {
     Rml::String renderer_label;
     Rml::String crt_label;
     Rml::String texfilter_label;
+    Rml::String winsize_label;
 
     // Disc verification (recomputed whenever disc_path changes).
     Rml::String disc_file;      // file name only, e.g. "tomba.cue"
@@ -332,10 +334,29 @@ const char* crt_name(int v) {
     }
 }
 
+// Offered 4:3 window widths (height = w*3/4). The toggle cycles through these.
+const int kWinWidths[] = { 960, 1280, 1600, 1920 };
+const int kNumWinWidths = (int)(sizeof(kWinWidths) / sizeof(kWinWidths[0]));
+
+// Snap an arbitrary width to the nearest offered option index.
+int winsize_index(int width) {
+    int best = 1, bestd = 1 << 30;  // default to 1280
+    for (int i = 0; i < kNumWinWidths; i++) {
+        int d = width > kWinWidths[i] ? width - kWinWidths[i] : kWinWidths[i] - width;
+        if (d < bestd) { bestd = d; best = i; }
+    }
+    return best;
+}
+
+std::string winsize_label_for(int width) {
+    return std::to_string(width) + " \xC3\x97 " + std::to_string(width * 3 / 4);  // "1280 × 960"
+}
+
 void refresh_labels(LauncherModel& m) {
     m.renderer_label  = renderer_name(m.renderer);
     m.crt_label       = crt_name(m.crt);
     m.texfilter_label = texfilter_name(m.texture_filter);
+    m.winsize_label   = winsize_label_for(m.window_width);
 }
 
 std::string region_long(const std::string& r) {
@@ -546,6 +567,7 @@ Result run(SDL_Window* window, void* gl_context,
     m.texture_filter = io.texture_filter;
     m.crt            = io.screen_kind;
     m.spu_hq         = io.spu_hq;
+    m.window_width   = kWinWidths[winsize_index(io.has_window_width ? io.window_width : 1280)];
     m.bios_path      = io.has_bios_path ? io.bios_path.generic_string() : Rml::String();
     m.disc_path      = io.has_disc_path ? io.disc_path.generic_string() : Rml::String();
     refresh_labels(m);
@@ -588,6 +610,7 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("spu_hq",         &m.spu_hq);
     c.Bind("renderer_label", &m.renderer_label);
     c.Bind("crt_label",      &m.crt_label);
+    c.Bind("winsize_label",  &m.winsize_label);
     c.Bind("texfilter_label",&m.texfilter_label);
     c.Bind("bios_path",      &m.bios_path);
     c.Bind("disc_path",      &m.disc_path);
@@ -651,6 +674,12 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.crt = (m.crt + 1) % 4; refresh_labels(m);
             handle.DirtyVariable("crt_label");
+        });
+    c.BindEventCallback("cycle_winsize",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            int i = (winsize_index(m.window_width) + 1) % kNumWinWidths;
+            m.window_width = kWinWidths[i]; refresh_labels(m);
+            handle.DirtyVariable("winsize_label");
         });
     c.BindEventCallback("toggle_spu",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -831,6 +860,7 @@ Result run(SDL_Window* window, void* gl_context,
         io.texture_filter = m.texture_filter; io.has_texture_filter = true;
         io.screen_kind = m.crt;               io.has_screen_kind = true;
         io.spu_hq = m.spu_hq;                 io.has_spu_hq = true;
+        io.window_width = m.window_width;     io.has_window_width = true;
         if (!m.bios_path.empty()) { io.bios_path = fs::path(std::string(m.bios_path)); io.has_bios_path = true; }
         if (!m.disc_path.empty()) { io.disc_path = fs::path(std::string(m.disc_path)); io.has_disc_path = true; }
 

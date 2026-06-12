@@ -485,6 +485,10 @@ UserSettings load_user_settings(const fs::path& path) {
             const auto n = toml::find<int64_t>(v, "supersampling");
             if (n >= 1 && n <= 4) { s.supersampling = (int)n; s.has_supersampling = true; }
         });
+        if (v.contains("window_width")) try_get([&]{
+            const auto n = toml::find<int64_t>(v, "window_width");
+            if (n >= 640 && n <= 3840) { s.window_width = (int)n; s.has_window_width = true; }
+        });
         if (v.contains("antialiasing")) try_get([&]{
             s.antialiasing = toml::find<bool>(v, "antialiasing"); s.has_antialiasing = true;
         });
@@ -584,6 +588,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "renderer          = \"" << (s.renderer ? "opengl" : "software") << "\"\n";
     if (s.has_supersampling)
         f << "supersampling     = " << s.supersampling << "\n";
+    if (s.has_window_width)
+        f << "window_width      = " << s.window_width << "\n";
     if (s.has_antialiasing)
         f << "antialiasing      = " << (s.antialiasing ? "true" : "false") << "\n";
     if (s.has_texture_filter)

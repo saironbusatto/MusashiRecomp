@@ -118,7 +118,23 @@ static bool          g_video_aa    = true;  /* linear present filtering */
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 static int           g_video_renderer = 0;  /* 0=software, 1=opengl (requested) */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
+static int           g_video_win_w    = 1280; /* window width (height = w*3/4, 4:3) */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
+
+/* Clamp a requested 4:3 window width to the primary display's usable area so an
+ * oversized choice (e.g. 1920 on a 1080p panel) still fits on screen. Keeps the
+ * 4:3 aspect: height = width*3/4. */
+static void clamp_window_4x3(int* w, int* h) {
+    int width = *w;
+    if (width < 640) width = 640;
+    SDL_Rect bounds;
+    if (SDL_GetDisplayUsableBounds(0, &bounds) == 0 && bounds.w > 0 && bounds.h > 0) {
+        if (width > bounds.w)         width = bounds.w;
+        if (width * 3 / 4 > bounds.h) width = bounds.h * 4 / 3;
+    }
+    *w = width;
+    *h = width * 3 / 4;
+}
 static bool          g_gl_active = false;    /* GL context live -> GL present path */
 /* Present straight from the FBO (fast, no readback). Set PSX_GL_FORCE_CPU_PRESENT=1
  * to force the software readout path instead — a diagnostic/fallback that also
@@ -1408,6 +1424,7 @@ int main(int argc, char** argv) {
             PSXRecompV4::load_user_settings(settings_path);
         if (us.has_renderer)       g_video_renderer  = us.renderer;
         if (us.has_supersampling)  g_video_scale     = us.supersampling;
+        if (us.has_window_width)   g_video_win_w     = us.window_width;
         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
         if (us.has_screen_kind)    g_video_screen    = us.screen_kind;
@@ -1460,17 +1477,25 @@ int main(int argc, char** argv) {
             seed.p2_device = p2_device; seed.has_p2_device = true;
             seed.p1_analog = p1_analog; seed.has_p1_analog = true;
             seed.p2_analog = p2_analog; seed.has_p2_analog = true;
+            seed.window_width = g_video_win_w; seed.has_window_width = true;
 
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
             SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
 
+            /* Launcher opens at the same 4:3 size the game will, so there's no
+             * jarring resize on LAUNCH. The dense dashboard needs a usable
+             * minimum, so the launcher floor is 1280 wide even if the game
+             * window is set smaller. */
+            int lwin_w = g_video_win_w < 1280 ? 1280 : g_video_win_w;
+            int lwin_h = 0;
+            clamp_window_4x3(&lwin_w, &lwin_h);
             std::string lwin_title = (game_name.empty() ? std::string("PSX") : game_name)
                                      + " \xE2\x80\x94 Launcher";
             SDL_Window* lwin = SDL_CreateWindow(
                 lwin_title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                1280, 924, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+                lwin_w, lwin_h, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
             psx_launcher::Result lr = psx_launcher::Result::Unavailable;
             if (lwin) {
                 SDL_GLContext lctx = SDL_GL_CreateContext(lwin);
@@ -1513,6 +1538,7 @@ int main(int argc, char** argv) {
                 if (seed.has_memcard2_path) memcard2_path = seed.memcard2_path;
                 p1_device = seed.p1_device; p2_device = seed.p2_device;
                 p1_analog = seed.p1_analog; p2_analog = seed.p2_analog;
+                g_video_win_w = seed.window_width;
                 /* Persist the user's choices next to the exe. */
                 PSXRecompV4::save_user_settings(
                     exe_dir_from_argv(argv[0]) / "settings.toml", seed);
@@ -1662,10 +1688,16 @@ int main(int argc, char** argv) {
 
     Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
     if (g_video_renderer == 1) win_flags |= SDL_WINDOW_OPENGL;
+    /* Open at the user-chosen 4:3 window size (default 1280x960) instead of the
+     * old hardcoded 640x480, so the game doesn't boot into a tiny window. The
+     * present path keeps a 640x480 logical space, so the image scales to fill
+     * the larger window with no aspect distortion. */
+    int game_w = g_video_win_w, game_h = 0;
+    clamp_window_4x3(&game_w, &game_h);
     sdl_window = SDL_CreateWindow(
         window_title.c_str(),
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        640, 480,
+        game_w, game_h,
         win_flags
     );
     if (!sdl_window) {

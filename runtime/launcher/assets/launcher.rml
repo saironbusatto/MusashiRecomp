@@ -146,6 +146,7 @@ button:hover { background-color: #232d3c; }
 .set-lbl { width: 230dp; flex: 0 0 230dp; color: #adbac7; }
 .set-ctl { flex: 1 1 auto; display: flex; flex-direction: row; align-items: center; }
 .toggle { width: 132dp; text-align: center; }
+.toggle.wide { width: 164dp; }
 .value { color: #ffffff; font-weight: bold; }
 .path { flex: 1 1 auto; min-width: 0dp; margin-left: 12dp; color: #7d8590;
 	white-space: nowrap; overflow: hidden; }
@@ -300,6 +301,8 @@ button:hover { background-color: #232d3c; }
 	<div data-if="view == 'settings'">
 		<div class="panel">
 			<div class="eyebrow">VIDEO</div>
+			<div class="set-row"><span class="set-lbl">Window size (4:3)</span><span class="set-ctl">
+				<button class="toggle wide" data-event-click="cycle_winsize"><span class="value">{{winsize_label}}</span></button></span></div>
 			<div class="set-row"><span class="set-lbl">Renderer</span><span class="set-ctl">
 				<button class="toggle" data-event-click="cycle_renderer"><span class="value">{{renderer_label}}</span></button></span></div>
 			<div class="set-row"><span class="set-lbl">Supersampling</span><span class="set-ctl">

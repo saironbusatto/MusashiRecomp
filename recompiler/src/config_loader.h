@@ -211,6 +211,9 @@ struct UserSettings {
     // [video]
     bool has_renderer       = false; int  renderer       = 0; // 0=software,1=opengl
     bool has_supersampling  = false; int  supersampling  = 1; // 1..4
+    // Window size: width in px; height is always width*3/4 (PSX 4:3). Applies to
+    // both the launcher and the emulator window so they boot at the same size.
+    bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960
     bool has_antialiasing   = false; bool antialiasing   = true;
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
     bool has_screen_kind    = false; int  screen_kind    = 0; // 0..3 (ScreenKind)
