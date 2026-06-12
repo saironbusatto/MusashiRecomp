@@ -84,6 +84,30 @@ button:hover { background-color: #30363d; }
 	overflow: hidden;
 }
 .path.empty { color: #f85149; }
+/* Disc verification badge — colour driven by data-class on disc_state. */
+.badge {
+	display: inline-block;
+	border-radius: 6dp;
+	padding: 4dp 12dp;
+	font-size: 13dp;
+	font-weight: bold;
+	background-color: #30363d;
+	color: #adbac7;
+}
+.badge.ok   { background-color: #1f6f3f; color: #d6f7df; }
+.badge.warn { background-color: #7a5a13; color: #ffe9a8; }
+.badge.bad  { background-color: #7a2230; color: #ffd6d6; }
+.badge.none { background-color: #30363d; color: #8b949e; }
+.badge-detail {
+	flex: 1 1 auto;
+	min-width: 0dp;
+	margin-left: 12dp;
+	color: #7d8590;
+	font-size: 14dp;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+	overflow: hidden;
+}
 #actions {
 	display: flex;
 	flex-direction: row;
@@ -172,6 +196,17 @@ button:hover { background-color: #30363d; }
 					<button data-event-click="browse_disc">Browse</button>
 					<span class="path" data-if="disc_path != ''">{{disc_path}}</span>
 					<span class="path empty" data-if="disc_path == ''">(not set)</span>
+				</span>
+			</div>
+			<div class="row">
+				<span class="label">Verification</span>
+				<span class="control">
+					<span class="badge"
+						data-class-ok="disc_state == 'ok'"
+						data-class-warn="disc_state == 'warn'"
+						data-class-bad="disc_state == 'bad'"
+						data-class-none="disc_state == 'none'">{{disc_status}}</span>
+					<span class="badge-detail">{{disc_detail}}</span>
 				</span>
 			</div>
 		</div>

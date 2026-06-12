@@ -179,6 +179,13 @@ struct GameConfig {
     // the union here).
     std::vector<std::filesystem::path> discs;
 
+    // Optional expected disc identity, for the launcher's "Disc verified" badge.
+    // disc_crc: full-file CRC32 (IEEE) of the data track. disc_sha1: lowercase
+    // hex SHA-1. Either may be absent (has_disc_crc / disc_sha1.empty()).
+    bool                  has_disc_crc = false;
+    uint32_t              disc_crc = 0;
+    std::string           disc_sha1;
+
     // [recompiler] block
     std::filesystem::path seeds_path;     // absolute path to seeds (text or json)
     std::filesystem::path bios_thunks_path; // optional; empty if not set

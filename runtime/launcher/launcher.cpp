@@ -8,6 +8,7 @@
 #include "launcher.h"
 
 #include "config_loader.h"
+#include "disc_identity.h"
 
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Context.h>
@@ -49,6 +50,11 @@ struct LauncherModel {
     Rml::String crt_label;
     Rml::String texfilter_label;
 
+    // Disc verification (recomputed whenever disc_path changes).
+    Rml::String disc_status;   // headline, e.g. "Disc verified"
+    Rml::String disc_detail;   // serial / region / CRC line
+    Rml::String disc_state;    // "ok" | "warn" | "bad" | "none" — drives the badge colour
+
     bool launch_requested = false;
     bool quit_requested   = false;
 };
@@ -68,6 +74,73 @@ void refresh_labels(LauncherModel& m) {
     m.renderer_label  = renderer_name(m.renderer);
     m.crt_label       = crt_name(m.crt);
     m.texfilter_label = texfilter_name(m.texture_filter);
+}
+
+// Re-run disc verification against m.disc_path and update the badge fields.
+// `expected_serial`/`expected_crc` come from game.toml (via GameInfo).
+void refresh_disc_status(LauncherModel& m, const std::string& expected_serial,
+                         uint32_t expected_crc, bool has_expected_crc) {
+    if (m.disc_path.empty()) {
+        m.disc_status = "No disc selected";
+        m.disc_detail = "Pick a disc image to verify it against this build.";
+        m.disc_state  = "none";
+        return;
+    }
+
+    // Only spend time hashing when there is an expected CRC to compare against.
+    const PSXRecompV4::DiscIdentity id = PSXRecompV4::identify_disc(
+        fs::path(std::string(m.disc_path)), expected_serial,
+        expected_crc, has_expected_crc, /*compute_crc=*/has_expected_crc);
+
+    if (!id.opened) {
+        m.disc_status = "Disc not found";
+        m.disc_detail = "Could not open the image or its CUE-referenced BIN.";
+        m.disc_state  = "bad";
+        return;
+    }
+    if (!id.has_header) {
+        m.disc_status = "Not a PlayStation disc";
+        m.disc_detail = "No ISO9660 header at the expected sectors.";
+        m.disc_state  = "bad";
+        return;
+    }
+
+    // Build the detail line: detected serial + region (+ CRC when computed).
+    std::string detail;
+    const std::string shown_serial =
+        !id.detected_serial.empty() ? id.detected_serial : std::string("unknown serial");
+    detail = shown_serial;
+    if (!id.region.empty()) detail += "  ·  " + id.region;
+    if (id.crc_computed) {
+        char crcbuf[16];
+        std::snprintf(crcbuf, sizeof(crcbuf), "%08X", id.crc);
+        detail += "  ·  CRC ";
+        detail += crcbuf;
+    }
+    m.disc_detail = detail;
+
+    const bool serial_ok = !id.expected_serial_given || id.serial_matches;
+    const bool crc_ok    = !id.expected_crc_given || id.crc_matches;
+
+    if (id.expected_crc_given && id.crc_computed && id.crc_matches) {
+        m.disc_status = "Disc verified";   // strongest: exact CRC match
+        m.disc_state  = "ok";
+    } else if (id.expected_crc_given && id.crc_computed && !id.crc_matches) {
+        m.disc_status = "CRC mismatch";
+        m.disc_state  = "bad";
+    } else if (serial_ok && id.expected_serial_given) {
+        m.disc_status = "Serial verified";
+        m.disc_state  = "ok";
+    } else if (!serial_ok) {
+        m.disc_status = "Wrong game?";
+        m.disc_detail = "Disc serial does not match this build (" + expected_serial + ").  " +
+                        m.disc_detail;
+        m.disc_state  = "warn";
+    } else {
+        m.disc_status = "PlayStation disc";  // header ok, nothing to compare against
+        m.disc_state  = "ok";
+    }
+    (void)crc_ok;
 }
 
 #if defined(_WIN32)
@@ -118,9 +191,13 @@ namespace psx_launcher {
 
 Result run(SDL_Window* window, void* gl_context,
            PSXRecompV4::UserSettings& io,
-           const char* game_name, const char* assets_dir)
+           const GameInfo& game, const char* assets_dir)
 {
     (void)gl_context;  // already created + current; we only need the window.
+
+    const std::string expected_serial = game.expected_serial ? game.expected_serial : "";
+    const uint32_t    expected_crc    = game.expected_crc;
+    const bool        has_expected_crc = game.has_expected_crc;
 
     if (!RmlGL3::Initialize()) {
         std::fprintf(stderr, "launcher: RmlGL3::Initialize failed\n");
@@ -172,6 +249,7 @@ Result run(SDL_Window* window, void* gl_context,
     m.bios_path      = io.has_bios_path ? io.bios_path.generic_string() : Rml::String();
     m.disc_path      = io.has_disc_path ? io.disc_path.generic_string() : Rml::String();
     refresh_labels(m);
+    refresh_disc_status(m, expected_serial, expected_crc, has_expected_crc);
 
     // ---- Data model: bind fields + action callbacks ----
     Rml::DataModelConstructor c = context->CreateDataModel("settings");
@@ -180,7 +258,7 @@ Result run(SDL_Window* window, void* gl_context,
         RmlGL3::Shutdown();
         return Result::Unavailable;
     }
-    Rml::String title = game_name ? Rml::String(game_name) : Rml::String("PSX");
+    Rml::String title = game.name ? Rml::String(game.name) : Rml::String("PSX");
     c.BindFunc("game_name", [title](Rml::Variant& out) { out = title; });
     c.Bind("supersampling",  &m.supersampling);
     c.Bind("antialiasing",   &m.antialiasing);
@@ -190,6 +268,9 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("texfilter_label",&m.texfilter_label);
     c.Bind("bios_path",      &m.bios_path);
     c.Bind("disc_path",      &m.disc_path);
+    c.Bind("disc_status",    &m.disc_status);
+    c.Bind("disc_detail",    &m.disc_detail);
+    c.Bind("disc_state",     &m.disc_state);
 
     Rml::DataModelHandle handle = c.GetModelHandle();
 
@@ -233,12 +314,17 @@ Result run(SDL_Window* window, void* gl_context,
             }
         });
     c.BindEventCallback("browse_disc",
-        [&m, window, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+        [&m, window, handle, expected_serial, expected_crc, has_expected_crc]
+        (Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             std::string p = win_pick_file(window, "Select disc image",
                 "Disc image (*.cue;*.bin;*.iso)\0*.cue;*.bin;*.iso\0All files (*.*)\0*.*\0\0");
             if (!p.empty()) {
                 m.disc_path = fs::path(p).generic_string();
+                refresh_disc_status(m, expected_serial, expected_crc, has_expected_crc);
                 handle.DirtyVariable("disc_path");
+                handle.DirtyVariable("disc_status");
+                handle.DirtyVariable("disc_detail");
+                handle.DirtyVariable("disc_state");
             }
         });
     c.BindEventCallback("launch",

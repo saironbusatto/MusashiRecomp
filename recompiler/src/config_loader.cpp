@@ -382,6 +382,20 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         discs.push_back(fs::absolute(root / d));
     }
 
+    // Optional expected disc identity (launcher verification badge).
+    bool has_disc_crc = false;
+    uint32_t disc_crc = 0;
+    std::string disc_sha1;
+    if (game.contains("disc_crc")) {
+        disc_crc = parse_hex(toml::find<std::string>(game, "disc_crc"), "game.disc_crc");
+        has_disc_crc = true;
+    }
+    if (game.contains("disc_sha1")) {
+        disc_sha1 = toml::find<std::string>(game, "disc_sha1");
+        // normalize to lowercase hex
+        for (char& c : disc_sha1) c = (char)std::tolower((unsigned char)c);
+    }
+
     // [recompiler]
     if (!cfg.contains("recompiler")) {
         throw std::runtime_error(
@@ -430,6 +444,9 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*text_size*/        text_size,
         /*stack_base*/       stack_base,
         /*discs*/            discs,
+        /*has_disc_crc*/     has_disc_crc,
+        /*disc_crc*/         disc_crc,
+        /*disc_sha1*/        disc_sha1,
         /*seeds_path*/       seeds_path,
         /*bios_thunks_path*/ bios_thunks_path,
         /*out_dir*/          out_dir,

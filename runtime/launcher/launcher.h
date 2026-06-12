@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 struct SDL_Window;
 
 namespace PSXRecompV4 { struct UserSettings; }
@@ -25,6 +27,15 @@ enum class Result {
     Unavailable, // launcher could not initialise (assets/GL); caller boots as if skipped
 };
 
+// Static facts about the game the launcher is configuring. Drives the title and
+// the disc-verification badge. Extends naturally for later phases.
+struct GameInfo {
+    const char* name             = nullptr;  // display name, e.g. "Tomba!"
+    const char* expected_serial  = nullptr;  // game id "SCUS-94236" (null = no serial check)
+    uint32_t    expected_crc     = 0;        // full-file CRC32 of the data track
+    bool        has_expected_crc = false;    // whether expected_crc is meaningful
+};
+
 // Run the launcher loop to completion. `gl_context` is an SDL_GLContext (void*
 // to avoid leaking SDL types into this header) already created and current on
 // `window`. `io` is seeded with the effective settings (game.toml ∪ settings.toml)
@@ -32,6 +43,6 @@ enum class Result {
 // is the directory holding launcher.rml / .rcss / fonts.
 Result run(SDL_Window* window, void* gl_context,
            PSXRecompV4::UserSettings& io,
-           const char* game_name, const char* assets_dir);
+           const GameInfo& game, const char* assets_dir);
 
 } // namespace psx_launcher

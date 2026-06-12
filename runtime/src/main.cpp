@@ -27,6 +27,7 @@
 #include "freeze_heartbeat.h"
 #include "config_loader.h"
 #include "crc32.h"
+#include "disc_identity.h"
 #if defined(PSX_LAUNCHER)
 #include "launcher.h"
 #endif
@@ -257,64 +258,12 @@ static std::string uppercase_ascii(std::string s) {
     return s;
 }
 
-static bool ends_with_ci(const std::string& s, const std::string& suffix) {
-    if (s.size() < suffix.size()) return false;
-    for (size_t i = 0; i < suffix.size(); i++) {
-        char a = (char)std::toupper((unsigned char)s[s.size() - suffix.size() + i]);
-        char b = (char)std::toupper((unsigned char)suffix[i]);
-        if (a != b) return false;
-    }
-    return true;
-}
-
-static std::filesystem::path cue_data_path(const std::filesystem::path& path) {
-    if (!ends_with_ci(path.string(), ".cue")) return path;
-
-    std::ifstream cue(path);
-    if (!cue.is_open()) return path;
-
-    std::string line;
-    while (std::getline(cue, line)) {
-        const std::string upper = uppercase_ascii(line);
-        const size_t file_pos = upper.find("FILE");
-        const size_t binary_pos = upper.find("BINARY");
-        if (file_pos == std::string::npos || binary_pos == std::string::npos) continue;
-
-        size_t q1 = line.find('"', file_pos);
-        size_t q2 = (q1 == std::string::npos) ? std::string::npos : line.find('"', q1 + 1);
-        std::string bin_name;
-        if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1 + 1) {
-            bin_name = line.substr(q1 + 1, q2 - q1 - 1);
-        } else {
-            std::istringstream iss(line.substr(file_pos + 4));
-            iss >> bin_name;
-        }
-        if (bin_name.empty()) break;
-
-        std::filesystem::path bin_path(bin_name);
-        if (bin_path.is_relative()) return path.parent_path() / bin_path;
-        return bin_path;
-    }
-    return path;
-}
-
 static bool read_at(std::ifstream& f, uint64_t offset, uint8_t* out, size_t len) {
     f.clear();
     f.seekg((std::streamoff)offset, std::ios::beg);
     if (!f.good()) return false;
     f.read(reinterpret_cast<char*>(out), (std::streamsize)len);
     return f.gcount() == (std::streamsize)len;
-}
-
-static bool is_iso_pvd(const uint8_t* sector) {
-    return sector[0] == 0x01 && std::memcmp(&sector[1], "CD001", 5) == 0 && sector[6] == 0x01;
-}
-
-static std::string psx_exe_id_from_game_id(const std::string& game_id) {
-    if (game_id.size() == 10 && game_id[4] == '-') {
-        return game_id.substr(0, 4) + "_" + game_id.substr(5, 3) + "." + game_id.substr(8, 2);
-    }
-    return game_id;
 }
 
 struct DiscValidation {
@@ -326,57 +275,21 @@ struct DiscValidation {
 
 static DiscValidation validate_disc_image(const std::filesystem::path& selected_path,
                                           const std::string& game_id) {
+    // Delegate to the shared disc-identity module so the launch-time check and
+    // the launcher badge can never drift apart. No CRC here — the launch check
+    // only cares about openability / header / serial; the launcher does the
+    // (slower) CRC pass when an expected CRC is configured.
+    const PSXRecompV4::DiscIdentity id =
+        PSXRecompV4::identify_disc(selected_path, game_id, /*expected_crc*/0,
+                                   /*has_expected_crc*/false, /*compute_crc*/false);
     DiscValidation v;
-    const std::filesystem::path data_path = cue_data_path(selected_path);
-    std::ifstream f(data_path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) {
-        v.detail = "Could not open the selected disc image or its CUE-referenced BIN file.";
-        return v;
-    }
-    v.opened = true;
-
-    const uint64_t size = (uint64_t)f.tellg();
-    uint8_t sector[2048];
-    if ((size >= (16ull * 2352ull + 24ull + sizeof(sector))) &&
-        read_at(f, 16ull * 2352ull + 24ull, sector, sizeof(sector)) &&
-        is_iso_pvd(sector)) {
-        v.has_header = true;
-    } else if ((size >= (16ull * 2048ull + sizeof(sector))) &&
-               read_at(f, 16ull * 2048ull, sector, sizeof(sector)) &&
-               is_iso_pvd(sector)) {
-        v.has_header = true;
-    }
-
-    if (!v.has_header) {
-        v.detail = "No ISO9660 CD001 header was found at the standard PS1 disc locations.";
-        return v;
-    }
-
-    if (game_id.empty()) {
-        v.id_matches = true;
-        return v;
-    }
-
-    const std::string exe_id = uppercase_ascii(psx_exe_id_from_game_id(game_id));
-    const std::string serial_id = uppercase_ascii(game_id);
-    const uint64_t scan_len_u64 = std::min<uint64_t>(size, 16ull * 1024ull * 1024ull);
-    const size_t scan_len = (size_t)scan_len_u64;
-    std::vector<uint8_t> scan(scan_len);
-    if (!read_at(f, 0, scan.data(), scan.size())) {
-        v.detail = "The ISO header is present, but the image could not be scanned for the game ID.";
-        return v;
-    }
-
-    auto contains_ascii = [&](const std::string& needle) {
-        if (needle.empty() || needle.size() > scan.size()) return false;
-        return std::search(scan.begin(), scan.end(), needle.begin(), needle.end()) != scan.end();
-    };
-
-    if (contains_ascii(exe_id) || contains_ascii(serial_id)) {
-        v.id_matches = true;
-    } else {
+    v.opened     = id.opened;
+    v.has_header = id.has_header;
+    v.id_matches = game_id.empty() ? true : id.serial_matches;
+    v.detail     = id.detail;
+    if (id.opened && id.has_header && !v.id_matches && v.detail.empty()) {
         v.detail = "The disc header is readable, but it does not contain the expected game ID " +
-                   exe_id + " / " + serial_id + " in the early disc metadata.";
+                   uppercase_ascii(game_id) + " in the early disc metadata.";
     }
     return v;
 }
@@ -1327,6 +1240,8 @@ int main(int argc, char** argv) {
     uint16_t   debug_port    = (uint16_t)DEFAULT_DEBUG_PORT;
     std::string game_name;
     std::string game_id;
+    bool        game_has_disc_crc = false;
+    uint32_t    game_disc_crc     = 0;
     std::string disc_speed;   /* "1x" | "2x" | "4x" | "instant" */
     int        instant_rate  = 0;   /* 0 = cdrom.c built-in default */
     uint32_t   game_entry_pc = 0;
@@ -1337,6 +1252,8 @@ int main(int argc, char** argv) {
             const auto gc = PSXRecompV4::load_game_config(game_config_path);
             game_name = gc.name;
             game_id   = gc.id;
+            game_has_disc_crc = gc.has_disc_crc;
+            game_disc_crc     = gc.disc_crc;
             if (!gc.discs.empty()) resolved_disc = gc.discs.front();
             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
@@ -1453,9 +1370,12 @@ int main(int argc, char** argv) {
                     SDL_GL_MakeCurrent(lwin, lctx);
                     SDL_GL_SetSwapInterval(1);
                     std::string assets = exe_dir_from_argv(argv[0]).string();
-                    lr = psx_launcher::run(lwin, lctx, seed,
-                                           game_name.empty() ? nullptr : game_name.c_str(),
-                                           assets.c_str());
+                    psx_launcher::GameInfo ginfo;
+                    ginfo.name             = game_name.empty() ? nullptr : game_name.c_str();
+                    ginfo.expected_serial  = game_id.empty()   ? nullptr : game_id.c_str();
+                    ginfo.expected_crc     = game_disc_crc;
+                    ginfo.has_expected_crc = game_has_disc_crc;
+                    lr = psx_launcher::run(lwin, lctx, seed, ginfo, assets.c_str());
                     SDL_GL_DeleteContext(lctx);
                 }
                 SDL_DestroyWindow(lwin);
