@@ -13,7 +13,7 @@ body {
 
 /* ---- top bar ---- */
 .topbar { display: flex; flex-direction: row; align-items: center; margin-bottom: 18dp; }
-.logo { width: 46dp; height: 46dp; margin-right: 16dp; decorator: image(img/logo.png); }
+.logo { width: 46dp; height: 46dp; margin-right: 16dp; decorator: image(img/logo.png contain); }
 .title-block { display: block; }
 h1 { display: block; font-size: 27dp; font-weight: bold; color: #ffffff; }
 .subtitle { display: block; color: #7d8590; font-size: 14dp; }
@@ -42,7 +42,7 @@ h1 { display: block; font-size: 27dp; font-weight: bold; color: #ffffff; }
 
 /* ---- disc verification panel ---- */
 .disc-panel { display: flex; flex-direction: row; align-items: flex-start; }
-.disc-art { width: 200dp; height: 200dp; margin-right: 24dp; decorator: image(img/disc.png); flex: 0 0 200dp; }
+.disc-art { width: 216dp; height: 216dp; margin-right: 24dp; decorator: image(img/disc.png contain); flex: 0 0 216dp; }
 .disc-info { display: block; flex: 1 1 auto; }
 .disc-title { display: block; font-size: 32dp; font-weight: bold; color: #ffffff; }
 .disc-sub { display: block; color: #9aa4b2; font-size: 16dp; margin-bottom: 16dp; }
@@ -91,9 +91,9 @@ button:hover { background-color: #232d3c; }
 .switch.on .knob { margin-left: 23dp; }
 
 .card-body { display: flex; flex-direction: row; align-items: center; }
-.pad-art { width: 168dp; height: 120dp; margin-right: 16dp; flex: 0 0 168dp; }
-.pad-art.digital { decorator: image(img/pad_digital.png); }
-.pad-art.analog  { decorator: image(img/pad_analog.png); }
+.pad-art { width: 206dp; height: 128dp; margin-right: 14dp; flex: 0 0 206dp; }
+.pad-art.digital { decorator: image(img/pad_digital.png contain); }
+.pad-art.analog  { decorator: image(img/pad_analog.png contain); }
 .card-col { display: block; flex: 1 1 auto; }
 .field-lbl { display: block; color: #8b949e; font-size: 12dp; margin-bottom: 5dp; }
 .dropdown {
@@ -106,7 +106,7 @@ button:hover { background-color: #232d3c; }
 .status-txt { color: #9aa4b2; font-size: 13dp; flex: 1 1 auto; }
 
 /* memcard */
-.mc-art { width: 110dp; height: 132dp; margin-right: 16dp; flex: 0 0 110dp; decorator: image(img/memcard.png); }
+.mc-art { width: 118dp; height: 132dp; margin-right: 16dp; flex: 0 0 118dp; decorator: image(img/memcard.png contain); }
 .mc-name { display: block; font-size: 20dp; font-weight: bold; color: #ffffff; margin-bottom: 10dp; }
 .mc-btns { display: flex; flex-direction: row; margin-bottom: 12dp; }
 .mc-btns button { margin-right: 8dp; }
