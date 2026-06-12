@@ -8,6 +8,7 @@
  */
 
 #include "spu.h"
+#include "spu_shadow.h"
 
 #include <string.h>
 
@@ -342,6 +343,53 @@ static void decode_block(SpuVoice *v) {
     }
 }
 
+/* ---- Verified-enhancement shadow tap (opt-in; see spu_shadow.{h,c}) ------
+ *
+ * When the float SPU shadow is enabled, the mix loop records — per output
+ * frame, per contributing voice — the EXACT inputs the canon used to produce
+ * that voice's contribution: the four decoded samples bracketing the current
+ * sub-sample phase, the fractional phase, the envelope level, and the per-voice
+ * L/R volumes. The shadow re-renders those in float with cubic interpolation.
+ * Sourcing the decoded data + envelope from the canon means the shadow can only
+ * differ in HOW a note is resampled, never in WHICH note plays.
+ *
+ * Inert and zero-cost when the shadow is disabled (s_shadow_tap_on == 0): the
+ * mix loop's recording is guarded by that flag, set once from spu_render. */
+typedef struct {
+    int16_t  s[4];     /* decoded samples at sample_idx-1 .. sample_idx+2 */
+    float    frac;     /* fractional phase in [0,1) at this output frame */
+    uint16_t env;      /* env_level (0..0x7FFF) */
+    int16_t  vol_l;    /* per-voice volume (already direct_volume-decoded) */
+    int16_t  vol_r;
+    uint8_t  active;
+} SpuShadowVoiceTap;
+
+/* One frame's worth of per-voice taps, plus the global scale used this block. */
+typedef struct {
+    SpuShadowVoiceTap voice[SPU_VOICE_COUNT];
+    int16_t main_l;
+    int16_t main_r;
+    int     enabled;   /* SPU control enable bit this block */
+} SpuShadowFrameTap;
+
+/* Sized to the largest spu_render block (main.cpp caps at 2048 frames). */
+#define SPU_SHADOW_TAP_FRAMES 2048
+static SpuShadowFrameTap s_shadow_tap[SPU_SHADOW_TAP_FRAMES];
+static int               s_shadow_tap_on = 0;   /* set by spu_render when enabled */
+static int               s_shadow_tap_frame = 0;
+
+/* The shadow reads s_shadow_tap as SpuShadowFrameTapPub[] (spu.h). Guarantee
+ * the internal and public layouts are identical so the cast is safe. */
+typedef char spu_shadow_tap_voice_size_check[
+    (sizeof(SpuShadowVoiceTap) == sizeof(SpuShadowVoiceTapPub)) ? 1 : -1];
+typedef char spu_shadow_tap_frame_size_check[
+    (sizeof(SpuShadowFrameTap) == sizeof(SpuShadowFrameTapPub)) ? 1 : -1];
+typedef char spu_shadow_voice_count_check[
+    (SPU_VOICE_COUNT == SPU_SHADOW_MAX_VOICES) ? 1 : -1];
+
+const void* spu_shadow_tap_buffer(void) { return s_shadow_tap; }
+int         spu_shadow_tap_count(void)  { return s_shadow_tap_frame; }
+
 static int16_t voice_next_sample(int idx) {
     SpuVoice *v = &voices[idx];
     if (!v->active) return 0;
@@ -372,6 +420,28 @@ static int16_t voice_next_sample(int idx) {
     int32_t shaped = ((int32_t)raw_s * (int32_t)v->env_level) >> 15;
     if (shaped > 32767)  shaped = 32767;
     if (shaped < -32768) shaped = -32768;
+
+    /* Shadow tap: record the four decoded samples bracketing the current
+     * sample position + the fractional phase + envelope, BEFORE the phase
+     * advances. The shadow re-interpolates these in float. Cross-block
+     * neighbours clamp to the block edge (the canon never interpolates across
+     * blocks either; documented in docs/SHADOW_ENHANCEMENTS.md). */
+    if (s_shadow_tap_on && s_shadow_tap_frame < SPU_SHADOW_TAP_FRAMES) {
+        SpuShadowVoiceTap *t =
+            &s_shadow_tap[s_shadow_tap_frame].voice[idx];
+        int si = v->sample_idx;
+        int i0 = si - 1, i2 = si + 1, i3 = si + 2;
+        if (i0 < 0) i0 = 0;
+        if (i2 >= SPU_BLOCK_SAMPLES) i2 = SPU_BLOCK_SAMPLES - 1;
+        if (i3 >= SPU_BLOCK_SAMPLES) i3 = SPU_BLOCK_SAMPLES - 1;
+        t->s[0] = v->samples[i0];
+        t->s[1] = v->samples[si];
+        t->s[2] = v->samples[i2];
+        t->s[3] = v->samples[i3];
+        t->frac = (float)v->phase / 4096.0f;
+        t->env  = v->env_level;
+        t->active = 1;
+    }
 
     /* Step envelope once per output sample (44.1 kHz). */
     adsr_run(idx, v);
@@ -443,6 +513,9 @@ void spu_init(void) {
     s_event_idx = 0;
     s_event_seq = 0;
     spu_cd_audio_reset();
+    s_shadow_tap_on = 0;
+    s_shadow_tap_frame = 0;
+    spu_shadow_reset();
 }
 
 void spu_render(int16_t* out_stereo, int frames) {
@@ -455,6 +528,16 @@ void spu_render(int16_t* out_stereo, int frames) {
     int16_t cd_vol_l = cd_input_volume(spu_regs[reg_index(0x1F801DB0u)]);
     int16_t cd_vol_r = cd_input_volume(spu_regs[reg_index(0x1F801DB2u)]);
 
+    /* Shadow tap: arm recording for this block if the float SPU shadow is on.
+     * Off by default => s_shadow_tap_on stays 0 and the mix loop is unchanged
+     * and byte-identical to upstream. */
+    s_shadow_tap_on = spu_shadow_enabled() ? 1 : 0;
+    s_shadow_tap_frame = 0;
+    if (s_shadow_tap_on) {
+        int cap = frames < SPU_SHADOW_TAP_FRAMES ? frames : SPU_SHADOW_TAP_FRAMES;
+        memset(s_shadow_tap, 0, (size_t)cap * sizeof(s_shadow_tap[0]));
+    }
+
     int32_t block_peak = 0;
     for (int f = 0; f < frames; f++) {
         int32_t mix_l = 0;
@@ -463,9 +546,15 @@ void spu_render(int16_t* out_stereo, int frames) {
         if (enabled) {
             for (int v = 0; v < SPU_VOICE_COUNT; v++) {
                 int16_t s = voice_next_sample(v);
-                if (!s) continue;
                 int16_t vl = direct_volume(voice_reg(v, 0));
                 int16_t vr = direct_volume(voice_reg(v, 1));
+                if (s_shadow_tap_on && f < SPU_SHADOW_TAP_FRAMES) {
+                    SpuShadowVoiceTap *t = &s_shadow_tap[f].voice[v];
+                    /* voice_next_sample already filled s[]/frac/env if active. */
+                    t->vol_l = vl;
+                    t->vol_r = vr;
+                }
+                if (!s) continue;
                 mix_l += ((int32_t)s * vl) >> 14;
                 mix_r += ((int32_t)s * vr) >> 14;
             }
@@ -490,10 +579,23 @@ void spu_render(int16_t* out_stereo, int frames) {
         if (right_peak > frame_peak) frame_peak = right_peak;
         if (frame_peak) nonzero_frames++;
         if (frame_peak > block_peak) block_peak = frame_peak;
+
+        if (s_shadow_tap_on && f < SPU_SHADOW_TAP_FRAMES) {
+            s_shadow_tap[f].main_l  = main_l;
+            s_shadow_tap[f].main_r  = main_r;
+            s_shadow_tap[f].enabled = enabled;
+            s_shadow_tap_frame = f + 1;
+        }
     }
     render_frames += (uint64_t)frames;
     last_peak = block_peak;
     if (block_peak > peak) peak = block_peak;
+
+    /* Verified-enhancement shadow: re-render this block in float from the
+     * tap, verify against the canon mix in `out_stereo`, and substitute only
+     * while proven. No-op (byte-identical) when disabled. The canon mix above
+     * stays the authoritative output AND the verify oracle. */
+    spu_shadow_process(out_stereo, frames);
 }
 
 void spu_debug_info(SpuDebugInfo* out) {
