@@ -14,14 +14,21 @@ body {
 	padding: 36dp;
 	display: block;
 }
+#content {
+	width: 720dp;
+	margin: 0dp auto;
+	display: block;
+}
 h1 {
+	display: block;
 	font-size: 34dp;
 	font-weight: bold;
 	color: #ffffff;
 	margin-bottom: 4dp;
 }
-.subtitle { color: #7d8590; margin-bottom: 24dp; }
+.subtitle { display: block; color: #7d8590; margin-bottom: 24dp; }
 .panel {
+	display: block;
 	background-color: #161b22;
 	border: 1dp #30363d;
 	border-radius: 10dp;
@@ -29,93 +36,150 @@ h1 {
 	margin-bottom: 18dp;
 }
 .section-title {
+	display: block;
 	color: #58a6ff;
 	font-size: 13dp;
 	font-weight: bold;
-	margin-bottom: 12dp;
+	margin-bottom: 14dp;
 }
+/* Each setting is a flex row: fixed-width label on the left, control on the right. */
 .row {
-	display: block;
+	display: flex;
+	flex-direction: row;
+	align-items: center;
 	margin-bottom: 10dp;
+	height: 32dp;
 }
-.label { color: #adbac7; }
+.row:last-child { margin-bottom: 0dp; }
+.label {
+	width: 230dp;
+	flex: 0 0 230dp;
+	color: #adbac7;
+}
+.control {
+	flex: 1 1 auto;
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	min-width: 0dp;
+}
 button {
 	background-color: #21262d;
 	border: 1dp #30363d;
 	border-radius: 6dp;
 	color: #e6e9ef;
 	padding: 7dp 14dp;
-	margin-left: 8dp;
 }
 button:hover { background-color: #30363d; }
+/* Toggle/cycle controls render at a consistent width so the rows align. */
+.toggle { width: 130dp; text-align: center; }
 .value { color: #ffffff; font-weight: bold; }
-.path { color: #7d8590; }
-#actions { margin-top: 8dp; }
+.path {
+	flex: 1 1 auto;
+	min-width: 0dp;
+	margin-left: 12dp;
+	color: #7d8590;
+	white-space: nowrap;
+	text-overflow: ellipsis;
+	overflow: hidden;
+}
+.path.empty { color: #f85149; }
+#actions {
+	display: flex;
+	flex-direction: row;
+	align-items: center;
+	margin-top: 8dp;
+}
 #launch {
 	background-color: #238636;
 	border-color: #2ea043;
 	color: #ffffff;
 	font-weight: bold;
-	padding: 10dp 28dp;
+	padding: 11dp 28dp;
+	flex: 1 1 auto;
+	text-align: center;
 }
 #launch:hover { background-color: #2ea043; }
-#quit { padding: 10dp 20dp; }
+#quit {
+	padding: 11dp 22dp;
+	margin-left: 12dp;
+}
 </style>
 </head>
 
 <body id="root" data-model="settings">
-	<h1>{{game_name}}</h1>
-	<div class="subtitle">PSX Recomp launcher</div>
+	<div id="content">
+		<h1>{{game_name}}</h1>
+		<div class="subtitle">PSX Recomp launcher</div>
 
-	<div class="panel">
-		<div class="section-title">VIDEO</div>
-		<div class="row">
-			<span class="label">Renderer</span>
-			<button data-event-click="cycle_renderer"><span class="value">{{renderer_label}}</span></button>
+		<div class="panel">
+			<div class="section-title">VIDEO</div>
+			<div class="row">
+				<span class="label">Renderer</span>
+				<span class="control">
+					<button class="toggle" data-event-click="cycle_renderer"><span class="value">{{renderer_label}}</span></button>
+				</span>
+			</div>
+			<div class="row">
+				<span class="label">Supersampling</span>
+				<span class="control">
+					<button class="toggle" data-event-click="cycle_ss"><span class="value">{{supersampling}}x</span></button>
+				</span>
+			</div>
+			<div class="row">
+				<span class="label">Antialiasing</span>
+				<span class="control">
+					<button class="toggle" data-event-click="toggle_aa"><span class="value" data-if="antialiasing">On</span><span class="value" data-if="antialiasing == false">Off</span></button>
+				</span>
+			</div>
+			<div class="row">
+				<span class="label">Texture filtering</span>
+				<span class="control">
+					<button class="toggle" data-event-click="cycle_texfilter"><span class="value">{{texfilter_label}}</span></button>
+				</span>
+			</div>
+			<div class="row">
+				<span class="label">Screen model</span>
+				<span class="control">
+					<button class="toggle" data-event-click="cycle_crt"><span class="value">{{crt_label}}</span></button>
+				</span>
+			</div>
 		</div>
-		<div class="row">
-			<span class="label">Supersampling</span>
-			<button data-event-click="cycle_ss"><span class="value">{{supersampling}}x</span></button>
-		</div>
-		<div class="row">
-			<span class="label">Antialiasing</span>
-			<button data-event-click="toggle_aa"><span class="value" data-if="antialiasing">On</span><span class="value" data-if="antialiasing == false">Off</span></button>
-		</div>
-		<div class="row">
-			<span class="label">Texture filtering</span>
-			<button data-event-click="cycle_texfilter"><span class="value">{{texfilter_label}}</span></button>
-		</div>
-		<div class="row">
-			<span class="label">Screen model</span>
-			<button data-event-click="cycle_crt"><span class="value">{{crt_label}}</span></button>
-		</div>
-	</div>
 
-	<div class="panel">
-		<div class="section-title">AUDIO</div>
-		<div class="row">
-			<span class="label">SPU high-quality (float shadow)</span>
-			<button data-event-click="toggle_spu"><span class="value" data-if="spu_hq">On</span><span class="value" data-if="spu_hq == false">Off</span></button>
+		<div class="panel">
+			<div class="section-title">AUDIO</div>
+			<div class="row">
+				<span class="label">SPU high-quality (float shadow)</span>
+				<span class="control">
+					<button class="toggle" data-event-click="toggle_spu"><span class="value" data-if="spu_hq">On</span><span class="value" data-if="spu_hq == false">Off</span></button>
+				</span>
+			</div>
 		</div>
-	</div>
 
-	<div class="panel">
-		<div class="section-title">SYSTEM</div>
-		<div class="row">
-			<span class="label">BIOS</span>
-			<button data-event-click="browse_bios">Browse</button>
-			<span class="path">{{bios_path}}</span>
+		<div class="panel">
+			<div class="section-title">SYSTEM</div>
+			<div class="row">
+				<span class="label">BIOS</span>
+				<span class="control">
+					<button data-event-click="browse_bios">Browse</button>
+					<span class="path" data-if="bios_path != ''">{{bios_path}}</span>
+					<span class="path empty" data-if="bios_path == ''">(not set)</span>
+				</span>
+			</div>
+			<div class="row">
+				<span class="label">Disc</span>
+				<span class="control">
+					<button data-event-click="browse_disc">Browse</button>
+					<span class="path" data-if="disc_path != ''">{{disc_path}}</span>
+					<span class="path empty" data-if="disc_path == ''">(not set)</span>
+				</span>
+			</div>
 		</div>
-		<div class="row">
-			<span class="label">Disc</span>
-			<button data-event-click="browse_disc">Browse</button>
-			<span class="path">{{disc_path}}</span>
-		</div>
-	</div>
 
-	<div id="actions">
-		<button id="launch" data-event-click="launch">LAUNCH GAME</button>
-		<button id="quit" data-event-click="quit">Quit</button>
+		<div id="actions">
+			<button id="launch" data-event-click="launch">LAUNCH GAME</button>
+			<button id="quit" data-event-click="quit">Quit</button>
+		</div>
 	</div>
 </body>
 </rml>
