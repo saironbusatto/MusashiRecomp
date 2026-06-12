@@ -108,6 +108,37 @@ void spu_cd_audio_reset(void);
 /* Get pointer to SPU RAM for direct access (512KB) */
 const uint8_t* spu_get_ram(void);
 
+/* ---- Verified-enhancement shadow tap (consumed by spu_shadow.c) ---------
+ *
+ * Present-time, opt-in float SPU re-render. When the shadow is enabled,
+ * spu_render fills a per-output-frame, per-voice tap with the exact inputs the
+ * canon used (the 4 decoded samples bracketing the sub-sample phase, the
+ * fractional phase, envelope level, and per-voice + main volumes). The shadow
+ * re-interpolates these in float. The layout MUST match spu.c's internal
+ * SpuShadowVoiceTap / SpuShadowFrameTap. */
+#define SPU_SHADOW_MAX_VOICES 24
+
+typedef struct {
+    int16_t  s[4];     /* decoded samples sample_idx-1 .. +2 (block-edge clamped) */
+    float    frac;     /* fractional sub-sample phase in [0,1) */
+    uint16_t env;      /* env_level (0..0x7FFF) */
+    int16_t  vol_l;    /* per-voice L volume (direct_volume-decoded) */
+    int16_t  vol_r;    /* per-voice R volume */
+    uint8_t  active;
+} SpuShadowVoiceTapPub;
+
+typedef struct {
+    SpuShadowVoiceTapPub voice[SPU_SHADOW_MAX_VOICES];
+    int16_t main_l;
+    int16_t main_r;
+    int     enabled;
+} SpuShadowFrameTapPub;
+
+/* Pointer to the tap array (SpuShadowFrameTapPub[]) and the number of valid
+ * frames filled by the most recent spu_render block. */
+const void* spu_shadow_tap_buffer(void);
+int         spu_shadow_tap_count(void);
+
 #ifdef __cplusplus
 }
 #endif
