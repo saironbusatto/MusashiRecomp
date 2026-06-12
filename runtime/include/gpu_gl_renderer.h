@@ -19,25 +19,58 @@ extern "C" {
  * Returns 1 on success, 0 to fall back to the SDL_Renderer present path. */
 int  gl_renderer_init_context(struct SDL_Window *win);
 
-/* Present an ARGB8888 image (BGRA byte order) as a full-screen quad + swap. */
+/* Present an ARGB8888 image (BGRA byte order) as a letterboxed quad + swap.
+ * Used for 24-bit (FMV) frames and the PSX_GL_FORCE_CPU_PRESENT diagnostic. */
 void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear);
 
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
 
-/* True when the GPU FBO holds the freshest VRAM (a GPU draw happened since the
- * last CPU sync). The present path reads from the FBO directly when true. */
-int  gl_renderer_have_gpu_frame(void);
-
-/* Sync the FBO down to CPU VRAM if the GPU side is ahead (else a no-op). The
- * software / 24-bit (FMV) present path calls this before reading CPU VRAM. */
+/* Sync the authoritative FBO down to CPU VRAM if the GPU side is ahead (else
+ * a no-op). The 24-bit (FMV) present path, screenshots, and the debug server
+ * call this before reading CPU VRAM. */
 void gl_renderer_sync_cpu(void);
 
-/* Present straight from the FBO, cropped to the display region. No readback;
- * fast path for GPU-rendered 15-bit frames. linear = filter on upscale. */
+/* THE present path for 15-bit frames: blit the display region straight from
+ * the authoritative VRAM FBO into a 4:3 letterboxed rect (no readback).
+ * Deterministic — used for every 15-bit frame. linear = filter on scale. */
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear);
 
 void gl_renderer_shutdown(void);
+
+/* Diagnostics (debug server): read GPU-side VRAM without touching the CPU
+ * array; report coherency flags + dirty rects. fbo_peek returns 0 when the
+ * GL pipeline is inactive. */
+int  gl_renderer_fbo_peek(int x, int y, int w, int h, uint16_t *out);
+void gl_renderer_diag(int *gpu_dirty, int pending[5], int pack[5]);
+
+/* Always-on coherency event ring (debug server "gl_coh_ring"): every upload
+ * flush, fill, copy, draw bbox, pack, full readback, present, and probe
+ * perturbation, with rect + frame. An op that flushes internally records its
+ * own event AFTER the FLUSH it caused (the event after a FLUSH = trigger). */
+enum {
+    GL_COH_FLUSH    = 1,   /* CPU->FBO upload flush (pending box)     */
+    GL_COH_FILL     = 2,   /* GP0(02) fill rect                       */
+    GL_COH_COPY_SRC = 3,   /* GP0(80) copy, source rect               */
+    GL_COH_COPY     = 4,   /* GP0(80) copy, dest rect                 */
+    GL_COH_DRAW     = 5,   /* drawn prim bbox (clipped to draw area)  */
+    GL_COH_PACK     = 6,   /* hr FBO -> raw mirror pack (dirty box)   */
+    GL_COH_ENSURE   = 7,   /* full FBO -> CPU VRAM readback           */
+    GL_COH_PRESENT  = 8,   /* 15-bit present blit (display rect)      */
+    GL_COH_UPLOAD   = 9,   /* bulk CPU->VRAM transfer_in dest rect    */
+    GL_COH_PEEK     = 10,  /* gl_fbo_peek probe (perturbs: flushes)   */
+    GL_COH_DIFF     = 11,  /* gl_vram_diff probe (perturbs: flushes)  */
+};
+
+typedef struct {
+    uint32_t frame;
+    uint8_t  kind;
+    int16_t  x0, y0, x1, y1;   /* native VRAM coords, inclusive */
+} GlCohEvent;
+
+uint64_t gl_renderer_coh_total(void);
+/* Fetch event by absolute sequence number; 0 if evicted or out of range. */
+int gl_renderer_coh_get(uint64_t seq, GlCohEvent *out);
 
 #ifdef __cplusplus
 }

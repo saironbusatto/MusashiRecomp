@@ -304,12 +304,15 @@ uint32_t gpu_read_gpuread(void) {
     if (!vram_read_active)
         return gpuread_latch;
 
-    /* Read two 16-bit pixels from VRAM and pack into one 32-bit word */
+    /* Read two 16-bit pixels from VRAM and pack into one 32-bit word.
+     * Routed through the renderer facade: under the GL backend the GPU-side
+     * framebuffer is authoritative and must be synced down before the CPU
+     * array is read (no-op cost on the software backend). */
     uint32_t value = 0;
     for (int i = 0; i < 2; i++) {
         uint16_t rx = (vram_read_x + vram_read_col) % 1024;
         uint16_t ry = (vram_read_y + vram_read_row) % 512;
-        value |= (uint32_t)vram[ry * 1024 + rx] << (i * 16);
+        value |= (uint32_t)gr_vram_read((int)rx, (int)ry) << (i * 16);
 
         if (++vram_read_col == vram_read_w) {
             vram_read_col = 0;
@@ -1561,7 +1564,8 @@ void gpu_get_draw_area(GpuDrawArea* out) {
 
 uint16_t gpu_vram_peek(int x, int y) {
     if (x < 0 || x >= 1024 || y < 0 || y >= 512) return 0;
-    return vram[y * 1024 + x];
+    /* Through the facade so the GL backend syncs its FBO down first. */
+    return gr_vram_read(x, y);
 }
 
 void gpu_write_gp0(uint32_t val) {
@@ -1581,8 +1585,10 @@ void gpu_write_gp0(uint32_t val) {
             uint16_t wx = (vram_write_x + vram_write_col) % 1024;
             uint16_t wy = (vram_write_y + vram_write_row) % 512;
 
-            /* Respect mask bit settings */
-            if (check_mask_bit && (vram[wy * 1024 + wx] & 0x8000))
+            /* Respect mask bit settings. The check reads through the facade:
+             * under the GL backend GPU-drawn mask bits live in the FBO, not
+             * the CPU array (one sync per burst; free when check is off). */
+            if (check_mask_bit && (gr_vram_read((int)wx, (int)wy) & 0x8000))
                 goto next_pixel;
 
             if (set_mask_bit)
