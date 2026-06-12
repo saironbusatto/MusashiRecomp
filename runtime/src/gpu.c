@@ -16,6 +16,7 @@
 #include "debug_server.h"
 #include "cpu_state.h"
 #include "event_ring.h"
+#include "color_lut.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -361,7 +362,49 @@ static uint8_t gpu_vram_byte(uint32_t byte_x, uint32_t y) {
     return (byte_x & 1u) ? (uint8_t)(hw >> 8) : (uint8_t)hw;
 }
 
+/* ---- Present-time screen-colour LUT (verified-enhancement, opt-in) -------
+ *
+ * PRESENT-TIME ONLY. This sits on the 15-bit-scanout -> RGB888 conversion that
+ * feeds the SDL/GL present path. It never touches VRAM and never runs on the
+ * depth24 (FMV) scanout (see gpu_display_pixel_rgb). It defaults to SCREEN_RAW
+ * (the original exact 5->3-replicated expansion below), so with the feature off
+ * the conversion — and therefore every hashed/oracle-diffed frame — is
+ * byte-identical to upstream. Opt in via PSX_SCREEN={crt,composite,trinitron};
+ * any other value (or unset) keeps the raw path.
+ *
+ * Built lazily on first use because env is read once and the GPU has no
+ * settings plumb yet. The raw fast-path below is preserved verbatim so the
+ * default never even consults the LUT. */
+static ColorLut* s_screen_lut = NULL;
+static int       s_screen_lut_init = 0;
+
+static void screen_lut_ensure(void) {
+    if (s_screen_lut_init) return;
+    s_screen_lut_init = 1;
+    const char* name = getenv("PSX_SCREEN");
+    ScreenKind kind = SCREEN_RAW;
+    if (!name || !screen_kind_from_name(name, &kind) || kind == SCREEN_RAW) {
+        s_screen_lut = NULL;  /* raw fast-path; passthrough */
+        return;
+    }
+    ColorSettings s;
+    s.screen = kind;
+    s.darken = -1.0;          /* per-screen default */
+    s.target = DISPLAY_SRGB;
+    s_screen_lut = color_lut_create(&s);
+    if (s_screen_lut && color_lut_is_passthrough(s_screen_lut)) {
+        color_lut_destroy(s_screen_lut);
+        s_screen_lut = NULL;
+    }
+}
+
 static void gpu_rgb555_to_rgb888(uint16_t c, uint8_t* r, uint8_t* g, uint8_t* b) {
+    screen_lut_ensure();
+    if (s_screen_lut) {
+        color_lut_map555(s_screen_lut, c, r, g, b);
+        return;
+    }
+    /* Default raw path — byte-identical to upstream. */
     *r = (uint8_t)((c & 0x1Fu) << 3);
     *g = (uint8_t)(((c >> 5) & 0x1Fu) << 3);
     *b = (uint8_t)(((c >> 10) & 0x1Fu) << 3);
