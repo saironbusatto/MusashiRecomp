@@ -551,6 +551,24 @@ static void shutdown_runtime(void) {
     debug_server_shutdown();
 }
 
+/* Linear gain ramp g0 -> g1 across a block of interleaved stereo frames. */
+static void sdl_audio_gain_ramp(int16_t* buf, int frames, float g0, float g1) {
+    if (frames <= 0) return;
+    const float step = (g1 - g0) / (float)frames;
+    float g = g0;
+    for (int f = 0; f < frames; f++, g += step) {
+        buf[f * 2 + 0] = (int16_t)((float)buf[f * 2 + 0] * g);
+        buf[f * 2 + 1] = (int16_t)((float)buf[f * 2 + 1] * g);
+    }
+}
+
+/* Fade-in state: samples of rising ramp still to apply after an unmute.
+ * Consumed by sdl_audio_pump across however many pump calls it spans.
+ * MUST fit sdl_audio_buf (2048 frames): the fade-out tail renders this many
+ * frames in one spu_render call. 1764 frames = 40 ms. */
+static const int sdl_audio_fade_samples = 44100 * 40 / 1000;  /* 40 ms */
+static int       sdl_audio_fadein_left  = 0;
+
 static void sdl_audio_pump(void) {
     if (!sdl_audio_device) return;
 
@@ -566,8 +584,63 @@ static void sdl_audio_pump(void) {
     if (frames > 2048) frames = 2048;
 
     spu_render(sdl_audio_buf, frames);
+    if (sdl_audio_fadein_left > 0) {
+        const float g0 = 1.0f - (float)sdl_audio_fadein_left
+                                / (float)sdl_audio_fade_samples;
+        int ramp = sdl_audio_fadein_left < frames ? sdl_audio_fadein_left : frames;
+        const float g1 = 1.0f - (float)(sdl_audio_fadein_left - ramp)
+                                / (float)sdl_audio_fade_samples;
+        sdl_audio_gain_ramp(sdl_audio_buf, ramp, g0, g1);
+        sdl_audio_fadein_left -= ramp;
+    }
     SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
                    (uint32_t)frames * bytes_per_frame);
+}
+
+/* Audio gating across turbo-loads transitions.
+ *
+ * The mute model stays: during turbo the guest runs at host speed, so
+ * rendered SPU audio is time-compressed garble — we stop pumping, the queue
+ * drains, voice positions freeze, and music resumes in place afterward.
+ * What changes is the EDGES:
+ *   - entering turbo: render one short tail of the current voice state,
+ *     ramp it to silence, and queue it — the drain ends in a fade instead
+ *     of a hard cut;
+ *   - leaving turbo: hold the mute for a short hangover first (loads often
+ *     re-trigger within a few frames; without the debounce the mute would
+ *     flicker audibly), then resume pumping with a rising ramp applied
+ *     across the first ~50 ms of samples (sdl_audio_pump above). */
+static void sdl_audio_update(int turbo_active) {
+    if (!sdl_audio_device) return;
+    const int HANGOVER_FRAMES = 8;  /* ~133 ms at 60 fps */
+    static int muted = 0;
+    static int hangover = 0;
+
+    if (turbo_active) {
+        if (!muted) {
+            int tail = sdl_audio_fade_samples;
+            const int buf_cap = (int)(sizeof(sdl_audio_buf) / (2 * sizeof(int16_t)));
+            if (tail > buf_cap) tail = buf_cap;
+            /* An unmute ramp may still be in progress; start the down-ramp
+             * from its current gain so the edge stays continuous. */
+            const float g0 = 1.0f - (float)sdl_audio_fadein_left
+                                    / (float)sdl_audio_fade_samples;
+            sdl_audio_fadein_left = 0;
+            spu_render(sdl_audio_buf, tail);
+            sdl_audio_gain_ramp(sdl_audio_buf, tail, g0, 0.0f);
+            SDL_QueueAudio(sdl_audio_device, sdl_audio_buf,
+                           (uint32_t)tail * sizeof(int16_t) * 2u);
+            muted = 1;
+        }
+        hangover = HANGOVER_FRAMES;
+        return;
+    }
+    if (muted) {
+        if (hangover > 0) { hangover--; return; }
+        muted = 0;
+        sdl_audio_fadein_left = sdl_audio_fade_samples;
+    }
+    sdl_audio_pump();
 }
 
 /* PS1 digital pad button bits (active-low: 0=pressed, 1=released).
@@ -1018,13 +1091,9 @@ static void sdl_vblank_present(void) {
     }
     sio_set_pad_state(pad_buttons_this_frame);
 
-    /* Turbo-active test, shared by the audio mute here and the pacing/
-     * present gate below. During turbo the guest runs at host speed, so
-     * rendered SPU audio is time-compressed garble — queueing it is what
-     * players hear as load-time stutter. Muting = stop queueing: the SDL
-     * device drains the last real-time samples and underruns to silence;
-     * SPU voice positions freeze with the pump, so music resumes from
-     * where it left off when pacing returns. */
+    /* Turbo-active test, shared by the audio gate here and the pacing/
+     * present gate below. sdl_audio_update owns the mute + fade-in/out +
+     * debounce across turbo transitions (see its comment). */
     int turbo_loads_active = 0;
     if (g_turbo_loads_enabled) {
         extern int fntrace_is_game_started(void);
@@ -1032,7 +1101,7 @@ static void sdl_vblank_present(void) {
             turbo_loads_active = 1;
     }
 #ifndef PSX_SDL_NO_AUDIO
-    if (!turbo_loads_active) sdl_audio_pump();
+    sdl_audio_update(turbo_loads_active);
 #endif
 
     /* TCP turbo is for automated validation and trace capture. It keeps the
@@ -1119,12 +1188,13 @@ static void sdl_vblank_present(void) {
         disabled_frame_presented = false;
         w = di.width; h = di.height;
 
-        /* OpenGL fast path: when the GPU FBO holds the freshest VRAM (a GPU
-         * draw happened this frame) and the display is 15-bit, present straight
-         * from the FBO — no 1 MB readback. Software / 24-bit (FMV) frames fall
-         * through to the CPU readout below, after syncing the FBO down. */
+        /* OpenGL: 15-bit frames ALWAYS present straight from the authoritative
+         * VRAM FBO — one deterministic path (the old per-frame FBO-vs-CPU
+         * alternation caused the menu seam/jitter). 24-bit (FMV) frames and
+         * the PSX_GL_FORCE_CPU_PRESENT diagnostic sync the FBO down and use
+         * the CPU readout below. */
 #ifndef PSX_SDL_NO_RENDER
-        if (g_gl_active && g_gl_fbo_present && !di.depth24 && gl_renderer_have_gpu_frame()) {
+        if (g_gl_active && g_gl_fbo_present && !di.depth24) {
             gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
                                      (int)w, (int)h, g_video_aa ? 1 : 0);
             return;
