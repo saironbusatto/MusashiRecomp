@@ -1,185 +1,147 @@
-# OpenGL Renderer — Handoff (for Fable)
+# OpenGL Renderer — Handoff
 
 Branch: `feat/gl-renderer` (both psxrecomp and TombaRecomp).
-Last commit this session: `b592447` (psxrecomp).
-Status: **experimental, opt-in.** Software renderer is still the committed
-default; OpenGL is selected per-game via `[video] renderer = "opengl"`.
-TombaRecomp `game.toml` has a LOCAL (uncommitted) `renderer = "opengl"` +
-`texture_filtering = "bilinear"` override for testing — do NOT commit those;
-committed defaults are `software` / `nearest`.
+Last commits this session: `0631538`..`45cc5c3` (psxrecomp).
+Status: **v2 architecture, opt-in, rendering cleanly on every screen
+tested.** Software renderer is still the committed default; OpenGL is
+selected per-game via `[video] renderer = "opengl"`. TombaRecomp
+`game.toml` has LOCAL (uncommitted) overrides (`renderer = "opengl"`,
+`texture_filtering = "bilinear"`, `supersampling = 2`) for testing — do
+NOT commit those; committed defaults are `software` / `nearest`.
 
-The goal of this work: add a hardware (OpenGL) renderer as a *selectable
-option* alongside software, to enable higher internal-resolution scaling
-without the software renderer's per-pixel CPU cost. Make it default-with-
-software-fallback only once it renders cleanly.
+Goal: a hardware (OpenGL) renderer as a *selectable option* alongside
+software, enabling higher internal-resolution scaling without the software
+renderer's per-pixel CPU cost. Make it default-with-software-fallback only
+after broad visual validation.
 
 ---
 
-## Architecture (as built)
+## Architecture (v2 — "GPU-authoritative VRAM")
 
 - **Facade + vtable.** `gpu.c` calls `gr_*` (gpu_render.h/.c); a
-  `GpuRenderBackend` vtable dispatches to the software (`sw_*`) or OpenGL
-  (`glb_*`) backend. `gr_set_backend()` picks at startup from the config.
-- **GL backend** lives in `runtime/src/gpu_gl_renderer.c`
-  (+ `runtime/include/gpu_gl_renderer.h`). VRAM is mirrored as a GL texture
-  (`s_vram_tex`, RGBA8) bound to an FBO (`s_fbo`) — the render target. A
-  second raw-16-bit integer texture (`s_vram_raw_tex`, GL_R16UI) is the
-  texture-sampling source for textured polys (CLUT decode in-shader).
-- **What's on the GPU now:** flat/gouraud triangles; textured triangles
-  (4/8/15-bit CLUT, texel-0 discard, PS1 *2-around-0x80 modulation);
-  flat/textured rects; fills (scissored glClear); lines (GL_LINES);
-  semi-transparency (4 PS1 blend modes via fixed-function blend; textured
-  STP via a 2-pass opaque/semi split).
-- **Still software** (route through CPU VRAM with FBO sync): `copy_rect`
-  (VRAM→VRAM blit), VRAM transfers in/out, single vram read/write.
-- **Coherency:** two dirty flags (`s_cpu_dirty`/`s_gpu_dirty`). A GPU draw
-  uploads CPU→FBO first if CPU is ahead (`ensure_gpu`); a software op reads
-  FBO→CPU first if GPU is ahead (`ensure_cpu`). Both are **full 1 MB**
-  syncs today.
-- **Present (main.cpp ~line 1118):**
-  - If the GPU drew this frame (`gl_renderer_have_gpu_frame()`) and the
-    display is 15-bit → `gl_renderer_present_vram()` blits the display
-    region from the FBO straight to the window (`glBlitFramebuffer`, no
-    readback). This is the fast path.
-  - Otherwise (software frame / 24-bit FMV) → `gl_renderer_sync_cpu()` then
-    the software readout path (`gpu_display_pixel_argb` → `gl_renderer_present`).
-  - `PSX_GL_FORCE_CPU_PRESENT=1` forces the software present path always
-    (diagnostic/fallback; also keeps CPU VRAM current every frame).
-- Present forces **native resolution** under GL (`glb_scale`/`glb_set_scale`
-  return 1) — GPU draws write the FBO at native res only, not the software
-  SSAA hi-res mirror `g_hr`. GPU-side hi-res scaling is not implemented yet.
+  `GpuRenderBackend` vtable dispatches to software (`sw_*`) or OpenGL
+  (`glb_*`). `gr_set_backend()` picks at startup from the config.
+- **GL backend** in `runtime/src/gpu_gl_renderer.c`
+  (+ `runtime/include/gpu_gl_renderer.h`). The single authoritative VRAM is
+  the **hr FBO** (`s_hr_tex`, RGBA8, 1024·S × 512·S, + depth24/stencil8);
+  internal scale S comes from `[video] supersampling` (GL-side; the SW
+  hi-res mirror is forced off under GL).
+- **Mask bit exact:** FBO alpha carries bit15; the stencil buffer mirrors it
+  (bit0). `check_mask` = stencil test EQUAL 0; writing 1 under check uses
+  GL_INVERT. Textured prims/copies/uploads draw in two passes split by the
+  texel STP bit so each pass writes one known stencil value.
+- **Coherency model** (all state in gpu_gl_renderer.c):
+  - `s_up_pending`: CPU→VRAM writes land in the CPU array immediately and
+    accumulate a pending rect; `flush_cpu_upload()` quad-blits the rect into
+    the hr FBO (and subimages the raw mirror directly) before the next GPU
+    op, present, or readback.
+  - `s_pack_dirty`: hr-FBO content not yet re-encoded into the native R16UI
+    raw mirror (`s_raw_tex`) — the texture-sampling source and readback
+    surface. `pack_flush()` runs a scissored PACK pass over the union before
+    any textured draw that samples a dirty page/CLUT.
+  - `s_gpu_dirty`: CPU array stale; `ensure_cpu()` = flush + pack + full
+    readback. Used by GPUREAD, A0 mask-check reads, vram peek, screenshots,
+    24-bit present.
+- **Texture sampling (Beetle-PSX model, structure studied from
+  beetle-psx-libretro `rsx/`):**
+  - Per-primitive **uv sampling bounds** (`u_limits`), clamped in the
+    fragment shader when no texture window is active. Filtered neighbours
+    and S>1 interpolation overshoot can never read outside the prim's own
+    texture rect. Rect prims pass exact bounds ([u0, u1-1] forward); 
+    triangles compute min/max with the exclusive max edge backed off for
+    axis-aligned (2D) uv mappings; uv ranges crossing a 256 wrap boundary
+    widen to the full page.
+  - **Bilinear** (`texture_filtering = "bilinear"`): nearest texel is the
+    base (cutout + STP authority), neighbours toward the sub-texel offset,
+    per-texel opacity weights with renormalised colour, discard iff
+    opacity < 0.5. The SW renderer's bilinear uses the same formulation
+    (GL/SW parity); SW nearest is untouched.
+  - **Sample-grid alignment:** all draw shaders shift positions by
+    `u_shift = 0.5/S − 1/64` so GL's center-sample grid matches the PS1
+    integer DDA (fixes striped/squished fonts). Beetle instead uses a
+    `+0.001` uv epsilon and truncation — coarser; we keep u_shift.
+- **GPU ops:** fills (scissored clear, wrap-split 4 ways), copy_rect
+  (hr→scratch blit + masked quad back), all triangle/rect/line prims,
+  batched CPU→VRAM uploads. Blending via glBlendFuncSeparate — alpha (mask
+  bit) is never blended.
+- **Present:** one deterministic path per depth. 15-bit always blits the
+  display rect from the hr FBO (4:3 letterboxed); 24-bit FMV syncs and
+  presents the CPU conversion (letterboxed). The old per-frame FBO-vs-CPU
+  alternation (menu jitter) is structurally gone.
+- **Init is all-or-nothing:** any shader/FBO failure → clean fallback to
+  pure software.
 
-## What works / is verified
+## Verified (2026-06-12 session)
 
-- Boots; renderer selectable; `[OpenGL]`/`[Software]` shown in window title.
-- BIOS/Sony logos, FMV (MDEC 24-bit intro), and gameplay terrain all render.
-- **Double-offset bug fixed** (`846e402`): `gpu.c` pre-applies `draw_offset`
-  to every primitive; the GPU triangle paths were adding it again, which
-  displaced all GPU geometry off-screen once the camera scrolled (symptom:
-  "the entire overworld is gone — only sprites left"). Fixed by not
-  re-applying `s_off` in `gpu_triangle`/`gpu_textured_triangle`.
-- Loads are faster (user-confirmed) thanks to present-from-FBO removing the
-  per-frame readback for GPU scenes.
-- Screenshot writes a real PNG (`ee0a454`) and now syncs the FBO down first
-  so captures reflect the on-screen frame under FBO-present (`b592447`).
+- BIOS → intro FMV (24-bit) → title → memcard slot screen → save-block list
+  all render **clean** under GL at S=1 and S=2 with bilinear on:
+  - Title vertical line at VRAM x=640 — GONE.
+  - Memory-card screens' cross seams (tile edges at 704/864/256/368) — GONE.
+  - Menu text fully readable under bilinear.
+- Root cause of all the black lines: the v1 bilinear base texel was
+  `floor(uv − 0.5)` — one texel OUTSIDE the prim on top/left edges. With
+  u0=v0=0 tiles (card wallpaper, title bg page seam) the neighbour wrapped
+  to empty VRAM → texel 0 → whole edge column/row discarded. They were
+  never coherency holes; both the FBO and (post-sync) CPU VRAM agreed.
+- gl_vram_diff at a quiesced (static-screen) moment: **0 mismatches**.
+- Audio fade (below) built and boots clean; user feel-test still pending.
 
----
+## Diagnostics (debug TCP 4470, dev builds)
 
-## OPEN ISSUES (what looks bad — fix these)
+- `gl_fbo_peek x= y= w= h=` — read GPU-side VRAM rect (via pack) without
+  writing CPU VRAM; returns pending/pack rects + gpu_dirty.
+- `gl_vram_diff` — full-VRAM FBO-vs-CPU mismatch count/bbox/samples. Forces
+  a full pack first so it reads FBO truth even if the raw-mirror invariant
+  broke. **Run it BEFORE any screenshot** — screenshots ensure_cpu (CPU :=
+  FBO) and make the diff trivially clean.
+- `gl_coh_ring n= [frame_min=]` — always-on coherency event ring: flushes,
+  fills, copy src/dst, draw bboxes, packs, readbacks, presents, probe
+  perturbations, each with rect + frame. The event AFTER a "flush" names
+  the op that triggered it. Keep n ≤ ~2000 per query (TCP send budget).
+- Caveats: peeks/diffs themselves flush pending uploads mid-frame (they're
+  recorded in the ring as peek/diff events). Animated screens legitimately
+  diverge mid-frame (gpu_dirty=1); only quiesced screens give clean diffs.
 
-### 1. Menu: vertical line splits the screen; the two halves JITTER badly
-- Repro: skip to the LOAD memory-card screen (pink "TOMBA!" tiled bg). A
-  vertical seam runs top-to-bottom near center; the two halves shimmer/jitter
-  frame-to-frame. "Looks awful."
-- **Key evidence:** with `PSX_GL_FORCE_CPU_PRESENT=1` the menu is CLEAN. So
-  the artifact is in the *present path*, NOT the GPU render of the frame.
-- Switching the FBO present from a crop-shader to `glBlitFramebuffer`
-  (`b592447`) did **not** fix it — so it's almost certainly NOT sub-texel
-  sampling.
-- **Leading hypothesis: the present path ALTERNATES frame-to-frame.** The
-  menu interleaves GPU draws (text/sprites) with software `copy_rect` (the
-  card-shell UI). Whether a frame ends on a GPU op (`s_gpu_dirty` → FBO/blit
-  present) or a software op (`s_cpu_dirty` → software present) flips between
-  frames. The two present paths likely differ in scale/position/seam →
-  jitter. The vertical seam may be where a `copy_rect` region meets GPU
-  content within one path.
-- **Suggested fix:** make the FBO the single authoritative surface and use
-  ONE present path deterministically. The clean way is to move `copy_rect`
-  onto the GPU (FBO self-blit) so the software round-trip — and the path
-  flip — disappears. See issue 6.
+## Open / deferred
 
-### 2. Gameplay: persistent horizontal dotted line under Tomba
-- A dashed/dotted horizontal line sits at about mid-body height across the
-  open area. Persists in the user's view.
-- NOT yet isolated to FBO-vs-software present (the attract demo didn't reach
-  this scene during the CPU-forced test). First step: reproduce with
-  `PSX_GL_FORCE_CPU_PRESENT=1` to see if it's render-side or present-side.
-- Candidate causes: a textured-rect/sprite strip seam; missing texture
-  window (issue 3); or the same present-path alternation as issue 1.
+1. **User visual validation** of the whole pass (incl. fullscreen letterbox
+   + audio fade feel) — everything above was screenshot-verified only.
+2. Gameplay smoke under GL this build (last session verified gameplay
+   renders; this session's shader changes were validated on title/menu
+   screens which exercise the same textured paths).
+3. Mirrored-texture mappings: bilinear/limits keep the full inclusive range
+   for mirrored rects (no exclusive-edge backoff); ±1 texel at
+   exact-integer uv remains the documented 1/64-bias tradeoff. Beetle
+   handles mirrors with a +1 uv offset (`off_u/off_v` in
+   gpu_polygon_sub.cpp) — adopt if a mirrored sprite ever shows it.
+4. Dirty-sub-rect readbacks (ensure_cpu is a full 1 MB read), dither (SW
+   lacks it too), GL_LINES vs Bresenham edge cases.
+5. S=4 unvalidated (S=2 verified this session).
 
-### 3. Garbled / fuzzy / misaligned text (e.g. the AP counter, top-right)
-- Glyphs look smeared, doubled, and misaligned.
-- **Leading cause: the GPU textured shader does NOT implement the PS1
-  TEXTURE WINDOW** (mask/offset UV wrap). The software path applies it in
-  `gpu_sw_renderer.c` `texel_fetch` (`g_tw_mask_x/y`, `g_tw_off_x/y`, the
-  `u = (u & ~(mask*8)) | ((off & mask)*8)` masking). `glb_set_texture_window`
-  just forwards to SW and is ignored by the GPU shader. Sprites/text that
-  rely on UV wrapping render wrong.
-- Also: `texture_filtering = "bilinear"` is honored only by the software
-  path; the GPU textured shader is nearest-only (issue 5). With bilinear
-  requested, the SW-vs-GPU mismatch can compound the fuzzy look.
-- **Suggested fix:** pass the texture-window mask/offset as uniforms to the
-  textured fragment shader and apply the same masking before the texel
-  fetch. Then add an optional bilinear texel fetch (issue 5).
+## Audio fade (shipped with this branch, main.cpp)
 
-### 4. Fullscreen does not preserve aspect ratio (stretches, no black bars)
-- Going fullscreen stretches the image to fill the window instead of
-  letterboxing to the PSX display aspect.
-- Both present paths map the source to the FULL drawable:
-  `gl_renderer_present` (quad over whole window) and
-  `gl_renderer_present_vram` (blit dst = `0,wh,ww,0`).
-- **Suggested fix:** compute a 4:3 (or correct PSX display aspect) dst rect
-  centered in the drawable, clear the whole window to black first, then
-  present into the inset rect. Apply to BOTH present functions.
-
-### 5. Bilinear texture filtering not honored on the GPU path
-- GPU textured shader does nearest texel fetch only. Software path supports
-  `texture_filtering = "bilinear"`. Add a bilinear path in the textured
-  fragment shader (manual 4-tap on the integer VRAM texture + CLUT, since
-  raw sampling is GL_R16UI/nearest).
-
-### 6. `copy_rect` still software → forces FBO↔CPU round-trips
-- This is the structural driver of issue 1 (present-path alternation) and of
-  residual lag. Implementing GPU `copy_rect` as an FBO-region self-copy
-  (careful with overlap; may need a scratch texture or `glBlitFramebuffer`
-  with a temp) lets the FBO stay authoritative and removes the software
-  round-trip for menus and scrolling buffers.
-
-### 7. Coherency is full-1 MB sync per transition
-- `ensure_gpu`/`ensure_cpu` upload/read the entire 1024×512 VRAM. Once
-  copy_rect is on the GPU and the FBO is authoritative, most syncs vanish;
-  what remains (texture/CLUT uploads via VRAM transfer) could be reduced to
-  dirty sub-rectangles.
-
-### 8. (Deferred goal) GPU-side internal-resolution scaling
-- The original ask: "higher scaling without performance loss." Present
-  currently forces native res. Once the above render correctly, allocate the
-  FBO at N× native, scale GPU draw coordinates, and downsample/blit on
-  present. This is the payoff; don't start it until 1–6 are clean.
-
----
-
-## TASK FOR NEXT SESSION (user-approved, separate from GL)
-
-### Audio fade-in/fade-out at turbo transition windows — APPROVED, implement
-- Context: `turbo_loads` runs load screens faster than real time. Tomba's
-  load BGM is *sequenced* (CPU writes SPU regs per game-frame), so under
-  turbo it speeds up into garble. We MUTE during turbo
-  (`main.cpp` ~line 1024–1032: `if (!turbo_loads_active) sdl_audio_pump();`).
-- Decoupling audio to "normal pace" during turbo is **NOT feasible** — the
-  music's tempo is bound to the frame rate that turbo is compressing
-  (analysis in session). The mute stays.
-- The mute's hard cut/resume causes awkward gaps. **User approved a quick
-  fade-in/fade-out** to smooth the edges (and a small hysteresis so very
-  short loads don't flicker the mute on/off).
-- Implementation sketch: apply a gain ramp (~30–60 ms) to the SPU output
-  when entering/leaving `turbo_loads_active` — ramp down before muting, ramp
-  up on resume — rather than hard start/stop of `sdl_audio_pump()`. Apply the
-  gain in `spu_render` output or scale the queued `int16_t` samples. Add a
-  small minimum-turbo-duration / debounce so brief loads don't audibly dip.
-
----
+`turbo_loads` mutes sequenced load BGM (tempo is frame-bound; can't
+decouple). `sdl_audio_update()` ramps gain over 40 ms at mute/unmute edges
+with an 8-frame unmute hangover to debounce burst gaps. The fade tail is
+sized to the ramp and clamped to `sdl_audio_buf` (the first version
+overflowed the 2048-frame buffer and corrupted adjacent statics — wedged
+the boot before display enable).
 
 ## Useful commands / paths
 
 - Build: `PATH=/c/msys64/mingw64/bin:$PATH cmake --build build-stable --target psx-runtime`
-  (run from `TombaRecomp/`; the GL source is in `psxrecomp/runtime/`).
+  (from `TombaRecomp/`; GL source is in `psxrecomp/runtime/`).
 - Run: `./build-stable/psx-runtime.exe --game game.toml` (BIOS path baked).
-- Debug TCP 4470: `python ../psxrecomp/tools/debug_client.py --port 4470 ping`
-  and `... screenshot_file path=foo.png` (now a real PNG, FBO-synced).
-- Force software present (diagnostic/fallback): set env
-  `PSX_GL_FORCE_CPU_PRESENT=1` before launch.
-- Reusable WIP patches live in `psxrecomp/_wip/` (gitignored).
-- Attract demo auto-plays gameplay on a cold boot (AP is always 97400 — it's
-  the canned demo). Tapping START a few times skips the long intro FMV to the
-  title/LOAD menu.
+- Debug: `python ../psxrecomp/tools/debug_client.py --port 4470 <cmd>`;
+  `screenshot_file path=...png` (CPU-side render after FBO sync — native
+  res, shows FBO truth; the window shows the S× blit).
+- Input injection: `press buttons=N frames=M` is consumed faster than some
+  screens poll — prefer `set_input buttons=0xNNNN`, sleep ~1–2 s, then
+  `clear_input`. Circle (0x2000) = confirm in Tomba menus; Start (0x0008)
+  skips the intro FMV.
+- A/B vs software: `sed -i 's/renderer          = "opengl"/renderer          = "software"/' game.toml`.
+- Beetle PSX GL reference (GPL — structure only, never copy code):
+  `psxrecomp/beetle-psx/rsx/rsx_lib_gl.cpp`, `rsx/shaders_gl/*.glsl.h`,
+  `mednafen/psx/gpu_polygon_sub.cpp` (uv limits, may_be_2d, mirror offsets).
+- GP0 ring decode: `python TombaRecomp/_shots/decode_frame.py <frame>`.
+- Attract demo auto-plays on cold boot (AP 97400 = canned demo).
