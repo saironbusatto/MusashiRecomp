@@ -512,3 +512,50 @@ Check whether ANY PC near `0xBFC34FF8` appears in
 sites aren't, it's an emit gap (fix in code_generator.cpp). If
 neighbors are absent too, it's a discovery gap (fix in function
 discovery seeds). Either way, then close Issue #3 alongside.
+
+## Issue #6 — Launcher art has rough cutout edges (memory cards + controllers)
+
+**Status:** open, cosmetic — deferred
+**Date opened:** 2026-06-12
+**Phase:** Launcher initiative (UI polish)
+
+### Symptom
+
+The launcher dashboard art (disc / controllers / memory cards / logo)
+is cropped out of the design mockup and background-knocked-out to
+transparent by `tools/crop_launcher_assets.ps1`. The **memory-card and
+controller cutouts look rough / jaggy around the edges** — a hard
+luminance threshold in the edge flood-fill leaves a 1–2px aliased
+fringe (and the anti-aliased boundary pixels that sit just above the
+threshold are kept, so the silhouette is stair-stepped). The disc reads
+cleaner because its silver rim contrasts more strongly with the dark
+background.
+
+### Cause
+
+`FloodTransparent` uses a binary alpha decision (`max(R,G,B) < thresh`
+→ alpha 0, else keep). There is no feathering of the boundary band, so
+the object silhouette inherits the threshold's hard step. The memory
+card and (grey) controller bodies are closer in luminance to the dark
+mockup background than the disc is, so the same threshold leaves more
+fringe on them.
+
+### Fix options (later)
+
+- Soft alpha ramp across a luminance band (`t_lo..t_hi`) instead of a
+  hard cutoff, applied to the flooded boundary pixels.
+- Or supersample: crop at 2–4× from the mockup, knock out, then
+  downscale with high-quality bicubic so the edge anti-aliases.
+- Or hand-mask the four assets once in an image editor (cleanest, but
+  manual).
+- Best long-term: replace the mockup-derived crops with proper source
+  renders (transparent PNGs) — the `decorator: image(...)` pipeline is
+  already in place, so it's a drop-in.
+
+### Notes
+
+Tooling: `tools/crop_launcher_assets.ps1` (crop + knockout),
+`tools/gen_launcher_assets.ps1` (procedural check/verdict icons),
+`tools/shot_launcher.ps1` (screenshot the GL launcher window). Mockup
+source: `C:\Users\Matthew\Desktop\ef772e04-a7db-4ecd-98bb-eb75a01de0a6.png`
+(1448×1086). Pure-cosmetic; does not block Phase 4/5 wiring.
