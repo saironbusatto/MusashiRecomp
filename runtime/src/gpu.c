@@ -69,16 +69,63 @@ static uint32_t gp0_cmd_source_addr  = 0xFFFFFFFFu;
  * counter, so stale entries age out without an explicit clear. */
 static int32_t  ws_xnum = 1, ws_xden = 1;   /* X squash factor; 1/1 = off */
 static uint32_t ws_anchor_addr = 0;          /* scratchpad addr of anchor SXY */
-static int      ws_hud_sprt = 0;             /* center-squash untagged SPRTs */
+static int      ws_hud_sprt = 0;             /* edge-anchor untagged HUD SPRTs */
 
 #define WS_TAG_BUCKETS 4096                  /* power of two */
 #define WS_TAG_PROBES  8
+#define WS_FMV_HYSTERESIS 30                 /* frames a colour MDEC decode pins 4:3 */
 typedef struct { uint32_t key; uint32_t stamp; int32_t anchor_x; } WsTag;
 static WsTag    ws_tags[WS_TAG_BUCKETS];
 static uint32_t ws_last_tag_stamp = (uint32_t)-1000; /* frame of newest tag */
 extern uint64_t s_frame_count;               /* defined in debug_server.c */
+extern int      mdec_recently_active(uint32_t within_frames);  /* mdec.c */
 
-static int ws_active(void) { return ws_xnum != ws_xden; }
+static int ws_configured(void) { return ws_xnum != ws_xden; }
+
+/* Gameplay vs full-2D screen. Character/billboard prims tag (psx_ws_sprite_tag)
+ * within the last couple of frames => the actor render funnel is running =>
+ * gameplay. A menu/title/save screen draws no tagged prims. The 2-frame window
+ * makes this frame-stable regardless of per-prim ordering within a frame. */
+static int ws_game_mode(void) {
+    return (uint32_t)s_frame_count - ws_last_tag_stamp <= 2;
+}
+
+/* True when the current frame is presented at native 4:3 (NOT stretched), so
+ * ALL squash must be suppressed and the content rendered pixel-native:
+ *   - FMV video (24-bit, or streamed 15-bit colour MDEC), and
+ *   - full-2D screens (menus/title/save — no character billboards this frame).
+ * Coupling squash to this exact predicate keeps content and present in lock-
+ * step: we squash IFF we stretch. Per-prim center-squash mangles composite 2D
+ * UI (dialog boxes built from tiled cap/middle pieces), so such screens get
+ * zero squash + a 4:3 pillarbox instead. The FMV check is cached per frame;
+ * game_mode is a cheap live check. */
+int gpu_ws_present_native_43(void) {
+    if (!ws_configured()) return 0;
+    if (!ws_game_mode()) return 1;                 /* full-2D screen */
+    static uint32_t fmv_frame_cache = 0xFFFFFFFFu;
+    static int      fmv_cached = 0;
+    uint32_t f = (uint32_t)s_frame_count;
+    if (f != fmv_frame_cache) {
+        fmv_frame_cache = f;
+        GpuDisplayInfo di; gpu_get_display_info(&di);
+        fmv_cached = di.depth24 || mdec_recently_active(WS_FMV_HYSTERESIS);
+    }
+    return fmv_cached;
+}
+
+/* Squash applies only when configured AND the frame is being stretched. */
+static int ws_active(void) { return ws_configured() && !gpu_ws_present_native_43(); }
+
+/* Per-side X cull margin in screen/world units (the game's draw classifier
+ * works in objX-camX where 1 unit ~= 1 native-4:3 screen pixel). The squash
+ * shows a half-view of 160/s pixels (s = squash factor = ws_xnum/ws_xden), so
+ * the visible edge moves out by 160*(1/s - 1) = 160*(xden-xnum)/xnum. Widening
+ * the cull window by this restores the original off-screen margin at the new
+ * edge. 0 whenever squash is inactive (4:3/boot/menu/FMV) → original cull. */
+int psx_ws_x_margin(void) {
+    if (!ws_active()) return 0;
+    return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
+}
 
 void gpu_ws_configure(int aspect_num, int aspect_den,
                       uint32_t sprite_anchor_addr, int hud_sprt_squash) {
@@ -96,9 +143,12 @@ void gpu_ws_configure(int aspect_num, int aspect_den,
 }
 
 /* Called from generated code at the entry of each [widescreen]
- * sprite_tag_funcs function: record prim pointer ($a0) -> projected anchor. */
+ * sprite_tag_funcs function: record prim pointer ($a0) -> projected anchor.
+ * Gated on ws_configured (NOT ws_active): ws_active depends on game_mode which
+ * THIS function sets, so gating it on ws_active would never let gameplay
+ * start (the first character of a frame would be suppressed forever). */
 void psx_ws_sprite_tag(CPUState* cpu) {
-    if (!ws_active() || !ws_anchor_addr) return;
+    if (!ws_configured() || !ws_anchor_addr) return;
     uint32_t key = cpu->gpr[4] & 0x1FFFFCu;
     if (!key) return;
     uint32_t sxy = cpu->read_word(ws_anchor_addr);
@@ -158,43 +208,24 @@ static int32_t ws_disp_w(void) {
     return di.width ? (int32_t)di.width : 320;
 }
 
-/* In-game vs full-2D-screen mode. Character/billboard prims were tagged
- * within the last couple of frames => gameplay is rendering; otherwise the
- * frame is a pure 2D screen (menus, save dialogs, title). */
-static int ws_game_mode(void) {
-    return (uint32_t)s_frame_count - ws_last_tag_stamp <= 2;
-}
-
-/* Pivot for an untagged screen-space prim spanning [x, x+w).
- *
- * Full-2D screens: a single centre pivot keeps every composite (tiled text,
- * dialog borders, background patterns) coherent — the whole screen presents
- * as native-proportion 4:3, pillarboxed in the wide frame.
- *
- * In-game: HUD elements are sparse and corner-anchored, so pivot by thirds —
- * elements in the outer thirds anchor to their screen edge (keeping their
- * 16:9 corner position), the middle third anchors to centre. Composites
- * (counter box + digits) sit comfortably inside one zone. */
-static int32_t ws_2d_pivot(int32_t x, int32_t w) {
+/* In-game HUD pivot for an untagged screen-space SPRT spanning [x, x+w).
+ * Only reached during gameplay (ws_active true). HUD elements are sparse and
+ * corner-anchored, so pivot by thirds: outer-third elements anchor to their
+ * screen edge (keeping the wide-screen corner position at native proportions),
+ * the middle third to centre. A composite (counter box + digits) sits inside
+ * one zone, so its pieces share a pivot and stay aligned. (Full-2D menu
+ * screens never reach here — they get zero squash + 4:3 pillarbox instead.) */
+static int32_t ws_hud_pivot(int32_t x, int32_t w) {
     int32_t W = ws_disp_w();
-    if (!ws_game_mode()) return W / 2;
     int32_t cx = 2 * x + w;            /* 2*centre, avoids losing the half */
     if (3 * cx < 2 * W) return 0;
     if (3 * cx > 4 * W) return W;
     return W / 2;
 }
 
-/* Untagged 2D mapping is widened to non-textured prims (dialog borders use
- * flat rects and lines) only on full-2D screens, where everything on screen
- * is screen-space by construction. In-game, non-textured prims may be
- * world-anchored (shadows, effects), so only textured rects are touched. */
-static int ws_menu_2d(void) {
-    return ws_active() && ws_hud_sprt && !ws_game_mode();
-}
-
 /* Shared transform for fixed-size textured sprites (8x8 / 16x16 / 1x1 dot):
- * squash *x0 in place (around the tagged anchor, else the 2D pivot for
- * screen-space prims) and return the squashed draw width, or 0 = no change. */
+ * squash *x0 in place (around the tagged anchor, else the HUD pivot) and
+ * return the squashed draw width, or 0 = no change. */
 static int ws_sprt_fixed_transform(int32_t *x0, int w) {
     if (!ws_active()) return 0;
     int32_t ax;
@@ -203,7 +234,7 @@ static int ws_sprt_fixed_transform(int32_t *x0, int w) {
         return (int)ws_scale_len(w);
     }
     if (ws_hud_sprt) {
-        *x0 = ws_scale_about(*x0, ws_2d_pivot(*x0, w));
+        *x0 = ws_scale_about(*x0, ws_hud_pivot(*x0, w));
         return (int)ws_scale_len(w);
     }
     return 0;
@@ -1043,11 +1074,6 @@ static void gp0_exec_mono_line(void) {
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     parse_vertex(gp0_cmd_buf[2], &x1, &y1);
-    if (ws_menu_2d()) {  /* dialog borders are drawn as lines */
-        int32_t piv = ws_disp_w() / 2;
-        x0 = ws_scale_about(x0, piv);
-        x1 = ws_scale_about(x1, piv);
-    }
     x0 += draw_offset_x; y0 += draw_offset_y;
     x1 += draw_offset_x; y1 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
@@ -1062,11 +1088,6 @@ static void gp0_exec_shaded_line(void) {
     int32_t x0, y0, x1, y1;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
     parse_vertex(gp0_cmd_buf[3], &x1, &y1);
-    if (ws_menu_2d()) {
-        int32_t piv = ws_disp_w() / 2;
-        x0 = ws_scale_about(x0, piv);
-        x1 = ws_scale_about(x1, piv);
-    }
     x0 += draw_offset_x; y0 += draw_offset_y;
     x1 += draw_offset_x; y1 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
@@ -1083,12 +1104,6 @@ static void gp0_exec_mono_rect(void) {
     int h = (gp0_cmd_buf[2] >> 16) & 0xFFFFu;
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
-    /* Full-2D screens only, and never full-width TILEs (fades/flashes must
-     * keep covering the whole frame). */
-    if (ws_menu_2d() && w < ws_disp_w()) {
-        x0 = ws_scale_about(x0, ws_disp_w() / 2);
-        w  = (int)ws_scale_len(w);
-    }
     x0 += draw_offset_x; y0 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x0, y0, w, h, color);
@@ -1121,7 +1136,7 @@ static void gp0_exec_textured_rect(void) {
             x0 = ws_scale_about(x0, ws_ax);
             ws_w = (int)ws_scale_len(w);
         } else if (ws_hud_sprt) {
-            x0 = ws_scale_about(x0, ws_2d_pivot(x0, w));
+            x0 = ws_scale_about(x0, ws_hud_pivot(x0, w));
             ws_w = (int)ws_scale_len(w);
         }
     }
@@ -1141,7 +1156,6 @@ static void gp0_exec_mono_dot(void) {
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x, y;
     parse_vertex(gp0_cmd_buf[1], &x, &y);
-    if (ws_menu_2d()) x = ws_scale_about(x, ws_disp_w() / 2);
     x += draw_offset_x; y += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
     gr_draw_flat_rect(x, y, 1, 1, color);
@@ -1176,14 +1190,9 @@ static void gp0_exec_mono_8x8(void) {
     uint16_t color = rgb888_to_rgb555(gp0_cmd_buf[0] & 0xFFFFFFu);
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
-    int w = 8;
-    if (ws_menu_2d()) {
-        x0 = ws_scale_about(x0, ws_disp_w() / 2);
-        w  = (int)ws_scale_len(8);
-    }
     x0 += draw_offset_x; y0 += draw_offset_y;
     gr_set_semi_transparency(semi_trans, (int)semi_transparency);
-    gr_draw_flat_rect(x0, y0, w, 8, color);
+    gr_draw_flat_rect(x0, y0, 8, 8, color);
 }
 
 /* Execute 16x16 textured sprite (GP0 0x7C-0x7F) */
@@ -1905,7 +1914,6 @@ void gpu_write_gp0(uint32_t val) {
         }
         int32_t x, y;
         parse_vertex(val, &x, &y);
-        if (ws_menu_2d()) x = ws_scale_about(x, ws_disp_w() / 2);
         x += draw_offset_x; y += draw_offset_y;
         if (polyline_has_prev) {
             gr_draw_line(polyline_prev_x, polyline_prev_y, x, y, polyline_color);
@@ -1924,7 +1932,6 @@ void gpu_write_gp0(uint32_t val) {
             /* First vertex */
             int32_t x, y;
             parse_vertex(val, &x, &y);
-            if (ws_menu_2d()) x = ws_scale_about(x, ws_disp_w() / 2);
             x += draw_offset_x; y += draw_offset_y;
             polyline_prev_x = x; polyline_prev_y = y;
             polyline_prev_c = polyline_color;
@@ -1945,7 +1952,6 @@ void gpu_write_gp0(uint32_t val) {
         {
             int32_t x, y;
             parse_vertex(val, &x, &y);
-            if (ws_menu_2d()) x = ws_scale_about(x, ws_disp_w() / 2);
             x += draw_offset_x; y += draw_offset_y;
             gr_draw_shaded_line(polyline_prev_x, polyline_prev_y, polyline_prev_c,
                                 x, y, polyline_color);

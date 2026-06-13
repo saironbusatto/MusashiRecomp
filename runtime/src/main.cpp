@@ -1275,11 +1275,12 @@ static void sdl_vblank_present(void) {
         }
         disabled_frame_presented = false;
         w = di.width; h = di.height;
-        /* 4:3-pinned frames: 24-bit display OR streamed 15-bit MDEC video
-         * (Tomba plays its movies as 15-bit frames; ~0.5 s hysteresis rides
-         * out gaps between decoded chunks) OR the pre-game BIOS boot. */
-        fmv_frame = di.depth24 != 0 || mdec_recently_active(30) != 0 ||
-                    !g_ws_engaged;
+        /* 4:3-pinned frames: the pre-game BIOS boot, plus (once engaged) every
+         * frame the widescreen layer presents native — FMV video and full-2D
+         * menu/title screens. gpu_ws_present_native_43() is the single source
+         * of truth, shared with the GTE/GPU squash so content and present stay
+         * locked: we squash IFF we stretch. */
+        fmv_frame = !g_ws_engaged || gpu_ws_present_native_43() != 0;
 
         /* OpenGL: 15-bit frames ALWAYS present straight from the authoritative
          * VRAM FBO — one deterministic path (the old per-frame FBO-vs-CPU

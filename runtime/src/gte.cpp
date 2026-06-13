@@ -119,6 +119,7 @@ static void depth_cue_from_ir(GTEState* gte) {
 // stay aligned with the visible frame.
 // ---------------------------------------------------------------------------
 static int32_t s_ws_xnum = 1, s_ws_xden = 1;
+extern "C" int gpu_ws_present_native_43(void);  /* gpu.c — suppress on 4:3 frames */
 
 extern "C" void gte_set_display_aspect(int num, int den) {
     if (num <= 0 || den <= 0) { s_ws_xnum = s_ws_xden = 1; return; }
@@ -165,9 +166,12 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     // Step 3: Perspective division
     int32_t h_div_sz = gte_divide(gte->H, gte->SZ[3], gte->FLAG);
 
-    // Step 4: Project to screen coordinates
+    // Step 4: Project to screen coordinates. Squash X only when configured AND
+    // this frame is being stretched — never on a 4:3-presented frame (FMV /
+    // full-2D screen), so content and present stay locked.
     int64_t xterm = (int64_t)gte->IR1 * h_div_sz;
-    if (s_ws_xnum != s_ws_xden) xterm = xterm * s_ws_xnum / s_ws_xden;
+    if (s_ws_xnum != s_ws_xden && !gpu_ws_present_native_43())
+        xterm = xterm * s_ws_xnum / s_ws_xden;
     int64_t sx = (gte->OFX + xterm) >> 16;
     int64_t sy = (gte->OFY + (int64_t)gte->IR2 * h_div_sz) >> 16;
     gte->push_sxy(sx, sy);

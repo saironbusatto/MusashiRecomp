@@ -497,6 +497,23 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_hud_sprt_squash = toml::find<bool>(ws, "hud_sprt_squash");
     }
 
+    // Optional [widescreen.cull] block — world-space draw-cull widening.
+    std::vector<uint32_t> ws_cull_bias_sites, ws_cull_range_sites, ws_cull_a1_sites;
+    if (cfg.contains("widescreen")) {
+        const toml::value& ws = toml::find(cfg, "widescreen");
+        if (ws.contains("cull")) {
+            const toml::value& cull = toml::find(ws, "cull");
+            auto load_sites = [&](const char* key, std::vector<uint32_t>& out) {
+                if (!cull.contains(key)) return;
+                for (const auto& a : toml::find<std::vector<std::string>>(cull, key))
+                    out.push_back(parse_hex(a, fmt::format("widescreen.cull.{}", key)));
+            };
+            load_sites("bias_sites",  ws_cull_bias_sites);
+            load_sites("range_sites", ws_cull_range_sites);
+            load_sites("a1_sites",    ws_cull_a1_sites);
+        }
+    }
+
     return GameConfig{
         /*config_path*/      config_path,
         /*project_root*/     root,
@@ -520,6 +537,9 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_sprite_tag_funcs*/   ws_sprite_tag_funcs,
         /*ws_sprite_anchor_addr*/ ws_sprite_anchor_addr,
         /*ws_hud_sprt_squash*/    ws_hud_sprt_squash,
+        /*ws_cull_bias_sites*/    ws_cull_bias_sites,
+        /*ws_cull_range_sites*/   ws_cull_range_sites,
+        /*ws_cull_a1_sites*/      ws_cull_a1_sites,
     };
 }
 

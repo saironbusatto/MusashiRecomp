@@ -95,6 +95,13 @@ void gpu_ws_configure(int aspect_num, int aspect_den,
                       uint32_t sprite_anchor_addr, int hud_sprt_squash);
 struct CPUState;
 void psx_ws_sprite_tag(struct CPUState* cpu);
+/* True when the current frame must present at native 4:3 (FMV video or a
+ * full-2D menu/title screen), so the squash is suppressed and content drawn
+ * pixel-native. The present path uses the same predicate to pillarbox. */
+int  gpu_ws_present_native_43(void);
+/* Per-side X cull-margin (screen/world units) emitted into the game's draw-
+ * cull immediates by the recompiler ([widescreen.cull]); 0 unless stretching. */
+int  psx_ws_x_margin(void);
 
 #ifdef __cplusplus
 }

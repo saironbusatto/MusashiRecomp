@@ -79,6 +79,7 @@ int main(int argc, char** argv) {
     bool                  inspect_mode = false;
     bool                  overlay_mode = false;
     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
+    std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
     std::filesystem::path out_dir = "generated";
 
     if (!config_path.empty()) {
@@ -89,6 +90,9 @@ int main(int argc, char** argv) {
         out_dir              = cfg.out_dir;
         ws_tag_funcs.insert(cfg.ws_sprite_tag_funcs.begin(),
                             cfg.ws_sprite_tag_funcs.end());
+        ws_cull_bias.insert(cfg.ws_cull_bias_sites.begin(), cfg.ws_cull_bias_sites.end());
+        ws_cull_range.insert(cfg.ws_cull_range_sites.begin(), cfg.ws_cull_range_sites.end());
+        ws_cull_a1.insert(cfg.ws_cull_a1_sites.begin(), cfg.ws_cull_a1_sites.end());
         fmt::print("config:         {}\n", config_path.string());
         fmt::print("  exe         = {}\n", exe_path.string());
         fmt::print("  seeds       = {}\n", extra_funcs_storage);
@@ -616,6 +620,9 @@ int main(int argc, char** argv) {
     codegen_config.emit_line_numbers = true;
     codegen_config.split_mid_function_targets = !overlay_mode;
     codegen_config.ws_sprite_tag_funcs = ws_tag_funcs;
+    codegen_config.ws_cull_bias_sites  = ws_cull_bias;
+    codegen_config.ws_cull_range_sites = ws_cull_range;
+    codegen_config.ws_cull_a1_sites    = ws_cull_a1;
 
     // Load per-game annotations: annotations/<exe_stem>_annotations.csv
     // Silently skipped if the file doesn't exist.

@@ -231,6 +231,21 @@ struct GameConfig {
     std::vector<uint32_t> ws_sprite_tag_funcs;
     uint32_t              ws_sprite_anchor_addr = 0;
     bool                  ws_hud_sprt_squash = false;
+
+    // Cull-margin widening. The game's per-object draw classifier compares
+    // (objX - camX + BIAS) against a RANGE derived from the 4:3 screen width;
+    // the GTE squash shows ~33% more world, so the fixed margin collapses and
+    // objects pop in/out near the wide-screen edges. We widen the window by
+    // emitting a runtime margin term psx_ws_x_margin() (0 at 4:3/boot/menu/FMV,
+    // ~the half-extra-width when stretching) into the relevant immediates:
+    //   cull_bias_sites:  an addiu rT,rS,imm → rT = rS + (imm + margin)
+    //   cull_range_sites: an sltiu rT,rS,imm → rT = rS <u (imm + 2*margin)
+    //   cull_a1_sites:    a nop (load/branch-delay) → a1 += margin (for the
+    //                     caller-supplied-margin classifier variants)
+    // All Ghidra-evidenced; empty by default. Changing these requires a regen.
+    std::vector<uint32_t> ws_cull_bias_sites;
+    std::vector<uint32_t> ws_cull_range_sites;
+    std::vector<uint32_t> ws_cull_a1_sites;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

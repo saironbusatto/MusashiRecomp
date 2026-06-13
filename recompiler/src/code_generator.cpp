@@ -679,6 +679,45 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
 
     std::string code;
 
+    // Widescreen cull-margin widening ([widescreen.cull] sites). Emit the
+    // window immediate with a runtime margin term psx_ws_x_margin() — 0 at
+    // 4:3/boot/menu/FMV, ~half-the-extra-width when stretching — so the world-
+    // space draw cull tracks the aspect and one build serves both. Each site's
+    // instruction type is verified; a mismatch is a loud build error (a bad
+    // address would silently mis-emit otherwise).
+    if (config_.ws_cull_bias_sites.count(addr)) {
+        if (opcode != 0x08 && opcode != 0x09) {  // addi / addiu
+            fmt::print(stderr, "ERROR: [widescreen.cull] bias site 0x{:08X} is not "
+                       "addi/addiu (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        uint32_t rs = get_rs(instr), rt = get_rt(instr);
+        int16_t imm = get_imm16(instr);
+        return fmt::format("{} = {} + ((int32_t){} + psx_ws_x_margin());{}",
+                           reg_name(rt), reg_name(rs), imm, comment);
+    }
+    if (config_.ws_cull_range_sites.count(addr)) {
+        if (opcode != 0x0B) {  // sltiu
+            fmt::print(stderr, "ERROR: [widescreen.cull] range site 0x{:08X} is not "
+                       "sltiu (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        uint32_t rs = get_rs(instr), rt = get_rt(instr);
+        int16_t imm = get_imm16(instr);
+        return fmt::format("{} = ({} < (uint32_t)((int32_t){} + 2*psx_ws_x_margin())) ? 1 : 0;{}",
+                           reg_name(rt), reg_name(rs), imm, comment);
+    }
+    if (config_.ws_cull_a1_sites.count(addr)) {
+        if (instr != 0x00000000u) {  // must be a nop we can safely repurpose
+            fmt::print(stderr, "ERROR: [widescreen.cull] a1 site 0x{:08X} is not a "
+                       "nop (0x{:08X})\n", addr, instr);
+            std::exit(1);
+        }
+        // a1 = $5: widen the caller-supplied margin (param-margin classifiers).
+        return fmt::format("cpu->gpr[5] = cpu->gpr[5] + psx_ws_x_margin();"
+                           "  /* ws cull a1 bias */{}", comment);
+    }
+
     // SPECIAL opcode (0x00)
     if (opcode == 0x00) {
         switch (funct) {
@@ -1632,7 +1671,8 @@ std::string CodeGenerator::generate_file(
     // This provides CPUState, GTE/trap declarations, and call_by_address().
     ss << "#include \"psx_runtime.h\"\n\n";
     ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
-    ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n\n";
+    ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
+    ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n\n";
 
     // Emit reference implementations for unaligned memory helpers.
     // These implement the MIPS lwl/lwr/swl/swr semantics.

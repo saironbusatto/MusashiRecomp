@@ -42,6 +42,15 @@ struct CodeGenConfig {
     // proportion correction at GP0 submission. Empty = no hooks (default).
     std::set<uint32_t> ws_sprite_tag_funcs;
 
+    // Widescreen cull-margin widening ([widescreen] cull_* sites). At these
+    // addresses the immediate is emitted with a runtime margin term
+    // psx_ws_x_margin() so the world-space draw cull widens with the aspect
+    // (0 at 4:3). bias = addiu (+margin); range = sltiu (+2*margin); a1 = a
+    // nop replaced with `a1 += margin`. See config_loader.h. Empty = default.
+    std::set<uint32_t> ws_cull_bias_sites;
+    std::set<uint32_t> ws_cull_range_sites;
+    std::set<uint32_t> ws_cull_a1_sites;
+
     CodeGenConfig()
         : emit_comments(true)
         , emit_line_numbers(true)
