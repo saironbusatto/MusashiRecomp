@@ -82,6 +82,10 @@ extern int      mdec_recently_active(uint32_t within_frames);  /* mdec.c */
 
 static int ws_configured(void) { return ws_xnum != ws_xden; }
 
+/* Forward decls: defined later but used by psx_ws_backdrop_x above them. */
+static int32_t ws_scale_about(int32_t x, int32_t ax);
+static int32_t ws_disp_w(void);
+
 /* Gameplay vs full-2D screen. Character/billboard prims tag (psx_ws_sprite_tag)
  * within the last couple of frames => the actor render funnel is running =>
  * gameplay. A menu/title/save screen draws no tagged prims. The 2-frame window
@@ -133,6 +137,49 @@ int psx_ws_x_margin(void) {
     if (ws_margin_override >= 0) return ws_margin_override;
     if (!ws_active()) return 0;
     return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
+}
+
+/* Widescreen backdrop screen-X correction ([widescreen.backdrop] x_sites).
+ * The parallax 2D backdrop layer (ocean/cloud/mountain/grass — overlay actor
+ * handlers e.g. 0x801216BC) computes its screen-X in pure integer math
+ * (screenX = (worldX - camX) >> parallax) and NEVER goes through the GTE, so
+ * the GTE X-squash (gte_set_display_aspect) that gives 3D the wider 16:9 FOV
+ * does not touch it. The recompiler emits this on each handler's final
+ * screenX store so the backdrop is squashed by the SAME factor around the
+ * screen centre: a far piece whose 4:3 screenX sat past the 320px edge (and
+ * was GPU-clipped → the blue void / half-rectangles at the edges) is pulled
+ * in to cover the revealed FOV. Identity at 4:3 / boot / FMV / full-2D (the
+ * exact ws_active() predicate the GTE squash uses), so one build serves both.
+ * x is the int16 screenX the handler was about to store. */
+int psx_ws_backdrop_x(int x) {
+    if (!ws_active()) return (int16_t)x;
+    int32_t cx = ws_disp_w() / 2;                 /* screen centre (=160 @ 320) */
+    return ws_scale_about((int16_t)x, cx);
+}
+
+/* Backdrop store-site registry. The [widescreen.backdrop] x_sites are emitted
+ * into native cache-DLL code by the recompiler, but overlay code very often
+ * runs INTERPRETED (no DLL loaded), where the emit can't reach. So the runtime
+ * also registers the same site PCs here and the dirty-RAM interpreter applies
+ * psx_ws_backdrop_x() at those `sh` PCs — same transform, both paths. Tiny set;
+ * a linear scan per matching SH is negligible. */
+#define WS_BACKDROP_SITES_MAX 16
+static uint32_t ws_backdrop_sites[WS_BACKDROP_SITES_MAX];
+static int      ws_backdrop_site_n = 0;
+
+void psx_ws_set_backdrop_sites(const uint32_t* pcs, int n) {
+    ws_backdrop_site_n = 0;
+    if (!pcs) return;
+    for (int i = 0; i < n && ws_backdrop_site_n < WS_BACKDROP_SITES_MAX; i++)
+        ws_backdrop_sites[ws_backdrop_site_n++] = pcs[i] & 0x1FFFFFFFu;
+}
+
+int psx_ws_is_backdrop_site(uint32_t pc) {
+    if (!ws_backdrop_site_n) return 0;
+    pc &= 0x1FFFFFFFu;
+    for (int i = 0; i < ws_backdrop_site_n; i++)
+        if (ws_backdrop_sites[i] == pc) return 1;
+    return 0;
 }
 
 /* Snapshot live widescreen state for the TCP gpu_state diagnostic. Mirrors

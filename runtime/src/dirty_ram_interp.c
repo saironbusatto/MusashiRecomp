@@ -28,6 +28,7 @@
 #include "debug_server.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
+#include "gpu.h"   /* psx_ws_is_backdrop_site / psx_ws_backdrop_x (interp hook) */
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -795,7 +796,15 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     }
     case 0x29: { /* SH */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->write_half(addr, (uint16_t)cpu->gpr[rt]);
+        uint16_t val  = (uint16_t)cpu->gpr[rt];
+        /* Widescreen backdrop screenX squash on the interpreter path: mirrors
+         * the recompiler emit at [widescreen.backdrop] x_sites. Overlay code
+         * (the parallax backdrop handlers) runs interpreted when no cache DLL
+         * is loaded, so without this the squash never happens. Identity at 4:3
+         * (psx_ws_backdrop_x gates on ws_active). */
+        if (psx_ws_is_backdrop_site(pc))
+            val = (uint16_t)psx_ws_backdrop_x((int16_t)val);
+        cpu->write_half(addr, val);
         return 0;
     }
     case 0x2A: { /* SWL */

@@ -792,6 +792,18 @@ void debug_server_log_call_entry(uint32_t func_addr) {
 void psx_restore_state_escape(void) {
     if (g_cbs.psx_restore_state_escape) g_cbs.psx_restore_state_escape();
 }
+/* Widescreen hooks (ABI v3): forward to the runtime's live widescreen state.
+ * Identity fallback if the host predates the callbacks (NULL) — so a v3 DLL
+ * stays correct (4:3) on an older host. */
+int psx_ws_backdrop_x(int x) {
+    return g_cbs.ws_backdrop_x ? g_cbs.ws_backdrop_x(x) : (int)(short)x;
+}
+int psx_ws_x_margin(void) {
+    return g_cbs.ws_x_margin ? g_cbs.ws_x_margin() : 0;
+}
+void psx_ws_sprite_tag(CPUState *cpu) {
+    if (g_cbs.ws_sprite_tag) g_cbs.ws_sprite_tag(cpu);
+}
 /* ----------------------------------------------------------------------- */
 
 """
@@ -1195,7 +1207,12 @@ def main():
             cmd = [args.recompiler, psx_path,
                    '--seeds', seeds_path,
                    '--out-dir', out_dir_tmp,
-                   '--overlay']
+                   '--overlay',
+                   # Forward the [widescreen] site lists so overlay-resident
+                   # emits (backdrop screenX squash, and any sprite-tag/cull
+                   # sites that resolve into overlay code) are applied. --ws-config
+                   # only adopts the widescreen lists, not the game's exe/paths.
+                   '--ws-config', os.path.abspath(args.game_toml)]
             print(f'  recompile: {args.recompiler} ...')
             toml_dir = os.path.dirname(os.path.abspath(args.game_toml))
             r = subprocess.run(cmd, capture_output=True, text=True,

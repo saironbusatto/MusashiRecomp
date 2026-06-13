@@ -103,6 +103,21 @@ int  gpu_ws_present_native_43(void);
  * cull immediates by the recompiler ([widescreen.cull]); 0 unless stretching. */
 int  psx_ws_x_margin(void);
 
+/* Backdrop screen-X correction ([widescreen.backdrop] x_sites). The parallax
+ * 2D backdrop layer computes screen-X without the GTE, so it misses the
+ * widescreen squash; the recompiler emits this on each backdrop handler's
+ * final screenX store to squash it around the screen centre (identity at 4:3).
+ * Pulls far backdrop pieces in from past the 320px edge to cover the 16:9 FOV. */
+int  psx_ws_backdrop_x(int x);
+
+/* Backdrop store-site registry: the runtime registers the [widescreen.backdrop]
+ * x_sites here (from game.toml) so the dirty-RAM interpreter applies the same
+ * psx_ws_backdrop_x() squash at those `sh` PCs that the recompiler emits into
+ * native cache DLLs — overlay code frequently runs interpreted, where the emit
+ * can't reach. PCs are masked to the physical (KUSEG) range. */
+void psx_ws_set_backdrop_sites(const uint32_t* pcs, int n);
+int  psx_ws_is_backdrop_site(uint32_t pc);
+
 /* Live widescreen state for diagnostics (TCP gpu_state). All pointers
  * optional. last_tag_frame/cur_frame let the caller see game_mode freshness. */
 typedef struct {

@@ -61,6 +61,12 @@ int main(int argc, char** argv) {
     // If --config is provided, all paths come from the TOML and other
     // CLI flags are ignored. Positional form below stays for back-compat.
     std::filesystem::path config_path;
+    // --ws-config <path>: load ONLY the [widescreen] site lists from this TOML
+    // without treating it as the full game config. Used by compile_overlays.py
+    // so overlay compilation gets the widescreen emits (sprite-tag / cull /
+    // backdrop) whose addresses live in overlay code — the overlay path is
+    // positional (no --config), so this is the channel for those sites.
+    std::filesystem::path ws_config_path;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--config" && i + 1 < argc) {
@@ -72,6 +78,14 @@ int main(int argc, char** argv) {
             break;
         }
     }
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--ws-config" && i + 1 < argc) { ws_config_path = argv[i + 1]; break; }
+        if (a.rfind("--ws-config=", 0) == 0) {
+            ws_config_path = a.substr(std::string("--ws-config=").size());
+            break;
+        }
+    }
 
     std::filesystem::path exe_path;
     std::string           extra_funcs_storage;  // lifetime anchor for the .c_str() below
@@ -80,6 +94,7 @@ int main(int argc, char** argv) {
     bool                  overlay_mode = false;
     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
     std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
+    std::set<uint32_t>    ws_backdrop_x;        // [widescreen.backdrop] x_sites
     std::filesystem::path out_dir = "generated";
 
     if (!config_path.empty()) {
@@ -93,6 +108,7 @@ int main(int argc, char** argv) {
         ws_cull_bias.insert(cfg.ws_cull_bias_sites.begin(), cfg.ws_cull_bias_sites.end());
         ws_cull_range.insert(cfg.ws_cull_range_sites.begin(), cfg.ws_cull_range_sites.end());
         ws_cull_a1.insert(cfg.ws_cull_a1_sites.begin(), cfg.ws_cull_a1_sites.end());
+        ws_backdrop_x.insert(cfg.ws_backdrop_x_sites.begin(), cfg.ws_backdrop_x_sites.end());
         fmt::print("config:         {}\n", config_path.string());
         fmt::print("  exe         = {}\n", exe_path.string());
         fmt::print("  seeds       = {}\n", extra_funcs_storage);
@@ -129,6 +145,23 @@ int main(int argc, char** argv) {
                 overlay_mode = true;
             }
         }
+    }
+
+    // --ws-config: merge the [widescreen] site lists from a side config WITHOUT
+    // adopting its exe/paths. The overlay path is positional (no --config), so
+    // this is how overlay compilation receives the widescreen emits whose
+    // addresses live in overlay code (backdrop screenX, and any sprite-tag /
+    // cull sites that resolve there). No-op when --config already provided the
+    // sites (same TOML) — std::set insert dedupes.
+    if (!ws_config_path.empty()) {
+        const auto wscfg = PSXRecompV4::load_game_config(ws_config_path);
+        ws_tag_funcs.insert(wscfg.ws_sprite_tag_funcs.begin(), wscfg.ws_sprite_tag_funcs.end());
+        ws_cull_bias.insert(wscfg.ws_cull_bias_sites.begin(), wscfg.ws_cull_bias_sites.end());
+        ws_cull_range.insert(wscfg.ws_cull_range_sites.begin(), wscfg.ws_cull_range_sites.end());
+        ws_cull_a1.insert(wscfg.ws_cull_a1_sites.begin(), wscfg.ws_cull_a1_sites.end());
+        ws_backdrop_x.insert(wscfg.ws_backdrop_x_sites.begin(), wscfg.ws_backdrop_x_sites.end());
+        fmt::print("ws-config:      {} (backdrop_x sites={})\n",
+                   ws_config_path.string(), ws_backdrop_x.size());
     }
 
     // Parse the PS1-EXE file
@@ -623,6 +656,7 @@ int main(int argc, char** argv) {
     codegen_config.ws_cull_bias_sites  = ws_cull_bias;
     codegen_config.ws_cull_range_sites = ws_cull_range;
     codegen_config.ws_cull_a1_sites    = ws_cull_a1;
+    codegen_config.ws_backdrop_x_sites = ws_backdrop_x;
 
     // Load per-game annotations: annotations/<exe_stem>_annotations.csv
     // Silently skipped if the file doesn't exist.
