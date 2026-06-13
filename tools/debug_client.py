@@ -265,6 +265,20 @@ def build_cmd(args):
         return {"cmd": "set_input", "buttons": args[1]}, pretty_json
     elif cmd == "clear_input":
         return {"cmd": "clear_input"}, pretty_json
+    elif cmd == "ws_margin":
+        if len(args) < 2:
+            return None, lambda _: "Usage: ws_margin <value|-1>"
+        return {"cmd": "ws_margin", "value": int(args[1])}, pretty_json
+    elif cmd == "ws_census":
+        # ws_census on|off   OR   ws_census <start> <end> [outfile]
+        if len(args) >= 2 and args[1] in ("on", "off"):
+            return {"cmd": "ws_census", "action": args[1]}, pretty_json
+        if len(args) < 3:
+            return None, lambda _: "Usage: ws_census on|off  |  ws_census <start> <end> [outfile]"
+        d = {"cmd": "ws_census", "start": int(args[1]), "end": int(args[2])}
+        if len(args) > 3:
+            d["out"] = args[3]
+        return d, pretty_json
     elif cmd == "quit":
         return {"cmd": "quit"}, pretty_json
     elif cmd == "dispatch_check":

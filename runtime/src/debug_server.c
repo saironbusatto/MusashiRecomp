@@ -3563,6 +3563,8 @@ static void handle_gpu_state(int id, const char *json)
     gpu_get_draw_area(&da);
     uint64_t nop, fill, draw, env, copy;
     gpu_get_gp0_stats(&nop, &fill, &draw, &env, &copy);
+    GpuWsDebug ws;
+    gpu_ws_get_debug(&ws);
     send_fmt("{\"id\":%d,\"ok\":true,"
              "\"display_x\":%d,\"display_y\":%d,"
              "\"width\":%d,\"height\":%d,"
@@ -3572,7 +3574,10 @@ static void handle_gpu_state(int id, const char *json)
              "\"gp0_writes\":%llu,"
              "\"gp0_nop\":%llu,\"gp0_fill\":%llu,\"gp0_draw\":%llu,\"gp0_env\":%llu,\"gp0_copy\":%llu,"
              "\"draw_area\":[%u,%u,%u,%u],"
-             "\"draw_offset\":[%d,%d]}",
+             "\"draw_offset\":[%d,%d],"
+             "\"ws\":{\"configured\":%d,\"active\":%d,\"game_mode\":%d,"
+             "\"present_native_43\":%d,\"x_margin\":%d,\"squash\":[%d,%d],"
+             "\"cur_frame\":%llu,\"last_tag_frame\":%u}}",
              id, di.display_x, di.display_y,
              di.width, di.height,
              di.depth24 ? 24 : 15, di.depth24,
@@ -3583,7 +3588,10 @@ static void handle_gpu_state(int id, const char *json)
              (unsigned long long)draw, (unsigned long long)env,
              (unsigned long long)copy,
              da.left, da.top, da.right, da.bottom,
-             da.offset_x, da.offset_y);
+             da.offset_x, da.offset_y,
+             ws.configured, ws.active, ws.game_mode,
+             ws.present_native_43, ws.x_margin, ws.xnum, ws.xden,
+             (unsigned long long)ws.cur_frame, ws.last_tag_frame);
 }
 
 static void handle_mem_words(int id, const char *json)
@@ -5185,6 +5193,36 @@ static void handle_clear_input(int id, const char *json)
     s_input_override = -1;
     s_input_frames   = 0;
     send_ok(id);
+}
+
+static void handle_ws_margin(int id, const char *json)
+{
+    int v = json_get_int(json, "value", -2);
+    if (v < -1) { send_err(id, "missing value (>=0 to force, -1 to clear)"); return; }
+    gpu_ws_set_margin_override(v);
+    GpuWsDebug ws;
+    gpu_ws_get_debug(&ws);
+    send_fmt("{\"id\":%d,\"ok\":true,\"override\":%d,\"x_margin\":%d,\"active\":%d}",
+             id, v, ws.x_margin, ws.active);
+}
+
+static void handle_ws_census(int id, const char *json)
+{
+    char act[16] = {0};
+    json_get_str(json, "action", act, sizeof(act));
+    if (strcmp(act, "on") == 0)  { gpu_ws_census_set(1); send_fmt("{\"id\":%d,\"ok\":true,\"on\":1,\"seq\":%llu}", id, (unsigned long long)gpu_ws_census_seq()); return; }
+    if (strcmp(act, "off") == 0) { gpu_ws_census_set(0); send_fmt("{\"id\":%d,\"ok\":true,\"on\":0,\"seq\":%llu}", id, (unsigned long long)gpu_ws_census_seq()); return; }
+    /* default action = dump */
+    int f0 = json_get_int(json, "start", -1);
+    int f1 = json_get_int(json, "end", -1);
+    if (f0 < 0 || f1 < 0) { send_err(id, "missing start/end (or action on|off)"); return; }
+    char path[256];
+    if (!json_get_str(json, "out", path, sizeof(path)))
+        snprintf(path, sizeof(path), "psx_census.csv");
+    int n = gpu_ws_census_dump((uint32_t)f0, (uint32_t)f1, path);
+    if (n < 0) { send_err(id, "census dump: cannot open file"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"rows\":%d,\"path\":\"%s\",\"seq\":%llu}",
+             id, n, path, (unsigned long long)gpu_ws_census_seq());
 }
 
 static void handle_turbo(int id, const char *json)
@@ -8434,6 +8472,8 @@ static const CmdEntry s_commands[] = {
     { "dump_ram",          handle_read_ram },   /* alias: one request, one response */
     { "write_ram",         handle_write_ram },
     { "gpu_state",         handle_gpu_state },
+    { "ws_margin",         handle_ws_margin },
+    { "ws_census",         handle_ws_census },
     { "mem_words",         handle_mem_words },
     { "vram_peek",         handle_vram_peek },
     { "gl_coh_ring",       handle_gl_coh_ring },

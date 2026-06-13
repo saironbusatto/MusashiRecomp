@@ -122,9 +122,33 @@ static int ws_active(void) { return ws_configured() && !gpu_ws_present_native_43
  * the visible edge moves out by 160*(1/s - 1) = 160*(xden-xnum)/xnum. Widening
  * the cull window by this restores the original off-screen margin at the new
  * edge. 0 whenever squash is inactive (4:3/boot/menu/FMV) → original cull. */
+/* Diagnostic override (8C): when >= 0, psx_ws_x_margin() returns this value
+ * unconditionally so a probe can sweep the cull margin live (0 = force 4:3
+ * cull while still stretching; large = over-draw) at a fixed camera position.
+ * -1 = normal computed margin. */
+static int ws_margin_override = -1;
+void gpu_ws_set_margin_override(int v) { ws_margin_override = v; }
+
 int psx_ws_x_margin(void) {
+    if (ws_margin_override >= 0) return ws_margin_override;
     if (!ws_active()) return 0;
     return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
+}
+
+/* Snapshot live widescreen state for the TCP gpu_state diagnostic. Mirrors
+ * the predicates above so a probe can see, mid-gameplay, whether the squash
+ * and the cull-margin are actually engaged (8C). */
+void gpu_ws_get_debug(GpuWsDebug* out) {
+    if (!out) return;
+    out->configured        = ws_configured();
+    out->active            = ws_active();
+    out->game_mode         = ws_game_mode();
+    out->present_native_43 = gpu_ws_present_native_43();
+    out->x_margin          = psx_ws_x_margin();
+    out->xnum              = ws_xnum;
+    out->xden              = ws_xden;
+    out->cur_frame         = s_frame_count;
+    out->last_tag_frame    = ws_last_tag_stamp;
 }
 
 void gpu_ws_configure(int aspect_num, int aspect_den,
@@ -1635,11 +1659,83 @@ void gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest) {
     if (out_newest) *out_newest = gp0_ring[newest_idx].frame;
 }
 
+/* ---- Draw census ring (ALWAYS-ON) -----------------------------------------
+ * Every drawn primitive (GP0 opcode 0x20-0x7F) records: frame, the prim's DMA
+ * source address, the live camera (scratchpad camX/camY), and the prim's first
+ * vertex in DRAWING space (pre draw_offset). Purpose: see object spawn/despawn
+ * and edge-cull in DATA, not screenshots. When a background object despawns,
+ * its prim simply stops appearing in the census at a specific camX while its
+ * last recorded screen-x shows how far on-screen it still was — i.e. the
+ * effective (4:3-sized) despawn margin, which the 16:9 view exceeds. A prim
+ * present in the census but absent on screen would instead indict the renderer
+ * gate. Query via TCP `ws_census` → CSV file (large dumps mustn't ride TCP). */
+#define WS_CENSUS_CAP (1u << 21)            /* 2,097,152 entries * 16B = 32 MiB */
+typedef struct {
+    uint32_t frame;
+    uint32_t src_addr;
+    int16_t  cam_x, cam_y;
+    int16_t  x, y;
+    uint8_t  opcode;
+    uint8_t  pad[3];
+} WsCensusEntry;
+static WsCensusEntry *ws_census = NULL;
+static uint64_t       ws_census_seq = 0;
+static int            ws_census_on  = 1;     /* always-on; toggle via ws_census */
+extern uint16_t       psx_read_half(uint32_t addr);
+
+static void ws_census_record(uint8_t opcode, int32_t x, int32_t y) {
+    if (!ws_census_on) return;
+    if (!ws_census) {
+        ws_census = (WsCensusEntry *)calloc(WS_CENSUS_CAP, sizeof(WsCensusEntry));
+        if (!ws_census) { ws_census_on = 0; return; }
+    }
+    WsCensusEntry *e = &ws_census[ws_census_seq & (WS_CENSUS_CAP - 1)];
+    e->frame    = (uint32_t)s_frame_count;
+    e->src_addr = gp0_cmd_source_addr;
+    e->cam_x    = (int16_t)psx_read_half(0x1F800176);
+    e->cam_y    = (int16_t)psx_read_half(0x1F800186);
+    e->x        = (int16_t)x;
+    e->y        = (int16_t)y;
+    e->opcode   = opcode;
+    ws_census_seq++;
+}
+
+/* Dump census rows for frames [f0,f1] to a CSV file. Returns row count. */
+int gpu_ws_census_dump(uint32_t f0, uint32_t f1, const char *path) {
+    if (!ws_census) return 0;
+    FILE *fp = fopen(path, "w");
+    if (!fp) return -1;
+    fprintf(fp, "frame,src_addr,cam_x,cam_y,x,y,opcode\n");
+    uint64_t total = ws_census_seq;
+    uint64_t avail = total < WS_CENSUS_CAP ? total : WS_CENSUS_CAP;
+    uint64_t start = total - avail;
+    int n = 0;
+    for (uint64_t s = start; s < total; s++) {
+        WsCensusEntry *e = &ws_census[s & (WS_CENSUS_CAP - 1)];
+        if (e->frame < f0 || e->frame > f1) continue;
+        fprintf(fp, "%u,0x%08X,%d,%d,%d,%d,0x%02X\n",
+                e->frame, e->src_addr, e->cam_x, e->cam_y, e->x, e->y, e->opcode);
+        n++;
+    }
+    fclose(fp);
+    return n;
+}
+
+void gpu_ws_census_set(int on) { ws_census_on = on ? 1 : 0; }
+uint64_t gpu_ws_census_seq(void) { return ws_census_seq; }
+
 /* Execute a fully-collected GP0 command */
 static void gp0_execute_command(void) {
     uint8_t opcode = (gp0_cmd_buf[0] >> 24) & 0xFF;
     gp0_opcode_count[opcode]++;
     gp0_ring_record(gp0_cmd_buf, gp0_words_needed);
+
+    /* Draw-census: capture every drawing primitive's first vertex + camera. */
+    if (opcode >= 0x20 && opcode <= 0x7F) {
+        int32_t cvx, cvy;
+        parse_vertex(gp0_cmd_buf[1], &cvx, &cvy);
+        ws_census_record(opcode, cvx, cvy);
+    }
 
     /* Categorize for diagnostics */
     if (opcode <= 0x01) gp0_nop_count++;
