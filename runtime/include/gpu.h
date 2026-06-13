@@ -103,6 +103,31 @@ int  gpu_ws_present_native_43(void);
  * cull immediates by the recompiler ([widescreen.cull]); 0 unless stretching. */
 int  psx_ws_x_margin(void);
 
+/* Live widescreen state for diagnostics (TCP gpu_state). All pointers
+ * optional. last_tag_frame/cur_frame let the caller see game_mode freshness. */
+typedef struct {
+    int      configured;        /* ws_xnum != ws_xden */
+    int      active;            /* squash currently applied this frame */
+    int      game_mode;         /* tagged char/billboard prim within 2 frames */
+    int      present_native_43; /* frame presents pillarboxed 4:3 (FMV/full-2D) */
+    int      x_margin;          /* psx_ws_x_margin() right now */
+    int      xnum, xden;        /* squash factor */
+    uint64_t cur_frame;
+    uint32_t last_tag_frame;    /* frame of newest tagged prim */
+} GpuWsDebug;
+void gpu_ws_get_debug(GpuWsDebug* out);
+
+/* Diagnostic: force psx_ws_x_margin() to return v (>=0) regardless of state,
+ * or -1 to restore the normal computed margin. For live cull-margin sweeps. */
+void gpu_ws_set_margin_override(int v);
+
+/* Always-on draw-census ring: every drawn primitive records frame / source
+ * addr / camera / first-vertex screen pos, so object spawn/despawn and edge
+ * culls are observable in data. Dump frames [f0,f1] to a CSV file. */
+int      gpu_ws_census_dump(uint32_t f0, uint32_t f1, const char *path);
+void     gpu_ws_census_set(int on);
+uint64_t gpu_ws_census_seq(void);
+
 #ifdef __cplusplus
 }
 #endif
