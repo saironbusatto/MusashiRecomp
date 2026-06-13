@@ -136,6 +136,10 @@ static int           g_video_aspect_den = 3;
  * tagged sprite prims + HUD SPRT center-squash. Inert at 0/false. */
 static uint32_t      g_ws_anchor_addr = 0;
 static bool          g_ws_hud_sprt = false;
+/* Widescreen engages at game entry (fntrace_is_game_started): the BIOS boot
+ * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
+ * Starts true when the configured aspect is already 4:3 (nothing to engage). */
+static bool          g_ws_engaged = true;
 /* Logical present width for the SDL_Renderer (software) path; 640*scale at
  * 4:3, wider for wide aspects. Height is always 480*scale. Set at window
  * creation alongside SDL_RenderSetLogicalSize. */
@@ -1235,10 +1239,21 @@ static void sdl_vblank_present(void) {
         frame_pacer_wait(&pacer, PSX_FRAME_PERIOD_MS);
     }
 
+    /* Engage widescreen at game entry: BIOS boot stays authentic 4:3. */
+    if (!g_ws_engaged) {
+        extern int fntrace_is_game_started(void);
+        if (fntrace_is_game_started()) {
+            g_ws_engaged = true;
+            gte_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+            gpu_ws_configure(g_video_aspect_num, g_video_aspect_den,
+                             g_ws_anchor_addr, g_ws_hud_sprt ? 1 : 0);
+        }
+    }
+
     /* ---- Display from our VRAM ---- */
     uint32_t w = 0, h = 0;
     int active_scale = 1;   /* hi-res mirror used only for 15-bit display */
-    bool fmv_frame = false;  /* FMV — present pillarboxed 4:3 in widescreen */
+    bool fmv_frame = false;  /* FMV/boot — present pillarboxed 4:3 in widescreen */
     {
         static bool disabled_frame_presented = false;
         GpuDisplayInfo di;
@@ -1260,10 +1275,11 @@ static void sdl_vblank_present(void) {
         }
         disabled_frame_presented = false;
         w = di.width; h = di.height;
-        /* FMV = 24-bit display OR streamed 15-bit MDEC video (Tomba plays
-         * its movies as 15-bit frames). ~0.5 s hysteresis rides out gaps
-         * between decoded chunks. */
-        fmv_frame = di.depth24 != 0 || mdec_recently_active(30) != 0;
+        /* 4:3-pinned frames: 24-bit display OR streamed 15-bit MDEC video
+         * (Tomba plays its movies as 15-bit frames; ~0.5 s hysteresis rides
+         * out gaps between decoded chunks) OR the pre-game BIOS boot. */
+        fmv_frame = di.depth24 != 0 || mdec_recently_active(30) != 0 ||
+                    !g_ws_engaged;
 
         /* OpenGL: 15-bit frames ALWAYS present straight from the authoritative
          * VRAM FBO — one deterministic path (the old per-frame FBO-vs-CPU
@@ -1694,16 +1710,17 @@ int main(int argc, char** argv) {
     /* Display aspect (widescreen hack). Identity at the default 4:3. The GTE
      * squashes screen-X around the game's projection centre; both present
      * paths stretch the 4:3 frame to the configured aspect. */
-    gte_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
-    gpu_ws_configure(g_video_aspect_num, g_video_aspect_den,
-                     g_ws_anchor_addr, g_ws_hud_sprt ? 1 : 0);
-    if (g_video_aspect_num * 3 != g_video_aspect_den * 4)
+    if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
+        /* Hold the squash off through the BIOS boot (authentic 4:3 logos);
+         * the per-frame present path engages it at game entry. */
+        g_ws_engaged = false;
         std::fprintf(stdout,
-                     "psxrecomp: widescreen %d:%d (GTE X-squash + stretched present%s%s)\n",
+                     "psxrecomp: widescreen %d:%d (GTE X-squash + stretched present%s%s; engages at game entry)\n",
                      g_video_aspect_num, g_video_aspect_den,
                      g_ws_anchor_addr ? " + sprite tags" : "",
                      g_ws_hud_sprt ? " + HUD squash" : "");
+    }
     /* Present-time screen-colour model (verified-enhancement LUT). Default raw
      * is byte-identical; PSX_SCREEN env overrides this at scanout. */
     gpu_set_screen_kind(g_video_screen);
