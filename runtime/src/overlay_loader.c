@@ -413,6 +413,16 @@ static void init_callbacks(void) {
     s_callbacks.call_bail_flag = &g_psx_call_bail;
     s_callbacks.bail_first     = &g_psx_bail_first;
     s_callbacks.bail_resolved  = &g_psx_bail_resolved;
+    /* Widescreen hooks (ABI v3): overlay-emitted psx_ws_* calls forward to
+     * the runtime's live widescreen state (gpu.c). */
+    {
+        extern int  psx_ws_backdrop_x(int x);
+        extern int  psx_ws_x_margin(void);
+        extern void psx_ws_sprite_tag(CPUState *cpu);
+        s_callbacks.ws_backdrop_x = psx_ws_backdrop_x;
+        s_callbacks.ws_x_margin   = psx_ws_x_margin;
+        s_callbacks.ws_sprite_tag = psx_ws_sprite_tag;
+    }
 }
 
 /* ---- DLL loading and export enumeration -------------------------------- */

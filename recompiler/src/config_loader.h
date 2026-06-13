@@ -246,6 +246,19 @@ struct GameConfig {
     std::vector<uint32_t> ws_cull_bias_sites;
     std::vector<uint32_t> ws_cull_range_sites;
     std::vector<uint32_t> ws_cull_a1_sites;
+
+    // Backdrop screen-X squash ([widescreen.backdrop] x_sites). The parallax
+    // 2D backdrop layer (ocean/cloud/mountain/grass — overlay actor handlers)
+    // computes screenX = (worldX - camX) >> parallax in pure integer math and
+    // stores it to the object's screen-X field WITHOUT the GTE, so the GTE
+    // X-squash that gives 3D the wider 16:9 FOV never reaches it; far pieces
+    // sit past the 320px edge and are clipped (the edge "void"/pop-in). Each
+    // x_site is a `sh rt,off(base)` storing the FINAL screenX; we emit it as
+    // `write_half(base+off, psx_ws_backdrop_x(rt))` so the value is squashed
+    // around screen centre (identity at 4:3). These addresses live in OVERLAY
+    // code, so the overlay compile must see this config (--ws-config). A regen
+    // is required; empty by default.
+    std::vector<uint32_t> ws_backdrop_x_sites;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

@@ -16,8 +16,15 @@
  *
  * v2: dispatch call-contract (Bug D family) — DLL call sites carry (ra, sp)
  *     contract checks and share the runtime's bail state via the appended
- *     callback pointers below. */
-#define PSX_OVERLAY_ABI_VERSION 2
+ *     callback pointers below.
+ * v3: widescreen backdrop screenX squash ([widescreen.backdrop] x_sites) —
+ *     overlay backdrop handlers now emit psx_ws_backdrop_x() at their screenX
+ *     store. This is an EMIT-content change (not a struct-ABI change), but the
+ *     version is the cache discriminator: bumping it forces the loader to
+ *     reject pre-backdrop DLLs so autocompile regenerates them with the squash.
+ *     (The deferred follow-up is to auto-derive this tag from a hash of the
+ *     widescreen config + emit headers; until then it's a manual bump.) */
+#define PSX_OVERLAY_ABI_VERSION 3
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -66,6 +73,15 @@ typedef struct {
     int      *call_bail_flag;
     uint64_t *bail_first;
     uint64_t *bail_resolved;
+    /* Widescreen hooks (ABI v3). The recompiler can emit psx_ws_* calls into
+     * OVERLAY code (backdrop screenX squash; and, for other games, sprite-tag
+     * or cull sites that resolve into overlays). These compute against the
+     * host's live widescreen state (gpu.c), so the DLL forwards to the runtime
+     * through these. Appended LAST (struct grows back-compatibly); may be NULL
+     * on a host that predates them — the DLL glue falls back to identity. */
+    int  (*ws_backdrop_x)(int x);
+    int  (*ws_x_margin)(void);
+    void (*ws_sprite_tag)(CPUState *cpu);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

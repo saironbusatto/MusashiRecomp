@@ -51,6 +51,13 @@ struct CodeGenConfig {
     std::set<uint32_t> ws_cull_range_sites;
     std::set<uint32_t> ws_cull_a1_sites;
 
+    // Widescreen backdrop screenX squash ([widescreen.backdrop] x_sites). Each
+    // address is a `sh rt,off(base)` storing a parallax 2D backdrop layer's
+    // final screen-X; emitted as write_half(base+off, psx_ws_backdrop_x(rt))
+    // so the un-GTE'd backdrop is squashed around screen centre for the 16:9
+    // FOV (identity at 4:3). Overlay-resident; see config_loader.h. Empty=default.
+    std::set<uint32_t> ws_backdrop_x_sites;
+
     CodeGenConfig()
         : emit_comments(true)
         , emit_line_numbers(true)

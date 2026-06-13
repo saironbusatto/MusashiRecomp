@@ -514,6 +514,19 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         }
     }
 
+    // Optional [widescreen.backdrop] block — parallax 2D backdrop screenX squash.
+    std::vector<uint32_t> ws_backdrop_x_sites;
+    if (cfg.contains("widescreen")) {
+        const toml::value& ws = toml::find(cfg, "widescreen");
+        if (ws.contains("backdrop")) {
+            const toml::value& bd = toml::find(ws, "backdrop");
+            if (bd.contains("x_sites"))
+                for (const auto& a : toml::find<std::vector<std::string>>(bd, "x_sites"))
+                    ws_backdrop_x_sites.push_back(
+                        parse_hex(a, "widescreen.backdrop.x_sites"));
+        }
+    }
+
     return GameConfig{
         /*config_path*/      config_path,
         /*project_root*/     root,
@@ -540,6 +553,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_cull_bias_sites*/    ws_cull_bias_sites,
         /*ws_cull_range_sites*/   ws_cull_range_sites,
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
+        /*ws_backdrop_x_sites*/   ws_backdrop_x_sites,
     };
 }
 

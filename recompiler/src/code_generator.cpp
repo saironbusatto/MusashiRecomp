@@ -717,6 +717,25 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         return fmt::format("cpu->gpr[5] = cpu->gpr[5] + psx_ws_x_margin();"
                            "  /* ws cull a1 bias */{}", comment);
     }
+    // Widescreen backdrop screenX squash ([widescreen.backdrop] x_sites). The
+    // site is the `sh rt,off(base)` storing a parallax 2D backdrop layer's
+    // final screen-X; squash the stored value around the screen centre so the
+    // un-GTE'd backdrop tracks the 16:9 FOV (psx_ws_backdrop_x is identity at
+    // 4:3). Instruction type is verified; a mismatch is a loud build error.
+    if (config_.ws_backdrop_x_sites.count(addr)) {
+        if (opcode != 0x29) {  // sh
+            fmt::print(stderr, "ERROR: [widescreen.backdrop] x site 0x{:08X} is not "
+                       "sh (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+        uint32_t rs = get_rs(instr), rt = get_rt(instr);
+        int16_t offset = get_imm16(instr);
+        if (offset == 0)
+            return fmt::format("cpu->write_half({}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
+                               reg_name(rs), reg_name(rt), comment);
+        return fmt::format("cpu->write_half({} + {}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
+                           reg_name(rs), offset, reg_name(rt), comment);
+    }
 
     // SPECIAL opcode (0x00)
     if (opcode == 0x00) {
@@ -1672,7 +1691,8 @@ std::string CodeGenerator::generate_file(
     ss << "#include \"psx_runtime.h\"\n\n";
     ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
-    ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n\n";
+    ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
+    ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n\n";
 
     // Emit reference implementations for unaligned memory helpers.
     // These implement the MIPS lwl/lwr/swl/swr semantics.
