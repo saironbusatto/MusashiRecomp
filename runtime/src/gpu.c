@@ -45,6 +45,135 @@ static int      gp0_words_needed;
 static uint32_t gp0_next_source_addr = 0xFFFFFFFFu;
 static uint32_t gp0_cmd_source_addr  = 0xFFFFFFFFu;
 
+/* ---- Widescreen proportion correction --------------------------------------
+ * Active only when [video] aspect_ratio != 4:3 AND the game's [widescreen]
+ * block opts in (see config_loader.h). Two mechanisms, both driven from the
+ * game.toml so nothing here is game-specific:
+ *
+ *  1. Tagged character/billboard prims. The recompiler emits a
+ *     psx_ws_sprite_tag(cpu) call at the entry of each configured
+ *     sprite-tag function ($a0 = prim pointer, scratchpad holds the prim's
+ *     GTE-projected anchor). The game computes the prim's screen-pixel
+ *     offsets/widths itself — which our GTE X-squash never sees — so tagged
+ *     prims get every X re-squashed around their own anchor at execution
+ *     time, restoring correct proportions on the stretched present.
+ *
+ *  2. Untagged textured rects (SPRT family). These never went through the
+ *     GTE at all (HUD, menus — pure screen space), so they're squashed
+ *     around the display centre, presenting at native proportions.
+ *     Untextured TILEs are never touched: full-screen fades/flashes must
+ *     keep covering the whole frame.
+ *
+ * The tag table is keyed by the prim's guest address (the DMA linked-list
+ * walk reports each word's source address) and stamped with the frame
+ * counter, so stale entries age out without an explicit clear. */
+static int32_t  ws_xnum = 1, ws_xden = 1;   /* X squash factor; 1/1 = off */
+static uint32_t ws_anchor_addr = 0;          /* scratchpad addr of anchor SXY */
+static int      ws_hud_sprt = 0;             /* center-squash untagged SPRTs */
+
+#define WS_TAG_BUCKETS 4096                  /* power of two */
+#define WS_TAG_PROBES  8
+typedef struct { uint32_t key; uint32_t stamp; int32_t anchor_x; } WsTag;
+static WsTag    ws_tags[WS_TAG_BUCKETS];
+extern uint64_t s_frame_count;               /* defined in debug_server.c */
+
+static int ws_active(void) { return ws_xnum != ws_xden; }
+
+void gpu_ws_configure(int aspect_num, int aspect_den,
+                      uint32_t sprite_anchor_addr, int hud_sprt_squash) {
+    /* X squash = (4*den)/(3*num) — the same factor the GTE applies. */
+    if (aspect_num <= 0 || aspect_den <= 0) { ws_xnum = ws_xden = 1; }
+    else {
+        int32_t n = 4 * aspect_den, d = 3 * aspect_num;
+        int32_t a = n, b = d;
+        while (b) { int32_t t = a % b; a = b; b = t; }
+        ws_xnum = n / a;
+        ws_xden = d / a;
+    }
+    ws_anchor_addr = sprite_anchor_addr;
+    ws_hud_sprt    = hud_sprt_squash;
+}
+
+/* Called from generated code at the entry of each [widescreen]
+ * sprite_tag_funcs function: record prim pointer ($a0) -> projected anchor. */
+void psx_ws_sprite_tag(CPUState* cpu) {
+    if (!ws_active() || !ws_anchor_addr) return;
+    uint32_t key = cpu->gpr[4] & 0x1FFFFCu;
+    if (!key) return;
+    uint32_t sxy = cpu->read_word(ws_anchor_addr);
+    int32_t  ax  = (int32_t)(int16_t)(sxy & 0xFFFFu);
+    uint32_t now = (uint32_t)s_frame_count;
+    uint32_t idx = (key >> 2) & (WS_TAG_BUCKETS - 1);
+    uint32_t victim = idx;
+    for (int i = 0; i < WS_TAG_PROBES; i++) {
+        uint32_t j = (idx + i) & (WS_TAG_BUCKETS - 1);
+        WsTag *t = &ws_tags[j];
+        if (t->key == key || t->key == 0) { victim = j; break; }
+        if (now - t->stamp > 2) victim = j;  /* stale — reusable */
+    }
+    ws_tags[victim].key      = key;
+    ws_tags[victim].stamp    = now;
+    ws_tags[victim].anchor_x = ax;
+}
+
+/* Look up the executing GP0 command's prim in the tag table. The command's
+ * first word lives at prim+4 (the PsyQ P_TAG header precedes it), but accept
+ * a direct hit too in case a tag site passes the colour-word address. */
+static int ws_tagged_anchor(int32_t *out_ax) {
+    if (!ws_active() || gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
+    uint32_t now = (uint32_t)s_frame_count;
+    for (int variant = 0; variant < 2; variant++) {
+        uint32_t key = (gp0_cmd_source_addr - (variant ? 0u : 4u)) & 0x1FFFFCu;
+        uint32_t idx = (key >> 2) & (WS_TAG_BUCKETS - 1);
+        for (int i = 0; i < WS_TAG_PROBES; i++) {
+            WsTag *t = &ws_tags[(idx + i) & (WS_TAG_BUCKETS - 1)];
+            if (t->key == key && now - t->stamp <= 2) {
+                *out_ax = t->anchor_x;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Squash x around pivot ax by ws_xnum/ws_xden, round to nearest. */
+static int32_t ws_scale_about(int32_t x, int32_t ax) {
+    int32_t d = x - ax;
+    int32_t s = (d * ws_xnum + (d >= 0 ? ws_xden / 2 : -ws_xden / 2)) / ws_xden;
+    return ax + s;
+}
+
+/* Squash a width; never below 1px so nothing vanishes. */
+static int32_t ws_scale_len(int32_t w) {
+    int32_t s = (w * ws_xnum + ws_xden / 2) / ws_xden;
+    return s < 1 ? 1 : s;
+}
+
+/* Horizontal display centre in drawing space (e.g. 160 in 320-wide modes) —
+ * the pivot for screen-space (HUD) prims. */
+static int32_t ws_hud_center_x(void) {
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    return di.width ? (int32_t)(di.width / 2) : 160;
+}
+
+/* Shared transform for fixed-size textured sprites (8x8 / 16x16 / 1x1 dot):
+ * squash *x0 in place (around the tagged anchor, else the display centre for
+ * screen-space prims) and return the squashed draw width, or 0 = no change. */
+static int ws_sprt_fixed_transform(int32_t *x0, int w) {
+    if (!ws_active()) return 0;
+    int32_t ax;
+    if (ws_tagged_anchor(&ax)) {
+        *x0 = ws_scale_about(*x0, ax);
+        return (int)ws_scale_len(w);
+    }
+    if (ws_hud_sprt) {
+        *x0 = ws_scale_about(*x0, ws_hud_center_x());
+        return (int)ws_scale_len(w);
+    }
+    return 0;
+}
+
 /* Polyline state */
 static uint16_t polyline_color;       /* mono polyline: current color */
 static int32_t  polyline_prev_x, polyline_prev_y;  /* previous vertex */
@@ -747,6 +876,14 @@ static void gp0_exec_textured_quad(void) {
     uint16_t clut_y = (clut >> 6) & 0x1FF;
     uint16_t tpage = (uint16_t)(gp0_cmd_buf[4] >> 16) & 0x1FF;
 
+    /* Widescreen: tagged billboard quads carry CPU-computed pixel offsets the
+     * GTE squash never saw — re-squash every X around the prim's anchor. */
+    {
+        int32_t ws_ax;
+        if (ws_tagged_anchor(&ws_ax))
+            for (int i = 0; i < 4; i++) vx[i] = ws_scale_about(vx[i], ws_ax);
+    }
+
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
         vy[i] += draw_offset_y;
@@ -913,7 +1050,6 @@ static void gp0_exec_textured_rect(void) {
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
-    x0 += draw_offset_x; y0 += draw_offset_y;
     int u0 = gp0_cmd_buf[2] & 0xFF;
     int v0 = (gp0_cmd_buf[2] >> 8) & 0xFF;
     uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
@@ -924,8 +1060,28 @@ static void gp0_exec_textured_rect(void) {
     if (w > 1023) w = 1023;
     if (h > 511)  h = 511;
 
+    /* Widescreen: tagged sprite parts squash around their projected anchor;
+     * untagged SPRTs are screen-space 2D (HUD/menus) and squash around the
+     * display centre. Texels keep full coverage via the scaled-rect path. */
+    int ws_w = 0;
+    if (ws_active() && w > 0) {
+        int32_t ws_ax;
+        if (ws_tagged_anchor(&ws_ax)) {
+            x0 = ws_scale_about(x0, ws_ax);
+            ws_w = (int)ws_scale_len(w);
+        } else if (ws_hud_sprt) {
+            x0 = ws_scale_about(x0, ws_hud_center_x());
+            ws_w = (int)ws_scale_len(w);
+        }
+    }
+
+    x0 += draw_offset_x; y0 += draw_offset_y;
     setup_textured_draw(color24, semi_trans, raw_texture);
-    gr_draw_textured_rect(x0, y0, w, h, u0, v0, clut_x, clut_y, current_texpage());
+    if (ws_w && ws_w != w)
+        gr_draw_textured_rect_scaled(x0, y0, ws_w, h, u0, v0, u0 + w, v0 + h,
+                                     clut_x, clut_y, current_texpage());
+    else
+        gr_draw_textured_rect(x0, y0, w, h, u0, v0, clut_x, clut_y, current_texpage());
 }
 
 /* Execute 1x1 dot (GP0 0x68-0x6B) */
@@ -946,6 +1102,7 @@ static void gp0_exec_textured_8x8(void) {
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+    int ws_w = ws_sprt_fixed_transform(&x0, 8);
     x0 += draw_offset_x; y0 += draw_offset_y;
     int u0 = gp0_cmd_buf[2] & 0xFF;
     int v0 = (gp0_cmd_buf[2] >> 8) & 0xFF;
@@ -954,7 +1111,11 @@ static void gp0_exec_textured_8x8(void) {
     uint16_t clut_y = (clut >> 6) & 0x1FF;
 
     setup_textured_draw(color24, semi_trans, raw_texture);
-    gr_draw_textured_rect(x0, y0, 8, 8, u0, v0, clut_x, clut_y, current_texpage());
+    if (ws_w && ws_w != 8)
+        gr_draw_textured_rect_scaled(x0, y0, ws_w, 8, u0, v0, u0 + 8, v0 + 8,
+                                     clut_x, clut_y, current_texpage());
+    else
+        gr_draw_textured_rect(x0, y0, 8, 8, u0, v0, clut_x, clut_y, current_texpage());
 }
 
 /* Execute 8x8 sprite (GP0 0x70-0x73) */
@@ -975,6 +1136,7 @@ static void gp0_exec_textured_16x16(void) {
     int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
     int32_t x0, y0;
     parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+    int ws_w = ws_sprt_fixed_transform(&x0, 16);
     x0 += draw_offset_x; y0 += draw_offset_y;
     int u0 = gp0_cmd_buf[2] & 0xFF;
     int v0 = (gp0_cmd_buf[2] >> 8) & 0xFF;
@@ -983,7 +1145,11 @@ static void gp0_exec_textured_16x16(void) {
     uint16_t clut_y = (clut >> 6) & 0x1FF;
 
     setup_textured_draw(color24, semi_trans, raw_texture);
-    gr_draw_textured_rect(x0, y0, 16, 16, u0, v0, clut_x, clut_y, current_texpage());
+    if (ws_w && ws_w != 16)
+        gr_draw_textured_rect_scaled(x0, y0, ws_w, 16, u0, v0, u0 + 16, v0 + 16,
+                                     clut_x, clut_y, current_texpage());
+    else
+        gr_draw_textured_rect(x0, y0, 16, 16, u0, v0, clut_x, clut_y, current_texpage());
 }
 
 /* ---- GP0 command execution ---- */
@@ -1503,6 +1669,7 @@ static void gp0_execute_command(void) {
             int raw_texture = (gp0_cmd_buf[0] >> 24) & 1;
             int32_t x0, y0;
             parse_vertex(gp0_cmd_buf[1], &x0, &y0);
+            (void)ws_sprt_fixed_transform(&x0, 1);  /* position only; 1px stays 1px */
             x0 += draw_offset_x; y0 += draw_offset_y;
             int u0 = gp0_cmd_buf[2] & 0xFF;
             int v0 = (gp0_cmd_buf[2] >> 8) & 0xFF;

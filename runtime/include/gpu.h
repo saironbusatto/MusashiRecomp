@@ -85,6 +85,17 @@ void gpu_set_vblank_callback(gpu_vblank_cb cb);
  * env var, if set, overrides this. Default 0 (raw) is byte-identical. */
 void gpu_set_screen_kind(int kind);
 
+/* Widescreen proportion correction (active only when aspect != 4:3 and the
+ * game's [widescreen] block opts in — see config_loader.h). Tagged
+ * character/billboard prims are re-squashed around their projected anchor;
+ * untagged SPRT prims (screen-space HUD/menus) around the display centre.
+ * psx_ws_sprite_tag is the per-prim callback the recompiler emits at the
+ * entry of each [widescreen] sprite_tag_funcs function. */
+void gpu_ws_configure(int aspect_num, int aspect_den,
+                      uint32_t sprite_anchor_addr, int hud_sprt_squash);
+struct CPUState;
+void psx_ws_sprite_tag(struct CPUState* cpu);
+
 #ifdef __cplusplus
 }
 #endif

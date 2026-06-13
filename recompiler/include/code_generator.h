@@ -36,6 +36,11 @@ struct CodeGenConfig {
     bool use_switch_for_blocks;   // Use switch instead of goto labels
     bool split_mid_function_targets; // Split branch targets into funcs for legacy main-EXE analysis
     std::string indent;           // Indentation string (default: "    ")
+    // Widescreen sprite-tag hooks ([widescreen] sprite_tag_funcs): functions
+    // that get a psx_ws_sprite_tag(cpu) callback emitted at entry, so the
+    // runtime can record the per-prim pointer ($a0) + projected anchor for
+    // proportion correction at GP0 submission. Empty = no hooks (default).
+    std::set<uint32_t> ws_sprite_tag_funcs;
 
     CodeGenConfig()
         : emit_comments(true)

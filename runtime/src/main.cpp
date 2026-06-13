@@ -131,6 +131,10 @@ extern "C" uint32_t mdec_get_decode_count(void);
  * in config_loader.h). */
 static int           g_video_aspect_num = 4;
 static int           g_video_aspect_den = 3;
+/* [widescreen] per-game hooks (see config_loader.h): anchor scratch addr for
+ * tagged sprite prims + HUD SPRT center-squash. Inert at 0/false. */
+static uint32_t      g_ws_anchor_addr = 0;
+static bool          g_ws_hud_sprt = false;
 /* Logical present width for the SDL_Renderer (software) path; 640*scale at
  * 4:3, wider for wide aspects. Height is always 480*scale. Set at window
  * creation alongside SDL_RenderSetLogicalSize. */
@@ -1440,6 +1444,8 @@ int main(int argc, char** argv) {
             g_video_screen     = gc.runtime.video_screen_kind;
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
+            g_ws_anchor_addr   = gc.ws_sprite_anchor_addr;
+            g_ws_hud_sprt      = gc.ws_hud_sprt_squash;
             g_audio_spu_hq     = gc.runtime.audio_spu_hq;
             g_auto_skip_fmv    = gc.runtime.video_auto_skip_fmv ? 1 : 0;
             { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
@@ -1679,9 +1685,14 @@ int main(int argc, char** argv) {
      * paths stretch the 4:3 frame to the configured aspect. */
     gte_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    gpu_ws_configure(g_video_aspect_num, g_video_aspect_den,
+                     g_ws_anchor_addr, g_ws_hud_sprt ? 1 : 0);
     if (g_video_aspect_num * 3 != g_video_aspect_den * 4)
-        std::fprintf(stdout, "psxrecomp: widescreen %d:%d (GTE X-squash + stretched present)\n",
-                     g_video_aspect_num, g_video_aspect_den);
+        std::fprintf(stdout,
+                     "psxrecomp: widescreen %d:%d (GTE X-squash + stretched present%s%s)\n",
+                     g_video_aspect_num, g_video_aspect_den,
+                     g_ws_anchor_addr ? " + sprite tags" : "",
+                     g_ws_hud_sprt ? " + HUD squash" : "");
     /* Present-time screen-colour model (verified-enhancement LUT). Default raw
      * is byte-identical; PSX_SCREEN env overrides this at scanout. */
     gpu_set_screen_kind(g_video_screen);

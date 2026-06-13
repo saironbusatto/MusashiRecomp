@@ -78,6 +78,7 @@ int main(int argc, char** argv) {
     const char*           extra_funcs_path = nullptr;
     bool                  inspect_mode = false;
     bool                  overlay_mode = false;
+    std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
     std::filesystem::path out_dir = "generated";
 
     if (!config_path.empty()) {
@@ -86,10 +87,15 @@ int main(int argc, char** argv) {
         extra_funcs_storage  = cfg.seeds_path.string();
         extra_funcs_path     = extra_funcs_storage.c_str();
         out_dir              = cfg.out_dir;
+        ws_tag_funcs.insert(cfg.ws_sprite_tag_funcs.begin(),
+                            cfg.ws_sprite_tag_funcs.end());
         fmt::print("config:         {}\n", config_path.string());
         fmt::print("  exe         = {}\n", exe_path.string());
         fmt::print("  seeds       = {}\n", extra_funcs_storage);
-        fmt::print("  out_dir     = {}\n\n", out_dir.string());
+        fmt::print("  out_dir     = {}\n", out_dir.string());
+        if (!ws_tag_funcs.empty())
+            fmt::print("  ws_tag_funcs= {}\n", ws_tag_funcs.size());
+        fmt::print("\n");
     } else {
         if (argc < 2) {
             fmt::print("Usage: {} --config <game.toml>                  # going-forward\n", argv[0]);
@@ -609,6 +615,7 @@ int main(int argc, char** argv) {
     codegen_config.emit_comments = true;
     codegen_config.emit_line_numbers = true;
     codegen_config.split_mid_function_targets = !overlay_mode;
+    codegen_config.ws_sprite_tag_funcs = ws_tag_funcs;
 
     // Load per-game annotations: annotations/<exe_stem>_annotations.csv
     // Silently skipped if the file doesn't exist.
