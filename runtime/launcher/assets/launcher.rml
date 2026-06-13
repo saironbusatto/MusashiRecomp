@@ -301,7 +301,9 @@ button:hover { background-color: #232d3c; }
 	<div data-if="view == 'settings'">
 		<div class="panel">
 			<div class="eyebrow">VIDEO</div>
-			<div class="set-row"><span class="set-lbl">Window size (4:3)</span><span class="set-ctl">
+			<div class="set-row"><span class="set-lbl">Aspect ratio</span><span class="set-ctl">
+				<button class="toggle" data-event-click="cycle_aspect"><span class="value">{{aspect_label}}</span></button></span></div>
+			<div class="set-row"><span class="set-lbl">Window size</span><span class="set-ctl">
 				<button class="toggle wide" data-event-click="cycle_winsize"><span class="value">{{winsize_label}}</span></button></span></div>
 			<div class="set-row"><span class="set-lbl">Renderer</span><span class="set-ctl">
 				<button class="toggle" data-event-click="cycle_renderer"><span class="value">{{renderer_label}}</span></button></span></div>
