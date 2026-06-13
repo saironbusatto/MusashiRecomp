@@ -50,6 +50,10 @@ extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);
 
 /* GTE (COP2) — defined in runtime/src/gte.cpp */
 extern void     gte_execute(CPUState* cpu, uint32_t cmd);
+/* Widescreen X-squash: display aspect num:den (4,3 = identity/off). Scales
+ * RTPS/RTPT screen-X around the game's OFX so a 4:3 frame stretched to the
+ * wide aspect shows a wider field of view. */
+extern void     gte_set_display_aspect(int num, int den);
 extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);
 extern uint32_t gte_read_ctrl(CPUState* cpu, uint8_t reg);
 extern void     gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);

@@ -32,9 +32,14 @@ void gl_renderer_present_blank(void);
 void gl_renderer_sync_cpu(void);
 
 /* THE present path for 15-bit frames: blit the display region straight from
- * the authoritative VRAM FBO into a 4:3 letterboxed rect (no readback).
+ * the authoritative VRAM FBO into a letterboxed rect (no readback).
  * Deterministic — used for every 15-bit frame. linear = filter on scale. */
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear);
+
+/* Display aspect for the present letterbox (default 4:3). A wide aspect
+ * stretches the 4:3 frame; pair with gte_set_display_aspect (cpu_state.h)
+ * for the widescreen field-of-view hack. */
+void gl_renderer_set_display_aspect(int num, int den);
 
 void gl_renderer_shutdown(void);
 

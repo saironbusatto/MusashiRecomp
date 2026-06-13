@@ -1110,10 +1110,20 @@ static void upload_present_tex(const uint32_t *pixels, int w, int h, int linear)
     }
 }
 
-/* 4:3 letterbox: largest 4:3 rect centered in the drawable. */
+/* Display aspect for the present letterbox. Default 4:3 (native). When a wide
+ * aspect is configured the 4:3 frame is stretched into it — paired with the
+ * GTE X-squash (gte_set_display_aspect) this nets a wider field of view. */
+static int s_aspect_num = 4, s_aspect_den = 3;
+
+void gl_renderer_set_display_aspect(int num, int den) {
+    if (num <= 0 || den <= 0) { num = 4; den = 3; }
+    s_aspect_num = num; s_aspect_den = den;
+}
+
+/* Letterbox: largest s_aspect rect centered in the drawable. */
 static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h) {
-    int dw = ww, dh = (ww * 3) / 4;
-    if (dh > wh) { dh = wh; dw = (wh * 4) / 3; }
+    int dw = ww, dh = (ww * s_aspect_den) / s_aspect_num;
+    if (dh > wh) { dh = wh; dw = (wh * s_aspect_num) / s_aspect_den; }
     *x = (ww - dw) / 2;
     *y = (wh - dh) / 2;
     *w = dw; *h = dh;

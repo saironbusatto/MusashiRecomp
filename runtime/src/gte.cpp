@@ -106,6 +106,31 @@ static void depth_cue_from_ir(GTEState* gte) {
 }
 
 // ---------------------------------------------------------------------------
+// Widescreen X-squash (verified-enhancement, default off = identity).
+//
+// For a display aspect wider than the native 4:3, screen-space X is scaled by
+// (4*den)/(3*num) around the projection centre OFX — e.g. 3/4 for 16:9 — and
+// the present path stretches the 4:3 frame to the wide aspect, netting a wider
+// horizontal field of view (the DuckStation/Beetle "widescreen hack", but
+// applied in our GTE library so every RTPS/RTPT caller — generated code,
+// interpreter, overlay DLLs — sees it). Only the IR1*h/sz term is scaled, NOT
+// OFX, so the squash is centred on the game's own projection centre and
+// games' post-projection screen-bounds culls (which read SXY back from us)
+// stay aligned with the visible frame.
+// ---------------------------------------------------------------------------
+static int32_t s_ws_xnum = 1, s_ws_xden = 1;
+
+extern "C" void gte_set_display_aspect(int num, int den) {
+    if (num <= 0 || den <= 0) { s_ws_xnum = s_ws_xden = 1; return; }
+    // squash = (4/3) / (num/den) = (4*den) / (3*num); identity for 4:3.
+    int32_t n = 4 * den, d = 3 * num;
+    int32_t a = n, b = d;
+    while (b) { int32_t t = a % b; a = b; b = t; }   // gcd
+    s_ws_xnum = n / a;
+    s_ws_xden = d / a;
+}
+
+// ---------------------------------------------------------------------------
 // RTPS — Perspective Transformation (internal, operates on given vertex V)
 // ---------------------------------------------------------------------------
 void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
@@ -141,7 +166,9 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     int32_t h_div_sz = gte_divide(gte->H, gte->SZ[3], gte->FLAG);
 
     // Step 4: Project to screen coordinates
-    int64_t sx = (gte->OFX + (int64_t)gte->IR1 * h_div_sz) >> 16;
+    int64_t xterm = (int64_t)gte->IR1 * h_div_sz;
+    if (s_ws_xnum != s_ws_xden) xterm = xterm * s_ws_xnum / s_ws_xden;
+    int64_t sx = (gte->OFX + xterm) >> 16;
     int64_t sy = (gte->OFY + (int64_t)gte->IR2 * h_div_sz) >> 16;
     gte->push_sxy(sx, sy);
 

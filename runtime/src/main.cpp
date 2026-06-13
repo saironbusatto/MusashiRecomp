@@ -118,7 +118,7 @@ static bool          g_video_aa    = true;  /* linear present filtering */
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 static int           g_video_renderer = 0;  /* 0=software, 1=opengl (requested) */
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
-static int           g_video_win_w    = 1280; /* window width (height = w*3/4, 4:3) */
+static int           g_video_win_w    = 1280; /* window width (height follows aspect) */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
 static int           g_auto_skip_fmv  = 0;   /* fast-forward FMVs invisibly to EOF */
 
@@ -126,19 +126,29 @@ static int           g_auto_skip_fmv  = 0;   /* fast-forward FMVs invisibly to E
 extern "C" int      cdrom_xa_stream_active(void);
 extern "C" uint32_t mdec_get_decode_count(void);
 
-/* Clamp a requested 4:3 window width to the primary display's usable area so an
- * oversized choice (e.g. 1920 on a 1080p panel) still fits on screen. Keeps the
- * 4:3 aspect: height = width*3/4. */
-static void clamp_window_4x3(int* w, int* h) {
+/* Display aspect W:H (default 4:3 = native). Wider aspects enable the
+ * widescreen hack: GTE X-squash + stretched present (see [video] aspect_ratio
+ * in config_loader.h). */
+static int           g_video_aspect_num = 4;
+static int           g_video_aspect_den = 3;
+/* Logical present width for the SDL_Renderer (software) path; 640*scale at
+ * 4:3, wider for wide aspects. Height is always 480*scale. Set at window
+ * creation alongside SDL_RenderSetLogicalSize. */
+static int           g_logical_w = 640;
+
+/* Clamp a requested window width to the primary display's usable area so an
+ * oversized choice (e.g. 1920 on a 1080p panel) still fits on screen. Keeps
+ * the given aspect: height = width*den/num. */
+static void clamp_window_aspect(int* w, int* h, int num, int den) {
     int width = *w;
     if (width < 640) width = 640;
     SDL_Rect bounds;
     if (SDL_GetDisplayUsableBounds(0, &bounds) == 0 && bounds.w > 0 && bounds.h > 0) {
-        if (width > bounds.w)         width = bounds.w;
-        if (width * 3 / 4 > bounds.h) width = bounds.h * 4 / 3;
+        if (width > bounds.w)             width = bounds.w;
+        if (width * den / num > bounds.h) width = bounds.h * num / den;
     }
     *w = width;
-    *h = width * 3 / 4;
+    *h = width * den / num;
 }
 static bool          g_gl_active = false;    /* GL context live -> GL present path */
 /* Present straight from the FBO (fast, no readback). Set PSX_GL_FORCE_CPU_PRESENT=1
@@ -1295,7 +1305,7 @@ static void sdl_vblank_present(void) {
     SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf,
                       (int)(src_w * sizeof(uint32_t)));
 
-    SDL_Rect dst = { 0, 0, 640 * g_video_scale, 480 * g_video_scale };
+    SDL_Rect dst = { 0, 0, g_logical_w, 480 * g_video_scale };
     SDL_RenderClear(sdl_renderer);
     SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
 
@@ -1423,13 +1433,15 @@ int main(int argc, char** argv) {
                 g_turbo_loads_enabled = 1;
                 std::fprintf(stdout, "psxrecomp: turbo_loads enabled (opt-in)\n");
             }
-            g_video_scale     = gc.runtime.video_supersampling;
-            g_video_aa        = gc.runtime.video_antialiasing;
-            g_video_texfilter = gc.runtime.video_texture_filter;
-            g_video_renderer  = gc.runtime.video_renderer;
-            g_video_screen    = gc.runtime.video_screen_kind;
-            g_audio_spu_hq    = gc.runtime.audio_spu_hq;
-            g_auto_skip_fmv   = gc.runtime.video_auto_skip_fmv ? 1 : 0;
+            g_video_scale      = gc.runtime.video_supersampling;
+            g_video_aa         = gc.runtime.video_antialiasing;
+            g_video_texfilter  = gc.runtime.video_texture_filter;
+            g_video_renderer   = gc.runtime.video_renderer;
+            g_video_screen     = gc.runtime.video_screen_kind;
+            g_video_aspect_num = gc.runtime.video_aspect_num;
+            g_video_aspect_den = gc.runtime.video_aspect_den;
+            g_audio_spu_hq     = gc.runtime.audio_spu_hq;
+            g_auto_skip_fmv    = gc.runtime.video_auto_skip_fmv ? 1 : 0;
             { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
@@ -1488,6 +1500,10 @@ int main(int argc, char** argv) {
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
         if (us.has_screen_kind)    g_video_screen    = us.screen_kind;
         if (us.has_auto_skip_fmv)  g_auto_skip_fmv   = us.auto_skip_fmv ? 1 : 0;
+        if (us.has_aspect_ratio) {
+            g_video_aspect_num = us.aspect_num;
+            g_video_aspect_den = us.aspect_den;
+        }
         if (us.has_spu_hq)         g_audio_spu_hq    = us.spu_hq;
         if (us.has_bios_path && !bios_from_cli) {
             settings_bios_storage = us.bios_path.string();
@@ -1533,6 +1549,8 @@ int main(int argc, char** argv) {
             seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
             seed.screen_kind = g_video_screen;            seed.has_screen_kind = true;
             seed.auto_skip_fmv = (g_auto_skip_fmv != 0);  seed.has_auto_skip_fmv = true;
+            seed.aspect_num = g_video_aspect_num;
+            seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
             seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
             seed.skip_launcher = skip_launcher_setting;   seed.has_skip_launcher = true;
             if (bios_path && bios_path[0]) { seed.bios_path = bios_path; seed.has_bios_path = true; }
@@ -1559,7 +1577,7 @@ int main(int argc, char** argv) {
              * window is set smaller. */
             int lwin_w = g_video_win_w < 1280 ? 1280 : g_video_win_w;
             int lwin_h = 0;
-            clamp_window_4x3(&lwin_w, &lwin_h);
+            clamp_window_aspect(&lwin_w, &lwin_h, 4, 3);
             std::string lwin_title = (game_name.empty() ? std::string("PSX") : game_name)
                                      + " \xE2\x80\x94 Launcher";
             SDL_Window* lwin = SDL_CreateWindow(
@@ -1596,6 +1614,8 @@ int main(int argc, char** argv) {
                 g_video_texfilter = seed.texture_filter;
                 g_video_screen    = seed.screen_kind;
                 g_auto_skip_fmv   = seed.auto_skip_fmv ? 1 : 0;
+                g_video_aspect_num = seed.aspect_num;
+                g_video_aspect_den = seed.aspect_den;
                 g_audio_spu_hq    = seed.spu_hq;
                 skip_launcher_setting = seed.skip_launcher;
                 if (seed.has_bios_path) {
@@ -1654,6 +1674,14 @@ int main(int argc, char** argv) {
     gr_set_scale(g_video_scale);
     g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
     gr_set_texture_filter(g_video_texfilter);
+    /* Display aspect (widescreen hack). Identity at the default 4:3. The GTE
+     * squashes screen-X around the game's projection centre; both present
+     * paths stretch the 4:3 frame to the configured aspect. */
+    gte_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+    if (g_video_aspect_num * 3 != g_video_aspect_den * 4)
+        std::fprintf(stdout, "psxrecomp: widescreen %d:%d (GTE X-squash + stretched present)\n",
+                     g_video_aspect_num, g_video_aspect_den);
     /* Present-time screen-colour model (verified-enhancement LUT). Default raw
      * is byte-identical; PSX_SCREEN env overrides this at scanout. */
     gpu_set_screen_kind(g_video_screen);
@@ -1759,12 +1787,13 @@ int main(int argc, char** argv) {
 
     Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
     if (g_video_renderer == 1) win_flags |= SDL_WINDOW_OPENGL;
-    /* Open at the user-chosen 4:3 window size (default 1280x960) instead of the
+    /* Open at the user-chosen window size (default 1280 wide) instead of the
      * old hardcoded 640x480, so the game doesn't boot into a tiny window. The
-     * present path keeps a 640x480 logical space, so the image scales to fill
-     * the larger window with no aspect distortion. */
+     * height follows the configured display aspect (4:3 native, wider for the
+     * widescreen hack); the present path letterboxes to the same aspect, so
+     * the image scales to fill the larger window with no further distortion. */
     int game_w = g_video_win_w, game_h = 0;
-    clamp_window_4x3(&game_w, &game_h);
+    clamp_window_aspect(&game_w, &game_h, g_video_aspect_num, g_video_aspect_den);
     sdl_window = SDL_CreateWindow(
         window_title.c_str(),
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
@@ -1826,12 +1855,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* Present in a 640x480 logical space (scaled by the supersampling factor
-     * so the full internal resolution reaches a large/fullscreen window; SDL
+    /* Present in a logical space of the configured aspect (640x480 at native
+     * 4:3, wider at widescreen aspects; scaled by the supersampling factor so
+     * the full internal resolution reaches a large/fullscreen window; SDL
      * still scales and letterboxes to the real output). Identity in the
      * default window when supersampling is off, so native rendering is
      * unchanged. */
-    SDL_RenderSetLogicalSize(sdl_renderer, 640 * g_video_scale, 480 * g_video_scale);
+    g_logical_w = 480 * g_video_aspect_num * g_video_scale / g_video_aspect_den;
+    SDL_RenderSetLogicalSize(sdl_renderer, g_logical_w, 480 * g_video_scale);
   }
 
     /* Staging buffer + backing texture are sized for the internal resolution

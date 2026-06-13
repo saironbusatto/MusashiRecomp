@@ -28,6 +28,32 @@ static uint32_t parse_hex(const std::string& s, const std::string& field) {
     }
 }
 
+// Parse a display aspect "W:H" string (e.g. "4:3", "16:9", "21:9"). Accepts
+// only aspects between native 4:3 and 32:9 — narrower than 4:3 has no
+// widescreen meaning and ultra-extreme values would squash the GTE X axis
+// into unusability. Returns false on malformed input or out-of-range aspect.
+static bool parse_aspect_ratio(const std::string& s, int* num, int* den) {
+    const size_t colon = s.find(':');
+    if (colon == std::string::npos || colon == 0 || colon + 1 >= s.size())
+        return false;
+    int n = 0, d = 0;
+    try {
+        size_t used = 0;
+        n = std::stoi(s.substr(0, colon), &used);
+        if (used != colon) return false;
+        const std::string rest = s.substr(colon + 1);
+        d = std::stoi(rest, &used);
+        if (used != rest.size()) return false;
+    } catch (const std::exception&) {
+        return false;
+    }
+    if (n <= 0 || d <= 0 || n > 99 || d > 99) return false;
+    if (3 * n < 4 * d) return false;   // narrower than 4:3
+    if (9 * n > 32 * d) return false;  // wider than 32:9
+    *num = n; *den = d;
+    return true;
+}
+
 // Parse the optional [runtime] block. All fields optional; absent fields
 // leave has_* = false on the returned struct. Paths are resolved relative
 // to `root` (project root).
@@ -123,6 +149,16 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
         if (video.contains("auto_skip_fmv")) {
             rt.video_auto_skip_fmv = toml::find<bool>(video, "auto_skip_fmv");
+        }
+        if (video.contains("aspect_ratio")) {
+            const auto mode = toml::find<std::string>(video, "aspect_ratio");
+            int n = 0, d = 0;
+            if (!parse_aspect_ratio(mode, &n, &d))
+                throw std::runtime_error(fmt::format(
+                    "[video] aspect_ratio must be \"W:H\", no narrower than 4:3 "
+                    "and no wider than 32:9 (e.g. \"4:3\", \"16:9\"): {}", mode));
+            rt.video_aspect_num = n;
+            rt.video_aspect_den = d;
         }
     }
 
@@ -510,6 +546,13 @@ UserSettings load_user_settings(const fs::path& path) {
         if (v.contains("auto_skip_fmv")) try_get([&]{
             s.auto_skip_fmv = toml::find<bool>(v, "auto_skip_fmv"); s.has_auto_skip_fmv = true;
         });
+        if (v.contains("aspect_ratio")) try_get([&]{
+            const auto m = toml::find<std::string>(v, "aspect_ratio");
+            int n = 0, d = 0;
+            if (parse_aspect_ratio(m, &n, &d)) {
+                s.aspect_num = n; s.aspect_den = d; s.has_aspect_ratio = true;
+            }
+        });
     }
     if (doc.contains("audio")) {
         const toml::value& a = toml::find(doc, "audio");
@@ -614,6 +657,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     }
     if (s.has_auto_skip_fmv)
         f << "auto_skip_fmv     = " << (s.auto_skip_fmv ? "true" : "false") << "\n";
+    if (s.has_aspect_ratio)
+        f << "aspect_ratio      = \"" << s.aspect_num << ":" << s.aspect_den << "\"\n";
     f << "\n[audio]\n";
     if (s.has_spu_hq)
         f << "spu_hq = " << (s.spu_hq ? "true" : "false") << "\n";
