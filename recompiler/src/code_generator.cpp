@@ -1301,6 +1301,10 @@ GeneratedFunction CodeGenerator::generate_function(
     body_ss << config_.indent
             << fmt::format("debug_server_log_call_entry(0x{:08X}u);\n",
                           func.start_addr);
+    if (config_.ws_sprite_tag_funcs.count(func.start_addr)) {
+        body_ss << config_.indent
+                << "psx_ws_sprite_tag(cpu);  /* widescreen: record prim ($a0) + anchor */\n";
+    }
 
     // Add function comment
     if (config_.emit_comments) {
@@ -1627,7 +1631,8 @@ std::string CodeGenerator::generate_file(
     // Include the generic PSX runtime header.
     // This provides CPUState, GTE/trap declarations, and call_by_address().
     ss << "#include \"psx_runtime.h\"\n\n";
-    ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n\n";
+    ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
+    ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n\n";
 
     // Emit reference implementations for unaligned memory helpers.
     // These implement the MIPS lwl/lwr/swl/swr semantics.

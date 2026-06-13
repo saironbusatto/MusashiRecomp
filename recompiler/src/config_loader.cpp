@@ -472,6 +472,31 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         out_stem = derive_out_stem(fs::path(exe_field).filename().string());
     }
 
+    // Optional [widescreen] block — per-game hooks for the widescreen hack.
+    std::vector<uint32_t> ws_sprite_tag_funcs;
+    uint32_t ws_sprite_anchor_addr = 0;
+    bool ws_hud_sprt_squash = false;
+    if (cfg.contains("widescreen")) {
+        const toml::value& ws = toml::find(cfg, "widescreen");
+        if (ws.contains("sprite_tag_funcs")) {
+            const auto& arr = toml::find<std::vector<std::string>>(ws, "sprite_tag_funcs");
+            for (const auto& a : arr)
+                ws_sprite_tag_funcs.push_back(
+                    parse_hex(a, "widescreen.sprite_tag_funcs"));
+        }
+        if (ws.contains("sprite_anchor_addr")) {
+            ws_sprite_anchor_addr = parse_hex(
+                toml::find<std::string>(ws, "sprite_anchor_addr"),
+                "widescreen.sprite_anchor_addr");
+        }
+        if (!ws_sprite_tag_funcs.empty() && ws_sprite_anchor_addr == 0)
+            throw std::runtime_error(fmt::format(
+                "{}: [widescreen] sprite_tag_funcs requires sprite_anchor_addr",
+                config_path.string()));
+        if (ws.contains("hud_sprt_squash"))
+            ws_hud_sprt_squash = toml::find<bool>(ws, "hud_sprt_squash");
+    }
+
     return GameConfig{
         /*config_path*/      config_path,
         /*project_root*/     root,
@@ -492,6 +517,9 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*strict*/           strict,
         /*out_stem*/         out_stem,
         /*runtime*/          parse_runtime_block(cfg, root),
+        /*ws_sprite_tag_funcs*/   ws_sprite_tag_funcs,
+        /*ws_sprite_anchor_addr*/ ws_sprite_anchor_addr,
+        /*ws_hud_sprt_squash*/    ws_hud_sprt_squash,
     };
 }
 

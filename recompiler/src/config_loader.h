@@ -212,6 +212,25 @@ struct GameConfig {
 
     // [runtime] block (optional)
     RuntimeConfig         runtime;
+
+    // [widescreen] block (optional) — per-game knobs for the widescreen hack
+    // ([video] aspect_ratio != 4:3). All default to inert; a game with no
+    // [widescreen] block gets the plain GTE squash + stretched present only.
+    //
+    // sprite_tag_funcs: guest addresses of functions called once per
+    //   character/billboard prim with the prim pointer in $a0 (the recompiler
+    //   emits a psx_ws_sprite_tag(cpu) callback at their entry). Tagged prims
+    //   get their X coords re-squashed around the prim's projected anchor at
+    //   GP0 submission, undoing the present stretch so sprites keep correct
+    //   proportions.
+    // sprite_anchor_addr: scratchpad address holding the prim's projected
+    //   anchor SXY (written by the game's RTPS preamble) at tag time.
+    // hud_sprt_squash: center-squash every UNtagged textured-rect (SPRT)
+    //   prim — pure screen-space 2D (HUD, menus) — so it presents at native
+    //   proportions. Untextured TILEs (fades) are never touched.
+    std::vector<uint32_t> ws_sprite_tag_funcs;
+    uint32_t              ws_sprite_anchor_addr = 0;
+    bool                  ws_hud_sprt_squash = false;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.
