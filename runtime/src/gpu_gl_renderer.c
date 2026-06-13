@@ -1120,13 +1120,17 @@ void gl_renderer_set_display_aspect(int num, int den) {
     s_aspect_num = num; s_aspect_den = den;
 }
 
-/* Letterbox: largest s_aspect rect centered in the drawable. */
-static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h) {
-    int dw = ww, dh = (ww * s_aspect_den) / s_aspect_num;
-    if (dh > wh) { dh = wh; dw = (wh * s_aspect_num) / s_aspect_den; }
+/* Letterbox: largest num:den rect centered in the drawable. */
+static void letterbox_rect_aspect(int ww, int wh, int num, int den,
+                                  int *x, int *y, int *w, int *h) {
+    int dw = ww, dh = (ww * den) / num;
+    if (dh > wh) { dh = wh; dw = (wh * num) / den; }
     *x = (ww - dw) / 2;
     *y = (wh - dh) / 2;
     *w = dw; *h = dh;
+}
+static void letterbox_rect(int ww, int wh, int *x, int *y, int *w, int *h) {
+    letterbox_rect_aspect(ww, wh, s_aspect_num, s_aspect_den, x, y, w, h);
 }
 
 static GLuint make_tex(GLenum internal, int w, int h, GLenum fmt, GLenum type) {
@@ -1319,15 +1323,22 @@ void gl_renderer_shutdown(void) {
 }
 
 /* CPU-readout present (24-bit FMV frames and the PSX_GL_FORCE_CPU_PRESENT
- * diagnostic): full-window clear, then a quad into the 4:3 letterbox rect. */
-void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear) {
+ * diagnostic): full-window clear, then a quad into the letterbox rect.
+ * force_4_3 pins the rect to native 4:3 regardless of the display aspect —
+ * FMVs are authored 4:3 and have no GTE squash to compensate a stretch, so
+ * widescreen presents them pillarboxed instead of distorted. */
+void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
+                         int force_4_3) {
     if (!s_ctx) return;
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
     glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     int lx, ly, lw, lh;
-    letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+    if (force_4_3)
+        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+    else
+        letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
     glViewport(lx, ly, lw, lh);
     p_glActiveTexture(PSXGL_TEXTURE0);
     upload_present_tex(pixels, src_w, src_h, linear);
@@ -1429,14 +1440,19 @@ void gl_renderer_diag(int *gpu_dirty, int pending[5], int pack[5]) {
 }
 
 /* THE present path for 15-bit frames: blit the display region from the
- * authoritative hr FBO into a 4:3 letterboxed rect. Deterministic — runs
- * every 15-bit frame regardless of what mix of ops produced it. */
-void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear) {
+ * authoritative hr FBO into a letterboxed rect. Deterministic — runs
+ * every 15-bit frame regardless of what mix of ops produced it.
+ * force_4_3 pins to native 4:3 (15-bit MDEC FMV frames on a wide aspect). */
+void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
+                              int force_4_3) {
     if (!s_ctx || !s_raster_ok) return;
     flush_cpu_upload();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
-    letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+    if (force_4_3)
+        letterbox_rect_aspect(ww, wh, 4, 3, &lx, &ly, &lw, &lh);
+    else
+        letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
 
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);

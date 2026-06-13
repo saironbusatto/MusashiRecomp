@@ -6,6 +6,11 @@
 
 extern uint64_t s_frame_count;
 
+/* FMV-activity detector: frame stamp of the newest colour (15/24-bit) MDEC
+ * decode. Streamed video decodes every frame; texture decompression uses the
+ * 4/8-bit luma path and does not stamp. */
+static uint64_t mdec_last_color_decode_frame = (uint64_t)0 - 1000u;
+
 enum {
     MDEC_CMD_NOP = 0,
     MDEC_CMD_DECODE = 1,
@@ -343,6 +348,9 @@ static void execute_decode(void) {
         mdec.decode_stop_reason = MDEC_STOP_INPUT_END;
     }
     mdec.decode_input_pos = pos;
+    /* FMV detector: stamp colour (15/24-bit) decodes only — streamed video.
+     * The 4/8-bit luma path above is texture decompression, not video. */
+    mdec_last_color_decode_frame = s_frame_count;
     trace_event(MDEC_EVT_DECODE_DONE, mdec.output_size);
 }
 
@@ -415,6 +423,10 @@ static void write_data(uint32_t value) {
     }
 
     begin_command(value);
+}
+
+int mdec_recently_active(uint32_t within_frames) {
+    return (uint64_t)(s_frame_count - mdec_last_color_decode_frame) <= within_frames;
 }
 
 void mdec_init(void) {

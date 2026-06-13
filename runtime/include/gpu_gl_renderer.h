@@ -20,8 +20,11 @@ extern "C" {
 int  gl_renderer_init_context(struct SDL_Window *win);
 
 /* Present an ARGB8888 image (BGRA byte order) as a letterboxed quad + swap.
- * Used for 24-bit (FMV) frames and the PSX_GL_FORCE_CPU_PRESENT diagnostic. */
-void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear);
+ * Used for 24-bit (FMV) frames and the PSX_GL_FORCE_CPU_PRESENT diagnostic.
+ * force_4_3 = pillarbox at native 4:3 even on a wide display aspect (FMVs
+ * are authored 4:3 and get no GTE squash to compensate the stretch). */
+void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linear,
+                         int force_4_3);
 
 /* Clear to black + swap (display-disabled frame). */
 void gl_renderer_present_blank(void);
@@ -33,8 +36,10 @@ void gl_renderer_sync_cpu(void);
 
 /* THE present path for 15-bit frames: blit the display region straight from
  * the authoritative VRAM FBO into a letterboxed rect (no readback).
- * Deterministic — used for every 15-bit frame. linear = filter on scale. */
-void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear);
+ * Deterministic — used for every 15-bit frame. linear = filter on scale.
+ * force_4_3 pins to native 4:3 (15-bit MDEC FMV frames on a wide aspect). */
+void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
+                              int force_4_3);
 
 /* Display aspect for the present letterbox (default 4:3). A wide aspect
  * stretches the 4:3 frame; pair with gte_set_display_aspect (cpu_state.h)

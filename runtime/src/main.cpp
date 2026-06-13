@@ -78,6 +78,7 @@ extern "C" void dma_init(void);
 
 /* mdec.c */
 extern "C" void mdec_init(void);
+extern "C" int  mdec_recently_active(uint32_t within_frames);
 
 /* timers.c */
 extern "C" void timers_init(void);
@@ -1237,6 +1238,7 @@ static void sdl_vblank_present(void) {
     /* ---- Display from our VRAM ---- */
     uint32_t w = 0, h = 0;
     int active_scale = 1;   /* hi-res mirror used only for 15-bit display */
+    bool fmv_frame = false;  /* FMV — present pillarboxed 4:3 in widescreen */
     {
         static bool disabled_frame_presented = false;
         GpuDisplayInfo di;
@@ -1258,6 +1260,10 @@ static void sdl_vblank_present(void) {
         }
         disabled_frame_presented = false;
         w = di.width; h = di.height;
+        /* FMV = 24-bit display OR streamed 15-bit MDEC video (Tomba plays
+         * its movies as 15-bit frames). ~0.5 s hysteresis rides out gaps
+         * between decoded chunks. */
+        fmv_frame = di.depth24 != 0 || mdec_recently_active(30) != 0;
 
         /* OpenGL: 15-bit frames ALWAYS present straight from the authoritative
          * VRAM FBO — one deterministic path (the old per-frame FBO-vs-CPU
@@ -1267,7 +1273,8 @@ static void sdl_vblank_present(void) {
 #ifndef PSX_SDL_NO_RENDER
         if (g_gl_active && g_gl_fbo_present && !di.depth24) {
             gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
-                                     (int)w, (int)h, g_video_aa ? 1 : 0);
+                                     (int)w, (int)h, g_video_aa ? 1 : 0,
+                                     fmv_frame ? 1 : 0);
             return;
         }
         if (g_gl_active) gl_renderer_sync_cpu();
@@ -1302,14 +1309,18 @@ static void sdl_vblank_present(void) {
     if (g_gl_active) {
         /* OpenGL present: upload the active display rect and draw a full-screen
          * quad. SDL_GL_SwapWindow handles vsync; the wall-clock pacer above
-         * still owns timing. */
-        gl_renderer_present(sdl_pixel_buf, src_w, src_h, g_video_aa ? 1 : 0);
+         * still owns timing. 24-bit (FMV) frames pin to native 4:3. */
+        gl_renderer_present(sdl_pixel_buf, src_w, src_h, g_video_aa ? 1 : 0,
+                            fmv_frame ? 1 : 0);
     } else {
     SDL_Rect src = { 0, 0, src_w, src_h };
     SDL_UpdateTexture(sdl_texture, &src, sdl_pixel_buf,
                       (int)(src_w * sizeof(uint32_t)));
 
-    SDL_Rect dst = { 0, 0, g_logical_w, 480 * g_video_scale };
+    /* FMV (24-bit) frames are authored 4:3 with no GTE squash to compensate
+     * the widescreen stretch — pillarbox them at native 4:3 instead. */
+    int dst_w = fmv_frame ? 640 * g_video_scale : g_logical_w;
+    SDL_Rect dst = { (g_logical_w - dst_w) / 2, 0, dst_w, 480 * g_video_scale };
     SDL_RenderClear(sdl_renderer);
     SDL_RenderCopy(sdl_renderer, sdl_texture, &src, &dst);
 

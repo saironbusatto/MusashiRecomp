@@ -16,6 +16,12 @@ uint32_t mdec_dma_read_word(void);
 int mdec_dma_write_ready(void);
 int mdec_dma_read_ready(void);
 
+/* FMV detector: nonzero if a colour (15/24-bit) MDEC decode ran within the
+ * last `within_frames` vblanks. Streamed video decodes continuously; the
+ * widescreen present pins such frames to native 4:3 (FMVs are authored 4:3
+ * and get no GTE squash to compensate the stretch). */
+int mdec_recently_active(uint32_t within_frames);
+
 typedef struct MDECDebugState {
     uint32_t command;
     uint32_t expected_halfwords;
