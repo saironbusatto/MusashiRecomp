@@ -113,6 +113,15 @@ struct RuntimeConfig {
     // all side effects (scene transition, save flags) happen exactly as normal.
     bool                  video_auto_skip_fmv = false;
 
+    // aspect_ratio: display aspect "W:H" (default "4:3" = native). A wider
+    // aspect (e.g. "16:9") enables the widescreen hack: the GTE squashes
+    // screen-X by (4*H)/(3*W) around the game's projection centre and the
+    // present path stretches the 4:3 frame to W:H — net effect is a wider
+    // field of view for GTE-projected geometry. Screen-space 2D (HUD, FMV,
+    // sprite widths) stretches; world geometry keeps correct proportions.
+    int                   video_aspect_num = 4;
+    int                   video_aspect_den = 3;
+
     // ---- [audio] block ----
     // spu_hq: enable the SPU float-shadow re-render (Catmull-Rom resample, float
     // headroom). Verified-enhancement, default OFF — spu_render output is
@@ -230,6 +239,8 @@ struct UserSettings {
     // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
     // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.
     bool has_skip_launcher  = false; bool skip_launcher  = false;
+    bool has_aspect_ratio   = false; int  aspect_num     = 4; // display aspect W:H
+                                     int  aspect_den     = 3; // (4:3 = native)
     // [audio]
     bool has_spu_hq         = false; bool spu_hq         = false;
     // [bios] / [disc] / [memcard]
