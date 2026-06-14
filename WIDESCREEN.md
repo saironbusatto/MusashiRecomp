@@ -1,7 +1,10 @@
 # Widescreen support (`feat/widescreen`)
 
-Status as of 2026-06-12. Branch `feat/widescreen` in **both** `psxrecomp`
-(framework) and `TombaRecomp` (game opt-in + config). Experimental.
+Status as of 2026-06-13. Branch `feat/widescreen` in **both** `psxrecomp`
+(framework) and `TombaRecomp` (game opt-in + config), pushed to remote.
+Experimental. Latest: the far-backdrop edge void is largely fixed (2D backdrop
+screenX squash + a depth-gated GTE-3D un-squash); a native-wide rewrite that
+would retire the squash entirely was spiked and shelved (see below).
 
 The framework feature is **generic and parameterized**: every game gets the
 plain behaviour for free, all knobs default to inert, and `aspect_ratio = "4:3"`
@@ -29,9 +32,21 @@ overlay DLLs uniformly — and extended well past what emulators ship with
 | `0792086` | **FMV 4:3 pillarbox** (24-bit OR streamed 15-bit MDEC video, detected via `mdec_recently_active`), **menu-2D coherence** (lines/flat-rects/mono-sprites squash on full-2D screens so dialog borders match the SPRT boxes; fades exempt), **HUD edge anchoring** (in-game untagged SPRTs pivot by thirds — outer-third elements keep their wide-screen corner position at native proportions). |
 | `5151e5b` | **Authentic 4:3 BIOS boot** — squash held off until game entry PC fires (`fntrace_is_game_started`); Sony/PS logos + shell render 4:3, widescreen engages at game start. |
 | TombaRecomp `124e3c9` | Tomba `[widescreen]` block (see config below). Tomba `game.toml` defaults `aspect_ratio = "4:3"`; the dev instance opts into 16:9 via `build-stable/settings.toml`. |
+| `8ae73c6` / TombaRecomp `01478fd` | **2D parallax-backdrop screenX squash** (`psx_ws_backdrop_x`, `runtime/src/gpu.c`). The actor-table backdrop (far mountains, midground bush row) is overlay 2D sprites computing `screenX = (worldX-camX)>>parallax` in pure integer math — never touches the GTE, so the GTE squash misses it and far pieces clip past the 320 edge. Fix squashes that stored screenX around screen-centre by the same factor. Applied on BOTH paths: native via `[widescreen.backdrop] x_sites` recompiler emit (overlay DLLs via OverlayCallbacks, ABI v2→v3), and the dirty-RAM interp SH hook (the path that runs in dev). Sites: type-0 `0x801217B4`, type-1 `0x8012196C`. |
+| `1e28a94` / TombaRecomp `66e13e5` | **Depth-gated far-backdrop GTE un-squash** (`gte_ws_set_suppress`, `runtime/src/gte.cpp`; `[widescreen.backdrop] unsquash_funcs` recompiler emit). The far ocean/cloud/distant-mountain is **GTE-3D** drawn by main-EXE `FUN_8004db3c`; the global squash compresses it toward centre → blue void at the revealed edges. Bracket that driver with a squash-suppress so its draws fill the frame skybox-style. Because the driver draws a MIX (far backdrop + near props), the suppress is **depth-gated**: only verts with projected SZ ≥ `s_ws_far_threshold` (default 900, live-tunable) un-squash; near props stay squashed/aligned. |
 
-User has visually confirmed: world geometry, characters, HUD, menus, and FMVs
-all present at correct (native) proportions on the 16:9 stretch.
+User has visually confirmed: world geometry, characters, HUD, menus, FMVs, and
+(2026-06-13) the far-backdrop edge fill all present at correct (native)
+proportions on the 16:9 stretch.
+
+**Live diagnostics (TCP debug server, committed `1e28a94`/earlier):**
+`ws_aspect num den` (toggle the GTE squash on/off in place — `1 1` = off),
+`ws_far_threshold [t]` (set the SZ depth split + read the backdrop driver's SZ
+stats so the split is data-driven), `ws_census on|off|<start> <end>` (always-on
+per-prim draw ring → CSV), `ws_margin <v|-1>` (force the cull margin), and the
+`gpu_state` `ws.{configured,active,game_mode,present_native_43,x_margin,squash}`
+readout. Plus `tools/_press.py` (TCP pad), `tools/_objtab.py` (0x800A3D08 actor
+table decoder).
 
 ---
 
@@ -58,6 +73,39 @@ the RTPS preamble stores the anchor SXY to scratchpad `0x1F800070`.
 
 **Changing `sprite_tag_funcs` requires a game regen** (the tag callback is
 emitted into the generated C). Everything else is runtime-only.
+
+---
+
+## Strategic direction: native-wide rendering (explored 2026-06-13, shelved)
+
+Everything above is the **squash hack**: compress a wider FOV into the 320
+framebuffer, present stretched. Its cost is a long tail of per-vertex-squash
+artifacts (backdrop void, prop drift, the mountain grass-top straddle — see
+ISSUES #8C). The **proper** fix is to stop squashing and render the wider FOV
+**natively** into a wider framebuffer. No squash → that entire artifact class
+disappears by construction (and it would likely fix the 8F dialogue split too).
+
+A runtime PoC (`ws_native_wide` toggle) was built and **proved viable, then
+reverted** (kept only as the checkpoint's history, not committed): drop the GTE
+X-squash, widen the GPU draw-area + display by `WS_WIDE_EXTRA=106` (320→426 =
+16:9 @ 240), and shift everything by `WS_WIDE_OFFSET=53` via `draw_offset` so 3D
+and 2D move together and stay aligned. Result: content rendered un-squashed at
+natural proportions with HUD/world alignment intact — the hypothesis held.
+
+**Why a native-recomp project should prefer this:** we run on native hardware, so
+**over-rendering off-screen geometry is essentially free** — we don't need to
+cull the reveal precisely, just render more and not worry about the waste.
+
+Remaining work to finish it (the PoC flushed these out):
+1. **Widen the game's screen-space rejects** so the revealed side strips draw
+   instead of being culled — e.g. `FUN_80027600`'s `SX>=0x140` (320) trivial
+   reject. Over-render: set the bound generously (recompiler emit, regen-class).
+2. **Paint the widened buffer region** — the game's framebuffer is 320 wide, so a
+   426-wide display read shows stale VRAM where nothing was drawn (the PoC's
+   right-edge garbage). The reveal must be covered (backdrop draws there once the
+   cull is widened) and/or the region cleared.
+3. **Re-anchor the 2D HUD/dialogue** to the wider frame (the `draw_offset` shift
+   centres them; corner HUD needs to map to the true edges).
 
 ---
 
