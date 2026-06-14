@@ -183,6 +183,10 @@ void cdrom_set_instant_rate(int per_frame) {
 }
 int cdrom_get_instant_rate(void) { return g_instant_max_per_frame; }
 
+/* Frontend FMV detector reads this to distinguish FMV/streaming XA from other
+ * sector traffic (FMV = streaming XA + active MDEC). */
+int cdrom_xa_stream_active(void) { return xa_stream_active; }
+
 static int instant_period(void) {
     int p = VBLANK_CYCLES_NTSC / g_instant_max_per_frame;
     return p < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : p;
@@ -191,7 +195,11 @@ static int instant_period(void) {
 static int apply_speed(int delay) {
     /* XA streaming (FMV / CDDA background music): preserve authentic timing.
      * FMVs interleave XA audio + MDEC video — speeding up sector delivery
-     * would cause both to play faster than the display refresh rate. */
+     * would desync the player (it depends on the authentic per-sector cadence;
+     * flooding it instantly hangs the movie on a white screen). FMV auto-skip
+     * therefore does NOT touch CD timing — it runs the whole machine faster via
+     * uncapped frame pacing (frontend), which speeds XA+MDEC+display together,
+     * preserving their relative sync. */
     if (xa_stream_active) return delay;
     if (g_disc_speed_divisor == 0) return instant_period(); /* bounded 'instant' */
     int d = delay / g_disc_speed_divisor;

@@ -313,6 +313,8 @@ button:hover { background-color: #232d3c; }
 				<button class="toggle" data-event-click="cycle_texfilter"><span class="value">{{texfilter_label}}</span></button></span></div>
 			<div class="set-row"><span class="set-lbl">Screen model</span><span class="set-ctl">
 				<button class="toggle" data-event-click="cycle_crt"><span class="value">{{crt_label}}</span></button></span></div>
+				<div class="set-row"><span class="set-lbl">Skip FMVs</span><span class="set-ctl">
+					<button class="toggle" data-event-click="toggle_skip_fmv"><span class="value" data-if="auto_skip_fmv">On</span><span class="value" data-if="auto_skip_fmv == false">Off</span></button></span></div>
 		</div>
 		<div class="panel">
 			<div class="eyebrow">AUDIO</div>

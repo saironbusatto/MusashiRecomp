@@ -120,6 +120,11 @@ static int           g_video_renderer = 0;  /* 0=software, 1=opengl (requested) 
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
 static int           g_video_win_w    = 1280; /* window width (height = w*3/4, 4:3) */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
+static int           g_auto_skip_fmv  = 0;   /* fast-forward FMVs invisibly to EOF */
+
+/* FMV auto-skip detection hooks (cdrom.c / mdec.c). */
+extern "C" int      cdrom_xa_stream_active(void);
+extern "C" uint32_t mdec_get_decode_count(void);
 
 /* Clamp a requested 4:3 window width to the primary display's usable area so an
  * oversized choice (e.g. 1920 on a 1080p panel) still fits on screen. Keeps the
@@ -1112,8 +1117,38 @@ static void sdl_vblank_present(void) {
         if (fntrace_is_game_started() && cdrom_load_in_progress())
             turbo_loads_active = 1;
     }
+
+    /* FMV auto-skip ([video] auto_skip_fmv). A streaming FMV is XA audio + MDEC
+     * video running together. Rather than fast-forward the stream (flooding XA
+     * sectors desyncs and hangs the player; even safe uncapped playback is slow
+     * and choppy), we trigger the GAME'S OWN skip: hold START while the movie is
+     * detected, and the FMV player tears the movie down cleanly and jumps to the
+     * next screen — instant, desync-free, with all state correct (verified: a
+     * START press during Tomba's opening movie lands exactly on the next scene).
+     * Detect "MDEC produced a frame since the last vblank AND XA is streaming";
+     * a short hold rides out brief inter-frame gaps. Injection (and the present/
+     * pacing safety-net below) stop the instant XA ends, so START doesn't bleed
+     * into the next screen. */
+    int fmv_skip_active = 0;
+    if (g_auto_skip_fmv) {
+        static uint32_t s_last_mdec = 0;
+        static int      s_fmv_hold  = 0;
+        uint32_t mc = mdec_get_decode_count();
+        int mdec_decoding = (mc != s_last_mdec);
+        s_last_mdec = mc;
+        int xa = cdrom_xa_stream_active();
+        if (mdec_decoding && xa) s_fmv_hold = 4;
+        else if (s_fmv_hold > 0) s_fmv_hold--;
+        fmv_skip_active = (s_fmv_hold > 0) && xa;
+        if (fmv_skip_active) {
+            /* Inject START (PSX pad word is active-low; START is bit 3) into
+             * port 1 so the game's FMV player aborts the movie itself. */
+            sio_set_pad_state_slot(0, (uint16_t)~(1u << 3));
+        }
+    }
+
 #ifndef PSX_SDL_NO_AUDIO
-    sdl_audio_update(turbo_loads_active);
+    sdl_audio_update(turbo_loads_active || fmv_skip_active);
 #endif
 
     /* TCP turbo is for automated validation and trace capture. It keeps the
@@ -1162,6 +1197,16 @@ static void sdl_vblank_present(void) {
         const int TL_PRESENT_EVERY = 30;
         tl_skip = (tl_skip + 1) % TL_PRESENT_EVERY;
         if (tl_skip != 0) return;
+    }
+
+    /* FMV auto-skip: run uncapped (no wall-clock pacing) and suppress nearly all
+     * presents so the fast-forwarded movie is invisible. Present 1-in-30 only so
+     * the window keeps pumping and never looks hung during the brief skip. */
+    if (fmv_skip_active) {
+        static int fs_skip = 0;
+        const int FMV_PRESENT_EVERY = 30;
+        fs_skip = (fs_skip + 1) % FMV_PRESENT_EVERY;
+        if (fs_skip != 0) return;
     }
 
     /* Wall-clock pacing: always runs once fast_boot has ended, even when the
@@ -1373,6 +1418,7 @@ int main(int argc, char** argv) {
             g_video_renderer  = gc.runtime.video_renderer;
             g_video_screen    = gc.runtime.video_screen_kind;
             g_audio_spu_hq    = gc.runtime.audio_spu_hq;
+            g_auto_skip_fmv   = gc.runtime.video_auto_skip_fmv ? 1 : 0;
             { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
@@ -1428,6 +1474,7 @@ int main(int argc, char** argv) {
         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
         if (us.has_screen_kind)    g_video_screen    = us.screen_kind;
+        if (us.has_auto_skip_fmv)  g_auto_skip_fmv   = us.auto_skip_fmv ? 1 : 0;
         if (us.has_spu_hq)         g_audio_spu_hq    = us.spu_hq;
         if (us.has_bios_path && !bios_from_cli) {
             settings_bios_storage = us.bios_path.string();
@@ -1465,6 +1512,7 @@ int main(int argc, char** argv) {
             seed.antialiasing = g_video_aa;               seed.has_antialiasing = true;
             seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
             seed.screen_kind = g_video_screen;            seed.has_screen_kind = true;
+            seed.auto_skip_fmv = (g_auto_skip_fmv != 0);  seed.has_auto_skip_fmv = true;
             seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
             if (bios_path && bios_path[0]) { seed.bios_path = bios_path; seed.has_bios_path = true; }
             if (!resolved_disc.empty())    { seed.disc_path = resolved_disc; seed.has_disc_path = true; }
@@ -1526,6 +1574,7 @@ int main(int argc, char** argv) {
                 g_video_aa        = seed.antialiasing;
                 g_video_texfilter = seed.texture_filter;
                 g_video_screen    = seed.screen_kind;
+                g_auto_skip_fmv   = seed.auto_skip_fmv ? 1 : 0;
                 g_audio_spu_hq    = seed.spu_hq;
                 if (seed.has_bios_path) {
                     settings_bios_storage = seed.bios_path.string();

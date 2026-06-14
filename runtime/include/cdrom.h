@@ -26,6 +26,12 @@ int  cdrom_get_setloc_lba(void);
 void cdrom_set_instant_rate(int per_frame);
 int  cdrom_get_instant_rate(void);
 
+/* FMV auto-skip detection: cdrom_xa_stream_active() lets the frontend detect
+ * that streaming XA (FMV/CDDA) is in progress. The skip itself is done by the
+ * frontend via uncapped pacing (it does NOT alter CD timing — flooding XA
+ * sectors desyncs and hangs the player). */
+int  cdrom_xa_stream_active(void);
+
 /* CD load-burst ring (always-on). One record per gap-separated run of
  * delivered data sectors. `out` receives up to `max` records, newest first
  * (layout matches cdrom.c's CdBurst — consumed by debug_server.c only). */

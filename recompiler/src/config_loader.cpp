@@ -121,6 +121,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
                 "[video] crt_filter must be \"raw\"|\"crt\"|\"composite\"|\"trinitron\": {}",
                 mode));
         }
+        if (video.contains("auto_skip_fmv")) {
+            rt.video_auto_skip_fmv = toml::find<bool>(video, "auto_skip_fmv");
+        }
     }
 
     // Optional [audio] block.
@@ -504,6 +507,9 @@ UserSettings load_user_settings(const fs::path& path) {
             else if (m == "composite") { s.screen_kind = 2; s.has_screen_kind = true; }
             else if (m == "trinitron") { s.screen_kind = 3; s.has_screen_kind = true; }
         });
+        if (v.contains("auto_skip_fmv")) try_get([&]{
+            s.auto_skip_fmv = toml::find<bool>(v, "auto_skip_fmv"); s.has_auto_skip_fmv = true;
+        });
     }
     if (doc.contains("audio")) {
         const toml::value& a = toml::find(doc, "audio");
@@ -600,6 +606,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
                       : s.screen_kind == 3 ? "trinitron" : "raw";
         f << "crt_filter        = \"" << k << "\"\n";
     }
+    if (s.has_auto_skip_fmv)
+        f << "auto_skip_fmv     = " << (s.auto_skip_fmv ? "true" : "false") << "\n";
     f << "\n[audio]\n";
     if (s.has_spu_hq)
         f << "spu_hq = " << (s.spu_hq ? "true" : "false") << "\n";

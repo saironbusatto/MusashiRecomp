@@ -295,9 +295,16 @@ static void append_color_macroblock(const int16_t *crblk, const int16_t *cbblk,
     }
 }
 
+/* Monotonic count of decode invocations — the frontend FMV detector samples
+ * this per display-frame to tell "MDEC is actively producing frames" (FMV)
+ * from idle. */
+static volatile uint32_t g_mdec_decode_count = 0;
+uint32_t mdec_get_decode_count(void) { return g_mdec_decode_count; }
+
 static void execute_decode(void) {
     uint32_t pos = 0;
     uint32_t end = mdec.input_count;
+    g_mdec_decode_count++;
     clear_output();
     mdec.decode_macroblocks = 0;
     mdec.decode_blocks = 0;

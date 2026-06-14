@@ -98,6 +98,7 @@ struct LauncherModel {
     bool antialiasing    = true;
     int  texture_filter  = 0;  // 0=nearest, 1=bilinear
     int  crt             = 0;  // 0=raw,1=crt,2=composite,3=trinitron
+    bool auto_skip_fmv   = false; // skip FMVs via the game's own skip
     bool spu_hq          = false;
     int  window_width    = 1280; // window size (4:3; height = w*3/4)
 
@@ -566,6 +567,7 @@ Result run(SDL_Window* window, void* gl_context,
     m.antialiasing   = io.antialiasing;
     m.texture_filter = io.texture_filter;
     m.crt            = io.screen_kind;
+    m.auto_skip_fmv  = io.auto_skip_fmv;
     m.spu_hq         = io.spu_hq;
     m.window_width   = kWinWidths[winsize_index(io.has_window_width ? io.window_width : 1280)];
     m.bios_path      = io.has_bios_path ? io.bios_path.generic_string() : Rml::String();
@@ -607,6 +609,7 @@ Result run(SDL_Window* window, void* gl_context,
     c.BindFunc("game_name", [title](Rml::Variant& out) { out = title; });
     c.Bind("supersampling",  &m.supersampling);
     c.Bind("antialiasing",   &m.antialiasing);
+    c.Bind("auto_skip_fmv",  &m.auto_skip_fmv);
     c.Bind("spu_hq",         &m.spu_hq);
     c.Bind("renderer_label", &m.renderer_label);
     c.Bind("crt_label",      &m.crt_label);
@@ -685,6 +688,11 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.spu_hq = !m.spu_hq;
             handle.DirtyVariable("spu_hq");
+        });
+    c.BindEventCallback("toggle_skip_fmv",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.auto_skip_fmv = !m.auto_skip_fmv;
+            handle.DirtyVariable("auto_skip_fmv");
         });
     c.BindEventCallback("browse_bios",
         [&m, window, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -859,6 +867,7 @@ Result run(SDL_Window* window, void* gl_context,
         io.antialiasing = m.antialiasing;     io.has_antialiasing = true;
         io.texture_filter = m.texture_filter; io.has_texture_filter = true;
         io.screen_kind = m.crt;               io.has_screen_kind = true;
+        io.auto_skip_fmv = m.auto_skip_fmv;   io.has_auto_skip_fmv = true;
         io.spu_hq = m.spu_hq;                 io.has_spu_hq = true;
         io.window_width = m.window_width;     io.has_window_width = true;
         if (!m.bios_path.empty()) { io.bios_path = fs::path(std::string(m.bios_path)); io.has_bios_path = true; }

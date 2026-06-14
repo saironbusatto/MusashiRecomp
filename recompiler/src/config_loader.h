@@ -105,6 +105,14 @@ struct RuntimeConfig {
     // PSX_SCREEN env var overrides this at runtime (debug path).
     int                   video_screen_kind = 0;
 
+    // auto_skip_fmv: when true, full-motion videos (streaming XA audio + MDEC
+    // video) are fast-forwarded invisibly to their end — the disc stream is
+    // delivered instantly, presentation + pacing are suppressed, and audio is
+    // muted for the duration, so an FMV plays out in a fraction of a second with
+    // nothing shown. The game's own player loop still runs to end-of-stream, so
+    // all side effects (scene transition, save flags) happen exactly as normal.
+    bool                  video_auto_skip_fmv = false;
+
     // ---- [audio] block ----
     // spu_hq: enable the SPU float-shadow re-render (Catmull-Rom resample, float
     // headroom). Verified-enhancement, default OFF — spu_render output is
@@ -217,6 +225,7 @@ struct UserSettings {
     bool has_antialiasing   = false; bool antialiasing   = true;
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
     bool has_screen_kind    = false; int  screen_kind    = 0; // 0..3 (ScreenKind)
+    bool has_auto_skip_fmv  = false; bool auto_skip_fmv  = false; // skip FMVs
     // [audio]
     bool has_spu_hq         = false; bool spu_hq         = false;
     // [bios] / [disc] / [memcard]

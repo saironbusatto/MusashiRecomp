@@ -56,6 +56,10 @@ typedef struct MDECDebugEvent {
     uint32_t underruns;
 } MDECDebugEvent;
 
+/* Monotonic decode-invocation counter — frontend FMV detector samples this
+ * per display-frame to detect active MDEC video (FMV) vs idle. */
+uint32_t mdec_get_decode_count(void);
+
 void mdec_debug_get_state(MDECDebugState *out);
 uint64_t mdec_debug_get_event_total(void);
 uint32_t mdec_debug_copy_events(uint64_t seq_lo, uint64_t seq_hi,
