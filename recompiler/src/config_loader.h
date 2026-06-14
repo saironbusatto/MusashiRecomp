@@ -259,6 +259,12 @@ struct GameConfig {
     // code, so the overlay compile must see this config (--ws-config). A regen
     // is required; empty by default.
     std::vector<uint32_t> ws_backdrop_x_sites;
+
+    // [widescreen.backdrop] unsquash_funcs — far-backdrop driver functions whose
+    // body is bracketed with gte_ws_set_suppress(1)/(0) so the GTE X-squash is
+    // OFF for their (far, parallax) draws: the backdrop fills the stretched 16:9
+    // frame instead of leaving edge void (8C). Main-EXE addresses; regen-class.
+    std::vector<uint32_t> ws_backdrop_unsquash_funcs;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

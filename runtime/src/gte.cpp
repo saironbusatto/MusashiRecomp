@@ -121,6 +121,36 @@ static void depth_cue_from_ir(GTEState* gte) {
 static int32_t s_ws_xnum = 1, s_ws_xden = 1;
 extern "C" int gpu_ws_present_native_43(void);  /* gpu.c — suppress on 4:3 frames */
 
+// Per-draw suppression of the X-squash (8C far-backdrop). The far backdrop
+// (ocean/cloud/distant mountain) is a parallax layer that is conceptually at
+// infinity: squashing it toward centre leaves its geometry short of the
+// revealed 16:9 edges (blue void). Drawing it UN-squashed lets its 4:3-extent
+// fill the stretched frame (skybox treatment) while the near 3D world keeps the
+// wider FOV. The recompiler brackets the backdrop driver (FUN_8004db3c) with
+// gte_ws_set_suppress(1)/(0) ([widescreen] backdrop_unsquash_funcs).
+// The driver (FUN_8004db3c) actually draws a MIX: the far backdrop (which we
+// want un-squashed) AND nearer props (doors/mansion models) that must stay
+// squashed or they drift relative to the rest of the world. So suppression is
+// DEPTH-GATED: only vertices with SZ (projected Z) >= s_ws_far_threshold get
+// un-squashed while suppress is active; nearer props keep the squash. Threshold
+// tuned live via the ws_far_threshold TCP cmd; SZ stats below characterize the
+// driver's depth range so the split is set from data, not a guess.
+static int s_ws_suppress = 0;
+static int32_t s_ws_far_threshold = 900;  /* SZ split: near props squashed, far backdrop un-squashed (8C, tunable via ws_far_threshold) */
+extern "C" void gte_ws_set_suppress(int on) { s_ws_suppress = on ? 1 : 0; }
+extern "C" void gte_ws_set_far_threshold(int t) { s_ws_far_threshold = t; }
+extern "C" int  gte_ws_get_far_threshold(void) { return (int)s_ws_far_threshold; }
+/* SZ stats observed while suppress is active (one frame window, reset on read). */
+static int32_t s_ws_sz_min = 0x7FFFFFFF, s_ws_sz_max = 0;
+static uint32_t s_ws_sz_n = 0, s_ws_sz_far = 0;
+extern "C" void gte_ws_get_sz_stats(int* mn, int* mx, unsigned* n, unsigned* far_n) {
+    if (mn) *mn = (s_ws_sz_n ? s_ws_sz_min : 0);
+    if (mx) *mx = s_ws_sz_max;
+    if (n)  *n  = s_ws_sz_n;
+    if (far_n) *far_n = s_ws_sz_far;
+    s_ws_sz_min = 0x7FFFFFFF; s_ws_sz_max = 0; s_ws_sz_n = 0; s_ws_sz_far = 0;
+}
+
 extern "C" void gte_set_display_aspect(int num, int den) {
     if (num <= 0 || den <= 0) { s_ws_xnum = s_ws_xden = 1; return; }
     // squash = (4/3) / (num/den) = (4*den) / (3*num); identity for 4:3.
@@ -170,7 +200,17 @@ void gte_rtps_internal(GTEState* gte, int16_t* V, bool setMac0) {
     // this frame is being stretched — never on a 4:3-presented frame (FMV /
     // full-2D screen), so content and present stay locked.
     int64_t xterm = (int64_t)gte->IR1 * h_div_sz;
-    if (s_ws_xnum != s_ws_xden && !gpu_ws_present_native_43())
+    bool do_squash = (s_ws_xnum != s_ws_xden) && !gpu_ws_present_native_43();
+    if (do_squash && s_ws_suppress) {
+        /* Depth-gated: un-squash only FAR geometry (the backdrop); keep near
+         * props squashed so they stay aligned. Record SZ stats for tuning. */
+        int32_t sz = gte->SZ[3];
+        if (sz < s_ws_sz_min) s_ws_sz_min = sz;
+        if (sz > s_ws_sz_max) s_ws_sz_max = sz;
+        s_ws_sz_n++;
+        if (sz >= s_ws_far_threshold) { do_squash = false; s_ws_sz_far++; }
+    }
+    if (do_squash)
         xterm = xterm * s_ws_xnum / s_ws_xden;
     int64_t sx = (gte->OFX + xterm) >> 16;
     int64_t sy = (gte->OFY + (int64_t)gte->IR2 * h_div_sz) >> 16;

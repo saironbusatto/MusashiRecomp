@@ -95,6 +95,7 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_tag_funcs;         // [widescreen] sprite_tag_funcs
     std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
     std::set<uint32_t>    ws_backdrop_x;        // [widescreen.backdrop] x_sites
+    std::set<uint32_t>    ws_backdrop_unsquash; // [widescreen.backdrop] unsquash_funcs
     std::filesystem::path out_dir = "generated";
 
     if (!config_path.empty()) {
@@ -109,6 +110,7 @@ int main(int argc, char** argv) {
         ws_cull_range.insert(cfg.ws_cull_range_sites.begin(), cfg.ws_cull_range_sites.end());
         ws_cull_a1.insert(cfg.ws_cull_a1_sites.begin(), cfg.ws_cull_a1_sites.end());
         ws_backdrop_x.insert(cfg.ws_backdrop_x_sites.begin(), cfg.ws_backdrop_x_sites.end());
+        ws_backdrop_unsquash.insert(cfg.ws_backdrop_unsquash_funcs.begin(), cfg.ws_backdrop_unsquash_funcs.end());
         fmt::print("config:         {}\n", config_path.string());
         fmt::print("  exe         = {}\n", exe_path.string());
         fmt::print("  seeds       = {}\n", extra_funcs_storage);
@@ -160,8 +162,9 @@ int main(int argc, char** argv) {
         ws_cull_range.insert(wscfg.ws_cull_range_sites.begin(), wscfg.ws_cull_range_sites.end());
         ws_cull_a1.insert(wscfg.ws_cull_a1_sites.begin(), wscfg.ws_cull_a1_sites.end());
         ws_backdrop_x.insert(wscfg.ws_backdrop_x_sites.begin(), wscfg.ws_backdrop_x_sites.end());
-        fmt::print("ws-config:      {} (backdrop_x sites={})\n",
-                   ws_config_path.string(), ws_backdrop_x.size());
+        ws_backdrop_unsquash.insert(wscfg.ws_backdrop_unsquash_funcs.begin(), wscfg.ws_backdrop_unsquash_funcs.end());
+        fmt::print("ws-config:      {} (backdrop_x sites={}, unsquash funcs={})\n",
+                   ws_config_path.string(), ws_backdrop_x.size(), ws_backdrop_unsquash.size());
     }
 
     // Parse the PS1-EXE file
@@ -657,6 +660,7 @@ int main(int argc, char** argv) {
     codegen_config.ws_cull_range_sites = ws_cull_range;
     codegen_config.ws_cull_a1_sites    = ws_cull_a1;
     codegen_config.ws_backdrop_x_sites = ws_backdrop_x;
+    codegen_config.ws_backdrop_unsquash_funcs = ws_backdrop_unsquash;
 
     // Load per-game annotations: annotations/<exe_stem>_annotations.csv
     // Silently skipped if the file doesn't exist.

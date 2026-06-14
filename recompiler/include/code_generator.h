@@ -42,6 +42,13 @@ struct CodeGenConfig {
     // proportion correction at GP0 submission. Empty = no hooks (default).
     std::set<uint32_t> ws_sprite_tag_funcs;
 
+    // Widescreen far-backdrop un-squash ([widescreen] backdrop_unsquash_funcs):
+    // functions whose body is bracketed by gte_ws_set_suppress(1)/(0) so the
+    // GTE X-squash is OFF for their (far-backdrop) draws — the backdrop fills
+    // the stretched 16:9 frame instead of leaving edge void (8C). Suppress is
+    // set at entry and cleared before every jr-$ra return. Empty = none.
+    std::set<uint32_t> ws_backdrop_unsquash_funcs;
+
     // Widescreen cull-margin widening ([widescreen] cull_* sites). At these
     // addresses the immediate is emitted with a runtime margin term
     // psx_ws_x_margin() so the world-space draw cull widens with the aspect

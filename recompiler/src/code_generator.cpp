@@ -1118,6 +1118,10 @@ std::string CodeGenerator::translate_basic_block(
                         }
                         if (ra_loaded_from_non_sp) break;
                     }
+                    if (config_.ws_backdrop_unsquash_funcs.count(cfg.function_start)) {
+                        ss << config_.indent
+                           << "gte_ws_set_suppress(0);  /* widescreen: end far-backdrop un-squash (8C) */\n";
+                    }
                     if (ra_loaded_from_non_sp) {
                         ss << config_.indent
                            << "cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;"
@@ -1362,6 +1366,10 @@ GeneratedFunction CodeGenerator::generate_function(
     if (config_.ws_sprite_tag_funcs.count(func.start_addr)) {
         body_ss << config_.indent
                 << "psx_ws_sprite_tag(cpu);  /* widescreen: record prim ($a0) + anchor */\n";
+    }
+    if (config_.ws_backdrop_unsquash_funcs.count(func.start_addr)) {
+        body_ss << config_.indent
+                << "gte_ws_set_suppress(1);  /* widescreen: un-squash far backdrop (8C) */\n";
     }
 
     // Add function comment
@@ -1692,7 +1700,8 @@ std::string CodeGenerator::generate_file(
     ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
-    ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n\n";
+    ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n";
+    ss << "extern void gte_ws_set_suppress(int on);  /* widescreen far-backdrop un-squash (gte.cpp) */\n\n";
 
     // Emit reference implementations for unaligned memory helpers.
     // These implement the MIPS lwl/lwr/swl/swr semantics.

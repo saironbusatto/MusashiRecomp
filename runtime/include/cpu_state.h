@@ -54,6 +54,7 @@ extern void     gte_execute(CPUState* cpu, uint32_t cmd);
  * RTPS/RTPT screen-X around the game's OFX so a 4:3 frame stretched to the
  * wide aspect shows a wider field of view. */
 extern void     gte_set_display_aspect(int num, int den);
+extern void     gte_ws_set_suppress(int on);  /* 8C: un-squash far backdrop draws */
 extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);
 extern uint32_t gte_read_ctrl(CPUState* cpu, uint8_t reg);
 extern void     gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);

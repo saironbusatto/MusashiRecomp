@@ -5206,6 +5206,36 @@ static void handle_ws_margin(int id, const char *json)
              id, v, ws.x_margin, ws.active);
 }
 
+/* Live GTE widescreen-squash toggle (diagnostic for 8C far-backdrop void):
+ * ws_aspect num=<n> den=<d> calls gte_set_display_aspect at runtime so we can
+ * compare squash ON (e.g. 16/9) vs OFF (1/1) in-place without a relaunch. */
+extern void gte_set_display_aspect(int num, int den);
+static void handle_ws_aspect(int id, const char *json)
+{
+    int num = json_get_int(json, "num", -1);
+    int den = json_get_int(json, "den", -1);
+    if (num <= 0 || den <= 0) { send_err(id, "need num>0 den>0 (1 1 = squash off)"); return; }
+    gte_set_display_aspect(num, den);
+    send_fmt("{\"id\":%d,\"ok\":true,\"num\":%d,\"den\":%d}", id, num, den);
+}
+
+/* 8C far-backdrop depth split. ws_far_threshold [t=<SZ>] sets the SZ cutoff
+ * above which backdrop-driver geometry is un-squashed (near props stay
+ * squashed). With no t=, just reports the observed SZ stats since last read so
+ * the threshold can be set from data. */
+extern void gte_ws_set_far_threshold(int t);
+extern int  gte_ws_get_far_threshold(void);
+extern void gte_ws_get_sz_stats(int* mn, int* mx, unsigned* n, unsigned* far_n);
+static void handle_ws_far_threshold(int id, const char *json)
+{
+    int t = json_get_int(json, "t", -123456789);  /* sentinel = no change */
+    if (t != -123456789) gte_ws_set_far_threshold(t);
+    int mn = 0, mx = 0; unsigned n = 0, far_n = 0;
+    gte_ws_get_sz_stats(&mn, &mx, &n, &far_n);
+    send_fmt("{\"id\":%d,\"ok\":true,\"threshold\":%d,\"sz_min\":%d,\"sz_max\":%d,\"sz_n\":%u,\"sz_far\":%u}",
+             id, gte_ws_get_far_threshold(), mn, mx, n, far_n);
+}
+
 static void handle_ws_census(int id, const char *json)
 {
     char act[16] = {0};
@@ -8473,6 +8503,8 @@ static const CmdEntry s_commands[] = {
     { "write_ram",         handle_write_ram },
     { "gpu_state",         handle_gpu_state },
     { "ws_margin",         handle_ws_margin },
+    { "ws_aspect",         handle_ws_aspect },
+    { "ws_far_threshold",  handle_ws_far_threshold },
     { "ws_census",         handle_ws_census },
     { "mem_words",         handle_mem_words },
     { "vram_peek",         handle_vram_peek },
