@@ -19,6 +19,28 @@
  *     callback pointers below. */
 #define PSX_OVERLAY_ABI_VERSION 2
 
+/* Codegen flavor of the recompiled output the overlays + runtime were built
+ * against. Overlays are keyed in the cache by guest-bytes CRC, which is
+ * flavor-BLIND — the same guest overlay yields the same filename whether it was
+ * compiled by the base recompiler or a variant (e.g. widescreen, which emits
+ * extra runtime symbols + GTE adjustments). Without a flavor tag a widescreen
+ * DLL and a base DLL for the same overlay collide. The flavor is folded into
+ * overlay_abi() (high 16 bits) so the loader's existing ABI gate rejects (and
+ * regenerates) any DLL whose flavor differs from the running build's, keeping
+ * caches separate even in a shared directory.
+ *
+ * Base/master MUST stay 0 so the tag == PSX_OVERLAY_ABI_VERSION (backward
+ * compatible with all existing base-flavor DLLs). A variant build overrides it
+ * (e.g. -DPSX_OVERLAY_FLAVOR=1 for widescreen) for BOTH the runtime and
+ * compile_overlays.py (its --flavor arg). */
+#ifndef PSX_OVERLAY_FLAVOR
+#define PSX_OVERLAY_FLAVOR 0
+#endif
+
+/* Combined tag exported by overlay_abi() and checked by the loader. */
+#define PSX_OVERLAY_ABI_TAG \
+    ((int)((PSX_OVERLAY_ABI_VERSION & 0xFFFF) | ((PSX_OVERLAY_FLAVOR & 0xFFFF) << 16)))
+
 typedef struct {
     /* Core dispatch: routes call_by_address() and out-of-overlay jal */
     void (*dispatch_call)(CPUState *cpu, uint32_t addr, uint32_t ra);

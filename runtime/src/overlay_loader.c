@@ -431,10 +431,13 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
     typedef int (*AbiFn)(void);
     AbiFn abi_fn = (AbiFn)GetProcAddress(h, "overlay_abi");
     int abi = abi_fn ? abi_fn() : 0;
-    if (abi != PSX_OVERLAY_ABI_VERSION) {
-        loader_log("ABI mismatch in %s: dll=%d runtime=%d — rejecting and "
-                   "deleting stale cache entry", dll_path, abi,
-                   PSX_OVERLAY_ABI_VERSION);
+    /* Tag = ABI version (low 16) | codegen flavor (high 16). Mismatch on either
+     * (wrong ABI, or a different-flavor cache e.g. widescreen vs base) is
+     * rejected + deleted so autocompile regenerates it for THIS build. */
+    if (abi != PSX_OVERLAY_ABI_TAG) {
+        loader_log("ABI/flavor mismatch in %s: dll=0x%X runtime=0x%X — rejecting "
+                   "and deleting stale cache entry", dll_path, abi,
+                   PSX_OVERLAY_ABI_TAG);
         FreeLibrary(h);
         DeleteFileA(dll_path);
         return 0;
@@ -496,10 +499,10 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
     typedef int (*AbiFn)(void);
     AbiFn abi_fn = (AbiFn)dlsym(h, "overlay_abi");
     int abi = abi_fn ? abi_fn() : 0;
-    if (abi != PSX_OVERLAY_ABI_VERSION) {
-        loader_log("ABI mismatch in %s: dll=%d runtime=%d — rejecting and "
-                   "deleting stale cache entry", dll_path, abi,
-                   PSX_OVERLAY_ABI_VERSION);
+    if (abi != PSX_OVERLAY_ABI_TAG) {
+        loader_log("ABI/flavor mismatch in %s: dll=0x%X runtime=0x%X — rejecting "
+                   "and deleting stale cache entry", dll_path, abi,
+                   PSX_OVERLAY_ABI_TAG);
         dlclose(h);
         remove(dll_path);
         return 0;

@@ -756,7 +756,7 @@ __declspec(dllexport)
 #else
 __attribute__((visibility("default")))
 #endif
-int overlay_abi(void) { return PSX_OVERLAY_ABI_VERSION; }
+int overlay_abi(void) { return PSX_OVERLAY_ABI_VERSION | (PSX_OVERLAY_FLAVOR << 16); }
 
 #ifdef _WIN32
 __declspec(dllexport)
@@ -1018,7 +1018,7 @@ def write_overlay_ranges(src_path: str, out_path: str,
 
 
 def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
-                gcc: str = 'gcc') -> bool:
+                gcc: str = 'gcc', flavor: int = 0) -> bool:
     import platform
     # Absolute OS-native paths: gcc invoked from cmd.exe (the runtime's
     # autocompile spawn) silently fails (exit 1, no stderr) on relative
@@ -1032,6 +1032,11 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
     cmd = [
         gcc, '-shared', *pic_flag, '-O2',
         '-DPSX_OVERLAY_DLL_BUILD',
+        # Codegen-flavor tag baked into overlay_abi() (base=0). The loader
+        # rejects DLLs whose flavor differs from the runtime's, so a widescreen
+        # cache and a base cache can never cross-contaminate even if they share
+        # a directory (they key by guest-bytes CRC, which is flavor-blind).
+        f'-DPSX_OVERLAY_FLAVOR={int(flavor)}',
         c_path,
         '-o', out_dll,
         *includes,
@@ -1068,6 +1073,10 @@ def main():
                     help='recompile even if output already exists')
     ap.add_argument('--static',          action='store_true',
                     help='B-2 mode: compile into binary (overlays_static.c) instead of DLL')
+    ap.add_argument('--flavor',          type=int, default=0,
+                    help='codegen flavor id baked into overlay_abi() (0=base/master; '
+                         'widescreen build passes 1). The loader rejects DLLs whose '
+                         'flavor != the runtime flavor, keeping caches separate.')
     args = ap.parse_args()
 
     # Read game ID from game.toml (strip BOM if present)
@@ -1246,7 +1255,7 @@ def main():
                         include_dirs.append(p)
 
                 success = compile_dll(patched_c, dll_path, include_dirs,
-                                      gcc=args.gcc)
+                                      gcc=args.gcc, flavor=args.flavor)
                 if success:
                     # Emit the per-entry code-range manifest beside the DLL.
                     # The loader keys it by the same filename stem with .ranges
