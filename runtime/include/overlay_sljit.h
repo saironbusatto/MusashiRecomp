@@ -92,6 +92,19 @@ void overlay_sljit_get_status(int *available, int *selftest_ok,
                               uint64_t *compiles, uint64_t *declines,
                               uint64_t *bytes_emitted);
 
+/* Call helper invoked by JIT'd shards at a jal/jalr site. Mirrors the dirty-RAM
+ * interpreter's call path EXACTLY: dispatch the callee as a unit (compiled /
+ * native-overlay / interp), then apply the (ra,sp) call contract. Returns 1 if
+ * the shard must return immediately (a transfer/bail unwind is in progress —
+ * cpu->pc / g_psx_call_bail carry it up to the dispatch loop), 0 if the callee
+ * returned normally and the shard should continue at the next instruction.
+ * check_contract: 1 for jal and jalr whose link reg is $ra (the contract checks
+ * $ra==return_pc); 0 for jalr to a non-$ra link (the callee won't set $ra to
+ * return_pc, so the contract doesn't apply) — matches the interpreter. Defined
+ * in overlay_loader.c (has the dispatch machinery). */
+int psx_sljit_call(CPUState *cpu, uint32_t target, uint32_t return_pc,
+                   int check_contract);
+
 #ifdef __cplusplus
 }
 #endif

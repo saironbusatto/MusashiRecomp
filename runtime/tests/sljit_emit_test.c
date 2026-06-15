@@ -34,6 +34,20 @@ static void cpu_init(CPUState *c){
     c->read_byte = rd_byte;  c->write_byte = wr_byte;
 }
 
+/* Stand-in for the runtime call helper (overlay_loader.c) so jal/jalr shards
+ * link in the harness. Records the call and simulates a trivial callee that
+ * returns normally — except a sentinel target that simulates a transfer/bail
+ * (return 1), which must make the shard return immediately. */
+static uint32_t g_call_target, g_call_return; static int g_call_check, g_call_count;
+int psx_sljit_call(CPUState *cpu, uint32_t target, uint32_t return_pc, int check_contract){
+    g_call_target = target; g_call_return = return_pc; g_call_check = check_contract;
+    g_call_count++;
+    if (target == 0x8000DEA0u) { cpu->pc = 0x8000BEEFu; return 1; }  /* simulate bail */
+    cpu->gpr[2] = target;       /* v0 = target (observable by the continuation) */
+    cpu->pc = 0;
+    return 0;                   /* continue */
+}
+
 /* ---- MIPS encoders ----------------------------------------------------- */
 #define ZERO 0
 #define V0 2
@@ -48,6 +62,7 @@ static uint32_t R(uint32_t op,uint32_t rs,uint32_t rt,uint32_t rd,uint32_t sh,ui
 static uint32_t I(uint32_t op,uint32_t rs,uint32_t rt,uint32_t imm){
     return (op<<26)|(rs<<21)|(rt<<16)|(imm & 0xFFFFu);
 }
+static uint32_t Jal(uint32_t target_virt){ return (3u<<26)|((target_virt>>2)&0x03FFFFFFu); }
 #define JR_RA   R(0,RA,0,0,0,0x08)
 #define NOP     0u
 
@@ -128,8 +143,6 @@ int main(void){
     /* 9. DECLINE cases — must return fn==NULL (fall to interpreter) */
     { uint32_t w[]={ I(4,A0,A1,2), NOP, JR_RA, NOP };     /* BEQ */
       CHECK(jit(w,4)==NULL,"decline: BEQ accepted"); }
-    { uint32_t w[]={ I(3,0,0,0x100), NOP, JR_RA, NOP };   /* JAL */
-      CHECK(jit(w,4)==NULL,"decline: JAL accepted"); }
     { uint32_t w[]={ R(0,V0,0,0,0,0x08), NOP };           /* JR v0 (non-ra) */
       CHECK(jit(w,2)==NULL,"decline: JR non-ra accepted"); }
     { uint32_t w[]={ I(4,A0,A1,1), JR_RA, NOP };          /* control in delay slot */
@@ -220,6 +233,40 @@ int main(void){
       OverlaySljitFn fn=jit(w,6); CHECK(fn,"J: declined");
       if(fn){ cpu_init(&cpu); fn(&cpu);
         CHECK(cpu.gpr[V0]==1,"J skip: v0=%u (want 1)",cpu.gpr[V0]); } }
+
+    /* 19. JAL: link $ra=return_pc (before delay), call helper, continuation runs
+     *   0 jal 0x80012340 ; 1 nop ; 2 addiu a1,zero,0x22 ; 3 jr ra ; 4 nop       */
+    { uint32_t tgt=0x80012340u;
+      uint32_t w[]={ Jal(tgt), NOP, I(9,ZERO,A1,0x22), JR_RA, NOP };
+      OverlaySljitFn fn=jit(w,5); CHECK(fn,"jal: declined");
+      if(fn){ cpu_init(&cpu); g_call_count=0; fn(&cpu);
+        CHECK(g_call_count==1,"jal: helper calls=%d",g_call_count);
+        CHECK(g_call_target==tgt,"jal: target=0x%X want 0x%X",g_call_target,tgt);
+        CHECK(g_call_return==BASE+8,"jal: return_pc=0x%X want 0x%X",g_call_return,BASE+8);
+        CHECK(g_call_check==1,"jal: check=%d",g_call_check);
+        CHECK(cpu.gpr[RA]==BASE+8,"jal: ra=0x%X want 0x%X",cpu.gpr[RA],BASE+8);
+        CHECK(cpu.gpr[A1]==0x22,"jal: continuation didn't run (a1=0x%X)",cpu.gpr[A1]); } }
+
+    /* 20. JALR rd=$ra, rs=t0: dynamic target captured before delay slot
+     *   0 lui t0,0x8001 ; 1 ori t0,t0,0x2340 ; 2 jalr ra,t0 ; 3 nop
+     *   4 addiu a1,zero,0x55 ; 5 jr ra ; 6 nop                                  */
+    { uint32_t tgt=0x80012340u;
+      uint32_t w[]={ I(0x0F,0,T0,0x8001), I(0x0D,T0,T0,0x2340), R(0,T0,0,RA,0,0x09), NOP,
+                     I(9,ZERO,A1,0x55), JR_RA, NOP };
+      OverlaySljitFn fn=jit(w,7); CHECK(fn,"jalr: declined");
+      if(fn){ cpu_init(&cpu); g_call_count=0; fn(&cpu);
+        CHECK(g_call_count==1,"jalr: helper calls=%d",g_call_count);
+        CHECK(g_call_target==tgt,"jalr: target=0x%X want 0x%X",g_call_target,tgt);
+        CHECK(g_call_check==1,"jalr: check=%d",g_call_check);
+        CHECK(cpu.gpr[RA]==BASE+16,"jalr: ra=0x%X want 0x%X",cpu.gpr[RA],BASE+16);
+        CHECK(cpu.gpr[A1]==0x55,"jalr: continuation didn't run (a1=0x%X)",cpu.gpr[A1]); } }
+
+    /* 21. JAL transfer/bail: helper returns 1 ⇒ shard returns, continuation skipped
+     *   0 jal 0x8000DEA0 ; 1 nop ; 2 addiu a1,zero,0x99 (must NOT run) ; 3 jr ra ; 4 nop */
+    { uint32_t w[]={ Jal(0x8000DEA0u), NOP, I(9,ZERO,A1,0x99), JR_RA, NOP };
+      OverlaySljitFn fn=jit(w,5); CHECK(fn,"jal-bail: declined");
+      if(fn){ cpu_init(&cpu); cpu.gpr[A1]=0; fn(&cpu);
+        CHECK(cpu.gpr[A1]==0,"jal-bail: continuation ran (a1=0x%X)",cpu.gpr[A1]); } }
 
     printf("\nsljit_emit_test: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
