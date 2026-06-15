@@ -36,6 +36,15 @@
 /* Output path — overwritten per dump. */
 static const char *kReportPath = "psx_last_run_report.json";
 
+/* Build identity, embedded into every report so a user-submitted crash can be
+ * correlated to an exact build (issue #1 reports had no version field). The git
+ * rev comes from runtime.cmake (PSX_BUILD_REV); __DATE__/__TIME__ are a always-
+ * available fallback that still distinguishes builds. */
+#ifndef PSX_BUILD_REV
+#define PSX_BUILD_REV "unknown"
+#endif
+static const char *kBuildId = PSX_BUILD_REV " (" __DATE__ " " __TIME__ ")";
+
 /* CPU state pointer (set by debug server at init). */
 extern CPUState *debug_cpu_ptr;
 
@@ -142,6 +151,7 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         "{\n"
         "  \"reason\": \"%s\",\n"
         "  \"exit_origin\": \"%s\",\n"
+        "  \"build\": \"%s\",\n"
         "  \"timestamp\": \"%s\",\n"
         "  \"frame\": %llu,\n"
         "  \"dispatch_depth\": %d,\n"
@@ -149,6 +159,7 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         "  \"last_store_pc\": \"0x%08X\",\n",
         reason ? reason : "(unknown)",
         s_exit_origin,
+        kBuildId,
         ts,
         (unsigned long long)s_frame_count,
         g_psx_dispatch_depth,

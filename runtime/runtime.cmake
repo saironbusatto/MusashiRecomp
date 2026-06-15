@@ -250,11 +250,23 @@ function(psxrecomp_add_runtime_target target)
         target_link_libraries(${target} PRIVATE ${SDL2_LIBRARIES})
     endif()
 
+    # Build identity: stamp the psxrecomp commit into the binary so a crash report
+    # can be correlated to an exact build (issue #1 user reports had no version).
+    # Computed at configure time from the psxrecomp repo (this file's dir); empty
+    # on failure (no git / not a repo) -> crash_trace.c falls back to "unknown".
+    execute_process(
+        COMMAND git -C "${CMAKE_CURRENT_FUNCTION_LIST_DIR}" describe --always --dirty --tags
+        OUTPUT_VARIABLE PSX_GIT_REV OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(NOT PSX_GIT_REV)
+        set(PSX_GIT_REV "unknown")
+    endif()
+
     target_compile_definitions(${target} PRIVATE
         DEFAULT_DEBUG_PORT=${PSXRT_DEBUG_PORT}
         PSX_DEFAULT_BIOS_PATH="${PSXRT_DEFAULT_BIOS_PATH}"
         PSX_DEFAULT_GAME_CONFIG_PATH="${PSXRT_DEFAULT_GAME_CONFIG_PATH}"
         PSX_WINDOW_TITLE="${PSXRT_WINDOW_TITLE}"
+        PSX_BUILD_REV="${PSX_GIT_REV}"
         FMT_HEADER_ONLY=1
         $<$<CXX_COMPILER_ID:MSVC>:SDL_MAIN_HANDLED>
     )
