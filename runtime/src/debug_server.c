@@ -7722,6 +7722,31 @@ static void handle_autocompile_status(int id, const char *json)
              id, ac_en, trig, (unsigned long long)delta, comp);
 }
 
+/* sljit_status: Tier-2 in-process JIT backend state. Runs the codegen smoke
+ * test on first query (JITs a trivial leaf and executes it), reports the
+ * resolved overlay backend (gcc/sljit/auto) and the shard compile/decline
+ * counters. */
+static void handle_sljit_status(int id, const char *json)
+{
+    extern int         overlay_sljit_selftest(void);
+    extern void        overlay_sljit_get_status(int *available, int *selftest_ok,
+                                                unsigned long long *compiles,
+                                                unsigned long long *declines,
+                                                unsigned long long *bytes_emitted);
+    extern int         overlay_backend_active(void);
+    extern const char *overlay_backend_name(int b);
+    (void)json;
+    int selftest = overlay_sljit_selftest();
+    int available = 0, st_ok = 0;
+    unsigned long long compiles = 0, declines = 0, bytes = 0;
+    overlay_sljit_get_status(&available, &st_ok, &compiles, &declines, &bytes);
+    send_fmt("{\"id\":%d,\"ok\":true,\"backend\":\"%s\",\"available\":%d,"
+             "\"selftest_ok\":%d,\"compiles\":%llu,\"declines\":%llu,"
+             "\"bytes_emitted\":%llu}\n",
+             id, overlay_backend_name(overlay_backend_active()), available,
+             selftest, compiles, declines, bytes);
+}
+
 /* autocompile_run: manually kick the configured background compile. */
 static void handle_autocompile_run(int id, const char *json)
 {
@@ -8617,6 +8642,7 @@ static const CmdEntry s_commands[] = {
     { "cdrom_bursts",         handle_cdrom_bursts },
     { "turbo_loads",          handle_turbo_loads },
     { "autocompile_status",   handle_autocompile_status },
+    { "sljit_status",         handle_sljit_status },
     { "autocompile_run",      handle_autocompile_run },
     { "overlay_rescan",       handle_overlay_rescan },
     { NULL, NULL }
