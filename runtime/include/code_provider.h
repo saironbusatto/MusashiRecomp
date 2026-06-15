@@ -36,6 +36,17 @@ extern "C" {
 /* Native shard ABI — identical to overlay_loader's OverlayFn / OverlaySljitFn. */
 typedef void (*CodeProviderFn)(CPUState *);
 
+/* Result of a synchronous on-miss compile. fn == NULL means the provider
+ * declined (caller runs the interpreter). On success [code_lo, code_lo+code_len)
+ * is the PHYS byte-range the fragment was compiled from — the caller registers a
+ * candidate over it for per-call live-byte validation (the backend-neutral
+ * equivalent of the gcc .ranges manifest). */
+typedef struct {
+    CodeProviderFn fn;        /* NULL = declined */
+    uint32_t       code_lo;   /* phys start of compiled code range */
+    uint32_t       code_len;  /* byte length of compiled code range */
+} CompiledFragment;
+
 typedef struct CodeProvider {
     const char *name;                 /* "gcc" | "sljit"                       */
     int  (*available)(void);          /* gcc: a compile cmd is configured;
@@ -49,13 +60,14 @@ typedef struct CodeProvider {
     int  (*busy)(void);
     void (*poll_main)(void);
 
-    /* Synchronous on-miss production of one fragment. Returns a native fn, or
-     * NULL to decline (caller falls through to the interpreter — the always-safe
-     * precision-over-recall floor). gcc leaves this NULL (a compiler spawn is
-     * far too slow for the dispatch path); sljit JITs in-process. A NULL hook is
-     * treated by callers as "always declines". */
-    CodeProviderFn (*compile_fragment)(uint32_t entry, const uint8_t *bytes,
-                                       uint32_t size, uint32_t image_base_vram);
+    /* Synchronous on-miss production of one fragment. Fills *out (out->fn NULL =
+     * declined → caller runs the interpreter, the always-safe precision-over-
+     * recall floor). gcc leaves this hook NULL (a compiler spawn is far too slow
+     * for the dispatch path); sljit JITs in-process. A NULL hook == always
+     * declines. `bytes`/`size`/`image_base_vram` describe the image to decode
+     * from (typically live RAM: bytes = RAM base, image_base_vram = 0). */
+    void (*compile_fragment)(uint32_t entry, const uint8_t *bytes, uint32_t size,
+                             uint32_t image_base_vram, CompiledFragment *out);
 } CodeProvider;
 
 /* Resolve the active backend (overlay_backend_resolve) and cache the matching

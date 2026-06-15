@@ -35,11 +35,15 @@ static int  sljit_request(void)   { return 0; }
 static int  sljit_busy(void)      { return 0; }
 static void sljit_poll_main(void) { }
 
-static CodeProviderFn sljit_compile_fragment(uint32_t entry, const uint8_t *bytes,
-                                             uint32_t size, uint32_t image_base_vram) {
+static void sljit_compile_fragment(uint32_t entry, const uint8_t *bytes,
+                                   uint32_t size, uint32_t image_base_vram,
+                                   CompiledFragment *out) {
+    OverlaySljitResult r = {0};
+    overlay_sljit_try_compile(entry, bytes, size, image_base_vram, &r);
     /* OverlaySljitFn and CodeProviderFn are the same void fn(CPUState*) type. */
-    return (CodeProviderFn)overlay_sljit_try_compile(entry, bytes, size,
-                                                     image_base_vram);
+    out->fn       = (CodeProviderFn)r.fn;
+    out->code_lo  = r.code_lo;
+    out->code_len = r.code_len;
 }
 
 static const CodeProvider s_sljit = {

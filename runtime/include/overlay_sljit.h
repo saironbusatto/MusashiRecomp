@@ -63,15 +63,29 @@ int overlay_sljit_available(void);
  * trusted. Surfaced via the debug server. */
 int overlay_sljit_selftest(void);
 
-/* Attempt to JIT the captured fragment at `entry` (guest vram) from `bytes`
- * (the captured image base) / `size`. On success returns a native OverlaySljitFn
- * and the caller registers it as a Tier-2 candidate. On ANY unsupported shape
- * returns NULL (caller falls through to Tier 3, the interpreter) — see the
- * SAFETY CONTRACT above. NOT YET IMPLEMENTED: currently always returns NULL
- * (every fragment safely declines to the interpreter). */
-OverlaySljitFn overlay_sljit_try_compile(uint32_t entry,
-                                         const uint8_t *bytes, uint32_t size,
-                                         uint32_t image_base_vram);
+/* Result of a fragment compile. fn == NULL means the emitter declined the whole
+ * fragment to the interpreter (Tier 3) — the always-safe outcome. On success,
+ * [code_lo, code_lo+code_len) is the PHYS byte-range the shard was compiled from
+ * (the caller registers a candidate over it for per-call live-byte validation,
+ * exactly like the gcc .ranges manifest). */
+typedef struct {
+    OverlaySljitFn fn;        /* NULL = declined */
+    uint32_t       code_lo;   /* phys start of compiled code range            */
+    uint32_t       code_len;  /* byte length of compiled code range           */
+    uint32_t       insns;     /* MIPS instructions compiled (diagnostics)     */
+} OverlaySljitResult;
+
+/* Attempt to JIT the leaf function at `entry` (guest vram) by decoding from
+ * `bytes` (an image whose byte[0] maps to vram `image_base_vram`) of `size`
+ * bytes. Fills *out. On ANY unsupported instruction/shape sets out->fn = NULL
+ * (caller falls through to Tier 3) — see the SAFETY CONTRACT above. First slice:
+ * compiles only single-block leaf functions terminating in `jr $ra`; everything
+ * else (internal branches, jal/jalr, jr to non-$ra, opcodes outside the slice)
+ * declines the whole fragment. */
+void overlay_sljit_try_compile(uint32_t entry,
+                               const uint8_t *bytes, uint32_t size,
+                               uint32_t image_base_vram,
+                               OverlaySljitResult *out);
 
 /* Diagnostics counters for the debug server. */
 void overlay_sljit_get_status(int *available, int *selftest_ok,

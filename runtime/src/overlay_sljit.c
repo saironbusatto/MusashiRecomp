@@ -8,6 +8,7 @@
 #include "overlay_sljit.h"
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
@@ -107,17 +108,271 @@ int overlay_sljit_selftest(void) {
     return s_selftest_ok;
 }
 
-/* ---- fragment compile (NOT YET IMPLEMENTED) ---------------------------- */
-OverlaySljitFn overlay_sljit_try_compile(uint32_t entry,
-                                         const uint8_t *bytes, uint32_t size,
-                                         uint32_t image_base_vram) {
-    (void)entry; (void)bytes; (void)size; (void)image_base_vram;
-    /* SAFETY CONTRACT: the MIPS->sljit emitter is not built yet, so every
-     * fragment safely declines to the interpreter (Tier 3). When the emitter
-     * lands it will compile what it can prove and continue to return NULL on
-     * any unsupported instruction/shape. */
-    s_declines++;
-    return NULL;
+/* ======================================================================== *
+ *  MIPS -> sljit emitter (SLJIT.md §7 step 4, first slice)
+ *
+ *  Parallels dirty_ram_interp.c's exec_one — same decode, but emits host code
+ *  instead of stepping. PARITY RULES:
+ *    - GPRs are MEMORY-BACKED in the CPUState struct (gpr[n] at [S0 + 4n]); each
+ *      instruction loads operands, computes, stores back. gpr[0] is never
+ *      written (hardwired 0); reads of gpr[0] read the struct's 0. No host
+ *      register allocation across instructions (a later pass).
+ *    - 32-bit ops everywhere (SLJIT_*32) so wraparound matches the R3000A.
+ *    - memory access routes through the cpu read/write callbacks (icall) exactly
+ *      like the interpreter, so MMIO / page-watch / dirty-tracking behave alike.
+ *  FIRST SLICE shape: single-block LEAF functions only, terminator `jr $ra`.
+ *  ANY other control transfer / unsupported opcode aborts the WHOLE fragment
+ *  (out->fn = NULL) and the caller runs the interpreter (precision over recall).
+ * ======================================================================== */
+
+/* cpu pointer lives in S0 after emit_enter(SLJIT_ARGS1V(P), ...). */
+#define R_CPU    SLJIT_S0
+#define GPR_OFF(n)  ((sljit_sw)(offsetof(CPUState, gpr) + 4u * (n)))
+
+/* MIPS field decoders (mirror dirty_ram_interp.c). */
+static inline uint32_t f_op   (uint32_t i) { return (i >> 26) & 0x3Fu; }
+static inline uint32_t f_rs   (uint32_t i) { return (i >> 21) & 0x1Fu; }
+static inline uint32_t f_rt   (uint32_t i) { return (i >> 16) & 0x1Fu; }
+static inline uint32_t f_rd   (uint32_t i) { return (i >> 11) & 0x1Fu; }
+static inline uint32_t f_sh   (uint32_t i) { return (i >>  6) & 0x1Fu; }
+static inline uint32_t f_fn   (uint32_t i) { return  i        & 0x3Fu; }
+static inline uint32_t f_imm  (uint32_t i) { return  i        & 0xFFFFu; }
+static inline sljit_sw f_simm (uint32_t i) { return (sljit_sw)(int32_t)(int16_t)f_imm(i); }
+
+/* gpr[n] -> reg (reads hardwired 0 for n==0 directly from the struct). */
+static void ld_gpr(struct sljit_compiler *C, sljit_s32 reg, uint32_t n) {
+    sljit_emit_op1(C, SLJIT_MOV32, reg, 0, SLJIT_MEM1(R_CPU), GPR_OFF(n));
+}
+/* reg -> gpr[n] (skips gpr[0] — hardwired). */
+static void st_gpr(struct sljit_compiler *C, uint32_t n, sljit_s32 reg) {
+    if (n == 0) return;
+    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU), GPR_OFF(n), reg, 0);
+}
+
+/* rd = rs <op2> rt (register-register ALU). */
+static void emit_alu_rr(struct sljit_compiler *C, sljit_s32 op,
+                        uint32_t rd, uint32_t rs, uint32_t rt) {
+    ld_gpr(C, SLJIT_R0, rs);
+    ld_gpr(C, SLJIT_R1, rt);
+    sljit_emit_op2(C, op, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
+    st_gpr(C, rd, SLJIT_R0);
+}
+
+/* rd = rt <shift> sh (immediate shift). */
+static void emit_shift_imm(struct sljit_compiler *C, sljit_s32 op,
+                           uint32_t rd, uint32_t rt, uint32_t sh) {
+    ld_gpr(C, SLJIT_R0, rt);
+    sljit_emit_op2(C, op, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)sh);
+    st_gpr(C, rd, SLJIT_R0);
+}
+
+/* rd = rt <shift> (rs & 31) (variable shift). */
+static void emit_shift_var(struct sljit_compiler *C, sljit_s32 op,
+                           uint32_t rd, uint32_t rt, uint32_t rs) {
+    ld_gpr(C, SLJIT_R1, rs);
+    sljit_emit_op2(C, SLJIT_AND32, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, 31);
+    ld_gpr(C, SLJIT_R0, rt);
+    sljit_emit_op2(C, op, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
+    st_gpr(C, rd, SLJIT_R0);
+}
+
+/* dst = (a <cond> b) ? 1 : 0, via flags. a/b already in R0/R1 or R0/IMM. */
+static void emit_setcc(struct sljit_compiler *C, sljit_s32 subop_setflag,
+                       sljit_s32 cc, uint32_t dst,
+                       sljit_s32 b_reg, sljit_sw b_imm) {
+    sljit_emit_op2u(C, subop_setflag, SLJIT_R0, 0,
+                    (b_reg == SLJIT_IMM) ? SLJIT_IMM : b_reg, b_imm);
+    sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_R0, 0, cc);
+    st_gpr(C, dst, SLJIT_R0);
+}
+
+/* Load via cpu->read_* (icall ARGS1(32,32)); addr = gpr[rs] + simm. `ext`
+ * is the post-call sign/zero extension op (SLJIT_MOV32 for word). */
+static void emit_load(struct sljit_compiler *C, size_t fnoff, sljit_s32 ext,
+                      uint32_t rt, uint32_t rs, sljit_sw simm) {
+    ld_gpr(C, SLJIT_R0, rs);
+    if (simm) sljit_emit_op2(C, SLJIT_ADD32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, simm);
+    /* target fn ptr -> R1 (full word); arg addr already in R0. */
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(R_CPU), (sljit_sw)fnoff);
+    sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(32, 32), SLJIT_R1, 0);
+    if (ext != SLJIT_MOV32)
+        sljit_emit_op1(C, ext, SLJIT_R0, 0, SLJIT_R0, 0);
+    st_gpr(C, rt, SLJIT_R0);
+}
+
+/* Store via cpu->write_* (icall ARGS2V(32,32)); addr = gpr[rs]+simm, val=gpr[rt]. */
+static void emit_store(struct sljit_compiler *C, size_t fnoff,
+                       uint32_t rt, uint32_t rs, sljit_sw simm) {
+    ld_gpr(C, SLJIT_R0, rs);
+    if (simm) sljit_emit_op2(C, SLJIT_ADD32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, simm);
+    ld_gpr(C, SLJIT_R1, rt);
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(R_CPU), (sljit_sw)fnoff);
+    sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2V(32, 32), SLJIT_R2, 0);
+}
+
+enum { EMIT_OK = 0, EMIT_TERM = 1, EMIT_ABORT = 2 };
+
+/* Emit ONE non-control instruction. Returns EMIT_OK, or EMIT_TERM iff `insn`
+ * is `jr $ra` (the only terminator this slice supports — caller then emits the
+ * delay slot + the shard return), or EMIT_ABORT for anything outside the slice
+ * (any other control transfer, or an unsupported opcode). */
+static int emit_one(struct sljit_compiler *C, uint32_t insn) {
+    uint32_t op = f_op(insn), rs = f_rs(insn), rt = f_rt(insn);
+    uint32_t rd = f_rd(insn), sh = f_sh(insn), fn = f_fn(insn);
+    uint32_t imm = f_imm(insn);
+    sljit_sw simm = f_simm(insn);
+
+    switch (op) {
+    case 0x00: /* SPECIAL */
+        switch (fn) {
+        case 0x00: emit_shift_imm(C, SLJIT_SHL32,  rd, rt, sh); return EMIT_OK; /* SLL (nop when 0) */
+        case 0x02: emit_shift_imm(C, SLJIT_LSHR32, rd, rt, sh); return EMIT_OK; /* SRL */
+        case 0x03: emit_shift_imm(C, SLJIT_ASHR32, rd, rt, sh); return EMIT_OK; /* SRA */
+        case 0x04: emit_shift_var(C, SLJIT_SHL32,  rd, rt, rs); return EMIT_OK; /* SLLV */
+        case 0x06: emit_shift_var(C, SLJIT_LSHR32, rd, rt, rs); return EMIT_OK; /* SRLV */
+        case 0x07: emit_shift_var(C, SLJIT_ASHR32, rd, rt, rs); return EMIT_OK; /* SRAV */
+        case 0x08: /* JR rs — terminator iff rs == $ra; else outside the slice */
+            return (rs == 31) ? EMIT_TERM : EMIT_ABORT;
+        case 0x0F: return EMIT_OK; /* SYNC = nop */
+        case 0x20: case 0x21: emit_alu_rr(C, SLJIT_ADD32, rd, rs, rt); return EMIT_OK; /* ADD/ADDU */
+        case 0x22: case 0x23: emit_alu_rr(C, SLJIT_SUB32, rd, rs, rt); return EMIT_OK; /* SUB/SUBU */
+        case 0x24: emit_alu_rr(C, SLJIT_AND32, rd, rs, rt); return EMIT_OK; /* AND */
+        case 0x25: emit_alu_rr(C, SLJIT_OR32,  rd, rs, rt); return EMIT_OK; /* OR */
+        case 0x26: emit_alu_rr(C, SLJIT_XOR32, rd, rs, rt); return EMIT_OK; /* XOR */
+        case 0x27: /* NOR: ~(rs|rt) */
+            ld_gpr(C, SLJIT_R0, rs); ld_gpr(C, SLJIT_R1, rt);
+            sljit_emit_op2(C, SLJIT_OR32,  SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
+            sljit_emit_op2(C, SLJIT_XOR32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)-1);
+            st_gpr(C, rd, SLJIT_R0);
+            return EMIT_OK;
+        case 0x2A: /* SLT (signed) */
+            ld_gpr(C, SLJIT_R0, rs); ld_gpr(C, SLJIT_R1, rt);
+            emit_setcc(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS, SLJIT_SIG_LESS, rd, SLJIT_R1, 0);
+            return EMIT_OK;
+        case 0x2B: /* SLTU (unsigned) */
+            ld_gpr(C, SLJIT_R0, rs); ld_gpr(C, SLJIT_R1, rt);
+            emit_setcc(C, SLJIT_SUB32 | SLJIT_SET_LESS, SLJIT_LESS, rd, SLJIT_R1, 0);
+            return EMIT_OK;
+        default: return EMIT_ABORT;
+        }
+    case 0x08: case 0x09: /* ADDI/ADDIU rt = rs + simm */
+        ld_gpr(C, SLJIT_R0, rs);
+        sljit_emit_op2(C, SLJIT_ADD32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, simm);
+        st_gpr(C, rt, SLJIT_R0);
+        return EMIT_OK;
+    case 0x0A: /* SLTI (signed) */
+        ld_gpr(C, SLJIT_R0, rs);
+        emit_setcc(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS, SLJIT_SIG_LESS, rt, SLJIT_IMM, simm);
+        return EMIT_OK;
+    case 0x0B: /* SLTIU (unsigned, simm sign-extended then compared unsigned) */
+        ld_gpr(C, SLJIT_R0, rs);
+        emit_setcc(C, SLJIT_SUB32 | SLJIT_SET_LESS, SLJIT_LESS, rt, SLJIT_IMM, simm);
+        return EMIT_OK;
+    case 0x0C: /* ANDI (zero-extended imm) */
+        ld_gpr(C, SLJIT_R0, rs);
+        sljit_emit_op2(C, SLJIT_AND32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)imm);
+        st_gpr(C, rt, SLJIT_R0);
+        return EMIT_OK;
+    case 0x0D: /* ORI */
+        ld_gpr(C, SLJIT_R0, rs);
+        sljit_emit_op2(C, SLJIT_OR32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)imm);
+        st_gpr(C, rt, SLJIT_R0);
+        return EMIT_OK;
+    case 0x0E: /* XORI */
+        ld_gpr(C, SLJIT_R0, rs);
+        sljit_emit_op2(C, SLJIT_XOR32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)imm);
+        st_gpr(C, rt, SLJIT_R0);
+        return EMIT_OK;
+    case 0x0F: /* LUI rt = imm << 16 (rt==0 is a nop — st_gpr skips it) */
+        sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)(imm << 16));
+        st_gpr(C, rt, SLJIT_R0);
+        return EMIT_OK;
+    case 0x20: emit_load(C, offsetof(CPUState, read_byte), SLJIT_MOV_S8,  rt, rs, simm); return EMIT_OK; /* LB */
+    case 0x21: emit_load(C, offsetof(CPUState, read_half), SLJIT_MOV_S16, rt, rs, simm); return EMIT_OK; /* LH */
+    case 0x23: emit_load(C, offsetof(CPUState, read_word), SLJIT_MOV32,   rt, rs, simm); return EMIT_OK; /* LW */
+    case 0x24: emit_load(C, offsetof(CPUState, read_byte), SLJIT_MOV_U8,  rt, rs, simm); return EMIT_OK; /* LBU */
+    case 0x25: emit_load(C, offsetof(CPUState, read_half), SLJIT_MOV_U16, rt, rs, simm); return EMIT_OK; /* LHU */
+    case 0x28: emit_store(C, offsetof(CPUState, write_byte), rt, rs, simm); return EMIT_OK; /* SB */
+    case 0x29: emit_store(C, offsetof(CPUState, write_half), rt, rs, simm); return EMIT_OK; /* SH */
+    case 0x2B: emit_store(C, offsetof(CPUState, write_word), rt, rs, simm); return EMIT_OK; /* SW */
+    default: return EMIT_ABORT;
+    }
+}
+
+/* Read a little-endian word from the decode image at phys offset `off`. */
+static inline uint32_t img_word(const uint8_t *b, uint32_t off) {
+    return  (uint32_t)b[off]
+         | ((uint32_t)b[off + 1] <<  8)
+         | ((uint32_t)b[off + 2] << 16)
+         | ((uint32_t)b[off + 3] << 24);
+}
+
+#define SLJIT_MAX_FRAG_INSNS 4096u
+
+void overlay_sljit_try_compile(uint32_t entry,
+                               const uint8_t *bytes, uint32_t size,
+                               uint32_t image_base_vram,
+                               OverlaySljitResult *out) {
+    out->fn = NULL; out->code_lo = 0; out->code_len = 0; out->insns = 0;
+    if (!bytes) { s_declines++; return; }
+
+    uint32_t entry_phys = entry & 0x1FFFFFFFu;
+    uint32_t base_phys  = image_base_vram & 0x1FFFFFFFu;
+    if (entry_phys < base_phys) { s_declines++; return; }
+    uint32_t off0 = entry_phys - base_phys;
+
+    struct sljit_compiler *C = sljit_create_compiler(NULL);
+    if (!C) { s_declines++; sljit_log("compile: create_compiler failed"); return; }
+
+    /* void shard(CPUState* cpu) — cpu arrives in S0. Scratches R0..R3 (operands,
+     * fn-ptr, addr/value, + icall headroom); one saved (S0). No locals. */
+    sljit_emit_enter(C, 0, SLJIT_ARGS1V(P), 4, 1, 0);
+
+    uint32_t code_words = 0;
+    int aborted = 0;
+    for (uint32_t i = 0; i < SLJIT_MAX_FRAG_INSNS; i++) {
+        uint32_t off = off0 + i * 4u;
+        if (off + 4u > size) { aborted = 1; break; }   /* ran off the image */
+        uint32_t insn = img_word(bytes, off);
+        int st = emit_one(C, insn);
+        if (st == EMIT_ABORT) { aborted = 1; break; }
+        if (st == EMIT_TERM) {
+            /* `jr $ra`: emit the delay-slot instruction (must be a plain,
+             * supported, non-control op — same constraint the interpreter's
+             * exec_delay_slot enforces), then return from the shard. The native
+             * return mirrors a gcc candidate's C return: leave cpu->pc as-is
+             * (the call-native contract checks $ra/$sp). */
+            uint32_t doff = off + 4u;
+            if (doff + 4u > size) { aborted = 1; break; }
+            uint32_t ds = img_word(bytes, doff);
+            int dst = emit_one(C, ds);
+            if (dst != EMIT_OK) { aborted = 1; break; }   /* control/unsupported in delay slot */
+            sljit_emit_return_void(C);
+            code_words = i + 2u;   /* jr + its delay slot */
+            break;
+        }
+        /* EMIT_OK: continue straight-line. */
+    }
+
+    if (aborted || code_words == 0) {
+        sljit_free_compiler(C);
+        s_declines++;
+        return;
+    }
+
+    void *code = sljit_generate_code(C, 0, NULL);
+    sljit_uw csz = sljit_get_generated_code_size(C);
+    sljit_free_compiler(C);
+    if (!code) { s_declines++; sljit_log("compile: generate_code failed @0x%08X", entry); return; }
+
+    out->fn       = (OverlaySljitFn)code;
+    out->code_lo  = entry_phys;
+    out->code_len = code_words * 4u;
+    out->insns    = code_words;
+    s_compiles++;
+    s_bytes += (uint64_t)csz;
+    sljit_log("compile ok @0x%08X: %u insns -> %lu bytes host",
+              entry, code_words, (unsigned long)csz);
 }
 
 void overlay_sljit_get_status(int *available, int *selftest_ok,

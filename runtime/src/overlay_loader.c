@@ -1,5 +1,7 @@
 #include "overlay_loader.h"
 #include "overlay_api.h"
+#include "code_provider.h"
+#include "overlay_sljit.h"
 #include "crc32.h"
 #include "dirty_ram_interp.h"
 #include "interrupts.h"
@@ -143,6 +145,7 @@ static uint32_t s_rehash_miss    = 0;   /* hashes that didn't match crc_code  */
 static uint32_t s_last_crc       = 0;
 static uint32_t s_no_manifest    = 0;   /* exports skipped (no manifest range)*/
 static uint32_t s_selfmod        = 0;   /* entries blacklisted (self-mod)     */
+static uint32_t s_sljit_registered = 0; /* sljit Tier-2 shards registered     */
 static uint32_t s_last_write_pc   = 0;
 static uint32_t s_last_write_addr = 0;
 static uint32_t s_last_write_size = 0;
@@ -267,6 +270,71 @@ static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) 
     c->next    = idx_head(phys);
     idx_set_head(phys, idx);
     if (c->state == ENTRY_VALID) s_valid_count++;
+}
+
+/* ---- sljit Tier-2 shard registration (SLJIT.md §7 step 5) -------------- */
+static void loader_log(const char *fmt, ...);   /* defined below */
+/* Register an in-process JIT shard as a native candidate, parallel to
+ * cand_register but without a .ranges manifest: the shard was JIT'd from the
+ * live RAM bytes over [lo, lo+len), so crc_code is hashed from those same bytes
+ * — a later dispatch runs the shard iff the code is still byte-identical
+ * (reload-on-return / self-mod safety, the same live-byte contract gcc
+ * candidates obey). */
+static void register_sljit_candidate(uint32_t phys, OverlayFn fn,
+                                     uint32_t lo, uint32_t len) {
+    if (s_cand_n >= CAND_CAP || len == 0) return;
+    int idx = s_cand_n++;
+    Candidate *c = &s_cand[idx];
+    c->addr        = phys & 0x1FFFFFFFu;
+    c->fn          = fn;
+    c->dll         = -1;            /* sentinel: sljit shard, not a DLL */
+    c->nranges     = 1;
+    c->range_lo[0] = lo & 0x1FFFFFFFu;
+    c->range_len[0] = len;
+    extern void overlay_watch_set_range(uint32_t phys, uint32_t len);
+    overlay_watch_set_range(c->range_lo[0], c->range_len[0]);
+    c->crc_code = cand_crc(c);      /* live bytes == the bytes we JIT'd from */
+    c->val_gen  = cand_gensum(c);
+    c->state    = ENTRY_VALID;
+    c->next     = idx_head(c->addr);
+    idx_set_head(c->addr, idx);
+    s_valid_count++;
+    s_sljit_registered++;
+    loader_log("sljit shard registered 0x%08X [%u bytes]", c->addr, len);
+}
+
+/* JIT-on-miss memo: phys entries already attempted (compiled or declined), so a
+ * declined fragment isn't re-attempted every dispatch. */
+#define MAX_SLJIT_TRIED 512
+static uint32_t s_sljit_tried[MAX_SLJIT_TRIED];
+static int      s_sljit_tried_n = 0;
+static int sljit_already_tried(uint32_t phys) {
+    for (int i = 0; i < s_sljit_tried_n; i++)
+        if (s_sljit_tried[i] == phys) return 1;
+    return 0;
+}
+static void sljit_mark_tried(uint32_t phys) {
+    if (s_sljit_tried_n < MAX_SLJIT_TRIED) s_sljit_tried[s_sljit_tried_n++] = phys;
+}
+
+/* Attempt an in-process JIT of the leaf function at `phys` from live RAM, and
+ * register the shard as a candidate on success. Gated by the caller to the
+ * validation configuration only (backend==sljit + diff_mode); see the dispatch
+ * hook. Decodes from live RAM exactly as the interpreter does. */
+static void try_sljit_region(uint32_t phys) {
+    const CodeProvider *cp = code_provider_active();
+    if (!cp->compile_fragment) return;
+    if (sljit_already_tried(phys)) return;
+    extern int dirty_ram_is_dirty(uint32_t phys);
+    if (!dirty_ram_is_dirty(phys)) return;   /* only JIT real runtime code */
+    sljit_mark_tried(phys);
+    uint8_t *ram = memory_get_ram_ptr();
+    if (!ram) return;
+    CompiledFragment frag = {0};
+    /* Decode from live RAM (bytes = RAM base, image_base_vram = 0 ⇒ offset = phys). */
+    cp->compile_fragment(phys, ram, 2u * 1024u * 1024u, 0u, &frag);
+    if (frag.fn)
+        register_sljit_candidate(phys, (OverlayFn)frag.fn, frag.code_lo, frag.code_len);
 }
 
 /* ---- Global state ------------------------------------------------------ */
@@ -680,6 +748,17 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
     if (head < 0 && s_active && overlay_cache_window_contains(phys)) {
         try_load_region(phys);
         head = idx_head(phys);
+        /* sljit JIT-on-miss (SLJIT.md §7 step 5), VALIDATION-GATED: only when
+         * the active backend is sljit AND the same-state differential is armed,
+         * and never inside a shadow run. This keeps normal play byte-identical
+         * (no sljit shard is ever created unless explicitly validating) while
+         * letting run_shadow_diff exercise fresh shards against the interpreter.
+         * Live (non-diff) sljit execution stays disabled until the gate passes. */
+        if (head < 0 && s_diff_mode && !s_in_shadow &&
+            overlay_backend_active() == OVERLAY_BACKEND_SLJIT) {
+            try_sljit_region(phys);
+            head = idx_head(phys);
+        }
     }
 
     for (int i = head; i >= 0; i = s_cand[i].next) {
@@ -836,6 +915,22 @@ void overlay_loader_get_reload_debug(int *r0_valid, uint32_t *r0_writes,
 }
 
 int overlay_loader_registered_count(void) { return s_valid_count; }
+
+/* sljit Tier-2 shards registered as candidates this session (diagnostics). */
+uint32_t overlay_loader_sljit_registered(void) { return s_sljit_registered; }
+
+/* Force a one-shot sljit JIT attempt of the leaf function at `addr` from live
+ * RAM and register it on success (bypasses the diff-mode gate — a probe). For
+ * the sljit_try debug command. Returns via the result struct. */
+void overlay_loader_sljit_probe(uint32_t addr, OverlaySljitResult *out) {
+    out->fn = NULL; out->code_lo = 0; out->code_len = 0; out->insns = 0;
+    uint8_t *ram = memory_get_ram_ptr();
+    if (!ram) return;
+    overlay_sljit_try_compile(addr & 0x1FFFFFFFu, ram, 2u * 1024u * 1024u, 0u, out);
+    if (out->fn)
+        register_sljit_candidate(addr & 0x1FFFFFFFu, (OverlayFn)out->fn,
+                                 out->code_lo, out->code_len);
+}
 
 /* ---- Native↔interp execution fingerprint differential (§5-E) ----------- */
 /* For each CANDIDATE function execution we record the FULL register file at

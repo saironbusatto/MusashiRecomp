@@ -17,6 +17,7 @@
 #include "overlay_loader.h"
 #include "overlay_capture.h"
 #include "code_provider.h"
+#include "overlay_sljit.h"
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
@@ -7729,13 +7730,8 @@ static void handle_autocompile_status(int id, const char *json)
  * counters. */
 static void handle_sljit_status(int id, const char *json)
 {
-    extern int         overlay_sljit_selftest(void);
-    extern void        overlay_sljit_get_status(int *available, int *selftest_ok,
-                                                unsigned long long *compiles,
-                                                unsigned long long *declines,
-                                                unsigned long long *bytes_emitted);
-    extern int         overlay_backend_active(void);
-    extern const char *overlay_backend_name(int b);
+    /* Declarations come from overlay_sljit.h (included above). */
+    extern unsigned int overlay_loader_sljit_registered(void);
     (void)json;
     int selftest = overlay_sljit_selftest();
     int available = 0, st_ok = 0;
@@ -7743,9 +7739,28 @@ static void handle_sljit_status(int id, const char *json)
     overlay_sljit_get_status(&available, &st_ok, &compiles, &declines, &bytes);
     send_fmt("{\"id\":%d,\"ok\":true,\"backend\":\"%s\",\"available\":%d,"
              "\"selftest_ok\":%d,\"compiles\":%llu,\"declines\":%llu,"
-             "\"bytes_emitted\":%llu}\n",
+             "\"bytes_emitted\":%llu,\"shards_registered\":%u}\n",
              id, overlay_backend_name(overlay_backend_active()), available,
-             selftest, compiles, declines, bytes);
+             selftest, compiles, declines, bytes,
+             overlay_loader_sljit_registered());
+}
+
+/* sljit_try <hex_addr>: force a one-shot JIT of the leaf function at a phys
+ * address from live RAM (bypasses the diff gate — a probe) and report whether
+ * the emitter accepted it. Lets the leaf emitter be exercised against a known
+ * function without waiting for a dispatch miss. */
+static void handle_sljit_try(int id, const char *json)
+{
+    extern void overlay_loader_sljit_probe(uint32_t addr, OverlaySljitResult *out);
+    uint32_t addr = 0;
+    const char *p = strstr(json, "\"addr\"");
+    if (p) { p = strchr(p, ':'); if (p) addr = (uint32_t)strtoul(p + 1, NULL, 0); }
+    if (!addr) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"need addr\"}\n", id); return; }
+    OverlaySljitResult r = {0};
+    overlay_loader_sljit_probe(addr, &r);
+    send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"compiled\":%d,"
+             "\"insns\":%u,\"code_lo\":\"0x%08X\",\"code_len\":%u}\n",
+             id, addr, r.fn ? 1 : 0, r.insns, r.code_lo, r.code_len);
 }
 
 /* autocompile_run: manually kick the active code provider's batch production
@@ -8647,6 +8662,7 @@ static const CmdEntry s_commands[] = {
     { "turbo_loads",          handle_turbo_loads },
     { "autocompile_status",   handle_autocompile_status },
     { "sljit_status",         handle_sljit_status },
+    { "sljit_try",            handle_sljit_try },
     { "autocompile_run",      handle_autocompile_run },
     { "overlay_rescan",       handle_overlay_rescan },
     { NULL, NULL }
