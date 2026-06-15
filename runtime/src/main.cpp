@@ -13,6 +13,7 @@
 #include "overlay_capture.h"
 #include "overlay_loader.h"
 #include "autocompile.h"
+#include "code_provider.h"
 #include "gpu.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
@@ -1058,7 +1059,11 @@ static void sdl_vblank_present(void) {
      * below, so capture detection and compile pickup keep running while the
      * frontend is skipping presents. Both are cheap and emu-thread-only. */
     overlay_autocapture_tick();
-    autocompile_poll_main();
+    {   /* Apply a finished batch compile via the active code provider (gcc:
+         * cache rescan on done; sljit: no-op — it produces synchronously). */
+        const CodeProvider *cp = code_provider_active();
+        if (cp->poll_main) cp->poll_main();
+    }
 
     /* Pump SDL events to prevent window freeze. */
     SDL_Event ev;
@@ -1457,6 +1462,14 @@ int main(int argc, char** argv) {
                     std::fprintf(stdout,
                         "psxrecomp: overlay autocompile enabled\n");
                 }
+                /* Resolve the Tier-2 codegen backend now that we know whether a
+                 * compile command is wired. auto => gcc when configured, else
+                 * sljit; env PSX_OVERLAY_BACKEND overrides. The active provider
+                 * is what the capture/dispatch spine produces code through. */
+                code_provider_init(
+                    gc.runtime.overlay_backend.empty()
+                        ? nullptr : gc.runtime.overlay_backend.c_str(),
+                    autocompile_configured());
             }
             std::fprintf(stdout, "psxrecomp: loaded game config %s (%s, %s)\n",
                          game_config_path, game_name.c_str(), game_id.c_str());

@@ -16,6 +16,7 @@
 #include "debug_server.h"
 #include "overlay_loader.h"
 #include "overlay_capture.h"
+#include "code_provider.h"
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
@@ -7747,13 +7748,16 @@ static void handle_sljit_status(int id, const char *json)
              selftest, compiles, declines, bytes);
 }
 
-/* autocompile_run: manually kick the configured background compile. */
+/* autocompile_run: manually kick the active code provider's batch production
+ * (gcc: spawn the configured background compile; sljit: inert, it produces
+ * synchronously on a dispatch miss). */
 static void handle_autocompile_run(int id, const char *json)
 {
-    extern int autocompile_request(void);
     (void)json;
-    int started = autocompile_request();
-    send_fmt("{\"id\":%d,\"ok\":true,\"started\":%d}\n", id, started);
+    const CodeProvider *cp = code_provider_active();
+    int started = (cp->request) ? cp->request() : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"started\":%d,\"backend\":\"%s\"}\n",
+             id, started, cp->name);
 }
 
 /* overlay_rescan: re-scan the DLL cache and clear the checked-regions memo
