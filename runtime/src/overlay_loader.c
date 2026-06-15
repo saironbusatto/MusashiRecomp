@@ -1033,7 +1033,23 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     memcpy(s_spad0, spad, SHADOW_SPAD_SIZE);
 
     /* Native (discarded). Nested calls run native (native_exec on). */
+    uint32_t stop_ra = cpu->gpr[31];   /* entry $ra = the function's return point */
     c->fn(cpu);
+    /* A shard that ends in a computed `jr rX` (jump table) EXITS with cpu->pc =
+     * target instead of running the whole function — live, dispatch re-enters
+     * there; but the interp side below chains through to the return, so we must
+     * complete the native side too or every tail-jump function falsely diverges.
+     * Chain the native run through tail-transfers to the same stop the interp
+     * uses, so we compare FULL native vs FULL interp execution. */
+    {
+        int guard = 0;
+        while (cpu->pc != 0 && !g_psx_call_bail && guard++ < 8192) {
+            uint32_t tv = cpu->pc;
+            if ((tv & 0x1FFFFFFFu) == (stop_ra & 0x1FFFFFFFu)) break;  /* returned */
+            cpu->pc = 0;
+            if (!dirty_ram_dispatch(cpu, tv, stop_ra)) { cpu->pc = tv; break; }
+        }
+    }
     CPUState cpuN = *cpu;
     memcpy(s_ramN, ram, SHADOW_RAM_SIZE);
 
