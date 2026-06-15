@@ -51,6 +51,23 @@ static int       g_scale   = 1;
 static int       g_hr_w    = VRAM_WIDTH;
 static int       g_hr_h    = VRAM_HEIGHT;
 
+/* ---- Native-wide compositor (separate present surfaces) ------------------
+ * Canonical VRAM stays faithful. For an opted-in wide game we ADDITIONALLY
+ * mirror each framebuffer-targeting primitive into an independent wide surface
+ * keyed by the back buffer's VRAM x-origin (base_x), at local x = vram_x -
+ * base_x + OFFSET. Independent surfaces ⇒ no cross-buffer bleed; margins clear
+ * cleanly; present reads the surface for the displayed buffer. Each surface is
+ * (g_wide_w * scale) × (VRAM_HEIGHT * scale) 16-bit; y is unshifted so the
+ * buffer's native VRAM y-band is reused directly. */
+#define WIDE_MAX_SURF 4
+static uint16_t *g_wide_surf[WIDE_MAX_SURF];   /* lazily-allocated surfaces */
+static int       g_wide_base[WIDE_MAX_SURF];   /* base_x per surface (-1 = free) */
+static int       g_wide_w        = 0;          /* wide width (native px); 0 = disabled */
+static int       g_wide_off      = 0;          /* centering OFFSET (native px) */
+static uint16_t *g_wide_cur      = NULL;       /* active mirror surface (NULL = no mirror) */
+static int       g_wide_cur_base = 0;          /* base_x of g_wide_cur */
+static void      wide_free_all(void);          /* defined with the surface helpers below */
+
 /* Draw area clipping rectangle (native coordinates) */
 static int g_clip_x1, g_clip_y1, g_clip_x2, g_clip_y2;
 
@@ -128,6 +145,24 @@ static inline RTarget rt_hires(void) {
     t.cy2 = g_clip_y2 * s + (s - 1);
     return t;
 }
+
+/* Native-wide mirror target: the active wide surface (g_wide_cur). Clip is the
+ * full surface; callers pass coordinates already translated into surface space
+ * (vram_x - base_x + OFFSET) and y-clipped to the buffer's band via the source
+ * primitive. Scale matches the SSAA scale. Only used when g_wide_cur != NULL. */
+static inline RTarget rt_wide(void) {
+    int s = g_scale;
+    RTarget t;
+    t.buf = g_wide_cur;
+    t.w = g_wide_w * s; t.h = VRAM_HEIGHT * s; t.s = s;
+    t.cx1 = 0; t.cy1 = 0;
+    t.cx2 = g_wide_w * s - 1; t.cy2 = VRAM_HEIGHT * s - 1;
+    return t;
+}
+
+/* X-translation (native px) from canonical VRAM space into the active wide
+ * surface: local_x = vram_x - base_x + OFFSET. */
+static inline int wide_dx(void) { return g_wide_off - g_wide_cur_base; }
 
 /* ------------------------------------------------------------------ */
 /* Semi-transparency blending                                         */
@@ -419,6 +454,9 @@ void sw_renderer_set_scale(int scale) {
     if (scale > SW_MAX_INTERNAL_SCALE) scale = SW_MAX_INTERNAL_SCALE;
 
     if (g_hr) { free(g_hr); g_hr = NULL; }
+    /* Wide compositor surfaces are scale-sized; drop them so they re-allocate
+     * at the new scale on next use (gpu re-configures native-wide after this). */
+    wide_free_all();
 
     g_scale = scale;
     if (scale > 1) {
@@ -653,6 +691,11 @@ void sw_draw_flat_triangle(int x0, int y0, int x1, int y1,
         RTarget hr = rt_hires();
         raster_flat_triangle(&hr, x0*s, y0*s, x1*s, y1*s, x2*s, y2*s, color);
     }
+    if (g_wide_cur) {
+        int s = g_scale, dx = wide_dx();
+        RTarget wt = rt_wide();
+        raster_flat_triangle(&wt, (x0+dx)*s, y0*s, (x1+dx)*s, y1*s, (x2+dx)*s, y2*s, color);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -764,6 +807,11 @@ void sw_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
         int s = g_scale;
         RTarget hr = rt_hires();
         raster_gouraud_triangle(&hr, x0*s, y0*s, c0, x1*s, y1*s, c1, x2*s, y2*s, c2);
+    }
+    if (g_wide_cur) {
+        int s = g_scale, dx = wide_dx();
+        RTarget wt = rt_wide();
+        raster_gouraud_triangle(&wt, (x0+dx)*s, y0*s, c0, (x1+dx)*s, y1*s, c1, (x2+dx)*s, y2*s, c2);
     }
 }
 
@@ -879,6 +927,13 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
         raster_textured_triangle(&hr, x0*s, y0*s, u0, v0,
                                  x1*s, y1*s, u1, v1,
                                  x2*s, y2*s, u2, v2, clut_x, clut_y, texpage);
+    }
+    if (g_wide_cur) {
+        int s = g_scale, dx = wide_dx();
+        RTarget wt = rt_wide();
+        raster_textured_triangle(&wt, (x0+dx)*s, y0*s, u0, v0,
+                                 (x1+dx)*s, y1*s, u1, v1,
+                                 (x2+dx)*s, y2*s, u2, v2, clut_x, clut_y, texpage);
     }
 }
 
@@ -1035,6 +1090,15 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
             x2*s, y2*s, u2, v2, r2, g2, b2,
             clut_x, clut_y, texpage, raw_texture);
     }
+    if (g_wide_cur) {
+        int s = g_scale, dx = wide_dx();
+        RTarget wt = rt_wide();
+        raster_shaded_textured_triangle(&wt,
+            (x0+dx)*s, y0*s, u0, v0, r0, g0, b0,
+            (x1+dx)*s, y1*s, u1, v1, r1, g1, b1,
+            (x2+dx)*s, y2*s, u2, v2, r2, g2, b2,
+            clut_x, clut_y, texpage, raw_texture);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1063,6 +1127,11 @@ void sw_draw_flat_rect(int x, int y, int w, int h, uint16_t color) {
         int s = g_scale;
         RTarget hr = rt_hires();
         raster_flat_rect(&hr, x*s, y*s, w*s, h*s, color);
+    }
+    if (g_wide_cur) {
+        int s = g_scale, dx = wide_dx();
+        RTarget wt = rt_wide();
+        raster_flat_rect(&wt, (x+dx)*s, y*s, w*s, h*s, color);
     }
 }
 
@@ -1113,6 +1182,11 @@ void sw_draw_textured_rect(int x, int y, int w, int h,
         int s = g_scale;
         RTarget hr = rt_hires();
         raster_textured_rect(&hr, x*s, y*s, w*s, h*s, u, v, clut_x, clut_y, texpage);
+    }
+    if (g_wide_cur) {
+        int s = g_scale, dx = wide_dx();
+        RTarget wt = rt_wide();
+        raster_textured_rect(&wt, (x+dx)*s, y*s, w*s, h*s, u, v, clut_x, clut_y, texpage);
     }
 }
 
@@ -1166,6 +1240,12 @@ void sw_draw_textured_rect_scaled(int x, int y, int w, int h,
         raster_textured_rect_scaled(&hr, x*s, y*s, w*s, h*s, u0, v0, u1, v1,
                                     clut_x, clut_y, texpage);
     }
+    if (g_wide_cur) {
+        int s = g_scale, dx = wide_dx();
+        RTarget wt = rt_wide();
+        raster_textured_rect_scaled(&wt, (x+dx)*s, y*s, w*s, h*s, u0, v0, u1, v1,
+                                    clut_x, clut_y, texpage);
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1185,6 +1265,18 @@ static inline void hr_put_block_opaque(int nx, int ny, uint16_t color) {
             put_opaque(&hr, bx + dx, by + dy, color);
 }
 
+/* Mirror a 1px line pixel into the active wide surface (s*s block, x-translated).
+ * Self-gates on g_wide_cur; runs at any scale. */
+static inline void wide_put_block_opaque(int nx, int ny, uint16_t color) {
+    if (!g_wide_cur) return;
+    int s = g_scale, tdx = wide_dx();
+    RTarget wt = rt_wide();
+    int bx = (nx + tdx) * s, by = ny * s;
+    for (int dy = 0; dy < s; dy++)
+        for (int dx = 0; dx < s; dx++)
+            put_opaque(&wt, bx + dx, by + dy, color);
+}
+
 void sw_draw_line(int x0, int y0, int x1, int y1, uint16_t color) {
     RTarget n = rt_native();
     int dx = abs(x1 - x0);
@@ -1196,6 +1288,7 @@ void sw_draw_line(int x0, int y0, int x1, int y1, uint16_t color) {
     for (;;) {
         put_opaque(&n, x0, y0, color);
         if (g_hr) hr_put_block_opaque(x0, y0, color);
+        wide_put_block_opaque(x0, y0, color);
 
         if (x0 == x1 && y0 == y1) break;
 
@@ -1230,6 +1323,7 @@ void sw_draw_shaded_line(int x0, int y0, uint16_t c0,
         uint16_t color = (uint16_t)(r | (g << 5) | (b << 10));
         put_opaque(&n, x0, y0, color);
         if (g_hr) hr_put_block_opaque(x0, y0, color);
+        wide_put_block_opaque(x0, y0, color);
 
         if (x0 == x1 && y0 == y1) break;
 
@@ -1360,3 +1454,93 @@ int sw_render_display_hires(uint32_t *out_pixels, int out_pitch,
 
     return count;
 }
+
+/* ------------------------------------------------------------------ */
+/* Native-wide compositor surfaces                                    */
+/* ------------------------------------------------------------------ */
+
+static void wide_free_all(void) {
+    for (int i = 0; i < WIDE_MAX_SURF; i++) {
+        if (g_wide_surf[i]) { free(g_wide_surf[i]); g_wide_surf[i] = NULL; }
+        g_wide_base[i] = -1;
+    }
+    g_wide_cur = NULL;
+}
+
+static uint16_t *wide_surf_for(int base_x) {
+    if (g_wide_w <= 0) return NULL;
+    for (int i = 0; i < WIDE_MAX_SURF; i++)
+        if (g_wide_surf[i] && g_wide_base[i] == base_x) return g_wide_surf[i];
+    for (int i = 0; i < WIDE_MAX_SURF; i++) {
+        if (!g_wide_surf[i]) {
+            size_t n = (size_t)(g_wide_w * g_scale) * (size_t)(VRAM_HEIGHT * g_scale);
+            g_wide_surf[i] = (uint16_t *)calloc(n, sizeof(uint16_t));
+            if (!g_wide_surf[i]) return NULL;
+            g_wide_base[i] = base_x;
+            return g_wide_surf[i];
+        }
+    }
+    return NULL;  /* more distinct buffers than WIDE_MAX_SURF — shouldn't happen */
+}
+
+/* Enable native-wide with a wide width + centering offset (native px), or
+ * disable (wide_w <= 0). Re-allocates if the width changed. */
+void sw_wide_configure(int wide_w, int offset) {
+    if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; return; }
+    if (wide_w != g_wide_w) wide_free_all();
+    g_wide_w = wide_w;
+    g_wide_off = offset;
+}
+
+/* Select the wide surface to mirror into for the back buffer at base_x. */
+void sw_wide_set_target(int base_x) {
+    g_wide_cur = wide_surf_for(base_x);
+    g_wide_cur_base = base_x;
+}
+
+/* Stop mirroring (offscreen draws that don't target a framebuffer). */
+void sw_wide_disable_target(void) { g_wide_cur = NULL; }
+
+/* Mirror a framebuffer clear: fill the full wide width over [y, y+h) of the
+ * surface for base_x, so the revealed margins are clean (not stale). */
+void sw_wide_clear(int base_x, int y, int h, uint16_t color) {
+    uint16_t *surf = wide_surf_for(base_x);
+    if (!surf) return;
+    int s = g_scale;
+    int W = g_wide_w * s;
+    int H = VRAM_HEIGHT * s;
+    int y0 = y * s, y1 = (y + h) * s;
+    if (y0 < 0) y0 = 0;
+    if (y1 > H) y1 = H;
+    for (int row = y0; row < y1; row++) {
+        uint16_t *dst = surf + (size_t)row * W;
+        for (int col = 0; col < W; col++) dst[col] = color;
+    }
+}
+
+/* Present source: convert the wide surface for the displayed buffer (base_x) to
+ * ARGB. Output is (g_wide_w*scale) wide × (disp_h*scale) tall. Returns 0 if no
+ * surface exists for base_x (caller falls back to the canonical present). */
+int sw_render_wide_display(uint32_t *out_pixels, int out_pitch, int base_x,
+                           int disp_y, int disp_h) {
+    uint16_t *surf = NULL;
+    for (int i = 0; i < WIDE_MAX_SURF; i++)
+        if (g_wide_surf[i] && g_wide_base[i] == base_x) { surf = g_wide_surf[i]; break; }
+    if (!surf || g_wide_w <= 0) return 0;
+    int s = g_scale;
+    int W = g_wide_w * s;
+    int H = VRAM_HEIGHT * s;
+    int out_h = disp_h * s;
+    int count = 0;
+    for (int row = 0; row < out_h; row++) {
+        int vy = disp_y * s + row;
+        if (vy < 0) vy = 0;
+        if (vy >= H) vy = H - 1;
+        const uint16_t *src = surf + (size_t)vy * W;
+        uint32_t *dst = (uint32_t *)((uint8_t *)out_pixels + row * out_pitch);
+        for (int col = 0; col < W; col++) { dst[col] = rgb555_to_argb(src[col]); count++; }
+    }
+    return count;
+}
+
+int sw_wide_width(void) { return g_wide_w; }

@@ -71,6 +71,15 @@ static int32_t  ws_xnum = 1, ws_xden = 1;   /* X squash factor; 1/1 = off */
 static uint32_t ws_anchor_addr = 0;          /* scratchpad addr of anchor SXY */
 static int      ws_hud_sprt = 0;             /* edge-anchor untagged HUD SPRTs */
 
+/* Wide-aspect mode: 0 = off (4:3 identity), 1 = squash (legacy hack — compress
+ * a wider FOV into the 320 frame, present stretched), 2 = native-wide (render
+ * the wider FOV into an actually wider frame and present 1:1; the GTE is NOT
+ * squashed — the frame is widened via draw_offset/draw_area and the display
+ * read). ws_cfg_num/den hold the configured aspect that drives the wide extent
+ * in native-wide mode. */
+static int      ws_mode    = 0;
+static int      ws_cfg_num = 4, ws_cfg_den = 3;
+
 #define WS_TAG_BUCKETS 4096                  /* power of two */
 #define WS_TAG_PROBES  8
 #define WS_FMV_HYSTERESIS 30                 /* frames a colour MDEC decode pins 4:3 */
@@ -81,6 +90,10 @@ extern uint64_t s_frame_count;               /* defined in debug_server.c */
 extern int      mdec_recently_active(uint32_t within_frames);  /* mdec.c */
 
 static int ws_configured(void) { return ws_xnum != ws_xden; }
+
+/* Any wide mode engaged (squash or native-wide). Drives the FMV/menu 4:3
+ * pillarbox + the game-vs-2D detector, which both modes share. */
+static int ws_engaged(void) { return ws_mode != 0; }
 
 /* Forward decls: defined later but used by psx_ws_backdrop_x above them. */
 static int32_t ws_scale_about(int32_t x, int32_t ax);
@@ -104,7 +117,7 @@ static int ws_game_mode(void) {
  * zero squash + a 4:3 pillarbox instead. The FMV check is cached per frame;
  * game_mode is a cheap live check. */
 int gpu_ws_present_native_43(void) {
-    if (!ws_configured()) return 0;
+    if (!ws_engaged()) return 0;
     if (!ws_game_mode()) return 1;                 /* full-2D screen */
     static uint32_t fmv_frame_cache = 0xFFFFFFFFu;
     static int      fmv_cached = 0;
@@ -119,6 +132,30 @@ int gpu_ws_present_native_43(void) {
 
 /* Squash applies only when configured AND the frame is being stretched. */
 static int ws_active(void) { return ws_configured() && !gpu_ws_present_native_43(); }
+
+/* ----- Native-wide (mode 2) ------------------------------------------------
+ * Render the wider FOV into an actually wider frame instead of squashing it.
+ * Engaged on game frames only (FMV/menu frames pillarbox 4:3 like squash). The
+ * frame grows symmetrically: each side by OFFSET display-pixels, total by
+ * EXTRA = 2*OFFSET. OFFSET = round(W*(3*num-4*den)/(8*den)) where W is the live
+ * display width — derived from the aspect so it generalises past 16:9 and
+ * tracks display-mode changes; EXTRA is forced even so OFFSET is integral
+ * (e.g. W=320 @ 16:9 -> OFFSET=53, EXTRA=106, frame 320 -> 426). The shift is
+ * applied via the GPU draw_offset (so 3D and 2D move together and stay
+ * aligned), the draw-area widens by EXTRA so the shifted content is not clipped
+ * on the right, and the present widens the display read by EXTRA. 0 when
+ * native-wide is inactive (4:3 / boot / squash mode / FMV / full-2D). */
+int ws_native_wide_active(void) {
+    return ws_mode == 2 && !gpu_ws_present_native_43();
+}
+static int ws_nw_offset(void) {
+    if (!ws_native_wide_active()) return 0;
+    int numr = 3 * ws_cfg_num - 4 * ws_cfg_den;   /* > 0 for aspects wider than 4:3 */
+    if (numr <= 0) return 0;
+    int w = (int)ws_disp_w();
+    return (w * numr + 4 * ws_cfg_den) / (8 * ws_cfg_den);   /* round-to-nearest */
+}
+int ws_nw_extra(void) { return 2 * ws_nw_offset(); }
 
 /* Per-side X cull margin in screen/world units (the game's draw classifier
  * works in objX-camX where 1 unit ~= 1 native-4:3 screen pixel). The squash
@@ -135,6 +172,12 @@ void gpu_ws_set_margin_override(int v) { ws_margin_override = v; }
 
 int psx_ws_x_margin(void) {
     if (ws_margin_override >= 0) return ws_margin_override;
+    /* Native-wide: widen the world-space draw cull by the per-side reveal
+     * (== the centering OFFSET in screen px) so the game SUBMITS the geometry
+     * that previously fell outside the 4:3 cull window; the wide compositor then
+     * rasterizes it into the revealed margins. Same recompiler emit sites as the
+     * squash path ([widescreen.cull]); 0 at 4:3 so the cull stays byte-identical. */
+    if (ws_native_wide_active()) return ws_nw_offset();
     if (!ws_active()) return 0;
     return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
 }
@@ -194,20 +237,27 @@ void gpu_ws_get_debug(GpuWsDebug* out) {
     out->x_margin          = psx_ws_x_margin();
     out->xnum              = ws_xnum;
     out->xden              = ws_xden;
+    out->mode              = ws_mode;
+    out->nw_extra          = ws_nw_extra();
     out->cur_frame         = s_frame_count;
     out->last_tag_frame    = ws_last_tag_stamp;
 }
 
 void gpu_ws_configure(int aspect_num, int aspect_den,
-                      uint32_t sprite_anchor_addr, int hud_sprt_squash) {
-    /* X squash = (4*den)/(3*num) — the same factor the GTE applies. */
-    if (aspect_num <= 0 || aspect_den <= 0) { ws_xnum = ws_xden = 1; }
-    else {
-        int32_t n = 4 * aspect_den, d = 3 * aspect_num;
+                      uint32_t sprite_anchor_addr, int hud_sprt_squash, int mode) {
+    ws_cfg_num = aspect_num > 0 ? aspect_num : 4;
+    ws_cfg_den = aspect_den > 0 ? aspect_den : 3;
+    ws_mode    = mode;
+    if (mode == 1) {
+        /* Squash factor = (4*den)/(3*num) — the same factor the GTE applies. */
+        int32_t n = 4 * ws_cfg_den, d = 3 * ws_cfg_num;
         int32_t a = n, b = d;
         while (b) { int32_t t = a % b; a = b; b = t; }
         ws_xnum = n / a;
         ws_xden = d / a;
+    } else {
+        /* Native-wide (2) and off (0): the GTE is NOT squashed. */
+        ws_xnum = ws_xden = 1;
     }
     ws_anchor_addr = sprite_anchor_addr;
     ws_hud_sprt    = hud_sprt_squash;
@@ -219,7 +269,7 @@ void gpu_ws_configure(int aspect_num, int aspect_den,
  * THIS function sets, so gating it on ws_active would never let gameplay
  * start (the first character of a frame would be suppressed forever). */
 void psx_ws_sprite_tag(CPUState* cpu) {
-    if (!ws_configured() || !ws_anchor_addr) return;
+    if (!ws_engaged() || !ws_anchor_addr) return;
     uint32_t key = cpu->gpr[4] & 0x1FFFFCu;
     if (!key) return;
     uint32_t sxy = cpu->read_word(ws_anchor_addr);
@@ -384,6 +434,36 @@ extern uint32_t i_stat;
 /* Display area start (GP1(05h)) */
 static uint32_t display_area_x;
 static uint32_t display_area_y;
+
+/* ----- Native-wide compositor driving (see runtime/src/gpu_sw_renderer.c) ----
+ * The renderer keeps a separate wide surface per framebuffer; we tell it which
+ * back buffer each draw targets and present from the displayed buffer's surface.
+ * A "framebuffer base" is a VRAM x-origin the display has scanned out from — we
+ * learn that set from GP1(05h) so the mirror only engages for real display
+ * buffers (not offscreen texture builds). Generic: no per-game constants. */
+#define WS_FB_BASES 4
+static uint32_t ws_fb_base[WS_FB_BASES];
+static int      ws_fb_n = 0;
+static void ws_note_display_base(uint32_t bx) {
+    for (int i = 0; i < ws_fb_n; i++) if (ws_fb_base[i] == bx) return;
+    if (ws_fb_n < WS_FB_BASES) { ws_fb_base[ws_fb_n++] = bx; return; }
+    for (int i = 1; i < WS_FB_BASES; i++) ws_fb_base[i - 1] = ws_fb_base[i];
+    ws_fb_base[WS_FB_BASES - 1] = bx;
+}
+static int ws_is_fb_base(uint32_t bx) {
+    for (int i = 0; i < ws_fb_n; i++) if (ws_fb_base[i] == bx) return 1;
+    return 0;
+}
+/* Point the renderer's wide mirror at the current back buffer (draw_area_left)
+ * when native-wide is active and that buffer is a known display buffer; else
+ * disable mirroring for this draw. Called when the draw env changes. */
+static void ws_nw_sync_target(void) {
+    if (!ws_native_wide_active()) { gr_wide_disable_target(); return; }
+    gr_wide_configure((int)ws_disp_w() + ws_nw_extra(), ws_nw_offset());
+    uint32_t base = draw_area_left;
+    if (ws_is_fb_base(base)) gr_wide_set_target((int)base);
+    else                     gr_wide_disable_target();
+}
 
 /* Horizontal display range (GP1(06h)) */
 static uint32_t h_display_x1;
@@ -1312,6 +1392,12 @@ static void gp0_exec_fill_rect(void) {
      * VRAM. Routed through the renderer so it also fills the hi-res
      * supersampling mirror (no-op cost when supersampling is off). */
     gr_fill_rect((int)dst_x, (int)dst_y, (int)width, (int)height, color16);
+
+    /* Native-wide: when the game clears a display buffer, clear the full width
+     * of that buffer's wide surface over the same rows — refreshing the centred
+     * content region and keeping the revealed margins clean. */
+    if (ws_native_wide_active() && ws_is_fb_base(dst_x))
+        gr_wide_clear((int)dst_x, (int)dst_y, (int)height, color16);
 }
 
 static void gp0_exec_draw_mode(void) {
@@ -1353,6 +1439,7 @@ static void gp0_exec_draw_area_tl(void) {
     draw_area_top  = (param >> 10) & 0x3FF;
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
+    ws_nw_sync_target();  /* back buffer (draw_area_left) → wide mirror surface */
 }
 
 static void gp0_exec_draw_area_br(void) {
@@ -1364,6 +1451,7 @@ static void gp0_exec_draw_area_br(void) {
     draw_area_bottom = (param >> 10) & 0x3FF;
     gr_set_draw_area((int)draw_area_left, (int)draw_area_top,
                      (int)draw_area_right, (int)draw_area_bottom);
+    ws_nw_sync_target();  /* back buffer (draw_area_left) → wide mirror surface */
 }
 
 static void gp0_exec_draw_offset(void) {
@@ -1373,6 +1461,9 @@ static void gp0_exec_draw_offset(void) {
     uint32_t param = gp0_cmd_buf[0] & 0x00FFFFFFu;
     draw_offset_x = sign_extend(param & 0x7FFu, 11);
     draw_offset_y = sign_extend((param >> 11) & 0x7FFu, 11);
+    /* Native-wide mirrors framebuffer draws into a separate wide surface (canonical
+     * VRAM stays faithful); the renderer needs the live draw offset to translate
+     * into surface-local coords, so keep gr_set_draw_offset current. */
     gr_set_draw_offset(draw_offset_x, draw_offset_y);
 }
 
@@ -1716,19 +1807,45 @@ void gpu_gp0_ring_frame_span(uint32_t *out_oldest, uint32_t *out_newest) {
  * effective (4:3-sized) despawn margin, which the 16:9 view exceeds. A prim
  * present in the census but absent on screen would instead indict the renderer
  * gate. Query via TCP `ws_census` → CSV file (large dumps mustn't ride TCP). */
-#define WS_CENSUS_CAP (1u << 21)            /* 2,097,152 entries * 16B = 32 MiB */
+#define WS_CENSUS_CAP (1u << 21)            /* 2,097,152 entries * 24B = 48 MiB */
 typedef struct {
     uint32_t frame;
     uint32_t src_addr;
     int16_t  cam_x, cam_y;
-    int16_t  x, y;
+    int16_t  x, y;        /* first vertex (screen / pre-draw_offset) */
+    int16_t  xmin, xmax;  /* screen-X extent across the prim's position verts */
+    int16_t  base_x;      /* back-buffer origin (draw_area_left) at draw time */
     uint8_t  opcode;
-    uint8_t  pad[3];
+    uint8_t  pad;
 } WsCensusEntry;
 static WsCensusEntry *ws_census = NULL;
 static uint64_t       ws_census_seq = 0;
 static int            ws_census_on  = 1;     /* always-on; toggle via ws_census */
 extern uint16_t       psx_read_half(uint32_t addr);
+
+/* Screen-X extent (raw vertex coords = SX, pre-draw_offset) across a prim's
+ * position vertices. Polygons (0x20-0x3F) decoded exactly via the packet stride
+ * (pos word = 1 + i*(1 + gouraud + textured)); rects/sprites/lines fall back to
+ * the first vertex. Lets the census show how far right each path reaches and
+ * whether anything is drawn past the 4:3 edge (native-wide margin diagnosis). */
+static void prim_sx_extent(uint8_t op, int32_t *xmin, int32_t *xmax) {
+    int32_t lo = 0x7FFF, hi = -0x8000;
+    if (op >= 0x20 && op <= 0x3F) {
+        int nv     = (op & 0x08) ? 4 : 3;
+        int stride = 1 + ((op & 0x10) ? 1 : 0) + ((op & 0x04) ? 1 : 0);
+        for (int i = 0; i < nv; i++) {
+            int32_t vx, vy;
+            parse_vertex(gp0_cmd_buf[1 + i * stride], &vx, &vy);
+            if (vx < lo) lo = vx;
+            if (vx > hi) hi = vx;
+        }
+    } else {
+        int32_t vx, vy;
+        parse_vertex(gp0_cmd_buf[1], &vx, &vy);
+        lo = hi = vx;
+    }
+    *xmin = lo; *xmax = hi;
+}
 
 static void ws_census_record(uint8_t opcode, int32_t x, int32_t y) {
     if (!ws_census_on) return;
@@ -1736,6 +1853,8 @@ static void ws_census_record(uint8_t opcode, int32_t x, int32_t y) {
         ws_census = (WsCensusEntry *)calloc(WS_CENSUS_CAP, sizeof(WsCensusEntry));
         if (!ws_census) { ws_census_on = 0; return; }
     }
+    int32_t xmn, xmx;
+    prim_sx_extent(opcode, &xmn, &xmx);
     WsCensusEntry *e = &ws_census[ws_census_seq & (WS_CENSUS_CAP - 1)];
     e->frame    = (uint32_t)s_frame_count;
     e->src_addr = gp0_cmd_source_addr;
@@ -1743,6 +1862,9 @@ static void ws_census_record(uint8_t opcode, int32_t x, int32_t y) {
     e->cam_y    = (int16_t)psx_read_half(0x1F800186);
     e->x        = (int16_t)x;
     e->y        = (int16_t)y;
+    e->xmin     = (int16_t)xmn;
+    e->xmax     = (int16_t)xmx;
+    e->base_x   = (int16_t)draw_area_left;
     e->opcode   = opcode;
     ws_census_seq++;
 }
@@ -1752,7 +1874,7 @@ int gpu_ws_census_dump(uint32_t f0, uint32_t f1, const char *path) {
     if (!ws_census) return 0;
     FILE *fp = fopen(path, "w");
     if (!fp) return -1;
-    fprintf(fp, "frame,src_addr,cam_x,cam_y,x,y,opcode\n");
+    fprintf(fp, "frame,src_addr,cam_x,cam_y,x,y,xmin,xmax,base_x,opcode\n");
     uint64_t total = ws_census_seq;
     uint64_t avail = total < WS_CENSUS_CAP ? total : WS_CENSUS_CAP;
     uint64_t start = total - avail;
@@ -1760,8 +1882,9 @@ int gpu_ws_census_dump(uint32_t f0, uint32_t f1, const char *path) {
     for (uint64_t s = start; s < total; s++) {
         WsCensusEntry *e = &ws_census[s & (WS_CENSUS_CAP - 1)];
         if (e->frame < f0 || e->frame > f1) continue;
-        fprintf(fp, "%u,0x%08X,%d,%d,%d,%d,0x%02X\n",
-                e->frame, e->src_addr, e->cam_x, e->cam_y, e->x, e->y, e->opcode);
+        fprintf(fp, "%u,0x%08X,%d,%d,%d,%d,%d,%d,%d,0x%02X\n",
+                e->frame, e->src_addr, e->cam_x, e->cam_y, e->x, e->y,
+                e->xmin, e->xmax, e->base_x, e->opcode);
         n++;
     }
     fclose(fp);
@@ -2198,6 +2321,7 @@ static void gp1_display_area_start(uint32_t val) {
      * bits 10-18: Y (0-511) */
     display_area_x = val & 0x3FF;
     display_area_y = (val >> 10) & 0x1FF;
+    ws_note_display_base(display_area_x);  /* learn the display buffer set (native-wide) */
 }
 
 static void gp1_h_display_range(uint32_t val) {

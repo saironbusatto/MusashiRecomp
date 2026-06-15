@@ -90,6 +90,18 @@ void sw_set_draw_area(int x1, int y1, int x2, int y2);
 void sw_get_draw_area(int *x1, int *y1, int *x2, int *y2);
 void sw_set_draw_offset(int x, int y);
 
+/* Native-wide compositor (see gpu_sw_renderer.c). Canonical VRAM stays faithful;
+ * framebuffer draws are mirrored into independent wide surfaces keyed by buffer
+ * base_x. wide_w<=0 disables. set_target selects/clears the mirror per back
+ * buffer; render_wide_display is the present source for the displayed buffer. */
+void sw_wide_configure(int wide_w, int offset);
+void sw_wide_set_target(int base_x);
+void sw_wide_disable_target(void);
+void sw_wide_clear(int base_x, int y, int h, uint16_t color);
+int  sw_render_wide_display(uint32_t* out_pixels, int out_pitch, int base_x,
+                            int disp_y, int disp_h);
+int  sw_wide_width(void);
+
 #ifdef __cplusplus
 }
 #endif

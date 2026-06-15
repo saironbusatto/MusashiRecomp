@@ -12,6 +12,84 @@ on this branch points at the psxrecomp `feat/native-wide` tip.
 
 ---
 
+## Implementation status (2026-06-15)
+
+**Foundation implemented + verified (runtime-only, committed on this branch).**
+The centering mechanic adopted is the **proven `draw_offset`-shift** approach
+(not the `OFX`-bias framing the phases below were originally written around — see
+"Core idea" for why it's strictly simpler). A wide-aspect **mode** model now
+lives in `gpu.c`: `0 = off (4:3 identity)`, `1 = squash (legacy)`, `2 =
+native-wide`. Native-wide, on a game frame (not FMV/menu):
+
+- **GTE** is fed the 4:3 ratio → identity, **no squash** (`main.cpp` engage).
+- **`draw_offset_x += OFFSET`** at the GP0(E5) chokepoint (`gpu.c`) → 3D *and* 2D
+  shift together by `OFFSET = round(W*(3num-4den)/(8den))` (=53 @ 320/16:9).
+- **`draw_area_right += EXTRA`** at GP0(E4), **clamped to 1023** so a buffer at
+  the VRAM edge clips rather than wraps into textures (`EXTRA = 2*OFFSET = 106`).
+- **Present widens the display read by EXTRA** (`main.cpp` `present_w`); the
+  existing 2× present then maps it 1:1 (isotropic) — the old squash-stretch
+  becomes an honest 2× with no magnification. No renderer-backend change needed
+  (both already render full-VRAM-width; only the read width + offsets changed).
+- Diagnostics: `gpu_state` reports `ws.mode`/`ws.nw_extra`; **`ws_nw on=<0|1>`**
+  TCP command toggles native-wide vs squash live for A/B.
+
+**Verified in gameplay (16:9):** content renders at **correct native
+proportions** (A/B vs squash: squash visibly stretches the dialogue text; native-
+wide keeps it compact) and present is 1:1. 4:3 is identity **by construction**
+(mode 0 → every native-wide term is 0; `present_w == w`).
+
+**Decision point #1 RESOLVED with ground truth (the gating finding).** Tomba's
+VRAM double-buffer is **two *adjacent* 320-wide buffers**: front `x∈[384,703]`,
+back `x∈[704,1023]` — the back is **flush against the 1024 VRAM right edge**, and
+the two buffers touch (704 = 384+320). So there is **no horizontal headroom** for
+the +EXTRA widening on either buffer: widening the back wraps past x=1023 into the
+texture region; widening the front overlaps the back. The revealed margin strips
+therefore show **adjacent-buffer / VRAM-wrap bleed** (a duplicated scene fragment
+on the right), NOT the clean "stale VRAM" the earlier PoC notes assumed. The
+center is correct; the edges are not.
+
+**The flicker (why the shared-canvas approach fails).** The first cut shifted +OFFSET
+into `draw_offset` and widened the display read by +EXTRA *inside canonical VRAM*.
+This **flickers badly** (and even segfaults) and cannot be made clean, because:
+- The display **alternates between the two framebuffers every frame**. Buffer A's
+  widened read `[384,810]` is in-bounds (→ bleed strip), but buffer B's `[704,1130]`
+  **falls off the 1024 VRAM edge** → black strip + the draw wraps `[1024,1129]→[0,105]`
+  over textures/CLUTs (the idle segfault). Two totally different frames → flicker.
+- Even widening VRAM to 2048 does **not** fix it: the buffers are *adjacent*
+  (Δ=320), so widened-A `[384,809]` and widened-B `[704,1129]` **share storage**
+  at `[704,809]`. A's content `[437,756]` and B's `[757,1076]` are adjacent → each
+  buffer's margin reads into the *other's* content, and clearing one margin erases
+  the other's content. Unfixable in a shared canvas.
+- VRAM is ~95% full (occupancy-mapped) → no room to *relocate* buffers apart.
+- Changing the canonical wrap mask to `&2047` is also unsafe: it alters PS1
+  coordinate semantics (negative/clipped coords, VRAM copies, clears, mask ops)
+  for the opted-in game, not just our framebuffer draws.
+
+**Adopted architecture (separate wide compositor surface).** Keep canonical PSX
+VRAM **1024-wide and completely faithful** — every GPU op unchanged, so 4:3 / non-
+opted games are byte-identical (the extensibility guarantee). For an opted-in wide
+game, maintain **independent wide present-surfaces keyed by framebuffer base**
+(learned from the `display_x` set). **Mirror** each framebuffer-targeting primitive
+into its buffer's surface at local coords `(SX+OFFSET, SY)`; clear margins
+in-surface; present from the surface matching `display_x`. Textures/CLUTs always
+sample canonical VRAM; the wide surfaces are render targets, not texture memory.
+Independent surfaces ⇒ no A↔B sharing ⇒ no bleed, clean margins, no flicker.
+
+Milestones: (1) wide surface + mirror + present → flicker/bleed gone (margins
+blank until culls widen); (2) regen-class cull-widening submits the off-screen FOV
+→ it rasterizes into the margins → true native-wide. Key complexity driver:
+whether the game does framebuffer feedback (reads its framebuffer back / VRAM→VRAM
+copies between buffers); `gp0_copy` is nonzero for Tomba so worth confirming.
+
+Reusable from the first cut: the opt-in **mode descriptor**, GTE-identity feed,
+`ws_nw_offset/extra` math, `ws_nw` live toggle, debug fields. Reverted: the
+canonical `draw_offset`/`draw_area`/clamp injections (they move into the wide
+surface's local coords). Files: `runtime/src/gpu.c`, `runtime/include/gpu.h`,
+`runtime/src/main.cpp`, `runtime/src/debug_server.c`, `runtime/src/gpu_sw_renderer.c`,
+`runtime/src/gpu_gl_renderer.c`.
+
+---
+
 ## Goal
 
 Render Tomba (and the framework generally) at a genuinely wide internal frame

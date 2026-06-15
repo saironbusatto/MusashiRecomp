@@ -89,6 +89,17 @@ void gr_set_draw_area(int x1, int y1, int x2, int y2);
 void gr_get_draw_area(int *x1, int *y1, int *x2, int *y2);
 void gr_set_draw_offset(int x, int y);
 
+/* Native-wide compositor. gr_wide_supported() reports whether the active
+ * backend implements it; if not, the others are no-ops and the caller keeps
+ * the canonical present path. */
+int  gr_wide_supported(void);
+void gr_wide_configure(int wide_w, int offset);
+void gr_wide_set_target(int base_x);
+void gr_wide_disable_target(void);
+void gr_wide_clear(int base_x, int y, int h, uint16_t color);
+int  gr_render_wide_display(uint32_t *out, int pitch, int base_x,
+                            int disp_y, int disp_h);
+
 /* ---- Backend vtable -----------------------------------------------------
  * A backend supplies the same set of functions.  gpu_gl_renderer.c (Phase 2)
  * provides gl_backend_get(); until it does, requesting OpenGL falls back to
@@ -146,6 +157,15 @@ typedef struct GpuRenderBackend {
     void (*set_draw_area)(int x1, int y1, int x2, int y2);
     void (*get_draw_area)(int *x1, int *y1, int *x2, int *y2);
     void (*set_draw_offset)(int x, int y);
+    /* Native-wide compositor (optional; NULL on backends without it — the
+     * facade then reports gr_wide_supported() == 0 and the caller keeps the
+     * canonical present). */
+    void (*wide_configure)(int wide_w, int offset);
+    void (*wide_set_target)(int base_x);
+    void (*wide_disable_target)(void);
+    void (*wide_clear)(int base_x, int y, int h, uint16_t color);
+    int  (*render_wide_display)(uint32_t *out, int pitch, int base_x,
+                                int disp_y, int disp_h);
 } GpuRenderBackend;
 
 #ifdef __cplusplus

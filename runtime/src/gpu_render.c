@@ -45,6 +45,11 @@ static const GpuRenderBackend SW_BACKEND = {
     .set_draw_area                 = sw_set_draw_area,
     .get_draw_area                 = sw_get_draw_area,
     .set_draw_offset               = sw_set_draw_offset,
+    .wide_configure                = sw_wide_configure,
+    .wide_set_target               = sw_wide_set_target,
+    .wide_disable_target           = sw_wide_disable_target,
+    .wide_clear                    = sw_wide_clear,
+    .render_wide_display           = sw_render_wide_display,
 };
 
 /* Supplied by gpu_gl_renderer.c; returns NULL until the GL backend is ready. */
@@ -130,3 +135,24 @@ void gr_vram_transfer_out(int x, int y, int w, int h, uint16_t *d)       { g_b->
 void gr_set_draw_area(int x1, int y1, int x2, int y2){ g_b->set_draw_area(x1, y1, x2, y2); }
 void gr_get_draw_area(int *x1, int *y1, int *x2, int *y2) { g_b->get_draw_area(x1, y1, x2, y2); }
 void gr_set_draw_offset(int x, int y)                { g_b->set_draw_offset(x, y); }
+
+/* Native-wide compositor — present only on backends that supply it. */
+int  gr_wide_supported(void) { return g_b->render_wide_display != 0; }
+void gr_wide_configure(int wide_w, int offset) {
+    if (g_b->wide_configure) g_b->wide_configure(wide_w, offset);
+}
+void gr_wide_set_target(int base_x) {
+    if (g_b->wide_set_target) g_b->wide_set_target(base_x);
+}
+void gr_wide_disable_target(void) {
+    if (g_b->wide_disable_target) g_b->wide_disable_target();
+}
+void gr_wide_clear(int base_x, int y, int h, uint16_t color) {
+    if (g_b->wide_clear) g_b->wide_clear(base_x, y, h, color);
+}
+int gr_render_wide_display(uint32_t *out, int pitch, int base_x,
+                           int disp_y, int disp_h) {
+    if (g_b->render_wide_display)
+        return g_b->render_wide_display(out, pitch, base_x, disp_y, disp_h);
+    return 0;
+}

@@ -91,10 +91,18 @@ void gpu_set_screen_kind(int kind);
  * untagged SPRT prims (screen-space HUD/menus) around the display centre.
  * psx_ws_sprite_tag is the per-prim callback the recompiler emits at the
  * entry of each [widescreen] sprite_tag_funcs function. */
+/* mode: 0 = off (4:3 identity), 1 = squash (legacy hack), 2 = native-wide
+ * (render the wider FOV into a wider frame, present 1:1; GTE not squashed). */
 void gpu_ws_configure(int aspect_num, int aspect_den,
-                      uint32_t sprite_anchor_addr, int hud_sprt_squash);
+                      uint32_t sprite_anchor_addr, int hud_sprt_squash, int mode);
 struct CPUState;
 void psx_ws_sprite_tag(struct CPUState* cpu);
+
+/* Native-wide (mode 2) on a game frame. ws_nw_extra() is the total width the
+ * frame grows by, in display pixels (the present path widens the display read
+ * by this; 0 when native-wide is inactive). */
+int  ws_native_wide_active(void);
+int  ws_nw_extra(void);
 /* True when the current frame must present at native 4:3 (FMV video or a
  * full-2D menu/title screen), so the squash is suppressed and content drawn
  * pixel-native. The present path uses the same predicate to pillarbox. */
@@ -127,6 +135,8 @@ typedef struct {
     int      present_native_43; /* frame presents pillarboxed 4:3 (FMV/full-2D) */
     int      x_margin;          /* psx_ws_x_margin() right now */
     int      xnum, xden;        /* squash factor */
+    int      mode;              /* 0 = off, 1 = squash, 2 = native-wide */
+    int      nw_extra;          /* native-wide frame growth (display px), 0 if off */
     uint64_t cur_frame;
     uint32_t last_tag_frame;    /* frame of newest tagged prim */
 } GpuWsDebug;

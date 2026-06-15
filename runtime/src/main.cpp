@@ -140,6 +140,10 @@ static bool          g_ws_hud_sprt = false;
  * — Sony logo, PS logo, shell — presents authentic 4:3 with no GTE squash.
  * Starts true when the configured aspect is already 4:3 (nothing to engage). */
 static bool          g_ws_engaged = true;
+/* Wide-aspect strategy: native-wide (render the wider FOV into a wider frame,
+ * present 1:1 — the GTE is NOT squashed) vs. the legacy squash hack. Default
+ * native-wide; toggle live via the ws_nw TCP command for A/B comparison. */
+static int           g_ws_native_wide = 1;
 /* Logical present width for the SDL_Renderer (software) path; 640*scale at
  * 4:3, wider for wide aspects. Height is always 480*scale. Set at window
  * creation alongside SDL_RenderSetLogicalSize. */
@@ -159,6 +163,21 @@ static void clamp_window_aspect(int* w, int* h, int num, int den) {
     *w = width;
     *h = width * den / num;
 }
+
+/* Live native-wide vs squash toggle (ws_nw TCP command) for A/B comparison.
+ * Re-engages with the chosen mode in place if widescreen is already running. */
+extern "C" void psx_ws_set_native_wide(int on) {
+    g_ws_native_wide = on ? 1 : 0;
+    if (g_ws_engaged && g_video_aspect_num * 3 != g_video_aspect_den * 4) {
+        int mode = g_ws_native_wide ? 2 : 1;
+        gte_set_display_aspect(mode == 1 ? g_video_aspect_num : 4,
+                               mode == 1 ? g_video_aspect_den : 3);
+        gpu_ws_configure(g_video_aspect_num, g_video_aspect_den,
+                         g_ws_anchor_addr, g_ws_hud_sprt ? 1 : 0, mode);
+    }
+}
+extern "C" int psx_ws_get_native_wide(void) { return g_ws_native_wide; }
+
 static bool          g_gl_active = false;    /* GL context live -> GL present path */
 /* Present straight from the FBO (fast, no readback). Set PSX_GL_FORCE_CPU_PRESENT=1
  * to force the software readout path instead — a diagnostic/fallback that also
@@ -961,6 +980,12 @@ static void set_player_device(PlayerInput& p, const std::string& dev, bool analo
     std::string d = lower_copy(trim_copy(dev));
     if (d.empty() || d == "none") { p.kind = 0; }
     else if (d == "keyboard")     { p.kind = 1; }
+    else if (d == "auto" || d == "gamepad" || d == "controller") {
+        /* First available SDL game controller (guid empty -> open_player falls
+         * back to the first connected pad). Lets a user default to "my
+         * controller" without pinning a specific GUID. */
+        p.kind = 2;  /* p.guid already cleared above */
+    }
     else {
         p.kind = 2;
         std::snprintf(p.guid, sizeof(p.guid), "%s", trim_copy(dev).c_str());
@@ -1244,14 +1269,19 @@ static void sdl_vblank_present(void) {
         extern int fntrace_is_game_started(void);
         if (fntrace_is_game_started()) {
             g_ws_engaged = true;
-            gte_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
+            int mode = g_ws_native_wide ? 2 : 1;
+            /* Native-wide: GTE drawn un-squashed — feed it the 4:3 ratio
+             * (identity squash). Squash mode: feed the real wide aspect. */
+            gte_set_display_aspect(mode == 1 ? g_video_aspect_num : 4,
+                                   mode == 1 ? g_video_aspect_den : 3);
             gpu_ws_configure(g_video_aspect_num, g_video_aspect_den,
-                             g_ws_anchor_addr, g_ws_hud_sprt ? 1 : 0);
+                             g_ws_anchor_addr, g_ws_hud_sprt ? 1 : 0, mode);
         }
     }
 
     /* ---- Display from our VRAM ---- */
     uint32_t w = 0, h = 0;
+    uint32_t present_w = 0;  /* display width actually presented (w + native-wide EXTRA) */
     int active_scale = 1;   /* hi-res mirror used only for 15-bit display */
     bool fmv_frame = false;  /* FMV/boot — present pillarboxed 4:3 in widescreen */
     {
@@ -1282,6 +1312,18 @@ static void sdl_vblank_present(void) {
          * locked: we squash IFF we stretch. */
         fmv_frame = !g_ws_engaged || gpu_ws_present_native_43() != 0;
 
+        /* Canonical present width. Native-wide does NOT widen the canonical read
+         * (that bled across adjacent framebuffers); it composites into a separate
+         * wide surface and presents from there instead (see gpu wide compositor). */
+        present_w = w;
+
+        /* Native-wide present: on a game frame, if the active backend has the
+         * wide compositor, present the wider surface (canonical width + EXTRA)
+         * from the displayed buffer's surface. FMV/menu frames stay 4:3. */
+        bool wide_present = (!fmv_frame && g_ws_engaged &&
+                             ws_native_wide_active() && gr_wide_supported());
+        if (wide_present) present_w = w + (uint32_t)ws_nw_extra();
+
         /* OpenGL: 15-bit frames ALWAYS present straight from the authoritative
          * VRAM FBO — one deterministic path (the old per-frame FBO-vs-CPU
          * alternation caused the menu seam/jitter). 24-bit (FMV) frames and
@@ -1290,7 +1332,7 @@ static void sdl_vblank_present(void) {
 #ifndef PSX_SDL_NO_RENDER
         if (g_gl_active && g_gl_fbo_present && !di.depth24) {
             gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
-                                     (int)w, (int)h, g_video_aa ? 1 : 0,
+                                     (int)present_w, (int)h, g_video_aa ? 1 : 0,
                                      fmv_frame ? 1 : 0);
             return;
         }
@@ -1302,15 +1344,32 @@ static void sdl_vblank_present(void) {
          * native path for those frames (the present filter still upscales). */
         active_scale = (g_video_scale > 1 && !di.depth24) ? g_video_scale : 1;
 
-        if (active_scale > 1) {
-            int sw = (int)w * active_scale;
-            gr_render_display_hires(sdl_pixel_buf, (int)(sw * sizeof(uint32_t)),
-                                    (int)di.display_x, (int)di.display_y,
-                                    (int)w, (int)h);
-        } else {
-            for (uint32_t y = 0; y < h; y++) {
-                for (uint32_t x = 0; x < w; x++) {
-                    sdl_pixel_buf[y * w + x] = gpu_display_pixel_argb(&di, x, y);
+        if (wide_present) {
+            /* The wide compositor surface is at the SSAA scale; output is
+             * present_w*scale × h*scale. Falls back to the canonical hires path
+             * if the displayed buffer has no surface yet. */
+            int s = g_video_scale;
+            int sw = (int)present_w * s;
+            int n = gr_render_wide_display(sdl_pixel_buf, (int)(sw * sizeof(uint32_t)),
+                                           (int)di.display_x, (int)di.display_y, (int)h);
+            if (n > 0) {
+                active_scale = s;
+            } else {
+                wide_present = false;
+                present_w = w;
+            }
+        }
+        if (!wide_present) {
+            if (active_scale > 1) {
+                int sw = (int)present_w * active_scale;
+                gr_render_display_hires(sdl_pixel_buf, (int)(sw * sizeof(uint32_t)),
+                                        (int)di.display_x, (int)di.display_y,
+                                        (int)present_w, (int)h);
+            } else {
+                for (uint32_t y = 0; y < h; y++) {
+                    for (uint32_t x = 0; x < present_w; x++) {
+                        sdl_pixel_buf[y * present_w + x] = gpu_display_pixel_argb(&di, x, y);
+                    }
                 }
             }
         }
@@ -1321,7 +1380,7 @@ static void sdl_vblank_present(void) {
      * smaller modes such as 320x224 for FMV; presenting the full texture would
      * leave the active image stuck in the upper-left portion of the window. */
 #ifndef PSX_SDL_NO_RENDER
-    int src_w = (int)w * active_scale;
+    int src_w = (int)present_w * active_scale;
     int src_h = (int)h * active_scale;
     if (g_gl_active) {
         /* OpenGL present: upload the active display rect and draw a full-screen
@@ -1715,17 +1774,19 @@ int main(int argc, char** argv) {
     gr_set_scale(g_video_scale);
     g_video_scale = gr_scale(); /* reflect any clamp / alloc fallback */
     gr_set_texture_filter(g_video_texfilter);
-    /* Display aspect (widescreen hack). Identity at the default 4:3. The GTE
-     * squashes screen-X around the game's projection centre; both present
-     * paths stretch the 4:3 frame to the configured aspect. */
+    /* Display aspect. Identity at the default 4:3. The present letterbox uses
+     * this aspect; native-wide fills it with a genuinely wider frame (no
+     * stretch), squash mode stretches the 4:3 frame into it. */
     gl_renderer_set_display_aspect(g_video_aspect_num, g_video_aspect_den);
     if (g_video_aspect_num * 3 != g_video_aspect_den * 4) {
-        /* Hold the squash off through the BIOS boot (authentic 4:3 logos);
+        /* Hold widescreen off through the BIOS boot (authentic 4:3 logos);
          * the per-frame present path engages it at game entry. */
         g_ws_engaged = false;
         std::fprintf(stdout,
-                     "psxrecomp: widescreen %d:%d (GTE X-squash + stretched present%s%s; engages at game entry)\n",
+                     "psxrecomp: widescreen %d:%d (%s%s%s; engages at game entry)\n",
                      g_video_aspect_num, g_video_aspect_den,
+                     g_ws_native_wide ? "native-wide, present 1:1"
+                                      : "GTE X-squash + stretched present",
                      g_ws_anchor_addr ? " + sprite tags" : "",
                      g_ws_hud_sprt ? " + HUD squash" : "");
     }

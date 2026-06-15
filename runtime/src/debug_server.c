@@ -3577,6 +3577,7 @@ static void handle_gpu_state(int id, const char *json)
              "\"draw_offset\":[%d,%d],"
              "\"ws\":{\"configured\":%d,\"active\":%d,\"game_mode\":%d,"
              "\"present_native_43\":%d,\"x_margin\":%d,\"squash\":[%d,%d],"
+             "\"mode\":%d,\"nw_extra\":%d,"
              "\"cur_frame\":%llu,\"last_tag_frame\":%u}}",
              id, di.display_x, di.display_y,
              di.width, di.height,
@@ -3591,6 +3592,7 @@ static void handle_gpu_state(int id, const char *json)
              da.offset_x, da.offset_y,
              ws.configured, ws.active, ws.game_mode,
              ws.present_native_43, ws.x_margin, ws.xnum, ws.xden,
+             ws.mode, ws.nw_extra,
              (unsigned long long)ws.cur_frame, ws.last_tag_frame);
 }
 
@@ -5214,9 +5216,23 @@ static void handle_ws_aspect(int id, const char *json)
 {
     int num = json_get_int(json, "num", -1);
     int den = json_get_int(json, "den", -1);
-    if (num <= 0 || den <= 0) { send_err(id, "need num>0 den>0 (1 1 = squash off)"); return; }
+    if (num <= 0 || den <= 0) { send_err(id, "need num>0 den>0 (4 3 = squash off)"); return; }
     gte_set_display_aspect(num, den);
     send_fmt("{\"id\":%d,\"ok\":true,\"num\":%d,\"den\":%d}", id, num, den);
+}
+
+/* Live native-wide vs squash toggle (A/B): ws_nw on=<0|1> re-engages the wide
+ * path in the chosen mode without a relaunch. 2 = native-wide, 1 = squash. */
+extern void psx_ws_set_native_wide(int on);
+extern int  psx_ws_get_native_wide(void);
+static void handle_ws_nw(int id, const char *json)
+{
+    int on = json_get_int(json, "on", -1);
+    if (on >= 0) psx_ws_set_native_wide(on);
+    GpuWsDebug ws;
+    gpu_ws_get_debug(&ws);
+    send_fmt("{\"id\":%d,\"ok\":true,\"native_wide\":%d,\"mode\":%d,\"nw_extra\":%d}",
+             id, psx_ws_get_native_wide(), ws.mode, ws.nw_extra);
 }
 
 /* 8C far-backdrop depth split. ws_far_threshold [t=<SZ>] sets the SZ cutoff
@@ -8504,6 +8520,7 @@ static const CmdEntry s_commands[] = {
     { "gpu_state",         handle_gpu_state },
     { "ws_margin",         handle_ws_margin },
     { "ws_aspect",         handle_ws_aspect },
+    { "ws_nw",             handle_ws_nw },
     { "ws_far_threshold",  handle_ws_far_threshold },
     { "ws_census",         handle_ws_census },
     { "mem_words",         handle_mem_words },
