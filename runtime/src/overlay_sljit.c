@@ -125,8 +125,11 @@ int overlay_sljit_selftest(void) {
  *  (out->fn = NULL) and the caller runs the interpreter (precision over recall).
  * ======================================================================== */
 
-/* cpu pointer lives in S0 after emit_enter(SLJIT_ARGS1V(P), ...). */
+/* cpu pointer lives in S0 after emit_enter(SLJIT_ARGS1V(P), ...). S1 is the
+ * control-transfer temp (branch predicate / jalr|jr-rX target), live only across
+ * a transfer's delay slot — never used by the GPR cache (which starts at S2). */
 #define R_CPU    SLJIT_S0
+#define R_CTRL   SLJIT_S1
 #define GPR_OFF(n)  ((sljit_sw)(offsetof(CPUState, gpr) + 4u * (n)))
 
 /* MIPS field decoders (mirror dirty_ram_interp.c). */
@@ -140,85 +143,203 @@ static inline uint32_t f_imm  (uint32_t i) { return  i        & 0xFFFFu; }
 static inline uint32_t f_tgt26(uint32_t i) { return  i        & 0x03FFFFFFu; }
 static inline sljit_sw f_simm (uint32_t i) { return (sljit_sw)(int32_t)(int16_t)f_imm(i); }
 
-/* gpr[n] -> reg (reads hardwired 0 for n==0 directly from the struct). */
-static void ld_gpr(struct sljit_compiler *C, sljit_s32 reg, uint32_t n) {
-    sljit_emit_op1(C, SLJIT_MOV32, reg, 0, SLJIT_MEM1(R_CPU), GPR_OFF(n));
+/* ===================== block-local GPR register cache =====================
+ * (SLJIT.md "register allocation" — the dominant perf win.) The memory-backed
+ * model loaded each operand from cpu->gpr[] and stored each result back, so a
+ * value produced by one instruction and consumed by the next made a useless
+ * round-trip through memory. Instead we cache MIPS GPRs in host SAVED registers
+ * (S2..S{N-1}) across a straight-line basic block. Saved registers are callee-
+ * saved, so they survive the read_/write_ icalls a plain load/store emits — the
+ * cache is only disturbed at basic-block boundaries and around helpers/calls
+ * that touch cpu->gpr[] in memory:
+ *   - gpr_flush  stores dirty slots to memory (keeps them, now clean): before
+ *                every control transfer, and before a helper/call that READS gpr.
+ *   - gpr_reset  drops all mappings (no store): at every branch-target label (a
+ *                join — all edges then read from memory) AFTER a preceding flush,
+ *                and after any helper/call that WROTE gpr (memory now supersedes
+ *                the cache). Unconditional transfers reset too (following code is
+ *                dead or label-guarded).
+ *   - gpr[0] is never cached (reads => IMM 0, writes => discarded).
+ * Correctness is independent of perf: a cache bug surfaces only as a same-state
+ * differential divergence (sljit shards run live ONLY after passing it), never
+ * as a silently-wrong shipped shard (the precision-over-recall contract). */
+#define GPR_SLOTS_MAX (SLJIT_NUMBER_OF_SAVED_REGISTERS - 2)  /* reserve S0, S1 */
+typedef struct { int reg; int dirty; int pinned; uint32_t lru; } GprSlot;
+static GprSlot  s_gpr[GPR_SLOTS_MAX];
+static int      s_gpr_slots;     /* active slots this compile (<= GPR_SLOTS_MAX)*/
+static uint32_t s_gpr_lru;
+
+static inline sljit_s32 slot_reg(int k) { return SLJIT_S(k + 2); } /* S2.. */
+
+static void gpr_reset(void) {
+    for (int k = 0; k < s_gpr_slots; k++) { s_gpr[k].reg = -1; s_gpr[k].dirty = 0; s_gpr[k].pinned = 0; }
 }
-/* reg -> gpr[n] (skips gpr[0] — hardwired). */
-static void st_gpr(struct sljit_compiler *C, uint32_t n, sljit_s32 reg) {
-    if (n == 0) return;
-    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU), GPR_OFF(n), reg, 0);
+static void gpr_flush(struct sljit_compiler *C) {
+    for (int k = 0; k < s_gpr_slots; k++)
+        if (s_gpr[k].reg >= 0 && s_gpr[k].dirty) {
+            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU),
+                           GPR_OFF((uint32_t)s_gpr[k].reg), slot_reg(k), 0);
+            s_gpr[k].dirty = 0;
+        }
+}
+static int gpr_find(int n) {
+    for (int k = 0; k < s_gpr_slots; k++) if (s_gpr[k].reg == n) return k;
+    return -1;
+}
+/* Pick a slot for MIPS reg n (n != 0): reuse n's slot, else an empty slot, else
+ * evict the LRU unpinned slot (flushing it if dirty). At most 3 slots are pinned
+ * per instruction and s_gpr_slots >= 4 whenever any reg is used, so a victim
+ * always exists. */
+static int gpr_alloc(struct sljit_compiler *C, int n) {
+    int k = gpr_find(n);
+    if (k >= 0) return k;
+    int empty = -1, victim = -1; uint32_t best = 0xFFFFFFFFu;
+    for (int j = 0; j < s_gpr_slots; j++) {
+        if (s_gpr[j].reg < 0) { empty = j; break; }
+        if (!s_gpr[j].pinned && s_gpr[j].lru < best) { best = s_gpr[j].lru; victim = j; }
+    }
+    k = (empty >= 0) ? empty : victim;
+    if (k < 0) k = 0;   /* unreachable given the pin invariant; defensive */
+    if (s_gpr[k].reg >= 0 && s_gpr[k].dirty)
+        sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU),
+                       GPR_OFF((uint32_t)s_gpr[k].reg), slot_reg(k), 0);
+    s_gpr[k].reg = n; s_gpr[k].dirty = 0; s_gpr[k].pinned = 0;
+    return k;
+}
+/* Source operand for reading MIPS reg n. $0 => IMM 0; else the slot host reg
+ * (loading it from memory on a cache miss). Pins the slot for this instruction. */
+static void gpr_src(struct sljit_compiler *C, uint32_t n, sljit_s32 *r, sljit_sw *w) {
+    *w = 0;
+    if (n == 0) { *r = SLJIT_IMM; return; }
+    int k = gpr_find((int)n);
+    if (k < 0) {
+        k = gpr_alloc(C, (int)n);
+        sljit_emit_op1(C, SLJIT_MOV32, slot_reg(k), 0, SLJIT_MEM1(R_CPU), GPR_OFF(n));
+    }
+    s_gpr[k].pinned = 1; s_gpr[k].lru = ++s_gpr_lru;
+    *r = slot_reg(k);
+}
+/* Destination host reg for writing MIPS reg n. $0 => scratch sink (discarded);
+ * else the (dirty-marked) slot reg. Won't evict pinned (source) slots. */
+static sljit_s32 gpr_dst(struct sljit_compiler *C, uint32_t n) {
+    if (n == 0) return SLJIT_R0;
+    int k = gpr_alloc(C, (int)n);
+    s_gpr[k].dirty = 1; s_gpr[k].lru = ++s_gpr_lru;
+    return slot_reg(k);
+}
+static void gpr_unpin(void) { for (int k = 0; k < s_gpr_slots; k++) s_gpr[k].pinned = 0; }
+
+/* Force an operand to be a register (materialize an IMM into `scratch`). Only
+ * needed where sljit would see BOTH operands as immediates (the rare $0,$0
+ * shape) or an icall/DIVMOD requires a named scratch. */
+static void as_reg(struct sljit_compiler *C, sljit_s32 *r, sljit_sw *w, sljit_s32 scratch) {
+    if (*r == SLJIT_IMM) {
+        sljit_emit_op1(C, SLJIT_MOV32, scratch, 0, SLJIT_IMM, *w);
+        *r = scratch; *w = 0;
+    }
 }
 
 /* rd = rs <op2> rt (register-register ALU). */
 static void emit_alu_rr(struct sljit_compiler *C, sljit_s32 op,
                         uint32_t rd, uint32_t rs, uint32_t rt) {
-    ld_gpr(C, SLJIT_R0, rs);
-    ld_gpr(C, SLJIT_R1, rt);
-    sljit_emit_op2(C, op, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
-    st_gpr(C, rd, SLJIT_R0);
+    sljit_s32 a, b, d; sljit_sw aw, bw;
+    gpr_src(C, rs, &a, &aw);
+    gpr_src(C, rt, &b, &bw);
+    if (a == SLJIT_IMM && b == SLJIT_IMM) as_reg(C, &a, &aw, SLJIT_R0);
+    d = gpr_dst(C, rd);
+    sljit_emit_op2(C, op, d, 0, a, aw, b, bw);
+    gpr_unpin();
 }
 
 /* rd = rt <shift> sh (immediate shift). */
 static void emit_shift_imm(struct sljit_compiler *C, sljit_s32 op,
                            uint32_t rd, uint32_t rt, uint32_t sh) {
-    ld_gpr(C, SLJIT_R0, rt);
-    sljit_emit_op2(C, op, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)sh);
-    st_gpr(C, rd, SLJIT_R0);
+    sljit_s32 a, d; sljit_sw aw;
+    gpr_src(C, rt, &a, &aw);
+    if (a == SLJIT_IMM) as_reg(C, &a, &aw, SLJIT_R0);
+    d = gpr_dst(C, rd);
+    sljit_emit_op2(C, op, d, 0, a, aw, SLJIT_IMM, (sljit_sw)sh);
+    gpr_unpin();
 }
 
 /* rd = rt <shift> (rs & 31) (variable shift). */
 static void emit_shift_var(struct sljit_compiler *C, sljit_s32 op,
                            uint32_t rd, uint32_t rt, uint32_t rs) {
-    ld_gpr(C, SLJIT_R1, rs);
-    sljit_emit_op2(C, SLJIT_AND32, SLJIT_R1, 0, SLJIT_R1, 0, SLJIT_IMM, 31);
-    ld_gpr(C, SLJIT_R0, rt);
-    sljit_emit_op2(C, op, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
-    st_gpr(C, rd, SLJIT_R0);
+    sljit_s32 a, c, d; sljit_sw aw, cw;
+    gpr_src(C, rs, &c, &cw);
+    if (c == SLJIT_IMM) {
+        /* count known at compile time (rs == $0 => 0): fold to an immediate shift */
+        gpr_src(C, rt, &a, &aw);
+        if (a == SLJIT_IMM) as_reg(C, &a, &aw, SLJIT_R0);
+        d = gpr_dst(C, rd);
+        sljit_emit_op2(C, op, d, 0, a, aw, SLJIT_IMM, (sljit_sw)(cw & 31));
+    } else {
+        sljit_emit_op2(C, SLJIT_AND32, SLJIT_R1, 0, c, 0, SLJIT_IMM, 31);
+        gpr_src(C, rt, &a, &aw);
+        if (a == SLJIT_IMM) as_reg(C, &a, &aw, SLJIT_R0);
+        d = gpr_dst(C, rd);
+        sljit_emit_op2(C, op, d, 0, a, aw, SLJIT_R1, 0);
+    }
+    gpr_unpin();
 }
 
-/* dst = (a <cond> b) ? 1 : 0, via flags. a/b already in R0/R1 or R0/IMM. */
-static void emit_setcc(struct sljit_compiler *C, sljit_s32 subop_setflag,
-                       sljit_s32 cc, uint32_t dst,
-                       sljit_s32 b_reg, sljit_sw b_imm) {
-    sljit_emit_op2u(C, subop_setflag, SLJIT_R0, 0,
-                    (b_reg == SLJIT_IMM) ? SLJIT_IMM : b_reg, b_imm);
-    sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_R0, 0, cc);
-    st_gpr(C, dst, SLJIT_R0);
+/* dst = (rs <cond> b) ? 1 : 0, via flags. b is gpr[rt] (has_rt) or `imm`. The
+ * dest slot is allocated BEFORE the flag-setting compare so a spill store can't
+ * clobber the flags between op2u and op_flags. */
+static void emit_slt(struct sljit_compiler *C, sljit_s32 setflag, sljit_s32 cc,
+                     uint32_t dst, uint32_t rs, int has_rt, uint32_t rt, sljit_sw imm) {
+    sljit_s32 a, b, d; sljit_sw aw, bw;
+    gpr_src(C, rs, &a, &aw);
+    if (has_rt) gpr_src(C, rt, &b, &bw); else { b = SLJIT_IMM; bw = imm; }
+    if (a == SLJIT_IMM && b == SLJIT_IMM) as_reg(C, &a, &aw, SLJIT_R0);
+    d = gpr_dst(C, dst);
+    sljit_emit_op2u(C, setflag, a, aw, b, bw);
+    sljit_emit_op_flags(C, SLJIT_MOV32, d, 0, cc);
+    gpr_unpin();
 }
 
 /* Load via cpu->read_* (icall ARGS1(32,32)); addr = gpr[rs] + simm. `ext`
- * is the post-call sign/zero extension op (SLJIT_MOV32 for word). */
+ * is the post-call sign/zero extension op (SLJIT_MOV32 for word). The icall
+ * clobbers scratch regs only; the GPR cache (saved regs) survives. */
 static void emit_load(struct sljit_compiler *C, size_t fnoff, sljit_s32 ext,
                       uint32_t rt, uint32_t rs, sljit_sw simm) {
-    ld_gpr(C, SLJIT_R0, rs);
+    sljit_s32 a; sljit_sw aw;
+    gpr_src(C, rs, &a, &aw);
+    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, a, aw);          /* addr -> R0 */
     if (simm) sljit_emit_op2(C, SLJIT_ADD32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, simm);
-    /* target fn ptr -> R1 (full word); arg addr already in R0. */
     sljit_emit_op1(C, SLJIT_MOV, SLJIT_R1, 0, SLJIT_MEM1(R_CPU), (sljit_sw)fnoff);
     sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS1(32, 32), SLJIT_R1, 0);
     if (ext != SLJIT_MOV32)
         sljit_emit_op1(C, ext, SLJIT_R0, 0, SLJIT_R0, 0);
-    st_gpr(C, rt, SLJIT_R0);
+    sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, rt), 0, SLJIT_R0, 0);
+    gpr_unpin();
 }
 
 /* Store via cpu->write_* (icall ARGS2V(32,32)); addr = gpr[rs]+simm, val=gpr[rt]. */
 static void emit_store(struct sljit_compiler *C, size_t fnoff,
                        uint32_t rt, uint32_t rs, sljit_sw simm) {
-    ld_gpr(C, SLJIT_R0, rs);
+    sljit_s32 a, b; sljit_sw aw, bw;
+    gpr_src(C, rs, &a, &aw);
+    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, a, aw);          /* addr -> R0 */
     if (simm) sljit_emit_op2(C, SLJIT_ADD32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, simm);
-    ld_gpr(C, SLJIT_R1, rt);
+    gpr_src(C, rt, &b, &bw);
+    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, b, bw);          /* value -> R1 */
     sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(R_CPU), (sljit_sw)fnoff);
     sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2V(32, 32), SLJIT_R2, 0);
+    gpr_unpin();
 }
 
 /* Emit a call to a void helper(CPUState*, uint32_t insn) — used for op-classes
- * that are interpreted by a parity-exact runtime helper (GTE/COP2, unaligned
- * mem) rather than inlined. cpu in R0, insn in R1, helper address in R2. */
+ * interpreted by a parity-exact runtime helper (GTE/COP2, unaligned mem) rather
+ * than inlined. The helper READS and WRITES cpu->gpr[] in memory, so the cache
+ * is flushed before and dropped after. cpu in R0, insn in R1, helper in R2. */
 static void emit_helper2(struct sljit_compiler *C, void *fn, uint32_t insn) {
+    gpr_flush(C);
     sljit_emit_op1(C, SLJIT_MOV,   SLJIT_R0, 0, R_CPU, 0);
     sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, (sljit_sw)insn);
     sljit_emit_op1(C, SLJIT_MOV,   SLJIT_R2, 0, SLJIT_IMM, (sljit_sw)(uintptr_t)fn);
     sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2V(P, 32), SLJIT_R2, 0);
+    gpr_reset();
 }
 
 enum { EMIT_OK = 0, EMIT_TERM = 1, EMIT_ABORT = 2 };
@@ -250,49 +371,53 @@ static int emit_one(struct sljit_compiler *C, uint32_t insn) {
         case 0x24: emit_alu_rr(C, SLJIT_AND32, rd, rs, rt); return EMIT_OK; /* AND */
         case 0x25: emit_alu_rr(C, SLJIT_OR32,  rd, rs, rt); return EMIT_OK; /* OR */
         case 0x26: emit_alu_rr(C, SLJIT_XOR32, rd, rs, rt); return EMIT_OK; /* XOR */
-        case 0x27: /* NOR: ~(rs|rt) */
-            ld_gpr(C, SLJIT_R0, rs); ld_gpr(C, SLJIT_R1, rt);
-            sljit_emit_op2(C, SLJIT_OR32,  SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
-            sljit_emit_op2(C, SLJIT_XOR32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)-1);
-            st_gpr(C, rd, SLJIT_R0);
+        case 0x27: { /* NOR: ~(rs|rt) */
+            sljit_s32 a, b, d; sljit_sw aw, bw;
+            gpr_src(C, rs, &a, &aw); gpr_src(C, rt, &b, &bw);
+            if (a == SLJIT_IMM && b == SLJIT_IMM) as_reg(C, &a, &aw, SLJIT_R0);
+            d = gpr_dst(C, rd);
+            sljit_emit_op2(C, SLJIT_OR32,  d, 0, a, aw, b, bw);
+            sljit_emit_op2(C, SLJIT_XOR32, d, 0, d, 0, SLJIT_IMM, (sljit_sw)-1);
+            gpr_unpin();
             return EMIT_OK;
+        }
         case 0x2A: /* SLT (signed) */
-            ld_gpr(C, SLJIT_R0, rs); ld_gpr(C, SLJIT_R1, rt);
-            emit_setcc(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS, SLJIT_SIG_LESS, rd, SLJIT_R1, 0);
+            emit_slt(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS, SLJIT_SIG_LESS, rd, rs, 1, rt, 0);
             return EMIT_OK;
         case 0x2B: /* SLTU (unsigned) */
-            ld_gpr(C, SLJIT_R0, rs); ld_gpr(C, SLJIT_R1, rt);
-            emit_setcc(C, SLJIT_SUB32 | SLJIT_SET_LESS, SLJIT_LESS, rd, SLJIT_R1, 0);
+            emit_slt(C, SLJIT_SUB32 | SLJIT_SET_LESS, SLJIT_LESS, rd, rs, 1, rt, 0);
             return EMIT_OK;
         case 0x10: /* MFHI rd = hi */
-            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_MEM1(R_CPU),
+            sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, rd), 0, SLJIT_MEM1(R_CPU),
                            (sljit_sw)offsetof(CPUState, hi));
-            st_gpr(C, rd, SLJIT_R0);
             return EMIT_OK;
         case 0x12: /* MFLO rd = lo */
-            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_MEM1(R_CPU),
+            sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, rd), 0, SLJIT_MEM1(R_CPU),
                            (sljit_sw)offsetof(CPUState, lo));
-            st_gpr(C, rd, SLJIT_R0);
             return EMIT_OK;
-        case 0x11: /* MTHI hi = rs */
-            ld_gpr(C, SLJIT_R0, rs);
+        case 0x11: { /* MTHI hi = rs */
+            sljit_s32 a; sljit_sw aw; gpr_src(C, rs, &a, &aw); as_reg(C, &a, &aw, SLJIT_R0);
             sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU),
-                           (sljit_sw)offsetof(CPUState, hi), SLJIT_R0, 0);
+                           (sljit_sw)offsetof(CPUState, hi), a, 0);
+            gpr_unpin();
             return EMIT_OK;
-        case 0x13: /* MTLO lo = rs */
-            ld_gpr(C, SLJIT_R0, rs);
+        }
+        case 0x13: { /* MTLO lo = rs */
+            sljit_s32 a; sljit_sw aw; gpr_src(C, rs, &a, &aw); as_reg(C, &a, &aw, SLJIT_R0);
             sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU),
-                           (sljit_sw)offsetof(CPUState, lo), SLJIT_R0, 0);
+                           (sljit_sw)offsetof(CPUState, lo), a, 0);
+            gpr_unpin();
             return EMIT_OK;
+        }
         case 0x18: /* MULT (signed 32x32 -> 64): hi:lo = sext(rs) * sext(rt) */
-        case 0x19: /* MULTU (unsigned) */
+        case 0x19: { /* MULTU (unsigned) */
             /* Extend both operands to a full host word so a single word MUL gives
              * the true 64-bit product; split into lo (low 32) and hi (>>32, the
              * raw upper 32 — interp does (uint64_t)r >> 32, a logical shift). */
-            sljit_emit_op1(C, (fn == 0x18) ? SLJIT_MOV_S32 : SLJIT_MOV_U32,
-                           SLJIT_R0, 0, SLJIT_MEM1(R_CPU), GPR_OFF(rs));
-            sljit_emit_op1(C, (fn == 0x18) ? SLJIT_MOV_S32 : SLJIT_MOV_U32,
-                           SLJIT_R1, 0, SLJIT_MEM1(R_CPU), GPR_OFF(rt));
+            sljit_s32 a, b; sljit_sw aw, bw; sljit_s32 ext = (fn == 0x18) ? SLJIT_MOV_S32 : SLJIT_MOV_U32;
+            gpr_src(C, rs, &a, &aw); sljit_emit_op1(C, ext, SLJIT_R0, 0, a, aw);
+            gpr_src(C, rt, &b, &bw); sljit_emit_op1(C, ext, SLJIT_R1, 0, b, bw);
+            gpr_unpin();
             sljit_emit_op2(C, SLJIT_MUL, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
             sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU),
                            (sljit_sw)offsetof(CPUState, lo), SLJIT_R0, 0);
@@ -300,11 +425,14 @@ static int emit_one(struct sljit_compiler *C, uint32_t insn) {
             sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU),
                            (sljit_sw)offsetof(CPUState, hi), SLJIT_R0, 0);
             return EMIT_OK;
+        }
         case 0x1A: { /* DIV (signed). Host idiv traps on /0 and INT_MIN/-1, so
                       * branch-guard both to the interpreter's defined results
                       * BEFORE the DIVMOD ever runs. */
-            ld_gpr(C, SLJIT_R0, rs);   /* a */
-            ld_gpr(C, SLJIT_R1, rt);   /* b */
+            sljit_s32 a, b; sljit_sw aw, bw;
+            gpr_src(C, rs, &a, &aw); sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, a, aw); /* a */
+            gpr_src(C, rt, &b, &bw); sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, b, bw); /* b */
+            gpr_unpin();
             struct sljit_jump *j_b0 =
                 sljit_emit_cmp(C, SLJIT_EQUAL | SLJIT_32, SLJIT_R1, 0, SLJIT_IMM, 0);
             struct sljit_jump *j_n1 =
@@ -339,8 +467,10 @@ static int emit_one(struct sljit_compiler *C, uint32_t insn) {
             return EMIT_OK;
         }
         case 0x1B: { /* DIVU (unsigned). Guard /0 to interp's defined result. */
-            ld_gpr(C, SLJIT_R0, rs);   /* a */
-            ld_gpr(C, SLJIT_R1, rt);   /* b */
+            sljit_s32 a, b; sljit_sw aw, bw;
+            gpr_src(C, rs, &a, &aw); sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, a, aw); /* a */
+            gpr_src(C, rt, &b, &bw); sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, b, bw); /* b */
+            gpr_unpin();
             struct sljit_jump *j_d0 =
                 sljit_emit_cmp(C, SLJIT_EQUAL | SLJIT_32, SLJIT_R1, 0, SLJIT_IMM, 0);
             sljit_emit_op0(C, SLJIT_DIVMOD_U32);   /* R0=R0/R1, R1=R0%R1 */
@@ -359,37 +489,35 @@ static int emit_one(struct sljit_compiler *C, uint32_t insn) {
         }
         default: return EMIT_ABORT;
         }
-    case 0x08: case 0x09: /* ADDI/ADDIU rt = rs + simm */
-        ld_gpr(C, SLJIT_R0, rs);
-        sljit_emit_op2(C, SLJIT_ADD32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, simm);
-        st_gpr(C, rt, SLJIT_R0);
+    case 0x08: case 0x09: { /* ADDI/ADDIU rt = rs + simm */
+        sljit_s32 a, d; sljit_sw aw;
+        gpr_src(C, rs, &a, &aw);
+        d = gpr_dst(C, rt);
+        if (a == SLJIT_IMM)   /* rs == $0: rt = simm (the common li idiom) */
+            sljit_emit_op1(C, SLJIT_MOV32, d, 0, SLJIT_IMM, aw + simm);
+        else
+            sljit_emit_op2(C, SLJIT_ADD32, d, 0, a, aw, SLJIT_IMM, simm);
+        gpr_unpin();
         return EMIT_OK;
+    }
     case 0x0A: /* SLTI (signed) */
-        ld_gpr(C, SLJIT_R0, rs);
-        emit_setcc(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS, SLJIT_SIG_LESS, rt, SLJIT_IMM, simm);
+        emit_slt(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS, SLJIT_SIG_LESS, rt, rs, 0, 0, simm);
         return EMIT_OK;
     case 0x0B: /* SLTIU (unsigned, simm sign-extended then compared unsigned) */
-        ld_gpr(C, SLJIT_R0, rs);
-        emit_setcc(C, SLJIT_SUB32 | SLJIT_SET_LESS, SLJIT_LESS, rt, SLJIT_IMM, simm);
+        emit_slt(C, SLJIT_SUB32 | SLJIT_SET_LESS, SLJIT_LESS, rt, rs, 0, 0, simm);
         return EMIT_OK;
-    case 0x0C: /* ANDI (zero-extended imm) */
-        ld_gpr(C, SLJIT_R0, rs);
-        sljit_emit_op2(C, SLJIT_AND32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)imm);
-        st_gpr(C, rt, SLJIT_R0);
+    case 0x0C: case 0x0D: case 0x0E: { /* ANDI / ORI / XORI (zero-extended imm) */
+        sljit_s32 a, d; sljit_sw aw;
+        sljit_s32 aop = (op == 0x0C) ? SLJIT_AND32 : (op == 0x0D) ? SLJIT_OR32 : SLJIT_XOR32;
+        gpr_src(C, rs, &a, &aw);
+        if (a == SLJIT_IMM) as_reg(C, &a, &aw, SLJIT_R0);   /* rs == $0 */
+        d = gpr_dst(C, rt);
+        sljit_emit_op2(C, aop, d, 0, a, aw, SLJIT_IMM, (sljit_sw)imm);
+        gpr_unpin();
         return EMIT_OK;
-    case 0x0D: /* ORI */
-        ld_gpr(C, SLJIT_R0, rs);
-        sljit_emit_op2(C, SLJIT_OR32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)imm);
-        st_gpr(C, rt, SLJIT_R0);
-        return EMIT_OK;
-    case 0x0E: /* XORI */
-        ld_gpr(C, SLJIT_R0, rs);
-        sljit_emit_op2(C, SLJIT_XOR32, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)imm);
-        st_gpr(C, rt, SLJIT_R0);
-        return EMIT_OK;
-    case 0x0F: /* LUI rt = imm << 16 (rt==0 is a nop — st_gpr skips it) */
-        sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, (sljit_sw)(imm << 16));
-        st_gpr(C, rt, SLJIT_R0);
+    }
+    case 0x0F: /* LUI rt = imm << 16 */
+        sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, rt), 0, SLJIT_IMM, (sljit_sw)(imm << 16));
         return EMIT_OK;
     case 0x20: emit_load(C, offsetof(CPUState, read_byte), SLJIT_MOV_S8,  rt, rs, simm); return EMIT_OK; /* LB */
     case 0x21: emit_load(C, offsetof(CPUState, read_half), SLJIT_MOV_S16, rt, rs, simm); return EMIT_OK; /* LH */
@@ -452,42 +580,44 @@ static int classify_control(uint32_t insn, uint32_t off, uint32_t entry_phys,
     return CTRL_NONE;
 }
 
-/* Compute a branch's taken/not-taken predicate (1/0) into S1, reading the
- * source registers at the BRANCH instruction (before its delay slot runs). */
+/* Compute a branch's taken/not-taken predicate (1/0) into R_CTRL (S1), reading
+ * the source registers at the BRANCH instruction (before its delay slot runs).
+ * Reads go through the GPR cache; the predicate lands in S1, which is never a
+ * cache slot, so it survives the delay slot + the pre-jump flush. */
 static void emit_cond_to_S1(struct sljit_compiler *C, uint32_t insn) {
     uint32_t op = f_op(insn), rs = f_rs(insn), rt = f_rt(insn);
+    sljit_s32 a, b; sljit_sw aw, bw;
     switch (op) {
     case 0x04: /* BEQ rs==rt */
-        ld_gpr(C, SLJIT_R0, rs); ld_gpr(C, SLJIT_R1, rt);
-        sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_Z, SLJIT_R0, 0, SLJIT_R1, 0);
-        sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_EQUAL);
-        break;
     case 0x05: /* BNE rs!=rt */
-        ld_gpr(C, SLJIT_R0, rs); ld_gpr(C, SLJIT_R1, rt);
-        sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_Z, SLJIT_R0, 0, SLJIT_R1, 0);
-        sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_NOT_EQUAL);
+        gpr_src(C, rs, &a, &aw); gpr_src(C, rt, &b, &bw);
+        if (a == SLJIT_IMM && b == SLJIT_IMM) as_reg(C, &a, &aw, SLJIT_R0);
+        sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_Z, a, aw, b, bw);
+        sljit_emit_op_flags(C, SLJIT_MOV32, R_CTRL, 0,
+                            (op == 0x04) ? SLJIT_EQUAL : SLJIT_NOT_EQUAL);
         break;
     case 0x06: /* BLEZ rs<=0 */
-        ld_gpr(C, SLJIT_R0, rs);
-        sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
-        sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_SIG_LESS_EQUAL);
+        gpr_src(C, rs, &a, &aw); as_reg(C, &a, &aw, SLJIT_R0);
+        sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS_EQUAL, a, 0, SLJIT_IMM, 0);
+        sljit_emit_op_flags(C, SLJIT_MOV32, R_CTRL, 0, SLJIT_SIG_LESS_EQUAL);
         break;
     case 0x07: /* BGTZ rs>0 */
-        ld_gpr(C, SLJIT_R0, rs);
-        sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_GREATER, SLJIT_R0, 0, SLJIT_IMM, 0);
-        sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_SIG_GREATER);
+        gpr_src(C, rs, &a, &aw); as_reg(C, &a, &aw, SLJIT_R0);
+        sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_GREATER, a, 0, SLJIT_IMM, 0);
+        sljit_emit_op_flags(C, SLJIT_MOV32, R_CTRL, 0, SLJIT_SIG_GREATER);
         break;
     default: /* REGIMM: BLTZ/BLTZAL (rt 0x00/0x10) → rs<0 ; BGEZ/BGEZAL (0x01/0x11) → rs>=0 */
-        ld_gpr(C, SLJIT_R0, rs);
+        gpr_src(C, rs, &a, &aw); as_reg(C, &a, &aw, SLJIT_R0);
         if (rt == 0x00 || rt == 0x10) {
-            sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS, SLJIT_R0, 0, SLJIT_IMM, 0);
-            sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_SIG_LESS);
+            sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS, a, 0, SLJIT_IMM, 0);
+            sljit_emit_op_flags(C, SLJIT_MOV32, R_CTRL, 0, SLJIT_SIG_LESS);
         } else {
-            sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_GREATER_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
-            sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_SIG_GREATER_EQUAL);
+            sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_GREATER_EQUAL, a, 0, SLJIT_IMM, 0);
+            sljit_emit_op_flags(C, SLJIT_MOV32, R_CTRL, 0, SLJIT_SIG_GREATER_EQUAL);
         }
         break;
     }
+    gpr_unpin();
 }
 
 /* Read a little-endian word from the decode image at phys offset `off`. */
@@ -496,6 +626,40 @@ static inline uint32_t img_word(const uint8_t *b, uint32_t off) {
          | ((uint32_t)b[off + 1] <<  8)
          | ((uint32_t)b[off + 2] << 16)
          | ((uint32_t)b[off + 3] << 24);
+}
+
+/* Bitmask of the distinct GPRs an instruction accesses THROUGH THE CACHE (i.e.
+ * via gpr_src/gpr_dst), used to size the saved-register prologue so its push/pop
+ * cost is proportional to a fragment's register pressure. MUST be a SUPERSET of
+ * the cached regs each emit path touches (an omission would under-size the cache
+ * and let gpr_alloc pick an unreserved saved reg). helper2 ops (COP2 / unaligned
+ * mem) and J touch gpr only via memory in the helper, so they contribute 0. */
+static uint32_t gpr_ref_mask(uint32_t insn) {
+    uint32_t op = f_op(insn), fn = f_fn(insn);
+    uint32_t m = 0;
+    if (op == 0x00) {                       /* SPECIAL */
+        if (fn == 0x08)                     /* JR rs (incl. jr $ra) */
+            m = (1u << f_rs(insn));
+        else if (fn == 0x09)                /* JALR rs, link = rd ? rd : 31 */
+            m = (1u << f_rs(insn)) | (1u << (f_rd(insn) ? f_rd(insn) : 31u));
+        else                                /* ALU / shift / mult / div / mf / mt */
+            m = (1u << f_rs(insn)) | (1u << f_rt(insn)) | (1u << f_rd(insn));
+    } else if (op == 0x01) {                /* REGIMM branch (+ link reg for *AL) */
+        uint32_t rt = f_rt(insn);
+        m = (1u << f_rs(insn));
+        if (rt == 0x10u || rt == 0x11u) m |= (1u << 31);
+    } else if (op == 0x03) {                /* JAL: link $ra */
+        m = (1u << 31);
+    } else if (op >= 0x04 && op <= 0x07) {  /* BEQ/BNE/BLEZ/BGTZ */
+        m = (1u << f_rs(insn)) | (1u << f_rt(insn));
+    } else if (op >= 0x08 && op <= 0x0E) {  /* ADDI..XORI, SLTI(U) */
+        m = (1u << f_rs(insn)) | (1u << f_rt(insn));
+    } else if (op == 0x0F) {                /* LUI */
+        m = (1u << f_rt(insn));
+    } else if ((op >= 0x20 && op <= 0x25) || op == 0x28 || op == 0x29 || op == 0x2B) {
+        m = (1u << f_rs(insn)) | (1u << f_rt(insn));   /* loads / stores */
+    }
+    return m & ~1u;                         /* $0 is never cached */
 }
 
 #define SLJIT_MAX_FRAG_INSNS 2048u
@@ -570,17 +734,27 @@ void overlay_sljit_try_compile(uint32_t entry,
         is_target[tw] = 1;
     }
 
+    /* Size the GPR register cache to this fragment's register pressure so the
+     * prologue only saves the saved-regs it will use (push/pop cost ∝ pressure;
+     * see gpr_ref_mask). distinct >= the max regs in any single instruction, so
+     * gpr_alloc always finds a slot. */
+    uint32_t used_mask = 0;
+    for (uint32_t i = 0; i < frag_words; i++)
+        used_mask |= gpr_ref_mask(img_word(bytes, off0 + i * 4u));
+    int distinct = 0;
+    for (uint32_t m = used_mask; m; m &= m - 1u) distinct++;
+    s_gpr_slots = (distinct < GPR_SLOTS_MAX) ? distinct : GPR_SLOTS_MAX;
+    s_gpr_lru = 0;
+
     /* ---- PASS 2: emit ----------------------------------------------------- */
     struct sljit_compiler *C = sljit_create_compiler(NULL);
     if (!C) { s_declines++; sljit_log("compile: create_compiler failed"); return; }
-    /* void shard(CPUState* cpu): S0=cpu, S1=branch predicate / jalr target,
-     * S2=psx_sljit_call address (only when the fragment has calls). Scratches
-     * R0..R4 (operands, fn-ptr, addr/value, call args + icall headroom). */
-    int saveds = (ncalls > 0) ? 3 : 2;
-    sljit_emit_enter(C, 0, SLJIT_ARGS1V(P), 5, saveds, 0);
-    if (ncalls > 0)
-        sljit_emit_op1(C, SLJIT_MOV, SLJIT_S2, 0,
-                       SLJIT_IMM, (sljit_sw)(uintptr_t)psx_sljit_call);
+    /* void shard(CPUState* cpu): S0=cpu (R_CPU), S1=control-transfer temp
+     * (R_CTRL: branch predicate / jalr|jr-rX target), S2..S{1+s_gpr_slots}=GPR
+     * register cache. Scratches R0..R4 (operands, fn-ptr, addr/value, the 4 call
+     * args + the call-helper fn-ptr). */
+    sljit_emit_enter(C, 0, SLJIT_ARGS1V(P), 5, 2 + s_gpr_slots, 0);
+    gpr_reset();
 
     static struct sljit_label *labels[SLJIT_MAX_FRAG_INSNS];
     struct { struct sljit_jump *j; uint32_t tw; } jmps[SLJIT_MAX_FRAG_CTRL];
@@ -597,7 +771,16 @@ void overlay_sljit_try_compile(uint32_t entry,
     int      pend_call_check = 0;   /* apply the (ra,sp) contract after the call*/
 
     for (uint32_t i = 0; i < frag_words; i++) {
-        if (is_target[i]) labels[i] = sljit_emit_label(C);
+        if (is_target[i]) {
+            /* Branch-target = a join. Flush the fall-through edge's dirty regs to
+             * memory (these stores precede the label, so a branch INTO it skips
+             * them — every incoming edge already flushed), then reset the cache so
+             * post-label code reads from memory (the one source all edges agree
+             * on). */
+            gpr_flush(C);
+            gpr_reset();
+            labels[i] = sljit_emit_label(C);
+        }
         uint32_t insn = img_word(bytes, off0 + i * 4u);
 
         if (pending == PEND_NONE) {
@@ -611,11 +794,9 @@ void overlay_sljit_try_compile(uint32_t entry,
                      * delay slot), then branch on the predicate. */
                     if (f_op(insn) == 0x01) {
                         uint32_t rtf = f_rt(insn);
-                        if (rtf == 0x10 || rtf == 0x11) {
-                            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0,
+                        if (rtf == 0x10 || rtf == 0x11)
+                            sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, 31), 0,
                                            SLJIT_IMM, (sljit_sw)(entry + i * 4u + 8u));
-                            st_gpr(C, 31, SLJIT_R0);
-                        }
                     }
                     emit_cond_to_S1(C, insn);  /* predicate read BEFORE the delay slot */
                 }
@@ -625,7 +806,10 @@ void overlay_sljit_try_compile(uint32_t entry,
                 continue;
             }
             if (ctrl == CTRL_TAILJUMP) {       /* jr rX (computed): capture target */
-                ld_gpr(C, SLJIT_S1, f_rs(insn));   /* read BEFORE the delay slot */
+                sljit_s32 a; sljit_sw aw;
+                gpr_src(C, f_rs(insn), &a, &aw);   /* read BEFORE the delay slot */
+                sljit_emit_op1(C, SLJIT_MOV32, R_CTRL, 0, a, aw);
+                gpr_unpin();
                 pending = PEND_TAIL;
                 continue;
             }
@@ -639,17 +823,18 @@ void overlay_sljit_try_compile(uint32_t entry,
                     pend_call_dynamic = 0;
                     pend_call_target  = ((pc_virt + 4u) & 0xF0000000u) | (f_tgt26(insn) << 2);
                     pend_call_check   = 1;
-                    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0,
+                    sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, 31), 0,
                                    SLJIT_IMM, (sljit_sw)pend_call_return);
-                    st_gpr(C, 31, SLJIT_R0);
                 } else {                           /* JALR rd, rs: dynamic target */
                     uint32_t link = crd ? crd : 31u;
+                    sljit_s32 a; sljit_sw aw;
                     pend_call_dynamic = 1;
                     pend_call_check   = (crd == 0 || crd == 31);
-                    ld_gpr(C, SLJIT_S1, crs);      /* capture target before delay slot */
-                    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0,
+                    gpr_src(C, crs, &a, &aw);      /* capture target before delay slot */
+                    sljit_emit_op1(C, SLJIT_MOV32, R_CTRL, 0, a, aw);
+                    sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, link), 0,
                                    SLJIT_IMM, (sljit_sw)pend_call_return);
-                    st_gpr(C, link, SLJIT_R0);
+                    gpr_unpin();
                 }
                 pending = PEND_CALL;
                 continue;
@@ -659,39 +844,51 @@ void overlay_sljit_try_compile(uint32_t entry,
             /* This instruction is the delay slot of the pending control insn;
              * it must be a plain, supported, non-control op (the constraint the
              * interpreter's exec_delay_slot enforces). It executes regardless of
-             * branch outcome, so emit it, THEN apply the pending transfer. */
+             * branch outcome, so emit it, flush the cache to memory (the transfer
+             * makes memory authoritative for the target/callee/return), THEN apply
+             * the pending transfer. */
             int32_t dummy = 0;
             if (classify_control(insn, i * 4u, entry_phys, &dummy) != CTRL_NONE) { aborted = 1; break; }
             if (emit_one(C, insn) != EMIT_OK) { aborted = 1; break; }
+            gpr_flush(C);
             if (pending == PEND_RET) {
                 sljit_emit_return_void(C);
+                gpr_reset();
             } else if (pending == PEND_TAIL) {
-                /* jr rX: transfer to the computed target (cpu->pc = S1), return;
-                 * the dispatch loop re-dispatches there (matches interp jr). */
+                /* jr rX: transfer to the computed target (cpu->pc = R_CTRL),
+                 * return; the dispatch loop re-dispatches there (matches interp). */
                 sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU),
-                               (sljit_sw)offsetof(CPUState, pc), SLJIT_S1, 0);
+                               (sljit_sw)offsetof(CPUState, pc), R_CTRL, 0);
                 sljit_emit_return_void(C);
+                gpr_reset();
             } else if (pending == PEND_BR) {
                 struct sljit_jump *j = pend_cond
-                    ? sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_S1, 0, SLJIT_IMM, 0)
+                    ? sljit_emit_cmp(C, SLJIT_NOT_EQUAL, R_CTRL, 0, SLJIT_IMM, 0)
                     : sljit_emit_jump(C, SLJIT_JUMP);
                 if (njmp >= (int)SLJIT_MAX_FRAG_CTRL) { aborted = 1; break; }
                 jmps[njmp].j = j; jmps[njmp].tw = pend_tw; njmp++;
+                /* Conditional: the not-taken fall-through keeps the just-flushed
+                 * (now-clean) cache. Unconditional J: nothing falls through, so
+                 * the following code is dead or label-guarded — reset. */
+                if (!pend_cond) gpr_reset();
             } else { /* PEND_CALL: psx_sljit_call(cpu, target, return_pc, check) */
                 sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, R_CPU, 0);           /* cpu */
                 if (pend_call_dynamic)
-                    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_S1, 0);  /* jalr target */
+                    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, R_CTRL, 0);    /* jalr target */
                 else
                     sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, (sljit_sw)pend_call_target);
                 sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, (sljit_sw)pend_call_return);
                 sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R3, 0, SLJIT_IMM, (sljit_sw)pend_call_check);
-                sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS4(32, P, 32, 32, 32), SLJIT_S2, 0);
+                sljit_emit_op1(C, SLJIT_MOV,   SLJIT_R4, 0,
+                               SLJIT_IMM, (sljit_sw)(uintptr_t)psx_sljit_call);
+                sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS4(32, P, 32, 32, 32), SLJIT_R4, 0);
                 /* helper returned nonzero ⇒ transfer/bail in progress: return now,
                  * propagating cpu->pc / g_psx_call_bail to the dispatch loop. */
                 struct sljit_jump *cont =
                     sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
                 sljit_emit_return_void(C);
                 sljit_set_label(cont, sljit_emit_label(C));
+                gpr_reset();   /* callee wrote cpu->gpr[] in memory */
             }
             pending = PEND_NONE;
         }
