@@ -132,8 +132,6 @@ int main(void){
       CHECK(jit(w,4)==NULL,"decline: JAL accepted"); }
     { uint32_t w[]={ R(0,V0,0,0,0,0x08), NOP };           /* JR v0 (non-ra) */
       CHECK(jit(w,2)==NULL,"decline: JR non-ra accepted"); }
-    { uint32_t w[]={ R(0,A0,A1,V0,0,0x1A), JR_RA, NOP };  /* DIV (deferred) */
-      CHECK(jit(w,3)==NULL,"decline: DIV accepted"); }
     { uint32_t w[]={ I(4,A0,A1,1), JR_RA, NOP };          /* control in delay slot */
       uint32_t w2[]={ JR_RA, I(4,A0,A1,1) };
       CHECK(jit(w2,2)==NULL,"decline: branch in jr delay slot accepted"); (void)w; }
@@ -187,6 +185,41 @@ int main(void){
     /* 15. Still-decline: JR to non-$ra */
     { uint32_t w[]={ R(0,V0,0,0,0,0x08), NOP };
       CHECK(jit(w,2)==NULL,"decline: JR non-ra accepted"); }
+
+    /* 16. DIV (signed): div a0,a1 ; mflo v0 ; mfhi v1 ; jr ra ; nop */
+    { uint32_t w[]={ R(0,A0,A1,0,0,0x1A), R(0,0,0,V0,0,0x12), R(0,0,0,V1,0,0x10), JR_RA, NOP };
+      OverlaySljitFn fn=jit(w,5); CHECK(fn,"div: declined");
+      if(fn){
+        cpu_init(&cpu); cpu.gpr[A0]=(uint32_t)-20; cpu.gpr[A1]=3; fn(&cpu);
+        CHECK(cpu.gpr[V0]==(uint32_t)-6,"div -20/3 lo: v0=0x%X",cpu.gpr[V0]);
+        CHECK(cpu.gpr[V1]==(uint32_t)-2,"div -20%%3 hi: v1=0x%X",cpu.gpr[V1]);
+        cpu_init(&cpu); cpu.gpr[A0]=5; cpu.gpr[A1]=0; fn(&cpu);          /* /0, a>0 */
+        CHECK(cpu.gpr[V0]==0xFFFFFFFFu,"div 5/0 lo: v0=0x%X",cpu.gpr[V0]);
+        CHECK(cpu.gpr[V1]==5,"div 5/0 hi: v1=%u",cpu.gpr[V1]);
+        cpu_init(&cpu); cpu.gpr[A0]=(uint32_t)-5; cpu.gpr[A1]=0; fn(&cpu);/* /0, a<0 */
+        CHECK(cpu.gpr[V0]==1,"div -5/0 lo: v0=0x%X",cpu.gpr[V0]);
+        cpu_init(&cpu); cpu.gpr[A0]=0x80000000u; cpu.gpr[A1]=(uint32_t)-1; fn(&cpu);/* overflow */
+        CHECK(cpu.gpr[V0]==0x80000000u,"div INT_MIN/-1 lo: v0=0x%X",cpu.gpr[V0]);
+        CHECK(cpu.gpr[V1]==0,"div INT_MIN/-1 hi: v1=%u",cpu.gpr[V1]); } }
+
+    /* 17. DIVU (unsigned): divu a0,a1 ; mflo v0 ; mfhi v1 */
+    { uint32_t w[]={ R(0,A0,A1,0,0,0x1B), R(0,0,0,V0,0,0x12), R(0,0,0,V1,0,0x10), JR_RA, NOP };
+      OverlaySljitFn fn=jit(w,5); CHECK(fn,"divu: declined");
+      if(fn){
+        cpu_init(&cpu); cpu.gpr[A0]=20; cpu.gpr[A1]=3; fn(&cpu);
+        CHECK(cpu.gpr[V0]==6 && cpu.gpr[V1]==2,"divu 20/3: v0=%u v1=%u",cpu.gpr[V0],cpu.gpr[V1]);
+        cpu_init(&cpu); cpu.gpr[A0]=20; cpu.gpr[A1]=0; fn(&cpu);          /* /0 */
+        CHECK(cpu.gpr[V0]==0xFFFFFFFFu && cpu.gpr[V1]==20,"divu 20/0: v0=0x%X v1=%u",cpu.gpr[V0],cpu.gpr[V1]); } }
+
+    /* 18. J (forward absolute): skip the v0=99 store
+     *   0 addiu v0,zero,1 ; 1 j ->word4 ; 2 nop ; 3 addiu v0,zero,99 (skipped)
+     *   4 jr ra ; 5 nop                                                       */
+    { uint32_t tphys = (BASE & 0x1FFFFFFFu) + 4u*4u;       /* word 4 */
+      uint32_t ji = (2u<<26) | ((tphys>>2) & 0x03FFFFFFu);
+      uint32_t w[]={ I(9,ZERO,V0,1), ji, NOP, I(9,ZERO,V0,99), JR_RA, NOP };
+      OverlaySljitFn fn=jit(w,6); CHECK(fn,"J: declined");
+      if(fn){ cpu_init(&cpu); fn(&cpu);
+        CHECK(cpu.gpr[V0]==1,"J skip: v0=%u (want 1)",cpu.gpr[V0]); } }
 
     printf("\nsljit_emit_test: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
