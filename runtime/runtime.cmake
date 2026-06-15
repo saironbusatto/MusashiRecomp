@@ -153,6 +153,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/overlay_loader.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_sljit.c
     ${PSXRECOMP_ROOT}/runtime/src/autocompile.c
+    ${PSXRECOMP_ROOT}/runtime/src/code_provider.c
     ${PSXRECOMP_ROOT}/runtime/src/event_ring.c
     ${PSXRECOMP_ROOT}/recompiler/src/config_loader.cpp
     # Tier-2 in-process JIT backend (sljit, BSD-2-Clause). Single TU; sljit
