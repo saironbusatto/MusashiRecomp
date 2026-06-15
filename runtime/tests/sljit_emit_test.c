@@ -47,6 +47,9 @@ int psx_sljit_call(CPUState *cpu, uint32_t target, uint32_t return_pc, int check
     cpu->pc = 0;
     return 0;                   /* continue */
 }
+/* Link stubs for the GTE/unaligned helpers (validated live, not in the harness). */
+void psx_sljit_cop2(CPUState *cpu, uint32_t insn){ (void)cpu; (void)insn; }
+void psx_sljit_memx(CPUState *cpu, uint32_t insn){ (void)cpu; (void)insn; }
 
 /* ---- MIPS encoders ----------------------------------------------------- */
 #define ZERO 0

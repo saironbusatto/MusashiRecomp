@@ -105,6 +105,16 @@ void overlay_sljit_get_status(int *available, int *selftest_ok,
 int psx_sljit_call(CPUState *cpu, uint32_t target, uint32_t return_pc,
                    int check_contract);
 
+/* Per-instruction helpers a shard calls for op-classes that are emitted as a
+ * call rather than inlined — each reproduces the dirty-RAM interpreter's exact
+ * behaviour for that instruction (parity by construction). Defined in
+ * overlay_loader.c.
+ *   psx_sljit_cop2 — COP2/GTE: MFC2/CFC2/MTC2/CTC2/cmd (op 0x12), LWC2 (0x32),
+ *                    SWC2 (0x3A).
+ *   psx_sljit_memx — unaligned mem: LWL/LWR/SWL/SWR (op 0x22/0x26/0x2A/0x2E). */
+void psx_sljit_cop2(CPUState *cpu, uint32_t insn);
+void psx_sljit_memx(CPUState *cpu, uint32_t insn);
+
 #ifdef __cplusplus
 }
 #endif

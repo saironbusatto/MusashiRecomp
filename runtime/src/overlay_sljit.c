@@ -211,6 +211,16 @@ static void emit_store(struct sljit_compiler *C, size_t fnoff,
     sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2V(32, 32), SLJIT_R2, 0);
 }
 
+/* Emit a call to a void helper(CPUState*, uint32_t insn) — used for op-classes
+ * that are interpreted by a parity-exact runtime helper (GTE/COP2, unaligned
+ * mem) rather than inlined. cpu in R0, insn in R1, helper address in R2. */
+static void emit_helper2(struct sljit_compiler *C, void *fn, uint32_t insn) {
+    sljit_emit_op1(C, SLJIT_MOV,   SLJIT_R0, 0, R_CPU, 0);
+    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, (sljit_sw)insn);
+    sljit_emit_op1(C, SLJIT_MOV,   SLJIT_R2, 0, SLJIT_IMM, (sljit_sw)(uintptr_t)fn);
+    sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2V(P, 32), SLJIT_R2, 0);
+}
+
 enum { EMIT_OK = 0, EMIT_TERM = 1, EMIT_ABORT = 2 };
 
 /* Emit ONE non-control instruction. Returns EMIT_OK, or EMIT_TERM iff `insn`
@@ -389,12 +399,20 @@ static int emit_one(struct sljit_compiler *C, uint32_t insn) {
     case 0x28: emit_store(C, offsetof(CPUState, write_byte), rt, rs, simm); return EMIT_OK; /* SB */
     case 0x29: emit_store(C, offsetof(CPUState, write_half), rt, rs, simm); return EMIT_OK; /* SH */
     case 0x2B: emit_store(C, offsetof(CPUState, write_word), rt, rs, simm); return EMIT_OK; /* SW */
+    case 0x22: case 0x26: case 0x2A: case 0x2E:   /* LWL/LWR/SWL/SWR */
+        emit_helper2(C, (void *)psx_sljit_memx, insn);
+        return EMIT_OK;
+    case 0x12:                                     /* COP2 (MFC2/CFC2/MTC2/CTC2/cmd) */
+    case 0x32: case 0x3A:                          /* LWC2 / SWC2 */
+        emit_helper2(C, (void *)psx_sljit_cop2, insn);
+        return EMIT_OK;
     default: return EMIT_ABORT;
     }
 }
 
 /* ---- control-flow classification (no emission) ------------------------- */
-enum { CTRL_NONE = 0, CTRL_RETURN, CTRL_BRANCH, CTRL_JUMP, CTRL_CALL, CTRL_ABORT };
+enum { CTRL_NONE = 0, CTRL_RETURN, CTRL_BRANCH, CTRL_JUMP, CTRL_CALL,
+       CTRL_TAILJUMP, CTRL_ABORT };
 
 /* Classify a possible control instruction. For CTRL_BRANCH (conditional) and
  * CTRL_JUMP (unconditional J), *out_tbyte is the target as a SIGNED byte offset
@@ -407,8 +425,8 @@ static int classify_control(uint32_t insn, uint32_t off, uint32_t entry_phys,
                             int32_t *out_tbyte) {
     uint32_t op = f_op(insn), fn = f_fn(insn), rs = f_rs(insn), rt = f_rt(insn);
     if (op == 0x00) {
-        if (fn == 0x08) return (rs == 31) ? CTRL_RETURN : CTRL_ABORT; /* JR */
-        if (fn == 0x09) return CTRL_CALL;                             /* JALR */
+        if (fn == 0x08) return (rs == 31) ? CTRL_RETURN : CTRL_TAILJUMP; /* JR $ra / jr rX */
+        if (fn == 0x09) return CTRL_CALL;                               /* JALR */
         return CTRL_NONE;
     }
     if (op == 0x03) return CTRL_CALL;                                 /* JAL */
@@ -424,11 +442,12 @@ static int classify_control(uint32_t insn, uint32_t off, uint32_t entry_phys,
         return CTRL_BRANCH;
     }
     if (op == 0x01) {                            /* REGIMM */
-        if (rt == 0x00 || rt == 0x01) {          /* BLTZ / BGEZ (no link) */
+        if (rt == 0x00 || rt == 0x01 ||          /* BLTZ / BGEZ */
+            rt == 0x10 || rt == 0x11) {          /* BLTZAL / BGEZAL (link) */
             *out_tbyte = (int32_t)off + 4 + (int32_t)(f_simm(insn) << 2);
             return CTRL_BRANCH;
         }
-        return CTRL_ABORT;                        /* BLTZAL/BGEZAL/other */
+        return CTRL_ABORT;                        /* other REGIMM */
     }
     return CTRL_NONE;
 }
@@ -458,9 +477,9 @@ static void emit_cond_to_S1(struct sljit_compiler *C, uint32_t insn) {
         sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_GREATER, SLJIT_R0, 0, SLJIT_IMM, 0);
         sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_SIG_GREATER);
         break;
-    default: /* REGIMM: BLTZ (rt==0) / BGEZ (rt==1) */
+    default: /* REGIMM: BLTZ/BLTZAL (rt 0x00/0x10) → rs<0 ; BGEZ/BGEZAL (0x01/0x11) → rs>=0 */
         ld_gpr(C, SLJIT_R0, rs);
-        if (rt == 0x00) {
+        if (rt == 0x00 || rt == 0x10) {
             sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS, SLJIT_R0, 0, SLJIT_IMM, 0);
             sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_SIG_LESS);
         } else {
@@ -532,6 +551,9 @@ void overlay_sljit_try_compile(uint32_t entry,
             if (i + 1u < SLJIT_MAX_FRAG_INSNS) is_ds[i + 1u] = 1;
             ncalls++;
         }
+        if (ctrl == CTRL_TAILJUMP) {       /* jr rX (computed): interior transfer */
+            if (i + 1u < SLJIT_MAX_FRAG_INSNS) is_ds[i + 1u] = 1;
+        }
         /* CTRL_NONE: straight-line, continue. */
     }
     if (!found_term || frag_words == 0 || frag_words > SLJIT_MAX_FRAG_INSNS) {
@@ -566,7 +588,7 @@ void overlay_sljit_try_compile(uint32_t entry,
     for (uint32_t i = 0; i < frag_words; i++) labels[i] = NULL;
 
     int aborted = 0;
-    enum { PEND_NONE = 0, PEND_RET, PEND_BR, PEND_CALL } pending = PEND_NONE;
+    enum { PEND_NONE = 0, PEND_RET, PEND_BR, PEND_CALL, PEND_TAIL } pending = PEND_NONE;
     uint32_t pend_tw = 0;
     int pend_cond = 0;          /* PEND_BR: 1 = conditional (S1), 0 = unconditional */
     uint32_t pend_call_target = 0;  /* PEND_CALL: jal absolute target           */
@@ -584,11 +606,27 @@ void overlay_sljit_try_compile(uint32_t entry,
             if (ctrl == CTRL_ABORT) { aborted = 1; break; }
             if (ctrl == CTRL_RETURN) { pending = PEND_RET; continue; }
             if (ctrl == CTRL_BRANCH || ctrl == CTRL_JUMP) {
-                if (ctrl == CTRL_BRANCH)
+                if (ctrl == CTRL_BRANCH) {
+                    /* BLTZAL/BGEZAL link $ra = pc+8 (unconditionally, before the
+                     * delay slot), then branch on the predicate. */
+                    if (f_op(insn) == 0x01) {
+                        uint32_t rtf = f_rt(insn);
+                        if (rtf == 0x10 || rtf == 0x11) {
+                            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0,
+                                           SLJIT_IMM, (sljit_sw)(entry + i * 4u + 8u));
+                            st_gpr(C, 31, SLJIT_R0);
+                        }
+                    }
                     emit_cond_to_S1(C, insn);  /* predicate read BEFORE the delay slot */
+                }
                 pending   = PEND_BR;
                 pend_cond = (ctrl == CTRL_BRANCH);
                 pend_tw   = (uint32_t)((int32_t)tbyte / 4);
+                continue;
+            }
+            if (ctrl == CTRL_TAILJUMP) {       /* jr rX (computed): capture target */
+                ld_gpr(C, SLJIT_S1, f_rs(insn));   /* read BEFORE the delay slot */
+                pending = PEND_TAIL;
                 continue;
             }
             if (ctrl == CTRL_CALL) {
@@ -626,6 +664,12 @@ void overlay_sljit_try_compile(uint32_t entry,
             if (classify_control(insn, i * 4u, entry_phys, &dummy) != CTRL_NONE) { aborted = 1; break; }
             if (emit_one(C, insn) != EMIT_OK) { aborted = 1; break; }
             if (pending == PEND_RET) {
+                sljit_emit_return_void(C);
+            } else if (pending == PEND_TAIL) {
+                /* jr rX: transfer to the computed target (cpu->pc = S1), return;
+                 * the dispatch loop re-dispatches there (matches interp jr). */
+                sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU),
+                               (sljit_sw)offsetof(CPUState, pc), SLJIT_S1, 0);
                 sljit_emit_return_void(C);
             } else if (pending == PEND_BR) {
                 struct sljit_jump *j = pend_cond

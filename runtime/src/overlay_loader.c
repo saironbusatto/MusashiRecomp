@@ -1240,6 +1240,62 @@ int psx_sljit_call(CPUState *cpu, uint32_t target, uint32_t return_pc,
     return 0;
 }
 
+/* COP2/GTE helper — mirrors dirty_ram_interp.c case 0x12 + LWC2/SWC2. */
+void psx_sljit_cop2(CPUState *cpu, uint32_t insn) {
+    uint32_t op = (insn >> 26) & 0x3Fu, rs = (insn >> 21) & 0x1Fu;
+    uint32_t rt = (insn >> 16) & 0x1Fu, rd = (insn >> 11) & 0x1Fu;
+    if (op == 0x12) {                              /* COP2 */
+        uint32_t cop_op = rs;
+        if      (cop_op == 0x00) { cpu->gpr[rt] = gte_read_data(cpu, (uint8_t)rd); cpu->gpr[0] = 0; } /* MFC2 */
+        else if (cop_op == 0x02) { cpu->gpr[rt] = gte_read_ctrl(cpu, (uint8_t)rd); cpu->gpr[0] = 0; } /* CFC2 */
+        else if (cop_op == 0x04) { gte_write_data(cpu, (uint8_t)rd, cpu->gpr[rt]); }                  /* MTC2 */
+        else if (cop_op == 0x06) { gte_write_ctrl(cpu, (uint8_t)rd, cpu->gpr[rt]); }                  /* CTC2 */
+        else if (cop_op & 0x10)  { gte_execute(cpu, insn & 0x1FFFFFFu); }                             /* GTE cmd */
+        return;
+    }
+    int32_t  simm = (int32_t)(int16_t)(insn & 0xFFFFu);
+    uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+    if      (op == 0x32) { gte_write_data(cpu, (uint8_t)rt, cpu->read_word(addr)); }   /* LWC2 */
+    else if (op == 0x3A) { cpu->write_word(addr, gte_read_data(cpu, (uint8_t)rt)); }   /* SWC2 */
+}
+
+/* Unaligned load/store helper — mirrors dirty_ram_interp.c interp_lwl/lwr/swl/swr
+ * + cases 0x22/0x26/0x2A/0x2E. */
+void psx_sljit_memx(CPUState *cpu, uint32_t insn) {
+    uint32_t op = (insn >> 26) & 0x3Fu, rs = (insn >> 21) & 0x1Fu, rt = (insn >> 16) & 0x1Fu;
+    int32_t  simm = (int32_t)(int16_t)(insn & 0xFFFFu);
+    uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+    uint32_t aligned = addr & ~3u;
+    uint32_t word = cpu->read_word(aligned);
+    uint32_t sh = addr & 3u, rtv = cpu->gpr[rt], v;
+    switch (op) {
+    case 0x22: /* LWL */
+        switch (sh) { case 0: v = (rtv & 0x00FFFFFFu) | (word << 24); break;
+                      case 1: v = (rtv & 0x0000FFFFu) | (word << 16); break;
+                      case 2: v = (rtv & 0x000000FFu) | (word << 8);  break;
+                      default: v = word; }
+        cpu->gpr[rt] = v; cpu->gpr[0] = 0; break;
+    case 0x26: /* LWR */
+        switch (sh) { case 0: v = word; break;
+                      case 1: v = (rtv & 0xFF000000u) | (word >> 8);  break;
+                      case 2: v = (rtv & 0xFFFF0000u) | (word >> 16); break;
+                      default: v = (rtv & 0xFFFFFF00u) | (word >> 24); }
+        cpu->gpr[rt] = v; cpu->gpr[0] = 0; break;
+    case 0x2A: /* SWL */
+        switch (sh) { case 0: word = (word & 0xFFFFFF00u) | (rtv >> 24); break;
+                      case 1: word = (word & 0xFFFF0000u) | (rtv >> 16); break;
+                      case 2: word = (word & 0xFF000000u) | (rtv >> 8);  break;
+                      default: word = rtv; }
+        cpu->write_word(aligned, word); break;
+    case 0x2E: /* SWR */
+        switch (sh) { case 0: word = rtv; break;
+                      case 1: word = (word & 0x000000FFu) | (rtv << 8);  break;
+                      case 2: word = (word & 0x0000FFFFu) | (rtv << 16); break;
+                      default: word = (word & 0x00FFFFFFu) | (rtv << 24); }
+        cpu->write_word(aligned, word); break;
+    }
+}
+
 /* Write the whole fingerprint log to a file (no TCP size limit). Returns the
  * number of entries written, or -1 on open failure. */
 int overlay_loader_write_fp_file(const char *path) {
