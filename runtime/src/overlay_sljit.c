@@ -253,6 +253,42 @@ static int emit_one(struct sljit_compiler *C, uint32_t insn) {
             ld_gpr(C, SLJIT_R0, rs); ld_gpr(C, SLJIT_R1, rt);
             emit_setcc(C, SLJIT_SUB32 | SLJIT_SET_LESS, SLJIT_LESS, rd, SLJIT_R1, 0);
             return EMIT_OK;
+        case 0x10: /* MFHI rd = hi */
+            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_MEM1(R_CPU),
+                           (sljit_sw)offsetof(CPUState, hi));
+            st_gpr(C, rd, SLJIT_R0);
+            return EMIT_OK;
+        case 0x12: /* MFLO rd = lo */
+            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_MEM1(R_CPU),
+                           (sljit_sw)offsetof(CPUState, lo));
+            st_gpr(C, rd, SLJIT_R0);
+            return EMIT_OK;
+        case 0x11: /* MTHI hi = rs */
+            ld_gpr(C, SLJIT_R0, rs);
+            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU),
+                           (sljit_sw)offsetof(CPUState, hi), SLJIT_R0, 0);
+            return EMIT_OK;
+        case 0x13: /* MTLO lo = rs */
+            ld_gpr(C, SLJIT_R0, rs);
+            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU),
+                           (sljit_sw)offsetof(CPUState, lo), SLJIT_R0, 0);
+            return EMIT_OK;
+        case 0x18: /* MULT (signed 32x32 -> 64): hi:lo = sext(rs) * sext(rt) */
+        case 0x19: /* MULTU (unsigned) */
+            /* Extend both operands to a full host word so a single word MUL gives
+             * the true 64-bit product; split into lo (low 32) and hi (>>32, the
+             * raw upper 32 — interp does (uint64_t)r >> 32, a logical shift). */
+            sljit_emit_op1(C, (fn == 0x18) ? SLJIT_MOV_S32 : SLJIT_MOV_U32,
+                           SLJIT_R0, 0, SLJIT_MEM1(R_CPU), GPR_OFF(rs));
+            sljit_emit_op1(C, (fn == 0x18) ? SLJIT_MOV_S32 : SLJIT_MOV_U32,
+                           SLJIT_R1, 0, SLJIT_MEM1(R_CPU), GPR_OFF(rt));
+            sljit_emit_op2(C, SLJIT_MUL, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_R1, 0);
+            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU),
+                           (sljit_sw)offsetof(CPUState, lo), SLJIT_R0, 0);
+            sljit_emit_op2(C, SLJIT_LSHR, SLJIT_R0, 0, SLJIT_R0, 0, SLJIT_IMM, 32);
+            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU),
+                           (sljit_sw)offsetof(CPUState, hi), SLJIT_R0, 0);
+            return EMIT_OK;
         default: return EMIT_ABORT;
         }
     case 0x08: case 0x09: /* ADDI/ADDIU rt = rs + simm */
@@ -299,6 +335,74 @@ static int emit_one(struct sljit_compiler *C, uint32_t insn) {
     }
 }
 
+/* ---- control-flow classification (no emission) ------------------------- */
+enum { CTRL_NONE = 0, CTRL_RETURN, CTRL_BRANCH, CTRL_ABORT };
+
+/* Classify a possible control instruction. For CTRL_BRANCH, *out_tbyte is the
+ * target as a SIGNED byte offset relative to the fragment entry. `off` is the
+ * instruction's byte offset within the fragment. This slice handles `jr $ra`
+ * (return) and PC-relative conditional branches only; J/JAL/JALR/jr-non-ra/
+ * link-branches are CTRL_ABORT (decline the whole fragment). */
+static int classify_control(uint32_t insn, uint32_t off, int32_t *out_tbyte) {
+    uint32_t op = f_op(insn), fn = f_fn(insn), rs = f_rs(insn), rt = f_rt(insn);
+    if (op == 0x00) {
+        if (fn == 0x08) return (rs == 31) ? CTRL_RETURN : CTRL_ABORT; /* JR */
+        if (fn == 0x09) return CTRL_ABORT;                            /* JALR */
+        return CTRL_NONE;
+    }
+    if (op == 0x02 || op == 0x03) return CTRL_ABORT;                  /* J / JAL */
+    if (op >= 0x04 && op <= 0x07) {              /* BEQ/BNE/BLEZ/BGTZ */
+        *out_tbyte = (int32_t)off + 4 + (int32_t)(f_simm(insn) << 2);
+        return CTRL_BRANCH;
+    }
+    if (op == 0x01) {                            /* REGIMM */
+        if (rt == 0x00 || rt == 0x01) {          /* BLTZ / BGEZ (no link) */
+            *out_tbyte = (int32_t)off + 4 + (int32_t)(f_simm(insn) << 2);
+            return CTRL_BRANCH;
+        }
+        return CTRL_ABORT;                        /* BLTZAL/BGEZAL/other */
+    }
+    return CTRL_NONE;
+}
+
+/* Compute a branch's taken/not-taken predicate (1/0) into S1, reading the
+ * source registers at the BRANCH instruction (before its delay slot runs). */
+static void emit_cond_to_S1(struct sljit_compiler *C, uint32_t insn) {
+    uint32_t op = f_op(insn), rs = f_rs(insn), rt = f_rt(insn);
+    switch (op) {
+    case 0x04: /* BEQ rs==rt */
+        ld_gpr(C, SLJIT_R0, rs); ld_gpr(C, SLJIT_R1, rt);
+        sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_Z, SLJIT_R0, 0, SLJIT_R1, 0);
+        sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_EQUAL);
+        break;
+    case 0x05: /* BNE rs!=rt */
+        ld_gpr(C, SLJIT_R0, rs); ld_gpr(C, SLJIT_R1, rt);
+        sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_Z, SLJIT_R0, 0, SLJIT_R1, 0);
+        sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_NOT_EQUAL);
+        break;
+    case 0x06: /* BLEZ rs<=0 */
+        ld_gpr(C, SLJIT_R0, rs);
+        sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+        sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_SIG_LESS_EQUAL);
+        break;
+    case 0x07: /* BGTZ rs>0 */
+        ld_gpr(C, SLJIT_R0, rs);
+        sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_GREATER, SLJIT_R0, 0, SLJIT_IMM, 0);
+        sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_SIG_GREATER);
+        break;
+    default: /* REGIMM: BLTZ (rt==0) / BGEZ (rt==1) */
+        ld_gpr(C, SLJIT_R0, rs);
+        if (rt == 0x00) {
+            sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS, SLJIT_R0, 0, SLJIT_IMM, 0);
+            sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_SIG_LESS);
+        } else {
+            sljit_emit_op2u(C, SLJIT_SUB32 | SLJIT_SET_SIG_GREATER_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+            sljit_emit_op_flags(C, SLJIT_MOV32, SLJIT_S1, 0, SLJIT_SIG_GREATER_EQUAL);
+        }
+        break;
+    }
+}
+
 /* Read a little-endian word from the decode image at phys offset `off`. */
 static inline uint32_t img_word(const uint8_t *b, uint32_t off) {
     return  (uint32_t)b[off]
@@ -307,7 +411,8 @@ static inline uint32_t img_word(const uint8_t *b, uint32_t off) {
          | ((uint32_t)b[off + 3] << 24);
 }
 
-#define SLJIT_MAX_FRAG_INSNS 4096u
+#define SLJIT_MAX_FRAG_INSNS 2048u
+#define SLJIT_MAX_FRAG_CTRL  512u   /* branches/jumps per fragment cap */
 
 void overlay_sljit_try_compile(uint32_t entry,
                                const uint8_t *bytes, uint32_t size,
@@ -321,43 +426,115 @@ void overlay_sljit_try_compile(uint32_t entry,
     if (entry_phys < base_phys) { s_declines++; return; }
     uint32_t off0 = entry_phys - base_phys;
 
-    struct sljit_compiler *C = sljit_create_compiler(NULL);
-    if (!C) { s_declines++; sljit_log("compile: create_compiler failed"); return; }
+    /* ---- PASS 1: find the terminator, collect branch targets + delay-slot
+     * offsets. Linear scan in memory order (branches don't break the layout);
+     * the fragment is [entry, jr $ra + its delay slot). ----------------------*/
+    static uint8_t is_target[SLJIT_MAX_FRAG_INSNS]; /* index by word            */
+    static uint8_t is_ds[SLJIT_MAX_FRAG_INSNS];     /* word is a delay slot      */
+    /* (static: avoids ~20 KB of stack; the emitter is single-threaded — JIT is
+     * synchronous on the emu thread.) */
+    struct { uint32_t bw; int32_t tbyte; } brs[SLJIT_MAX_FRAG_CTRL];
+    int nbr = 0;
+    uint32_t frag_words = 0;
+    int found_term = 0;
 
-    /* void shard(CPUState* cpu) — cpu arrives in S0. Scratches R0..R3 (operands,
-     * fn-ptr, addr/value, + icall headroom); one saved (S0). No locals. */
-    sljit_emit_enter(C, 0, SLJIT_ARGS1V(P), 4, 1, 0);
+    memset(is_target, 0, sizeof is_target);
+    memset(is_ds, 0, sizeof is_ds);
 
-    uint32_t code_words = 0;
-    int aborted = 0;
     for (uint32_t i = 0; i < SLJIT_MAX_FRAG_INSNS; i++) {
         uint32_t off = off0 + i * 4u;
-        if (off + 4u > size) { aborted = 1; break; }   /* ran off the image */
+        if (off + 4u > size) break;                 /* off image w/o terminator */
         uint32_t insn = img_word(bytes, off);
-        int st = emit_one(C, insn);
-        if (st == EMIT_ABORT) { aborted = 1; break; }
-        if (st == EMIT_TERM) {
-            /* `jr $ra`: emit the delay-slot instruction (must be a plain,
-             * supported, non-control op — same constraint the interpreter's
-             * exec_delay_slot enforces), then return from the shard. The native
-             * return mirrors a gcc candidate's C return: leave cpu->pc as-is
-             * (the call-native contract checks $ra/$sp). */
-            uint32_t doff = off + 4u;
-            if (doff + 4u > size) { aborted = 1; break; }
-            uint32_t ds = img_word(bytes, doff);
-            int dst = emit_one(C, ds);
-            if (dst != EMIT_OK) { aborted = 1; break; }   /* control/unsupported in delay slot */
-            sljit_emit_return_void(C);
-            code_words = i + 2u;   /* jr + its delay slot */
+        int32_t tbyte = 0;
+        int ctrl = classify_control(insn, i * 4u, &tbyte);
+        if (ctrl == CTRL_ABORT) { s_declines++; return; }
+        if (ctrl == CTRL_RETURN) {
+            if (i + 1u < SLJIT_MAX_FRAG_INSNS) is_ds[i + 1u] = 1;
+            frag_words  = i + 2u;                    /* jr + delay slot */
+            found_term  = 1;
             break;
         }
-        /* EMIT_OK: continue straight-line. */
+        if (ctrl == CTRL_BRANCH) {
+            if (i + 1u < SLJIT_MAX_FRAG_INSNS) is_ds[i + 1u] = 1;
+            if (nbr >= (int)SLJIT_MAX_FRAG_CTRL) { s_declines++; return; }
+            brs[nbr].bw = i; brs[nbr].tbyte = tbyte; nbr++;
+        }
+        /* CTRL_NONE: straight-line, continue. */
+    }
+    if (!found_term || frag_words == 0 || frag_words > SLJIT_MAX_FRAG_INSNS) {
+        s_declines++; return;
+    }
+    if (off0 + frag_words * 4u > size) { s_declines++; return; }  /* delay slot off image */
+
+    /* Validate branch targets: in-range, aligned, not landing on a delay slot. */
+    for (int b = 0; b < nbr; b++) {
+        int32_t tb = brs[b].tbyte;
+        if (tb < 0 || (tb & 3) != 0) { s_declines++; return; }
+        uint32_t tw = (uint32_t)tb / 4u;
+        if (tw >= frag_words || is_ds[tw]) { s_declines++; return; }
+        is_target[tw] = 1;
     }
 
-    if (aborted || code_words == 0) {
-        sljit_free_compiler(C);
-        s_declines++;
-        return;
+    /* ---- PASS 2: emit ----------------------------------------------------- */
+    struct sljit_compiler *C = sljit_create_compiler(NULL);
+    if (!C) { s_declines++; sljit_log("compile: create_compiler failed"); return; }
+    /* void shard(CPUState* cpu): cpu in S0; S1 holds a branch predicate.
+     * Scratches R0..R3 (operands, fn-ptr, addr/value + icall headroom). */
+    sljit_emit_enter(C, 0, SLJIT_ARGS1V(P), 4, 2, 0);
+
+    static struct sljit_label *labels[SLJIT_MAX_FRAG_INSNS];
+    struct { struct sljit_jump *j; uint32_t tw; } jmps[SLJIT_MAX_FRAG_CTRL];
+    int njmp = 0;
+    for (uint32_t i = 0; i < frag_words; i++) labels[i] = NULL;
+
+    int aborted = 0;
+    enum { PEND_NONE = 0, PEND_RET, PEND_BR } pending = PEND_NONE;
+    uint32_t pend_tw = 0;
+
+    for (uint32_t i = 0; i < frag_words; i++) {
+        if (is_target[i]) labels[i] = sljit_emit_label(C);
+        uint32_t insn = img_word(bytes, off0 + i * 4u);
+
+        if (pending == PEND_NONE) {
+            int32_t tbyte = 0;
+            int ctrl = classify_control(insn, i * 4u, &tbyte);
+            if (ctrl == CTRL_ABORT) { aborted = 1; break; }
+            if (ctrl == CTRL_RETURN) { pending = PEND_RET; continue; }
+            if (ctrl == CTRL_BRANCH) {
+                emit_cond_to_S1(C, insn);   /* predicate read BEFORE the delay slot */
+                pending = PEND_BR;
+                pend_tw = (uint32_t)((int32_t)tbyte / 4);
+                continue;
+            }
+            if (emit_one(C, insn) != EMIT_OK) { aborted = 1; break; }
+        } else {
+            /* This instruction is the delay slot of the pending control insn;
+             * it must be a plain, supported, non-control op (the constraint the
+             * interpreter's exec_delay_slot enforces). It executes regardless of
+             * branch outcome, so emit it, THEN apply the pending transfer. */
+            int32_t dummy = 0;
+            if (classify_control(insn, i * 4u, &dummy) != CTRL_NONE) { aborted = 1; break; }
+            if (emit_one(C, insn) != EMIT_OK) { aborted = 1; break; }
+            if (pending == PEND_RET) {
+                sljit_emit_return_void(C);
+            } else {
+                struct sljit_jump *j =
+                    sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_S1, 0, SLJIT_IMM, 0);
+                if (njmp >= (int)SLJIT_MAX_FRAG_CTRL) { aborted = 1; break; }
+                jmps[njmp].j = j; jmps[njmp].tw = pend_tw; njmp++;
+            }
+            pending = PEND_NONE;
+        }
+    }
+    if (!aborted && pending != PEND_NONE) aborted = 1;  /* control w/o delay slot */
+    if (aborted) { sljit_free_compiler(C); s_declines++; return; }
+
+    /* Bind each branch jump to its target label. */
+    for (int k = 0; k < njmp; k++) {
+        if (jmps[k].tw >= frag_words || !labels[jmps[k].tw]) {
+            sljit_free_compiler(C); s_declines++; return;   /* defensive */
+        }
+        sljit_set_label(jmps[k].j, labels[jmps[k].tw]);
     }
 
     void *code = sljit_generate_code(C, 0, NULL);
@@ -367,12 +544,12 @@ void overlay_sljit_try_compile(uint32_t entry,
 
     out->fn       = (OverlaySljitFn)code;
     out->code_lo  = entry_phys;
-    out->code_len = code_words * 4u;
-    out->insns    = code_words;
+    out->code_len = frag_words * 4u;
+    out->insns    = frag_words;
     s_compiles++;
     s_bytes += (uint64_t)csz;
-    sljit_log("compile ok @0x%08X: %u insns -> %lu bytes host",
-              entry, code_words, (unsigned long)csz);
+    sljit_log("compile ok @0x%08X: %u insns (%d br) -> %lu bytes host",
+              entry, frag_words, nbr, (unsigned long)csz);
 }
 
 void overlay_sljit_get_status(int *available, int *selftest_ok,

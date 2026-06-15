@@ -37,6 +37,7 @@ static void cpu_init(CPUState *c){
 /* ---- MIPS encoders ----------------------------------------------------- */
 #define ZERO 0
 #define V0 2
+#define V1 3
 #define A0 4
 #define A1 5
 #define T0 8
@@ -136,6 +137,56 @@ int main(void){
     { uint32_t w[]={ I(4,A0,A1,1), JR_RA, NOP };          /* control in delay slot */
       uint32_t w2[]={ JR_RA, I(4,A0,A1,1) };
       CHECK(jit(w2,2)==NULL,"decline: branch in jr delay slot accepted"); (void)w; }
+
+    /* 10. MULT (signed) + MFHI/MFLO: -3 * 5 = -15 => hi=0xFFFFFFFF lo=0xFFFFFFF1 */
+    { uint32_t w[]={ R(0,A0,A1,0,0,0x18), R(0,0,0,V0,0,0x10), R(0,0,0,V1,0,0x12), JR_RA, NOP };
+      OverlaySljitFn fn=jit(w,5); CHECK(fn,"mult: declined");
+      if(fn){ cpu_init(&cpu); cpu.gpr[A0]=(uint32_t)-3; cpu.gpr[A1]=5; fn(&cpu);
+        CHECK(cpu.gpr[V0]==0xFFFFFFFFu,"mult hi: v0=0x%X",cpu.gpr[V0]);
+        CHECK(cpu.gpr[V1]==0xFFFFFFF1u,"mult lo: v1=0x%X",cpu.gpr[V1]); } }
+
+    /* 11. MULTU (unsigned): 0xFFFFFFFF * 2 = 0x1FFFFFFFE => hi=1 lo=0xFFFFFFFE */
+    { uint32_t w[]={ R(0,A0,A1,0,0,0x19), R(0,0,0,V0,0,0x10), R(0,0,0,V1,0,0x12), JR_RA, NOP };
+      OverlaySljitFn fn=jit(w,5); CHECK(fn,"multu: declined");
+      if(fn){ cpu_init(&cpu); cpu.gpr[A0]=0xFFFFFFFFu; cpu.gpr[A1]=2; fn(&cpu);
+        CHECK(cpu.gpr[V0]==1u,"multu hi: v0=0x%X",cpu.gpr[V0]);
+        CHECK(cpu.gpr[V1]==0xFFFFFFFEu,"multu lo: v1=0x%X",cpu.gpr[V1]); } }
+
+    /* 12. Loop (backward branch): v0 = sum(1..a0)
+     *   0 addiu v0,zero,0 ; 1 addiu t0,a0,0
+     *   2 blez t0,end(+5) ; 3 nop
+     *   4 addu v0,v0,t0   ; 5 addiu t0,t0,-1
+     *   6 beq zero,zero,loop(-5) ; 7 nop ; 8 jr ra ; 9 nop                  */
+    { uint32_t w[]={ I(9,ZERO,V0,0), I(9,A0,T0,0),
+                     I(6,T0,0,5), NOP,
+                     R(0,V0,T0,V0,0,0x21), I(9,T0,T0,0xFFFF),
+                     I(4,ZERO,ZERO,(uint16_t)(-5)), NOP, JR_RA, NOP };
+      OverlaySljitFn fn=jit(w,10); CHECK(fn,"loop: declined");
+      if(fn){ cpu_init(&cpu); cpu.gpr[A0]=5; fn(&cpu);
+        CHECK(cpu.gpr[V0]==15,"loop sum(1..5): v0=%u",cpu.gpr[V0]);
+        cpu_init(&cpu); cpu.gpr[A0]=0; fn(&cpu);
+        CHECK(cpu.gpr[V0]==0,"loop sum(1..0): v0=%u",cpu.gpr[V0]); } }
+
+    /* 13. Forward conditional: v0 = max(a0,a1) (signed)
+     *   0 slt t0,a0,a1 ; 1 bne t0,zero,L1(+4) ; 2 nop
+     *   3 addu v0,a0,zero ; 4 beq zero,zero,L2(+2) ; 5 nop
+     *   6 L1: addu v0,a1,zero ; 7 L2: jr ra ; 8 nop                          */
+    { uint32_t w[]={ R(0,A0,A1,T0,0,0x2A), I(5,T0,ZERO,4), NOP,
+                     R(0,A0,ZERO,V0,0,0x21), I(4,ZERO,ZERO,2), NOP,
+                     R(0,A1,ZERO,V0,0,0x21), JR_RA, NOP };
+      OverlaySljitFn fn=jit(w,9); CHECK(fn,"max: declined");
+      if(fn){ cpu_init(&cpu); cpu.gpr[A0]=10; cpu.gpr[A1]=7; fn(&cpu);
+        CHECK(cpu.gpr[V0]==10,"max(10,7): v0=%u",cpu.gpr[V0]);
+        cpu_init(&cpu); cpu.gpr[A0]=3; cpu.gpr[A1]=8; fn(&cpu);
+        CHECK(cpu.gpr[V0]==8,"max(3,8): v0=%u",cpu.gpr[V0]); } }
+
+    /* 14. Still-decline: branch target landing on a delay slot (the jr's) */
+    { uint32_t w[]={ I(4,A0,A1,2), NOP, JR_RA, NOP };  /* BEQ target=word3=jr ds */
+      CHECK(jit(w,4)==NULL,"decline: branch into delay slot accepted"); }
+
+    /* 15. Still-decline: JR to non-$ra */
+    { uint32_t w[]={ R(0,V0,0,0,0,0x08), NOP };
+      CHECK(jit(w,2)==NULL,"decline: JR non-ra accepted"); }
 
     printf("\nsljit_emit_test: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
