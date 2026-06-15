@@ -394,7 +394,7 @@ static int emit_one(struct sljit_compiler *C, uint32_t insn) {
 }
 
 /* ---- control-flow classification (no emission) ------------------------- */
-enum { CTRL_NONE = 0, CTRL_RETURN, CTRL_BRANCH, CTRL_JUMP, CTRL_ABORT };
+enum { CTRL_NONE = 0, CTRL_RETURN, CTRL_BRANCH, CTRL_JUMP, CTRL_CALL, CTRL_ABORT };
 
 /* Classify a possible control instruction. For CTRL_BRANCH (conditional) and
  * CTRL_JUMP (unconditional J), *out_tbyte is the target as a SIGNED byte offset
@@ -408,10 +408,10 @@ static int classify_control(uint32_t insn, uint32_t off, uint32_t entry_phys,
     uint32_t op = f_op(insn), fn = f_fn(insn), rs = f_rs(insn), rt = f_rt(insn);
     if (op == 0x00) {
         if (fn == 0x08) return (rs == 31) ? CTRL_RETURN : CTRL_ABORT; /* JR */
-        if (fn == 0x09) return CTRL_ABORT;                            /* JALR */
+        if (fn == 0x09) return CTRL_CALL;                             /* JALR */
         return CTRL_NONE;
     }
-    if (op == 0x03) return CTRL_ABORT;                                /* JAL */
+    if (op == 0x03) return CTRL_CALL;                                 /* JAL */
     if (op == 0x02) {                            /* J target (absolute) */
         /* In KSEG the region's high bits cancel under the phys mask, so the
          * fragment-relative byte offset is just target_phys - entry_phys. */
@@ -503,6 +503,7 @@ void overlay_sljit_try_compile(uint32_t entry,
      * synchronous on the emu thread.) */
     struct { uint32_t bw; int32_t tbyte; } brs[SLJIT_MAX_FRAG_CTRL];
     int nbr = 0;
+    int ncalls = 0;
     uint32_t frag_words = 0;
     int found_term = 0;
 
@@ -527,6 +528,10 @@ void overlay_sljit_try_compile(uint32_t entry,
             if (nbr >= (int)SLJIT_MAX_FRAG_CTRL) { s_declines++; return; }
             brs[nbr].bw = i; brs[nbr].tbyte = tbyte; nbr++;
         }
+        if (ctrl == CTRL_CALL) {           /* jal/jalr: delay slot, no fragment target */
+            if (i + 1u < SLJIT_MAX_FRAG_INSNS) is_ds[i + 1u] = 1;
+            ncalls++;
+        }
         /* CTRL_NONE: straight-line, continue. */
     }
     if (!found_term || frag_words == 0 || frag_words > SLJIT_MAX_FRAG_INSNS) {
@@ -546,9 +551,14 @@ void overlay_sljit_try_compile(uint32_t entry,
     /* ---- PASS 2: emit ----------------------------------------------------- */
     struct sljit_compiler *C = sljit_create_compiler(NULL);
     if (!C) { s_declines++; sljit_log("compile: create_compiler failed"); return; }
-    /* void shard(CPUState* cpu): cpu in S0; S1 holds a branch predicate.
-     * Scratches R0..R3 (operands, fn-ptr, addr/value + icall headroom). */
-    sljit_emit_enter(C, 0, SLJIT_ARGS1V(P), 4, 2, 0);
+    /* void shard(CPUState* cpu): S0=cpu, S1=branch predicate / jalr target,
+     * S2=psx_sljit_call address (only when the fragment has calls). Scratches
+     * R0..R4 (operands, fn-ptr, addr/value, call args + icall headroom). */
+    int saveds = (ncalls > 0) ? 3 : 2;
+    sljit_emit_enter(C, 0, SLJIT_ARGS1V(P), 5, saveds, 0);
+    if (ncalls > 0)
+        sljit_emit_op1(C, SLJIT_MOV, SLJIT_S2, 0,
+                       SLJIT_IMM, (sljit_sw)(uintptr_t)psx_sljit_call);
 
     static struct sljit_label *labels[SLJIT_MAX_FRAG_INSNS];
     struct { struct sljit_jump *j; uint32_t tw; } jmps[SLJIT_MAX_FRAG_CTRL];
@@ -556,9 +566,13 @@ void overlay_sljit_try_compile(uint32_t entry,
     for (uint32_t i = 0; i < frag_words; i++) labels[i] = NULL;
 
     int aborted = 0;
-    enum { PEND_NONE = 0, PEND_RET, PEND_BR } pending = PEND_NONE;
+    enum { PEND_NONE = 0, PEND_RET, PEND_BR, PEND_CALL } pending = PEND_NONE;
     uint32_t pend_tw = 0;
     int pend_cond = 0;          /* PEND_BR: 1 = conditional (S1), 0 = unconditional */
+    uint32_t pend_call_target = 0;  /* PEND_CALL: jal absolute target           */
+    uint32_t pend_call_return = 0;  /* return address (continuation)            */
+    int      pend_call_dynamic = 0; /* 1 = jalr (target in S1), 0 = jal (const) */
+    int      pend_call_check = 0;   /* apply the (ra,sp) contract after the call*/
 
     for (uint32_t i = 0; i < frag_words; i++) {
         if (is_target[i]) labels[i] = sljit_emit_label(C);
@@ -577,6 +591,31 @@ void overlay_sljit_try_compile(uint32_t entry,
                 pend_tw   = (uint32_t)((int32_t)tbyte / 4);
                 continue;
             }
+            if (ctrl == CTRL_CALL) {
+                /* Link write + (jalr) target capture happen BEFORE the delay slot
+                 * (the delay slot may clobber rs); the dispatch happens AFTER it. */
+                uint32_t cop = f_op(insn), crs = f_rs(insn), crd = f_rd(insn);
+                uint32_t pc_virt = entry + i * 4u;
+                pend_call_return = pc_virt + 8u;
+                if (cop == 0x03) {                 /* JAL: link $ra, absolute target */
+                    pend_call_dynamic = 0;
+                    pend_call_target  = ((pc_virt + 4u) & 0xF0000000u) | (f_tgt26(insn) << 2);
+                    pend_call_check   = 1;
+                    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0,
+                                   SLJIT_IMM, (sljit_sw)pend_call_return);
+                    st_gpr(C, 31, SLJIT_R0);
+                } else {                           /* JALR rd, rs: dynamic target */
+                    uint32_t link = crd ? crd : 31u;
+                    pend_call_dynamic = 1;
+                    pend_call_check   = (crd == 0 || crd == 31);
+                    ld_gpr(C, SLJIT_S1, crs);      /* capture target before delay slot */
+                    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0,
+                                   SLJIT_IMM, (sljit_sw)pend_call_return);
+                    st_gpr(C, link, SLJIT_R0);
+                }
+                pending = PEND_CALL;
+                continue;
+            }
             if (emit_one(C, insn) != EMIT_OK) { aborted = 1; break; }
         } else {
             /* This instruction is the delay slot of the pending control insn;
@@ -588,12 +627,27 @@ void overlay_sljit_try_compile(uint32_t entry,
             if (emit_one(C, insn) != EMIT_OK) { aborted = 1; break; }
             if (pending == PEND_RET) {
                 sljit_emit_return_void(C);
-            } else {
+            } else if (pending == PEND_BR) {
                 struct sljit_jump *j = pend_cond
                     ? sljit_emit_cmp(C, SLJIT_NOT_EQUAL, SLJIT_S1, 0, SLJIT_IMM, 0)
                     : sljit_emit_jump(C, SLJIT_JUMP);
                 if (njmp >= (int)SLJIT_MAX_FRAG_CTRL) { aborted = 1; break; }
                 jmps[njmp].j = j; jmps[njmp].tw = pend_tw; njmp++;
+            } else { /* PEND_CALL: psx_sljit_call(cpu, target, return_pc, check) */
+                sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, R_CPU, 0);           /* cpu */
+                if (pend_call_dynamic)
+                    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_S1, 0);  /* jalr target */
+                else
+                    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, (sljit_sw)pend_call_target);
+                sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, (sljit_sw)pend_call_return);
+                sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R3, 0, SLJIT_IMM, (sljit_sw)pend_call_check);
+                sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS4(32, P, 32, 32, 32), SLJIT_S2, 0);
+                /* helper returned nonzero ⇒ transfer/bail in progress: return now,
+                 * propagating cpu->pc / g_psx_call_bail to the dispatch loop. */
+                struct sljit_jump *cont =
+                    sljit_emit_cmp(C, SLJIT_EQUAL, SLJIT_R0, 0, SLJIT_IMM, 0);
+                sljit_emit_return_void(C);
+                sljit_set_label(cont, sljit_emit_label(C));
             }
             pending = PEND_NONE;
         }
@@ -620,8 +674,8 @@ void overlay_sljit_try_compile(uint32_t entry,
     out->insns    = frag_words;
     s_compiles++;
     s_bytes += (uint64_t)csz;
-    sljit_log("compile ok @0x%08X: %u insns (%d br) -> %lu bytes host",
-              entry, frag_words, nbr, (unsigned long)csz);
+    sljit_log("compile ok @0x%08X: %u insns (%d br, %d call) -> %lu bytes host",
+              entry, frag_words, nbr, ncalls, (unsigned long)csz);
 }
 
 void overlay_sljit_get_status(int *available, int *selftest_ok,

@@ -321,7 +321,8 @@ static void sljit_mark_tried(uint32_t phys) {
  * register the shard as a candidate on success. Gated by the caller to the
  * validation configuration only (backend==sljit + diff_mode); see the dispatch
  * hook. Decodes from live RAM exactly as the interpreter does. */
-static void try_sljit_region(uint32_t phys) {
+static void try_sljit_region(uint32_t addr) {
+    uint32_t phys = addr & 0x1FFFFFFFu;
     const CodeProvider *cp = code_provider_active();
     if (!cp->compile_fragment) return;
     if (sljit_already_tried(phys)) return;
@@ -331,8 +332,11 @@ static void try_sljit_region(uint32_t phys) {
     uint8_t *ram = memory_get_ram_ptr();
     if (!ram) return;
     CompiledFragment frag = {0};
-    /* Decode from live RAM (bytes = RAM base, image_base_vram = 0 ⇒ offset = phys). */
-    cp->compile_fragment(phys, ram, 2u * 1024u * 1024u, 0u, &frag);
+    /* Decode from live RAM: bytes = RAM base, image_base_vram = 0 ⇒ byte offset =
+     * (entry & 0x1FFFFFFF) = phys. Pass the VIRTUAL entry so return_pc and
+     * jal/J targets carry the KSEG bits the guest uses — the interpreter computes
+     * pc from the virtual address, and saved $ra values must match byte-exact. */
+    cp->compile_fragment(addr, ram, 2u * 1024u * 1024u, 0u, &frag);
     if (frag.fn)
         register_sljit_candidate(phys, (OverlayFn)frag.fn, frag.code_lo, frag.code_len);
 }
@@ -756,7 +760,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
          * Live (non-diff) sljit execution stays disabled until the gate passes. */
         if (head < 0 && s_diff_mode && !s_in_shadow &&
             overlay_backend_active() == OVERLAY_BACKEND_SLJIT) {
-            try_sljit_region(phys);
+            try_sljit_region(addr);   /* virtual entry (carries KSEG bits) */
             head = idx_head(phys);
         }
     }
@@ -926,7 +930,9 @@ void overlay_loader_sljit_probe(uint32_t addr, OverlaySljitResult *out) {
     out->fn = NULL; out->code_lo = 0; out->code_len = 0; out->insns = 0;
     uint8_t *ram = memory_get_ram_ptr();
     if (!ram) return;
-    overlay_sljit_try_compile(addr & 0x1FFFFFFFu, ram, 2u * 1024u * 1024u, 0u, out);
+    /* Virtual entry so return_pc / jal targets carry the KSEG bits (see
+     * try_sljit_region); byte offset is still (entry & 0x1FFFFFFF) = phys. */
+    overlay_sljit_try_compile(addr, ram, 2u * 1024u * 1024u, 0u, out);
     if (out->fn)
         register_sljit_candidate(addr & 0x1FFFFFFFu, (OverlayFn)out->fn,
                                  out->code_lo, out->code_len);
@@ -1170,6 +1176,48 @@ int overlay_loader_call_native(CPUState *cpu, uint32_t addr) {
     if (!overlay_loader_dispatch(cpu, addr)) return 0;
     overlay_fp_log(addr, in_regs, cpu, 1);
     return 1;
+}
+
+/* ---- jal/jalr call helper for sljit shards (SLJIT.md §7) ---------------- */
+/* A JIT'd shard calls this at every jal/jalr site instead of open-coding the
+ * call contract. It reproduces the dirty-RAM interpreter's call path EXACTLY
+ * (see exec_one cases 0x03 / SPECIAL 0x09 and dispatch_nonlocal_call), so a
+ * shard-issued call behaves identically to an interpreted one — including the
+ * wild-return / bail unwind that the contract guards (Bug A/C/D family). The
+ * one principled difference from the interpreter's local-dirty fast path: a
+ * native shard cannot resume itself block-by-block, so a not-yet-native callee
+ * is run as a UNIT via psx_dispatch_call (which handles interp/dirty callees to
+ * the return contract) rather than the interpreter's pc-chain. See overlay_sljit.h. */
+int psx_sljit_call(CPUState *cpu, uint32_t target, uint32_t return_pc,
+                   int check_contract) {
+    uint32_t site_sp = cpu->gpr[29];   /* sp at the call (after the delay slot) */
+#ifdef PSX_HAS_GAME_DISPATCH
+    {
+        extern int psx_dispatch_game_compiled(CPUState *cpu, uint32_t addr);
+        cpu->pc = 0;
+        if (psx_dispatch_game_compiled(cpu, target)) {
+            if (g_psx_call_bail) return 1;
+            if (cpu->pc != 0) return 1;
+            if (check_contract && psx_call_contract(cpu, return_pc, site_sp)) return 1;
+            return 0;
+        }
+    }
+#endif
+    cpu->pc = 0;
+    if (overlay_loader_call_native(cpu, target)) {
+        if (g_psx_call_bail) return 1;
+        if (cpu->pc != 0) return 1;
+        if (check_contract && psx_call_contract(cpu, return_pc, site_sp)) return 1;
+        return 0;
+    }
+    /* Not a resolved compiled/native unit: dispatch the callee as a unit (the
+     * interpreter's nonlocal path — handles interp/dirty callees + the return
+     * contract internally). */
+    cpu->pc = 0;
+    psx_dispatch_call(cpu, target, return_pc);
+    if (g_psx_call_bail) return 1;
+    if (cpu->pc != 0) return 1;
+    return 0;
 }
 
 /* Write the whole fingerprint log to a file (no TCP size limit). Returns the
