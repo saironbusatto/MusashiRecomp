@@ -63,6 +63,9 @@ typedef struct {
     int       dll;                       /* source DLL index                   */
     int       next;                      /* next candidate at same addr, -1 end*/
     uint32_t  diff_passes;               /* clean same-state diffs (verify budget)*/
+    int       device_touch;              /* 1 = touches MMIO; never run its shard,
+                                          * always interp (shadow diff can't safely
+                                          * double-execute device I/O). */
 } Candidate;
 
 /* Same-state differential verify budget: diff a candidate this many times with
@@ -139,6 +142,15 @@ uint32_t overlay_loader_get_inprogress(void) { return s_native_inprogress; }
 /* Same-state differential — defined fully below; declared here for dispatch. */
 static int  s_diff_mode = 0;
 static int  s_in_shadow = 0;
+/* Live sljit mode (PSX_OVERLAY_SLJIT_LIVE / sljit_live debug cmd): JIT overlay
+ * functions on-miss and run them LIVE without the per-shard differential — the
+ * production model (sljit is the sync on-miss producer; safety is the emitter's
+ * decline-on-unsupported contract, validated broadly). Off by default; the diff
+ * gate above stays the dev path. Lets a developer feel the real toolchain-less
+ * player experience (pure sljit + interp floor, no gcc, no diff overhead). */
+static int  s_sljit_live = 0;
+void overlay_loader_set_sljit_live(int on) { s_sljit_live = on ? 1 : 0; }
+int  overlay_loader_get_sljit_live(void)   { return s_sljit_live; }
 static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr);
 
 /* ---- Counters (surfaced via overlay_loader_status) --------------------- */
@@ -306,6 +318,7 @@ static void register_sljit_candidate(uint32_t phys, OverlayFn fn,
     c->val_gen  = cand_gensum(c);
     c->state    = ENTRY_VALID;
     c->diff_passes = 0;
+    c->device_touch = 0;
     c->next     = idx_head(c->addr);
     idx_set_head(c->addr, idx);
     s_valid_count++;
@@ -647,6 +660,15 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
     strncpy(s_game_id,   game_id,   sizeof(s_game_id)   - 1);
     init_callbacks();
     scan_cache_dir();
+    /* PSX_OVERLAY_SLJIT_LIVE=1 -> run sljit shards live on-miss (no diff gate):
+     * the toolchain-less production model. Only meaningful with backend=sljit. */
+    {
+        const char *e = getenv("PSX_OVERLAY_SLJIT_LIVE");
+        if (e && *e && *e != '0') {
+            s_sljit_live = 1;
+            loader_log("sljit LIVE mode on (JIT-on-miss, no diff gate)");
+        }
+    }
     s_active = 1;
 }
 
@@ -762,13 +784,12 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
     if (head < 0 && s_active && overlay_cache_window_contains(phys)) {
         try_load_region(phys);
         head = idx_head(phys);
-        /* sljit JIT-on-miss (SLJIT.md §7 step 5), VALIDATION-GATED: only when
-         * the active backend is sljit AND the same-state differential is armed,
-         * and never inside a shadow run. This keeps normal play byte-identical
-         * (no sljit shard is ever created unless explicitly validating) while
-         * letting run_shadow_diff exercise fresh shards against the interpreter.
-         * Live (non-diff) sljit execution stays disabled until the gate passes. */
-        if (head < 0 && s_diff_mode && !s_in_shadow &&
+        /* sljit JIT-on-miss (SLJIT.md §7 step 5). Fires when the active backend is
+         * sljit and EITHER the same-state differential is armed (dev validation
+         * path — shards created then diffed vs interp) OR live mode is on (the
+         * production model — shards created and run live, no per-shard diff).
+         * Never inside a shadow run. */
+        if (head < 0 && (s_diff_mode || s_sljit_live) && !s_in_shadow &&
             overlay_backend_active() == OVERLAY_BACKEND_SLJIT) {
             try_sljit_region(addr);   /* virtual entry (carries KSEG bits) */
             head = idx_head(phys);
@@ -796,6 +817,10 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
                 s_revalidations++;              /* reload-on-return */
                 s_valid_count++;
             }
+            /* Device-touching functions never run their shard: the shadow diff
+             * can't safely double-execute MMIO/SIO/DMA to validate them, so they
+             * always fall to the interpreter (the authoritative single path). */
+            if (c->device_touch) { s_disp_interp++; return 0; }
             /* Same-state differential: run native+interp from identical state,
              * compare, keep the interp result. Takes precedence over the A/B
              * toggle. Verify-budget: once a candidate has passed cleanly enough
@@ -991,7 +1016,10 @@ int overlay_loader_is_candidate(uint32_t phys) {
 #define SHADOW_SPAD_SIZE 1024u
 static uint8_t  s_ram0[SHADOW_RAM_SIZE];   /* pre-call main-RAM snapshot  */
 static uint8_t  s_ramN[SHADOW_RAM_SIZE];   /* post-native main-RAM        */
+static uint8_t  s_ramI[SHADOW_RAM_SIZE];   /* post-interp main-RAM (kept) */
 static uint8_t  s_spad0[SHADOW_SPAD_SIZE]; /* pre-call scratchpad snapshot*/
+static uint8_t  s_spadI[SHADOW_SPAD_SIZE]; /* post-interp scratchpad (kept)*/
+static uint64_t s_shadow_skipped_dev = 0;  /* candidates skipped: touch MMIO */
 /* s_diff_mode / s_in_shadow declared above (before dispatch). */
 
 typedef struct {
@@ -1021,26 +1049,70 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     extern uint8_t *memory_get_ram_ptr(void);
     extern uint8_t *memory_get_scratchpad_ptr(void);
     extern int dirty_ram_dispatch(CPUState *cpu, uint32_t addr, uint32_t stop_addr);
+    extern int      g_shadow_mmio_watch;   /* memory.c — device-access detector */
+    extern uint64_t g_shadow_mmio_hits;
     uint8_t *ram  = memory_get_ram_ptr();
     uint8_t *spad = memory_get_scratchpad_ptr();
 
     s_in_shadow = 1;
     int saved_supp = s_suppress_irq;
     s_suppress_irq = 1;                 /* isolate computation; longjmp-safe */
+    /* Validate ONE function at a time: nested OVERLAY calls run via the
+     * INTERPRETER on BOTH passes (s_native_exec=0). Otherwise the native pass
+     * dispatches each callee as its own native shard while the interp pass runs
+     * it interp, so the diff compares the whole call TREE and a callee that bails
+     * or diverges is misattributed to this candidate (e.g. a contract bail that
+     * skips THIS function's epilogue -> $sp off by the frame size). Per-function
+     * isolation proves exactly this shard's codegen vs the interp oracle; whole-
+     * tree soundness then follows by induction. */
+    int sv = s_native_exec;
+    s_native_exec = 0;
 
     CPUState cpu0 = *cpu;
     memcpy(s_ram0,  ram,  SHADOW_RAM_SIZE);
     memcpy(s_spad0, spad, SHADOW_SPAD_SIZE);
 
-    /* Native (discarded). Nested calls run native (native_exec on). */
+    /* PASS 1 — INTERPRETER, the authoritative single execution, with the device
+     * detector armed. Running interp FIRST (not native) guarantees device I/O
+     * happens AT MOST ONCE and only via the trusted path: if this function (or a
+     * callee) touches ANY MMIO we abandon the native pass entirely — device I/O
+     * must never be double-executed (one spurious card/SIO/DMA write corrupts
+     * hardware state and wedges the guest, e.g. the save-load crash). */
+    uint64_t mmio0 = g_shadow_mmio_hits;
+    g_shadow_mmio_watch++;
+    dirty_ram_dispatch(cpu, addr, cpu->gpr[31]);
+    g_shadow_mmio_watch--;
+    s_shadow_calls++;
+
+    if (g_shadow_mmio_hits != mmio0) {
+        /* Device-touching: keep the interp result live (already in *cpu/ram/spad),
+         * mark the candidate so it ALWAYS runs via the interpreter (never its
+         * shard, never re-diffed). sljit covers the pure-compute majority; device
+         * functions stay on the interpreter — safe by construction, no double I/O. */
+        c->device_touch = 1;
+        s_shadow_skipped_dev++;
+        g_psx_call_bail = 0;
+        s_native_exec  = sv;
+        s_suppress_irq = saved_supp;
+        s_in_shadow    = 0;
+        return;
+    }
+
+    /* Device-free: preserve the interp result, then run the NATIVE shard from the
+     * same input and compare. No device I/O on either pass (proven clean above). */
+    CPUState cpuI = *cpu;
+    memcpy(s_ramI,  ram,  SHADOW_RAM_SIZE);
+    memcpy(s_spadI, spad, SHADOW_SPAD_SIZE);
+
+    *cpu = cpu0;
+    memcpy(ram,  s_ram0,  SHADOW_RAM_SIZE);
+    memcpy(spad, s_spad0, SHADOW_SPAD_SIZE);
+
     uint32_t stop_ra = cpu->gpr[31];   /* entry $ra = the function's return point */
     c->fn(cpu);
-    /* A shard that ends in a computed `jr rX` (jump table) EXITS with cpu->pc =
-     * target instead of running the whole function — live, dispatch re-enters
-     * there; but the interp side below chains through to the return, so we must
-     * complete the native side too or every tail-jump function falsely diverges.
-     * Chain the native run through tail-transfers to the same stop the interp
-     * uses, so we compare FULL native vs FULL interp execution. */
+    /* A shard that ends in a computed `jr rX` (jump table) exits with cpu->pc =
+     * target rather than running to the return; chain through tail-transfers to
+     * the same stop the interp used, so we compare FULL native vs FULL interp. */
     {
         int guard = 0;
         while (cpu->pc != 0 && !g_psx_call_bail && guard++ < 8192) {
@@ -1053,35 +1125,17 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     CPUState cpuN = *cpu;
     memcpy(s_ramN, ram, SHADOW_RAM_SIZE);
 
-    /* Restore CPU + main RAM + scratchpad, then run interpreter (kept). Restoring
-     * scratchpad is essential — these functions use it as working memory, and
-     * leaving native's mutations there would make the interp pass diverge
-     * spuriously. (Device/DMA/cycle state still isn't restored; functions that
-     * read those may still show as divergent — treated as suspect, not proof.) */
-    *cpu = cpu0;
-    memcpy(ram,  s_ram0,  SHADOW_RAM_SIZE);
-    memcpy(spad, s_spad0, SHADOW_SPAD_SIZE);
-    int sv = s_native_exec;
-    s_native_exec = 0;
-    /* Shadow run executes the candidate to its return: the entry $ra is the
-     * stop contract, same as the live dispatch path. */
-    dirty_ram_dispatch(cpu, addr, cpu->gpr[31]);  /* runs interp (guarded) */
-    s_native_exec = sv;
-
-    s_shadow_calls++;
-
-    /* Compare native (cpuN/s_ramN) vs interp (*cpu/ram) under identical input. */
+    /* Compare native (cpuN/s_ramN) vs interp (cpuI/s_ramI) under identical input. */
     int reg = -1;
-    for (int r = 1; r < 32; r++) if (cpuN.gpr[r] != cpu->gpr[r]) { reg = r; break; }
-    int hidiff = (cpuN.hi != cpu->hi), lodiff = (cpuN.lo != cpu->lo);
+    for (int r = 1; r < 32; r++) if (cpuN.gpr[r] != cpuI.gpr[r]) { reg = r; break; }
+    int hidiff = (cpuN.hi != cpuI.hi), lodiff = (cpuN.lo != cpuI.lo);
     int64_t ramoff = -1;
-    if (memcmp(s_ramN, ram, SHADOW_RAM_SIZE) != 0) {
+    if (memcmp(s_ramN, s_ramI, SHADOW_RAM_SIZE) != 0) {
         for (uint32_t a = 0; a < SHADOW_RAM_SIZE; a++)
-            if (s_ramN[a] != ram[a]) { ramoff = (int64_t)a; break; }
+            if (s_ramN[a] != s_ramI[a]) { ramoff = (int64_t)a; break; }
     }
     if (reg < 0 && !hidiff && !lodiff && ramoff < 0) {
-        /* Clean pass: credit the verify budget. After OVERLAY_DIFF_BUDGET clean
-         * passes this candidate stops being diffed and runs normally. */
+        /* Clean pass: credit the verify budget. */
         if (c->diff_passes < OVERLAY_DIFF_BUDGET) c->diff_passes++;
     } else {
         s_shadow_divs++;
@@ -1090,28 +1144,36 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
             s_detail_addr = c->addr;
             for (int r = 0; r < 32; r++) {
                 s_detail_nat_gpr[r] = cpuN.gpr[r];
-                s_detail_int_gpr[r] = cpu->gpr[r];
+                s_detail_int_gpr[r] = cpuI.gpr[r];
             }
             s_detail_nat_hi = cpuN.hi; s_detail_nat_lo = cpuN.lo;
-            s_detail_int_hi = cpu->hi; s_detail_int_lo = cpu->lo;
+            s_detail_int_hi = cpuI.hi; s_detail_int_lo = cpuI.lo;
         }
         if (s_sdiv_n < SDIV_CAP) {
             ShadowDiv *d = &s_sdiv[s_sdiv_n++];
             d->seq = s_shadow_calls; d->addr = c->addr;
             d->reg = reg;
             d->reg_native = (reg >= 0) ? cpuN.gpr[reg] : 0;
-            d->reg_interp = (reg >= 0) ? cpu->gpr[reg] : 0;
+            d->reg_interp = (reg >= 0) ? cpuI.gpr[reg] : 0;
             d->hi_diff = hidiff; d->lo_diff = lodiff;
             d->ram_off = ramoff;
             if (ramoff >= 0) {
                 uint32_t a = (uint32_t)ramoff & ~3u;
                 d->ram_native = *(uint32_t *)&s_ramN[a];
-                d->ram_interp = *(uint32_t *)&ram[a];
+                d->ram_interp = *(uint32_t *)&s_ramI[a];
             }
         }
     }
+    /* Restore the interp result as the authoritative live state (native discarded).
+     * A bail raised by the shadow run must never leak into live execution (a
+     * spurious in-progress unwind wedges the guest). */
+    *cpu = cpuI;
+    memcpy(ram,  s_ramI,  SHADOW_RAM_SIZE);
+    memcpy(spad, s_spadI, SHADOW_SPAD_SIZE);
+    g_psx_call_bail = 0;
+    s_native_exec  = sv;
     s_suppress_irq = saved_supp;
-    s_in_shadow = 0;
+    s_in_shadow    = 0;
 }
 
 int overlay_loader_dump_shadow_detail(char *out, int cap) {
@@ -1138,9 +1200,11 @@ int overlay_loader_dump_shadow_detail(char *out, int cap) {
 int overlay_loader_dump_shadow(char *out, int cap) {
     int n = 0;
     n += snprintf(out + n, cap - n,
-        "{\"diff_mode\":%d,\"shadow_calls\":%llu,\"divergences\":%llu,\"records\":[",
+        "{\"diff_mode\":%d,\"shadow_calls\":%llu,\"divergences\":%llu,"
+        "\"skipped_device\":%llu,\"records\":[",
         s_diff_mode, (unsigned long long)s_shadow_calls,
-        (unsigned long long)s_shadow_divs);
+        (unsigned long long)s_shadow_divs,
+        (unsigned long long)s_shadow_skipped_dev);
     for (int i = 0; i < s_sdiv_n && n < cap - 200; i++) {
         ShadowDiv *d = &s_sdiv[i];
         n += snprintf(out + n, cap - n,
