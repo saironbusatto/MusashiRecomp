@@ -85,6 +85,20 @@ static int append_fmt(char *buf, size_t cap, size_t *pos, const char *fmt, ...) 
     return 1;
 }
 
+/* Escape a string for use as a JSON string value: backslash and double-quote
+ * are backslash-escaped, control chars are dropped. Windows module paths
+ * (e.g. C:\Games\...\TombaRecomp.exe) otherwise emit invalid JSON that parsers
+ * reject — which is exactly what happened to a user-submitted crash report. */
+static void json_escape(const char *in, char *out, size_t outcap) {
+    size_t o = 0;
+    for (size_t i = 0; in && in[i] && o + 2 < outcap; i++) {
+        unsigned char ch = (unsigned char)in[i];
+        if (ch == '\\' || ch == '"') { out[o++] = '\\'; out[o++] = (char)ch; }
+        else if (ch >= 0x20)         { out[o++] = (char)ch; }
+    }
+    out[o] = 0;
+}
+
 /* Serialize a single uint32_t hex value as a JSON string. */
 static void hex32(char *out, uint32_t v) {
     snprintf(out, 16, "\"0x%08X\"", v);
@@ -162,11 +176,13 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
                 mod_base = mbi.AllocationBase;
                 GetModuleFileNameA((HMODULE)mod_base, mod_name, sizeof(mod_name));
             }
+            char mod_esc[MAX_PATH * 2];
+            json_escape(mod_name, mod_esc, sizeof(mod_esc));
             append_fmt(buf, sizeof(buf), &pos,
                 "    \"module\": \"%s\",\n"
                 "    \"module_base\": \"%p\",\n"
                 "    \"module_offset\": \"0x%llX\",\n",
-                mod_name, mod_base,
+                mod_esc, mod_base,
                 (unsigned long long)((char *)addr - (char *)mod_base));
         }
 
@@ -193,9 +209,11 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
                 GetModuleFileNameA((HMODULE)mbi.AllocationBase, mod_name,
                                    sizeof(mod_name));
                 const char *base = strrchr(mod_name, '\\');
+                char bn_esc[MAX_PATH * 2];
+                json_escape(base ? base + 1 : mod_name, bn_esc, sizeof(bn_esc));
                 append_fmt(buf, sizeof(buf), &pos,
                     "%s\n      {\"module\": \"%s\", \"offset\": \"0x%llX\"}",
-                    emitted ? "," : "", base ? base + 1 : mod_name,
+                    emitted ? "," : "", bn_esc,
                     (unsigned long long)(v - (ULONG_PTR)mbi.AllocationBase));
                 emitted++;
             }
