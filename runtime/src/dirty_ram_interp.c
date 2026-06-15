@@ -841,7 +841,34 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
  * event-timeline ring can tag events as INTERP vs STATIC. The EPC-sentinel
  * branch inside can longjmp out (not restoring here); psx_check_interrupts
  * clears the flag at its longjmp landing to cover that case. */
+/* Always-on runaway-recursion guard. The host C stack mirrors the guest call
+ * graph (each guest call = a nested psx_dispatch_call -> dirty_ram_dispatch C
+ * frame), so an unbounded self-recursion — e.g. a bogus jump-table handler that
+ * re-enters its own entity loop (issue #1 seesaw crash: v0=0x8001DFF8) — silently
+ * overflows the host stack with no diagnostic (raw STATUS_STACK_OVERFLOW). Trip
+ * well below overflow: dump full state (crash report carries dispatch_depth + the
+ * dirty_block cycle that NAMES the recursing PC) and halt-and-serve, so the next
+ * reproduction (whoever hits it) is captured cleanly + live-inspectable instead of
+ * a bare SEH. Normal guest nesting is shallow (<~64); the default 256 sits far
+ * above that and below overflow (~500+ frames on a 1 MB stack). Override via
+ * PSX_RECURSION_LIMIT. One-shot. NOT a fix — the upstream bogus-pointer divergence
+ * still needs the oracle; this converts a hard crash into a catchable, diagnosed
+ * bail (Rule 15: make the failure observable). */
 int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
+    extern int g_psx_dispatch_depth;
+    extern void psx_fatal_halt(const char *reason);
+    static int  s_rec_guard = 0;
+    static int  s_rec_limit = 0;
+    if (s_rec_limit == 0) {
+        const char *e = getenv("PSX_RECURSION_LIMIT");
+        s_rec_limit = (e && *e) ? atoi(e) : 256;
+        if (s_rec_limit < 32) s_rec_limit = 32;
+    }
+    if (!s_rec_guard && g_psx_dispatch_depth > s_rec_limit) {
+        s_rec_guard = 1;   /* one-shot: first trip wins the report */
+        psx_fatal_halt("dispatch recursion guard tripped — runaway self-call "
+                       "(see dispatch_depth + dirty_block cycle for the recursing PC)");
+    }
     int prev = g_dirty_interp_active;
     g_dirty_interp_active = 1;
     int r = dirty_ram_dispatch_inner(cpu, addr, stop_addr);
