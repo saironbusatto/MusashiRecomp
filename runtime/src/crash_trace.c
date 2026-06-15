@@ -46,6 +46,13 @@ extern uint64_t s_frame_count;
 extern uint32_t g_debug_current_func_addr;
 extern uint32_t g_debug_last_store_pc;
 
+/* Native dispatch nesting depth (generated/SCPH1001_dispatch.c). Incremented per
+ * nested psx_dispatch_call, decremented on return. A huge value at crash time is
+ * the direct fingerprint of runaway recursion (the host C stack mirrors the guest
+ * call graph, so an unbounded call chain overflows it -> STATUS_STACK_OVERFLOW
+ * 0xC00000FD). Pairs with the dirty_block tail, which names the recursing PCs. */
+extern int g_psx_dispatch_depth;
+
 /* Dispatch ring — accessor wrappers exported by debug_server.c. */
 #define DISPATCH_TRACE_CAP (1 << 16)
 extern uint32_t crash_trace_dispatch_ring_get(int idx);
@@ -137,12 +144,14 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         "  \"exit_origin\": \"%s\",\n"
         "  \"timestamp\": \"%s\",\n"
         "  \"frame\": %llu,\n"
+        "  \"dispatch_depth\": %d,\n"
         "  \"last_func_addr\": \"0x%08X\",\n"
         "  \"last_store_pc\": \"0x%08X\",\n",
         reason ? reason : "(unknown)",
         s_exit_origin,
         ts,
         (unsigned long long)s_frame_count,
+        g_psx_dispatch_depth,
         g_debug_current_func_addr,
         g_debug_last_store_pc);
 
