@@ -301,10 +301,37 @@ static int cache_idx_has_path(const char *path) {
     return 0;
 }
 
-static void scan_cache_dir(void) {
+/* Canonical cache arch-abi tag (see SLJIT.md §4 — caches are namespaced per
+ * backend AND per target so a Windows-x64 gcc DLL and, later, a same-OS arm64
+ * or an sljit blob for the same fragment never comingle). compile_overlays.py
+ * computes the IDENTICAL string from platform.system()/machine(); keep the two
+ * mappings in lockstep ("<os>-<arch>": win|linux|macos + x64|arm64|x86). */
+#if defined(_WIN32)
+#  define PSX_OL_OS "win"
+#elif defined(__APPLE__)
+#  define PSX_OL_OS "macos"
+#else
+#  define PSX_OL_OS "linux"
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+#  define PSX_OL_ARCH "arm64"
+#elif defined(__x86_64__) || defined(_M_X64)
+#  define PSX_OL_ARCH "x64"
+#elif defined(__i386__) || defined(_M_IX86)
+#  define PSX_OL_ARCH "x86"
+#else
+#  define PSX_OL_ARCH "unknown"
+#endif
+#define PSX_OVERLAY_ARCH_ABI PSX_OL_OS "-" PSX_OL_ARCH
+
+const char *overlay_loader_arch_abi(void) { return PSX_OVERLAY_ARCH_ABI; }
+
+/* Scan one directory for <addr8>_<crc8>.dll cache entries into the index.
+ * `dir` is a full directory path. Idempotent (skips already-indexed paths). */
+static void scan_one_cache_dir(const char *dir) {
 #ifdef _WIN32
     char pattern[768];
-    snprintf(pattern, sizeof(pattern), "%s/%s/*_*.dll", s_cache_dir, s_game_id);
+    snprintf(pattern, sizeof(pattern), "%s/*_*.dll", dir);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -323,15 +350,30 @@ static void scan_cache_dir(void) {
         uint32_t addr = (uint32_t)strtoul(fd.cFileName, NULL, 16);
         if (s_cache_idx_count >= CACHE_IDX_CAP) break;
         char full[768];
-        snprintf(full, sizeof(full), "%s/%s/%s",
-                 s_cache_dir, s_game_id, fd.cFileName);
+        snprintf(full, sizeof(full), "%s/%s", dir, fd.cFileName);
         if (cache_idx_has_path(full)) continue;  /* rescan idempotence */
         CacheEntry *e = &s_cache_idx[s_cache_idx_count++];
         e->region_start = addr;
         snprintf(e->path, sizeof(e->path), "%s", full);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
+#else
+    (void)dir;
 #endif
+}
+
+/* Scan the namespaced gcc cache (gcc/<arch-abi>/) AND the legacy flat layout
+ * (<game_id>/*.dll) for back-compat — existing caches keep loading with no
+ * migration. The sljit/<arch-abi>/ namespace is reserved (no on-disk blobs in
+ * v1: sljit re-JITs from the coverage manifest; see SLJIT.md §5.3). */
+static void scan_cache_dir(void) {
+    char dir[768];
+    snprintf(dir, sizeof(dir), "%s/%s/gcc/%s",
+             s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI);
+    scan_one_cache_dir(dir);
+    /* Legacy flat layout (pre-namespacing). */
+    snprintf(dir, sizeof(dir), "%s/%s", s_cache_dir, s_game_id);
+    scan_one_cache_dir(dir);
 }
 
 /* True if the cache holds a DLL for this region compiled from an image with
