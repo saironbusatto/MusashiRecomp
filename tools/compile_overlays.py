@@ -41,6 +41,27 @@ except ImportError:
         sys.exit(1)
 
 import json
+import platform
+
+
+def cache_arch_abi() -> str:
+    """Canonical cache arch-abi tag, IDENTICAL to overlay_loader.c's
+    PSX_OVERLAY_ARCH_ABI ("<os>-<arch>": win|linux|macos + x64|arm64|x86).
+    gcc DLLs are namespaced under <game_id>/gcc/<arch-abi>/ so same-OS
+    different-arch caches (and, later, sljit blobs) never comingle. Keep this
+    mapping in lockstep with overlay_loader.c."""
+    sysname = platform.system()
+    os_tag = {'Windows': 'win', 'Darwin': 'macos'}.get(sysname, 'linux')
+    m = platform.machine().lower()
+    if m in ('amd64', 'x86_64', 'x64'):
+        arch = 'x64'
+    elif m in ('arm64', 'aarch64'):
+        arch = 'arm64'
+    elif m in ('i386', 'i686', 'x86'):
+        arch = 'x86'
+    else:
+        arch = 'unknown'
+    return f'{os_tag}-{arch}'
 
 
 # ---------------------------------------------------------------------------
@@ -1093,8 +1114,13 @@ def main():
             return
         os.makedirs(args.out_dir, exist_ok=True)
     else:
-        cache_dir = os.path.join(args.out_dir, game_id)
+        # Namespaced gcc cache (SLJIT.md §4 — no comingling). Legacy flat layout
+        # (<out-dir>/<game_id>/) is still READ by the loader and for prior-ranges
+        # coverage merge below, so existing caches keep working with no migration.
+        legacy_cache_dir = os.path.join(args.out_dir, game_id)
+        cache_dir = os.path.join(legacy_cache_dir, 'gcc', cache_arch_abi())
         os.makedirs(cache_dir, exist_ok=True)
+        print(f'Cache dir: {cache_dir}')
 
     with open(args.captures) as f:
         captures = json.load(f)
@@ -1120,8 +1146,14 @@ def main():
         # re-derives their interior/alias disposition — feeding them back as
         # roots would truncate their hosts.
         if not args.static:
-            prior_ranges = os.path.join(cache_dir,
-                                        f'{phys_addr:08X}_{crc32:08X}.ranges')
+            ranges_name = f'{phys_addr:08X}_{crc32:08X}.ranges'
+            prior_ranges = os.path.join(cache_dir, ranges_name)
+            # Fall back to the legacy flat layout so coverage from pre-namespacing
+            # builds still merges forward (don't regress a fresh build).
+            if not os.path.exists(prior_ranges):
+                legacy_prior = os.path.join(legacy_cache_dir, ranges_name)
+                if os.path.exists(legacy_prior):
+                    prior_ranges = legacy_prior
             if os.path.exists(prior_ranges):
                 prior_entries = []
                 with open(prior_ranges) as pf:
