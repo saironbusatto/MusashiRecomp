@@ -517,6 +517,12 @@ UserSettings load_user_settings(const fs::path& path) {
             s.spu_hq = toml::find<bool>(a, "spu_hq"); s.has_spu_hq = true;
         });
     }
+    if (doc.contains("launcher")) {
+        const toml::value& l = toml::find(doc, "launcher");
+        if (l.contains("skip_launcher")) try_get([&]{
+            s.skip_launcher = toml::find<bool>(l, "skip_launcher"); s.has_skip_launcher = true;
+        });
+    }
     if (doc.contains("bios")) {
         const toml::value& b = toml::find(doc, "bios");
         if (b.contains("path")) try_get([&]{
@@ -611,6 +617,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     f << "\n[audio]\n";
     if (s.has_spu_hq)
         f << "spu_hq = " << (s.spu_hq ? "true" : "false") << "\n";
+    if (s.has_skip_launcher)
+        f << "\n[launcher]\nskip_launcher = " << (s.skip_launcher ? "true" : "false") << "\n";
     if (s.has_bios_path)
         f << "\n[bios]\npath = \"" << fwd(s.bios_path) << "\"\n";
     if (s.has_disc_path)

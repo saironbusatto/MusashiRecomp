@@ -226,6 +226,10 @@ struct UserSettings {
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
     bool has_screen_kind    = false; int  screen_kind    = 0; // 0..3 (ScreenKind)
     bool has_auto_skip_fmv  = false; bool auto_skip_fmv  = false; // skip FMVs
+    // [launcher] — when true, boot straight into the game and skip the GUI
+    // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
+    // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.
+    bool has_skip_launcher  = false; bool skip_launcher  = false;
     // [audio]
     bool has_spu_hq         = false; bool spu_hq         = false;
     // [bios] / [disc] / [memcard]

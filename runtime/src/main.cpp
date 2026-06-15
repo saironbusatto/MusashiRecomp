@@ -1341,11 +1341,18 @@ int main(int argc, char** argv) {
     const char* game_config_path = nullptr;
     const char* disc_override_path = nullptr;
     bool        bios_from_cli = false;  /* CLI --bios/positional wins over settings.toml */
+    /* Launcher overrides (mirrors snesrecomp): --launcher forces the GUI back on
+     * even when [launcher] skip_launcher = true is set; --no-launcher (and the
+     * PSX_NO_LAUNCHER env) forces it off. --launcher wins if both are given. */
+    bool        force_launcher    = false;
+    bool        force_no_launcher = false;
     /* Parse args.
      *   --bios <path>       override the compile-time BIOS path
      *   --game <toml>       load a game config (single source of truth for
      *                       disc / memcard / window title / debug port)
      *   --disc <path>       override the game config disc path
+     *   --launcher          force the GUI launcher (overrides skip_launcher)
+     *   --no-launcher       skip the GUI launcher (boot straight in)
      *   <positional>        deprecated alias for --bios
      * No --memcard-dir / --game-root flags: those are config-driven. */
     for (int i = 1; i < argc; i++) {
@@ -1356,6 +1363,10 @@ int main(int argc, char** argv) {
             game_config_path = argv[++i];
         } else if (std::strcmp(argv[i], "--disc") == 0 && i + 1 < argc) {
             disc_override_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--launcher") == 0) {
+            force_launcher = true;
+        } else if (std::strcmp(argv[i], "--no-launcher") == 0) {
+            force_no_launcher = true;
         } else if (argv[i][0] != '-') {
             bios_path = argv[i];
             bios_from_cli = true;
@@ -1462,12 +1473,14 @@ int main(int argc, char** argv) {
      * bundled game.toml. Any field present there overrides the config value;
      * the command line (--bios/--disc) still wins over the file. Absent =>
      * fall through to game.toml. The file is the launcher's persistence. */
+    bool skip_launcher_setting = false;  /* [launcher] skip_launcher from settings.toml */
     std::string settings_bios_storage;  /* must outlive resolve_bios_for_runtime */
     {
         std::filesystem::path settings_path =
             exe_dir_from_argv(argv[0]) / "settings.toml";
         const PSXRecompV4::UserSettings us =
             PSXRecompV4::load_user_settings(settings_path);
+        if (us.has_skip_launcher)  skip_launcher_setting = us.skip_launcher;
         if (us.has_renderer)       g_video_renderer  = us.renderer;
         if (us.has_supersampling)  g_video_scale     = us.supersampling;
         if (us.has_window_width)   g_video_win_w     = us.window_width;
@@ -1502,9 +1515,16 @@ int main(int argc, char** argv) {
      * boots. Seeded with the effective settings (game.toml ∪ settings.toml);
      * on LAUNCH the user's choices are persisted to settings.toml and applied.
      * The launcher window/context is fully torn down before the emulator's own
-     * window is created, so the emulator boot path below is untouched. Skipped
-     * via PSX_NO_LAUNCHER=1 (e.g. CI / scripted runs). */
-    if (!std::getenv("PSX_NO_LAUNCHER")) {
+     * window is created, so the emulator boot path below is untouched.
+     *
+     * Skip the GUI (boot straight in) when ANY of: PSX_NO_LAUNCHER=1 env,
+     * --no-launcher, or the persisted [launcher] skip_launcher setting — unless
+     * --launcher forces it back on (mirrors snesrecomp's SkipLauncher / --launcher).
+     * This removes the dismiss-the-launcher round-trip for scripted/debug runs. */
+    const bool want_launcher =
+        force_launcher ||
+        (!std::getenv("PSX_NO_LAUNCHER") && !force_no_launcher && !skip_launcher_setting);
+    if (want_launcher) {
         if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) == 0) {
             PSXRecompV4::UserSettings seed;
             seed.renderer = g_video_renderer;             seed.has_renderer = true;
@@ -1514,6 +1534,7 @@ int main(int argc, char** argv) {
             seed.screen_kind = g_video_screen;            seed.has_screen_kind = true;
             seed.auto_skip_fmv = (g_auto_skip_fmv != 0);  seed.has_auto_skip_fmv = true;
             seed.spu_hq = g_audio_spu_hq;                 seed.has_spu_hq = true;
+            seed.skip_launcher = skip_launcher_setting;   seed.has_skip_launcher = true;
             if (bios_path && bios_path[0]) { seed.bios_path = bios_path; seed.has_bios_path = true; }
             if (!resolved_disc.empty())    { seed.disc_path = resolved_disc; seed.has_disc_path = true; }
             seed.memcard_dir = memcard_dir;          seed.has_memcard_dir = true;
@@ -1576,6 +1597,7 @@ int main(int argc, char** argv) {
                 g_video_screen    = seed.screen_kind;
                 g_auto_skip_fmv   = seed.auto_skip_fmv ? 1 : 0;
                 g_audio_spu_hq    = seed.spu_hq;
+                skip_launcher_setting = seed.skip_launcher;
                 if (seed.has_bios_path) {
                     settings_bios_storage = seed.bios_path.string();
                     bios_path = settings_bios_storage.c_str();
