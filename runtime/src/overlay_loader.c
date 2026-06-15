@@ -62,7 +62,16 @@ typedef struct {
     int       state;                     /* ENTRY_VALID/INVALID/BLACKLIST      */
     int       dll;                       /* source DLL index                   */
     int       next;                      /* next candidate at same addr, -1 end*/
+    uint32_t  diff_passes;               /* clean same-state diffs (verify budget)*/
 } Candidate;
+
+/* Same-state differential verify budget: diff a candidate this many times with
+ * 0 divergence, then trust it (stop diffing — run it normally). Bounds the
+ * differential's cost to ~(distinct functions × budget) instead of every
+ * dispatch forever, making a validation playtest playable; a DIVERGING
+ * candidate never reaches the budget, so it stays diff-gated (interp result
+ * kept) and never executes native live. */
+#define OVERLAY_DIFF_BUDGET 32u
 
 #define CAND_CAP   16384
 static Candidate s_cand[CAND_CAP];
@@ -296,6 +305,7 @@ static void register_sljit_candidate(uint32_t phys, OverlayFn fn,
     c->crc_code = cand_crc(c);      /* live bytes == the bytes we JIT'd from */
     c->val_gen  = cand_gensum(c);
     c->state    = ENTRY_VALID;
+    c->diff_passes = 0;
     c->next     = idx_head(c->addr);
     idx_set_head(c->addr, idx);
     s_valid_count++;
@@ -788,8 +798,14 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
             }
             /* Same-state differential: run native+interp from identical state,
              * compare, keep the interp result. Takes precedence over the A/B
-             * toggle. */
-            if (s_diff_mode && !s_in_shadow) { run_shadow_diff(cpu, c, addr); return 1; }
+             * toggle. Verify-budget: once a candidate has passed cleanly enough
+             * times it's trusted and falls through to normal execution, so the
+             * diff cost stays bounded (a diverging candidate never reaches the
+             * budget — it keeps being diff-gated and never runs native live). */
+            if (s_diff_mode && !s_in_shadow && c->diff_passes < OVERLAY_DIFF_BUDGET) {
+                run_shadow_diff(cpu, c, addr);
+                return 1;
+            }
 
             /* A/B: prove whether native EXECUTION is the cause. When off, the
              * candidate matched (byte-exact) but we DON'T run native — interp
@@ -1047,7 +1063,11 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
         for (uint32_t a = 0; a < SHADOW_RAM_SIZE; a++)
             if (s_ramN[a] != ram[a]) { ramoff = (int64_t)a; break; }
     }
-    if (reg >= 0 || hidiff || lodiff || ramoff >= 0) {
+    if (reg < 0 && !hidiff && !lodiff && ramoff < 0) {
+        /* Clean pass: credit the verify budget. After OVERLAY_DIFF_BUDGET clean
+         * passes this candidate stops being diffed and runs normally. */
+        if (c->diff_passes < OVERLAY_DIFF_BUDGET) c->diff_passes++;
+    } else {
         s_shadow_divs++;
         if (!s_detail_captured) {
             s_detail_captured = 1;
@@ -1289,10 +1309,10 @@ int overlay_loader_dump_candidates(char *out, int cap) {
         n += snprintf(out + n, cap - n,
             "%s{\"addr\":\"0x%08X\",\"state\":%d,\"nranges\":%d,"
             "\"crc\":\"0x%08X\",\"live\":\"0x%08X\",\"match\":%d,"
-            "\"val_gen\":%u,\"gen\":%u,\"dll\":%d}",
+            "\"val_gen\":%u,\"gen\":%u,\"dll\":%d,\"diff_passes\":%u}",
             i ? "," : "", c->addr, c->state, c->nranges,
             c->crc_code, live, (live == c->crc_code) ? 1 : 0,
-            c->val_gen, sum, c->dll);
+            c->val_gen, sum, c->dll, c->diff_passes);
     }
     n += snprintf(out + n, cap - n, "]");
     return n;
