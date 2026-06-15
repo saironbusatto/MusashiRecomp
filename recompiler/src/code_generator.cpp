@@ -717,6 +717,33 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         return fmt::format("cpu->gpr[5] = cpu->gpr[5] + psx_ws_x_margin();"
                            "  /* ws cull a1 bias */{}", comment);
     }
+    // Widescreen automatic horizontal-FOV cull widening ([widescreen.cull]
+    // auto_screen_x). ws_auto_cull_func_ is set when this function carries the
+    // GTE screen-extent reject signature, so a per-vertex width compare here is
+    // `sltiu rt, SX, 0x140` (or inclusive 0x141). Emit it widened by
+    // +2*psx_ws_x_margin() (0 at 4:3 ⇒ byte-identical; = the wide-surface extra
+    // when 16:9), so geometry out to the wide frame edge is submitted rather
+    // than culled at the 320 boundary. Same shape as an explicit range_site but
+    // applied by signature — no per-address list. (Reached only when the addr is
+    // not already an explicit cull site, which returns above.)
+    if (ws_auto_cull_func_ && opcode == 0x0B) {  // sltiu
+        uint16_t uimm = get_imm16_u(instr);
+        if (uimm == 0x140 || uimm == 0x141) {
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            // SX is a 16-bit GTE screen coord loaded via lhu, so an off-LEFT
+            // vertex is a large unsigned value (e.g. -30 -> 0xFFE2). A plain
+            // `SX <u (imm+2m)` widen therefore reveals only the RIGHT margin —
+            // the left stays culled. Sign-extend SX and shift by +margin so the
+            // verdict is the wide window (-margin <= SX < imm+margin): both the
+            // left AND right 16:9 margins pass, and geometry past the wide
+            // surface on either side is still rejected. At margin=0 this reduces
+            // exactly to the vanilla `SX <u imm` verdict (byte-identical).
+            return fmt::format("{} = ((uint32_t)((int32_t)(int16_t){} + psx_ws_x_margin()) "
+                               "< (uint32_t)((int32_t){} + 2*psx_ws_x_margin())) ? 1 : 0;"
+                               "  /* ws auto screen-x cull (both edges) */{}",
+                               reg_name(rt), reg_name(rs), (int)uimm, comment);
+        }
+    }
     // Widescreen backdrop screenX squash ([widescreen.backdrop] x_sites). The
     // site is the `sh rt,off(base)` storing a parallax 2D backdrop layer's
     // final screen-X; squash the stored value around the screen centre so the
@@ -1349,6 +1376,28 @@ std::string CodeGenerator::translate_basic_block(
     return ss.str();
 }
 
+bool CodeGenerator::func_has_screen_extent_cull(const ControlFlowGraph& cfg) const {
+    // The GTE per-vertex trivial-reject pairs a width compare (sltiu …,0x140 or
+    // inclusive 0x141) with a height compare (sltiu …,0xE0 or 0xF1) in the same
+    // function. Presence of both is the signature of a screen-extent render
+    // funnel; a lone width compare elsewhere (rare) is left alone.
+    bool has_x = false, has_y = false;
+    for (uint32_t block_addr : cfg.block_order) {
+        const BasicBlock& block = cfg.blocks.at(block_addr);
+        for (uint32_t a = block.start_addr; a <= block.end_addr; a += 4) {
+            auto io = exe_.read_word(a);
+            if (!io.has_value()) continue;
+            uint32_t in = *io;
+            if ((in & 0xFC000000u) != 0x2C000000u) continue;  // not sltiu
+            uint16_t im = (uint16_t)(in & 0xFFFF);
+            if (im == 0x140 || im == 0x141) has_x = true;
+            else if (im == 0xE0 || im == 0xF1) has_y = true;
+            if (has_x && has_y) return true;
+        }
+    }
+    return false;
+}
+
 GeneratedFunction CodeGenerator::generate_function(
     const Function& func,
     const ControlFlowGraph& cfg,
@@ -1357,6 +1406,12 @@ GeneratedFunction CodeGenerator::generate_function(
     GeneratedFunction result;
     result.function_name = func.name;
     result.signature = fmt::format("void {}(CPUState* cpu)", func.name);
+
+    // Widescreen auto cull (gated): detect the screen-extent reject signature so
+    // translate_instruction widens this function's width compares. Cleared for
+    // every function so it never leaks across functions.
+    ws_auto_cull_func_ = config_.ws_auto_screen_x_cull &&
+                         func_has_screen_extent_cull(cfg);
 
     std::stringstream body_ss;
     body_ss << "{\n";
@@ -1500,6 +1555,11 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     std::vector<GeneratedFunction> results;
     if (aliases.empty()) return results;
     uint32_t host = aliases[0]->alias_walk_lo;
+
+    // Widescreen auto cull (gated): set per-group so a stale value from the last
+    // generate_function() call can't leak into this body. (See generate_function.)
+    ws_auto_cull_func_ = config_.ws_auto_screen_x_cull &&
+                         func_has_screen_extent_cull(cfg);
 
     // Jump-table edges + mid-block labels for this host's CFG.
     extra_labels_.clear();

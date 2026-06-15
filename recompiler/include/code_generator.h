@@ -58,6 +58,15 @@ struct CodeGenConfig {
     std::set<uint32_t> ws_cull_range_sites;
     std::set<uint32_t> ws_cull_a1_sites;
 
+    // Widescreen automatic horizontal-FOV cull widening ([widescreen.cull]
+    // auto_screen_x). When true, any function carrying the GTE screen-extent
+    // reject signature — at least one `sltiu …,0x140/0x141` (right/width) AND
+    // one `sltiu …,0xE0/0xF1` (bottom/height) — has every width compare emitted
+    // with + 2*psx_ws_x_margin() (0 at 4:3). This routes the whole render-funnel
+    // (≈100 sites in Tomba) through one helper with no per-address list, and is
+    // generic to any PSX GTE title. The vertical (0xE0) bound is never touched.
+    bool ws_auto_screen_x_cull = false;
+
     // Widescreen backdrop screenX squash ([widescreen.backdrop] x_sites). Each
     // address is a `sh rt,off(base)` storing a parallax 2D backdrop layer's
     // final screen-X; emitted as write_half(base+off, psx_ws_backdrop_x(rt))
@@ -142,6 +151,17 @@ private:
     std::set<uint32_t> known_functions_;  // Addresses of functions in this compilation unit
     std::set<uint32_t> extra_labels_;    // Mid-block addresses that need inline labels (jump table targets)
     const AnnotationTable* annotations_ = nullptr;
+
+    // Set per-function by generate_function when config_.ws_auto_screen_x_cull is
+    // on AND the function carries the GTE screen-extent reject signature; read by
+    // translate_instruction to widen that function's width compares. See
+    // func_has_screen_extent_cull().
+    bool ws_auto_cull_func_ = false;
+
+    // True iff the function's instruction stream contains both a screen-width
+    // reject (`sltiu …,0x140` or `…,0x141`) and a screen-height reject
+    // (`sltiu …,0xE0` or `…,0xF1`) — the uniform GTE per-vertex trivial-reject.
+    bool func_has_screen_extent_cull(const ControlFlowGraph& cfg) const;
 
     // Instruction translation
     std::string translate_instruction(uint32_t addr, uint32_t instr);

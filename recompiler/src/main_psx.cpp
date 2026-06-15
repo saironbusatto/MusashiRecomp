@@ -96,6 +96,7 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_cull_bias, ws_cull_range, ws_cull_a1; // [widescreen.cull]
     std::set<uint32_t>    ws_backdrop_x;        // [widescreen.backdrop] x_sites
     std::set<uint32_t>    ws_backdrop_unsquash; // [widescreen.backdrop] unsquash_funcs
+    bool                  ws_auto_screen_x_cull = false; // [widescreen.cull] auto_screen_x
     std::filesystem::path out_dir = "generated";
 
     if (!config_path.empty()) {
@@ -111,6 +112,7 @@ int main(int argc, char** argv) {
         ws_cull_a1.insert(cfg.ws_cull_a1_sites.begin(), cfg.ws_cull_a1_sites.end());
         ws_backdrop_x.insert(cfg.ws_backdrop_x_sites.begin(), cfg.ws_backdrop_x_sites.end());
         ws_backdrop_unsquash.insert(cfg.ws_backdrop_unsquash_funcs.begin(), cfg.ws_backdrop_unsquash_funcs.end());
+        ws_auto_screen_x_cull = ws_auto_screen_x_cull || cfg.ws_auto_screen_x_cull;
         fmt::print("config:         {}\n", config_path.string());
         fmt::print("  exe         = {}\n", exe_path.string());
         fmt::print("  seeds       = {}\n", extra_funcs_storage);
@@ -163,6 +165,7 @@ int main(int argc, char** argv) {
         ws_cull_a1.insert(wscfg.ws_cull_a1_sites.begin(), wscfg.ws_cull_a1_sites.end());
         ws_backdrop_x.insert(wscfg.ws_backdrop_x_sites.begin(), wscfg.ws_backdrop_x_sites.end());
         ws_backdrop_unsquash.insert(wscfg.ws_backdrop_unsquash_funcs.begin(), wscfg.ws_backdrop_unsquash_funcs.end());
+        ws_auto_screen_x_cull = ws_auto_screen_x_cull || wscfg.ws_auto_screen_x_cull;
         fmt::print("ws-config:      {} (backdrop_x sites={}, unsquash funcs={})\n",
                    ws_config_path.string(), ws_backdrop_x.size(), ws_backdrop_unsquash.size());
     }
@@ -661,6 +664,9 @@ int main(int argc, char** argv) {
     codegen_config.ws_cull_a1_sites    = ws_cull_a1;
     codegen_config.ws_backdrop_x_sites = ws_backdrop_x;
     codegen_config.ws_backdrop_unsquash_funcs = ws_backdrop_unsquash;
+    codegen_config.ws_auto_screen_x_cull = ws_auto_screen_x_cull;
+    if (ws_auto_screen_x_cull)
+        fmt::print("  ws_auto_screen_x_cull = ON (render-funnel FOV widening)\n");
 
     // Load per-game annotations: annotations/<exe_stem>_annotations.csv
     // Silently skipped if the file doesn't exist.

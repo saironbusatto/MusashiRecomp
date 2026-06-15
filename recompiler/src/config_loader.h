@@ -265,6 +265,17 @@ struct GameConfig {
     // OFF for their (far, parallax) draws: the backdrop fills the stretched 16:9
     // frame instead of leaving edge void (8C). Main-EXE addresses; regen-class.
     std::vector<uint32_t> ws_backdrop_unsquash_funcs;
+
+    // [widescreen.cull] auto_screen_x — automatic horizontal-FOV cull widening.
+    // GTE-projected render funnels reject a primitive when ALL its vertices fall
+    // off the 4:3 frame: a per-vertex `sltiu vN, SX, 0x140` (right edge) paired
+    // with `sltiu vN, SY, 0xE0` (bottom edge) in the same function. When this is
+    // true the recompiler auto-detects that signature and emits every width
+    // compare (0x140 / inclusive 0x141) with + 2*psx_ws_x_margin(), so the
+    // wider 16:9 field of view is submitted instead of culled at 320 — no
+    // per-site address list needed. 0 at 4:3 ⇒ byte-identical. Off by default;
+    // a regen is required. (Vertical 0xE0 bound is left untouched.)
+    bool ws_auto_screen_x_cull = false;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.
