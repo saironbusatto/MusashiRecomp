@@ -297,23 +297,32 @@ static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) 
 
     /* Obsolescence (load priority: static > gcc shard > sljit shard > interp). A
      * gcc DLL is the optimized, dev-validated artifact and OUTRANKS an sljit shard
-     * a user machine JIT'd for the SAME content. Once this gcc candidate is in the
+     * a user machine JIT'd for the same function. Once this gcc candidate is in the
      * chain it already wins dispatch (it's at the head, ahead of the older sljit
      * shard, and content-keyed dispatch picks the first match), but we also
      * explicitly retire the superseded sljit shard so it can never run — even if
-     * this gcc candidate is later self-mod-blacklisted. Precise by content: only a
-     * shard JIT'd from the IDENTICAL bytes (same crc_code) is superseded; an sljit
-     * shard for a DIFFERENT overlay variant at this address is distinct coverage
-     * and is kept. */
-    for (int j = c->next; j >= 0; j = s_cand[j].next) {
-        Candidate *o = &s_cand[j];
-        if (o->dll == -1 && o->state != ENTRY_BLACKLIST &&
-            o->crc_code == c->crc_code) {
-            if (o->state == ENTRY_VALID && s_valid_count > 0) s_valid_count--;
-            o->state = ENTRY_BLACKLIST;
-            s_sljit_obsoleted++;
-            loader_log("sljit shard 0x%08X obsoleted by gcc DLL (crc 0x%08X)",
-                       o->addr, o->crc_code);
+     * this gcc candidate is later self-mod-blacklisted.
+     *
+     * "Same function/content" is keyed on CURRENT LIVE-RAM VALIDITY, not crc_code
+     * equality: the two backends hash DIFFERENT byte ranges for the same function
+     * (sljit hashes its contiguous JIT fragment [entry, terminator]; the gcc
+     * .ranges manifest hashes the recompiler's per-function instruction walk, with
+     * interleaved jump-tables/data excised), so their crc_code values legitimately
+     * differ even for identical source bytes. The backend-independent test is: this
+     * gcc candidate matches live RAM (c->state == VALID, computed above) AND the
+     * sljit shard at the same entry also matches live RAM right now — i.e. both
+     * describe the CURRENTLY-LIVE variant. An sljit shard for a DIFFERENT overlay
+     * variant at this address does NOT match live and is kept (distinct coverage). */
+    if (c->state == ENTRY_VALID) {
+        for (int j = c->next; j >= 0; j = s_cand[j].next) {
+            Candidate *o = &s_cand[j];
+            if (o->dll == -1 && o->state != ENTRY_BLACKLIST &&
+                cand_crc(o) == o->crc_code) {        /* o matches live => same variant */
+                if (o->state == ENTRY_VALID && s_valid_count > 0) s_valid_count--;
+                o->state = ENTRY_BLACKLIST;
+                s_sljit_obsoleted++;
+                loader_log("sljit shard 0x%08X obsoleted by gcc DLL", o->addr);
+            }
         }
     }
 }
