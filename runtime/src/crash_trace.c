@@ -267,6 +267,30 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         append_str(buf, sizeof(buf), &pos, "  \"cpu\": null,\n");
     }
 
+    /* Recursion fingerprint (build-independent GUEST addresses): the func entered
+     * when the native stack guard tripped, plus the recent recompiled-function-
+     * entry ring — for a runaway, recent_fn's tail repeats the recursing func, so
+     * the report names the culprit even when the native stack_scan is absent (the
+     * graceful-halt path) or unmappable (host offsets vs a different build). */
+    {
+        extern uint32_t g_psx_recent_fn[];
+        extern uint32_t g_psx_recent_fn_i;
+        extern uint32_t g_psx_recursion_func;
+        enum { RECENT_FN_CAP = 64 };
+        uint32_t total = g_psx_recent_fn_i;
+        int count = (total < (uint32_t)RECENT_FN_CAP) ? (int)total : RECENT_FN_CAP;
+        append_fmt(buf, sizeof(buf), &pos,
+            "  \"recursion_func\": \"0x%08X\",\n"
+            "  \"recent_fn\": {\n    \"total\": %u,\n    \"count\": %d,\n    \"addrs\": [",
+            g_psx_recursion_func, total, count);
+        uint32_t start = total - (uint32_t)count;
+        for (int i = 0; i < count; i++) {
+            uint32_t a = g_psx_recent_fn[(start + (uint32_t)i) & (RECENT_FN_CAP - 1u)];
+            append_fmt(buf, sizeof(buf), &pos, "%s\"0x%08X\"", i == 0 ? "" : ",", a);
+        }
+        append_str(buf, sizeof(buf), &pos, "]\n  },\n");
+    }
+
     /* dispatch_ring tail (last 256) */
     {
         uint64_t total = crash_trace_dispatch_seq_get();

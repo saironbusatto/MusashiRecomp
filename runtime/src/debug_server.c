@@ -1650,8 +1650,23 @@ static int is_chain_epilogue(uint32_t phys) {
  * diagnostics, NOT a root fix: the upstream data corruption that produces the
  * wild recursion is unaddressed (needs an oracle repro — see crash report's
  * dirty_block cycle for the recursing PCs). */
+/* Always-on recent guest function-entry ring (GUEST addresses — build-independent,
+ * unlike the SEH native stack_scan whose host offsets only map against the exact
+ * crashing binary). Fed at EVERY recompiled function entry in BOTH debug and
+ * release. For a runaway recursion the tail of this ring is dominated by the
+ * recursing func(s); the crash report dumps it so the next ORGANIC crash names
+ * the culprit directly — closing the gap where the report otherwise can't
+ * identify a direct-call (dispatch_depth=0) runaway. g_psx_recursion_func is the
+ * function being entered at the instant the guard trips (the recursing one).
+ * Defined unconditionally so crash_trace.c can always dump them; only the FEED
+ * (and the guard) is gated on PSX_STACK_GUARD. */
+#define PSX_RECENT_FN_CAP 64u
+uint32_t g_psx_recent_fn[PSX_RECENT_FN_CAP];
+uint32_t g_psx_recent_fn_i   = 0;
+uint32_t g_psx_recursion_func = 0;
+
 #ifdef PSX_STACK_GUARD
-static void psx_native_stack_guard(void) {
+static void psx_native_stack_guard(uint32_t func_addr) {
     char probe;
     uintptr_t sp      = (uintptr_t)&probe;
     uintptr_t base    = (uintptr_t)__readgsqword(0x08);    /* TEB StackBase (high) */
@@ -1660,17 +1675,38 @@ static void psx_native_stack_guard(void) {
     uintptr_t headroom = (base - dealloc) / 4;             /* ¼ stack (256 KB on a 1 MB fiber) */
     if (headroom < (128u << 10)) headroom = 128u << 10;
     if (sp > dealloc && (sp - dealloc) < headroom) {
+        g_psx_recursion_func = func_addr;                  /* the func recursing at the trip */
         extern void psx_fatal_halt(const char *reason);
         psx_fatal_halt("native stack guard tripped — runaway guest recursion "
                        "(direct func_X dispatch; g_psx_dispatch_depth is blind to it "
-                       "— see stack_scan + the dirty_block cycle for the recursing PCs)");
+                       "— see recursion_func + recent_fn ring + the dirty_block cycle)");
     }
 }
 #endif
 
+/* Self-test for the runaway-recursion crash capture: the `synth_recurse` TCP
+ * command forces a deep recursion on the next guest function entry so you can
+ * confirm the stack guard halts gracefully AND the report names the culprit
+ * (recursion_func + recent_fn). Debug-only (the command lives behind the debug
+ * server); intentionally HALTS the emulation. */
+#ifndef PSX_NO_DEBUG_TOOLS
+static volatile int s_synth_recurse_armed = 0;
+static int psx_synth_recurse(volatile int n) {
+    volatile char pad[2048]; pad[0] = (char)n;
+    debug_server_log_call_entry(0x8000DEADu);   /* feeds the ring + runs the guard each level */
+    int r = psx_synth_recurse(n + 1);
+    return r + pad[0];
+}
+void debug_server_synth_recurse_arm(void) { s_synth_recurse_armed = 1; }
+#endif
+
 void debug_server_log_call_entry(uint32_t func_addr) {
 #ifdef PSX_STACK_GUARD
-    psx_native_stack_guard();   /* runs in debug AND release (before the early-return) */
+    g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
+    psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
+#endif
+#ifndef PSX_NO_DEBUG_TOOLS
+    if (s_synth_recurse_armed) { s_synth_recurse_armed = 0; psx_synth_recurse(0); }
 #endif
 #ifdef PSX_NO_DEBUG_TOOLS
     /* Hottest call site in the binary — called at the top of every
@@ -5293,6 +5329,18 @@ static void handle_ws_margin(int id, const char *json)
  * phases are true GL_TIME_ELAPSED times — unaffected by the debug build's CPU
  * overhead — so scene_gpu (fill) vs present_gpu (wide composite) vs emu_cpu
  * (guest emulation, frame minus present) pinpoints where the frame goes. */
+/* Self-test the runaway-recursion crash capture: forces a runaway on the next
+ * guest function entry; the stack guard halts gracefully and the report names the
+ * recursing func (0x8000DEAD here) + the recent_fn ring. Validates that an
+ * organic crash will be root-causable. Intentionally halts the emulation. */
+static void handle_synth_recurse(int id, const char *json)
+{
+    (void)json;
+    extern void debug_server_synth_recurse_arm(void);
+    debug_server_synth_recurse_arm();
+    send_fmt("{\"id\":%d,\"ok\":true,\"armed\":true}", id);
+}
+
 static void handle_frame_perf(int id, const char *json)
 {
     (void)json;
@@ -8748,6 +8796,7 @@ static const CmdEntry s_commands[] = {
     { "vram_peek",         handle_vram_peek },
     { "gl_coh_ring",       handle_gl_coh_ring },
     { "frame_perf",        handle_frame_perf },
+    { "synth_recurse",     handle_synth_recurse },
     { "gl_fbo_peek",       handle_gl_fbo_peek },
     { "gl_vram_diff",      handle_gl_vram_diff },
     { "irq_state",         handle_irq_state },
