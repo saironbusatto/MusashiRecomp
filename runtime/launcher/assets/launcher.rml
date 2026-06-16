@@ -37,7 +37,11 @@ h1 { display: block; font-size: 27dp; font-weight: bold; color: #ffffff; }
 .cards-row { display: flex; flex-direction: row; align-items: stretch; margin-bottom: 13dp; }
 .card {
 	display: block;
-	flex: 1 1 auto;
+	/* flex-basis 0 + min-width 0 so the two cards always split the row exactly
+	 * 50/50 regardless of their content. (flex-basis:auto sized each card to its
+	 * content, so selecting a controller widened that card.) */
+	flex: 1 1 0dp;
+	min-width: 0dp;
 	background-color: #11161f;
 	border: 1dp #1e2733;
 	border-radius: 12dp;
