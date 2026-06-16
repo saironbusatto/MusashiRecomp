@@ -1355,10 +1355,15 @@ static void sdl_vblank_present(void) {
         active_scale = (g_video_scale > 1 && !di.depth24) ? g_video_scale : 1;
 
         if (wide_present) {
-            /* The wide compositor surface is at the SSAA scale; output is
-             * present_w*scale × h*scale. Falls back to the canonical hires path
-             * if the displayed buffer has no surface yet. */
-            int s = g_video_scale;
+            /* The wide compositor surface is at the renderer's REAL internal
+             * scale, which gr_render_wide_display uses for its readback pitch.
+             * Use gr_scale() (== that internal scale) rather than g_video_scale:
+             * on the GL backend g_video_scale can be stale (1) while the renderer
+             * supersamples at 2, and a mismatch makes the present read the wide
+             * buffer at the wrong width (a magnified top-left slice). gr_scale()
+             * is guaranteed to match the readback. Falls back to the canonical
+             * hires path if the displayed buffer has no surface yet. */
+            int s = gr_scale();
             int sw = (int)present_w * s;
             int n = gr_render_wide_display(sdl_pixel_buf, (int)(sw * sizeof(uint32_t)),
                                            (int)di.display_x, (int)di.display_y, (int)h);
@@ -1945,6 +1950,13 @@ int main(int argc, char** argv) {
     if (g_video_renderer == 1) {
         g_gl_active = (gl_renderer_init_context(sdl_window) != 0);
         if (!g_gl_active) gr_set_backend(GR_BACKEND_SOFTWARE);
+        /* The GL backend establishes its real internal scale HERE (raster init),
+         * which is AFTER the earlier `g_video_scale = gr_scale()` sync (that ran
+         * before this and so saw the default scale 1). Re-sync now so the staging
+         * buffer below is sized for the true scale and the native-wide present
+         * (which uses gr_scale()) matches it — otherwise sdl_pixel_buf is
+         * undersized and the wide readback overflows it. */
+        g_video_scale = gr_scale();
     }
     /* Title bar shows the clean game title (set at window creation); the active
      * renderer is reported via the debug server / config, not appended here. */
