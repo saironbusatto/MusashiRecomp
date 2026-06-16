@@ -86,6 +86,44 @@ void autocompile_configure(const char *cmd, const char *cwd) {
 int autocompile_configured(void) { return s_cmd[0] != '\0'; }
 int autocompile_busy(void)       { return s_state == AC_RUNNING; }
 
+/* Probe PATH for a real C compiler (gcc/cc/clang). A configured command STRING
+ * (autocompile_configured) is not enough: the shipped game.toml always carries
+ * overlay_autocompile_cmd, so it can't tell a dev box from a toolchain-less
+ * player. This opens each candidate exe in each PATH dir — the actual "can we
+ * compile a shard" signal. Memoized (PATH doesn't change mid-run). */
+int autocompile_toolchain_available(void) {
+    static int s_cached = -1;
+    if (s_cached >= 0) return s_cached;
+    const char *path = getenv("PATH");
+    int found = 0;
+    if (path && *path) {
+#ifdef _WIN32
+        const char sep = ';';
+        static const char *exes[] = { "gcc.exe", "cc.exe", "clang.exe" };
+#else
+        const char sep = ':';
+        static const char *exes[] = { "gcc", "cc", "clang" };
+#endif
+        const char *p = path;
+        while (*p && !found) {
+            const char *e = strchr(p, sep);
+            size_t dlen = e ? (size_t)(e - p) : strlen(p);
+            if (dlen > 0 && dlen < 480) {
+                for (size_t k = 0; k < sizeof(exes) / sizeof(exes[0]); k++) {
+                    char cand[512];
+                    snprintf(cand, sizeof(cand), "%.*s/%s", (int)dlen, p, exes[k]);
+                    FILE *f = fopen(cand, "rb");
+                    if (f) { fclose(f); found = 1; break; }
+                }
+            }
+            if (!e) break;
+            p = e + 1;
+        }
+    }
+    s_cached = found;
+    return found;
+}
+
 int autocompile_request(void) {
     if (!autocompile_configured() || s_state == AC_RUNNING) return 0;
 #ifdef _WIN32

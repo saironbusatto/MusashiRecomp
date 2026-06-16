@@ -1463,13 +1463,21 @@ int main(int argc, char** argv) {
                         "psxrecomp: overlay autocompile enabled\n");
                 }
                 /* Resolve the Tier-2 codegen backend now that we know whether a
-                 * compile command is wired. auto => gcc when configured, else
-                 * sljit; env PSX_OVERLAY_BACKEND overrides. The active provider
-                 * is what the capture/dispatch spine produces code through. */
+                 * compile command is wired. auto => gcc only when a C compiler is
+                 * ACTUALLY reachable (a real dev box — not merely a configured
+                 * command string, which the shipped game.toml always carries),
+                 * else sljit (toolchain-less production); env PSX_OVERLAY_BACKEND
+                 * overrides. The active provider is what the capture/dispatch
+                 * spine produces code through. */
                 code_provider_init(
                     gc.runtime.overlay_backend.empty()
                         ? nullptr : gc.runtime.overlay_backend.c_str(),
-                    autocompile_configured());
+                    autocompile_configured() && autocompile_toolchain_available());
+                /* Now that the backend is resolved, apply the sljit live policy:
+                 * a toolchain-less (sljit) machine runs validated shards live so
+                 * it self-improves on the normal play path; PSX_OVERLAY_SLJIT_LIVE
+                 * overrides. (Validated-live, not blind — see the dispatch gate.) */
+                overlay_loader_apply_live_policy();
             }
             std::fprintf(stdout, "psxrecomp: loaded game config %s (%s, %s)\n",
                          game_config_path, game_name.c_str(), game_id.c_str());

@@ -684,16 +684,27 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
     strncpy(s_game_id,   game_id,   sizeof(s_game_id)   - 1);
     init_callbacks();
     scan_cache_dir();
-    /* PSX_OVERLAY_SLJIT_LIVE=1 -> run sljit shards live on-miss (no diff gate):
-     * the toolchain-less production model. Only meaningful with backend=sljit. */
-    {
-        const char *e = getenv("PSX_OVERLAY_SLJIT_LIVE");
-        if (e && *e && *e != '0') {
-            s_sljit_live = 1;
-            loader_log("sljit LIVE mode on (JIT-on-miss, no diff gate)");
-        }
-    }
+    /* Live-mode policy is applied later via overlay_loader_apply_live_policy(),
+     * AFTER code_provider_init resolves the backend (the default depends on it). */
     s_active = 1;
+}
+
+/* Apply the sljit live-execution policy once the Tier-2 backend is resolved
+ * (call AFTER code_provider_init). Default: live ON when the resolved backend is
+ * sljit (the toolchain-less production model — JIT on miss, VALIDATE via the
+ * same-state diff, promote to native only on a clean verify budget; device +
+ * diverging shards stay on the interpreter), OFF otherwise. The
+ * PSX_OVERLAY_SLJIT_LIVE env var overrides either way (0 forces off, nonzero
+ * forces on) — a dev escape hatch. NOTE: "live" here is VALIDATED-live, not the
+ * old blind path; see overlay_loader_dispatch's diff gate. */
+void overlay_loader_apply_live_policy(void) {
+    int live = (overlay_backend_active() == OVERLAY_BACKEND_SLJIT) ? 1 : 0;
+    const char *e = getenv("PSX_OVERLAY_SLJIT_LIVE");
+    if (e && *e) live = (*e != '0') ? 1 : 0;
+    s_sljit_live = live;
+    loader_log("sljit live policy: backend=%s env=%s -> live=%d",
+               overlay_backend_name(overlay_backend_active()),
+               e && *e ? e : "(unset)", live);
 }
 
 void overlay_loader_check_cache(uint32_t load_addr, uint32_t size,
