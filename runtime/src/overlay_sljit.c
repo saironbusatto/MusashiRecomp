@@ -1,9 +1,12 @@
 /* overlay_sljit.c — Tier-2 self-contained in-process JIT backend (sljit).
  * See overlay_sljit.h for the tier model and the precision-over-recall SAFETY
- * CONTRACT. This file currently provides: backend-selection policy, sljit
- * availability + a real codegen smoke test, and the try_compile entry point
- * that (until the MIPS->sljit emitter lands) safely declines every fragment to
- * the interpreter. The validated gcc path is untouched. */
+ * CONTRACT. Provides: backend-selection policy, sljit availability + a real
+ * codegen smoke test, and the MIPS->sljit emitter (overlay_sljit_try_compile)
+ * that parallels dirty_ram_interp.c — leaf+multi-block functions with branches,
+ * mult/div, jal/jalr calls, jr-tables, GTE/COP2, unaligned mem, and block-local
+ * GPR register allocation. Unsupported instructions/shapes abort the WHOLE
+ * fragment (return fn=NULL → caller runs the interpreter), so the emitter can
+ * decline but never mis-compile. The validated gcc path is untouched. */
 
 #include "overlay_sljit.h"
 

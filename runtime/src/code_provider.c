@@ -28,9 +28,10 @@ static const CodeProvider s_gcc = {
 
 /* ---- sljit provider: in-process JIT (sync on-miss only, v1) ---------------- */
 /* No batch/async path: sljit produces synchronously at a dispatch miss, so
- * request/busy/poll_main are inert. compile_fragment delegates to the emitter,
- * which currently declines every fragment (the emitter is SLJIT.md step 4) —
- * safe by construction (precision over recall). */
+ * request/busy/poll_main are inert. compile_fragment delegates to the MIPS->sljit
+ * emitter (overlay_sljit_try_compile), which compiles the supported instruction
+ * classes and declines the rest (fn=NULL) — safe by construction (precision over
+ * recall). The returned shard is validated via the same-state diff before live. */
 static int  sljit_request(void)   { return 0; }
 static int  sljit_busy(void)      { return 0; }
 static void sljit_poll_main(void) { }

@@ -15,8 +15,9 @@
  *     rescan on the emu thread. Seconds of latency; many fragments per run.
  *   - SYNC / ON-MISS (compile_fragment): the sljit model. JIT a single fragment
  *     in-process at a dispatch miss, sub-ms, return a native fn the caller
- *     registers immediately. (Wired into the dispatch path in SLJIT.md step 5;
- *     defined here so the abstraction is honest about both modes, not gcc-only.)
+ *     registers immediately. Wired into the dispatch path (overlay_loader.c
+ *     try_sljit_region); the sljit shard is then VALIDATED via the same-state
+ *     diff before it runs live (see SLJIT.md §11 / overlay_loader_dispatch).
  *
  * A provider sets the hooks it supports and leaves the rest NULL; callers
  * null-check before invoking. The gcc provider's batch hooks are thin pass-
