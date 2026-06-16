@@ -384,7 +384,7 @@ void refresh_labels(LauncherModel& m) {
     m.aspect_label    = aspect_name(m.aspect_index);
     m.winsize_label   = winsize_label_for(m.window_width, m.aspect_index);
     m.widescreen      = (m.aspect_index == 1);   // 16:9 == experimental native-wide
-    m.ws_eligible     = (m.renderer == 0);       // software renderer only (native-wide compositor)
+    m.ws_eligible     = true;                     // native-wide works on BOTH backends now (SW + GL compositor)
 }
 
 std::string region_long(const std::string& r) {
@@ -597,9 +597,6 @@ Result run(SDL_Window* window, void* gl_context,
     m.auto_skip_fmv  = io.auto_skip_fmv;
     m.spu_hq         = io.spu_hq;
     m.aspect_index   = io.has_aspect_ratio ? aspect_index_for(io.aspect_num, io.aspect_den) : 0;
-    // Native-wide widescreen is software-only; never carry a wide aspect on a
-    // non-software renderer (it would present stretched). Force 4:3 there.
-    if (m.renderer != 0) m.aspect_index = 0;
     m.window_width   = kWinWidths[winsize_index(io.has_window_width ? io.window_width : 1280)];
     m.bios_path      = io.has_bios_path ? io.bios_path.generic_string() : Rml::String();
     m.disc_path      = io.has_disc_path ? io.disc_path.generic_string() : Rml::String();
@@ -690,16 +687,8 @@ Result run(SDL_Window* window, void* gl_context,
     c.BindEventCallback("cycle_renderer",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.renderer ^= 1;
-            // Widescreen (native-wide) is software-only: leaving the software
-            // renderer forces 4:3 and hides the toggle, since the experimental
-            // wide path would present stretched on OpenGL (GL compositor TBD).
-            if (m.renderer != 0) m.aspect_index = 0;
             refresh_labels(m);
             handle.DirtyVariable("renderer_label");
-            handle.DirtyVariable("widescreen");
-            handle.DirtyVariable("ws_eligible");
-            handle.DirtyVariable("aspect_label");
-            handle.DirtyVariable("winsize_label");
         });
     c.BindEventCallback("cycle_ss",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -727,9 +716,9 @@ Result run(SDL_Window* window, void* gl_context,
             handle.DirtyVariable("aspect_label");
             handle.DirtyVariable("winsize_label");  /* height follows aspect */
         });
-    // EXPERIMENTAL widescreen On/Off (software renderer only). On => 16:9 native-
-    // wide (aspect_index 1), Off => 4:3 (aspect_index 0). Hidden when ws_eligible
-    // is false (non-software renderer), so this is a no-op there as a safety net.
+    // EXPERIMENTAL widescreen On/Off. On => 16:9 native-wide (aspect_index 1),
+    // Off => 4:3 (aspect_index 0). Works on BOTH renderers (SW + the GL wide
+    // compositor), so it is no longer gated on the software renderer.
     //
     // 21:9 (kAspects[2]) is STUBBED but intentionally hidden: the engine handles
     // it (offset / cull / compositor are all aspect-derived), but the parallax +
@@ -739,7 +728,6 @@ Result run(SDL_Window* window, void* gl_context,
     // cycles aspect_index 0/1/2 and is the scaffold for it.
     c.BindEventCallback("toggle_widescreen",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            if (m.renderer != 0) return;                       // SW-only
             m.aspect_index = (m.aspect_index == 1) ? 0 : 1;    // 16:9 <-> 4:3
             refresh_labels(m);
             handle.DirtyVariable("widescreen");
