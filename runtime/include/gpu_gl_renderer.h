@@ -87,6 +87,14 @@ uint64_t gl_renderer_coh_total(void);
 /* Fetch event by absolute sequence number; 0 if evicted or out of range. */
 int gl_renderer_coh_get(uint64_t seq, GlCohEvent *out);
 
+/* frame_perf: aggregate the per-frame GPU/CPU phase-timing ring (debug server
+ * "frame_perf"). wide_filter: -1 = all frames, 0 = 4:3 present, 1 = native-wide.
+ * Fills out[9]: [0]=count, [1]=total_ms avg, [2]=total_ms max, [3]=emu_cpu_ms avg
+ * (frame minus the present call), [4]=present_wall_ms avg, [5]=scene_gpu_ms avg,
+ * [6]=scene_gpu_ms max, [7]=present_gpu_ms avg, [8]=present_gpu_ms max. GPU phases
+ * are true GL_TIME_ELAPSED times (CPU-overhead independent). Returns the count. */
+int gl_renderer_perf_aggregate(int wide_filter, double out[9]);
+
 #ifdef __cplusplus
 }
 #endif

@@ -153,6 +153,22 @@ typedef void   (APIENTRY *PFN_glGenRenderbuffers)(GLsizei, GLuint *);
 typedef void   (APIENTRY *PFN_glBindRenderbuffer)(GLenum, GLuint);
 typedef void   (APIENTRY *PFN_glRenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
 typedef void   (APIENTRY *PFN_glFramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
+/* GPU timer queries (ARB_timer_query / core GL 3.3) — frame_perf instrumentation. */
+typedef void   (APIENTRY *PFN_glGenQueries)(GLsizei, GLuint *);
+typedef void   (APIENTRY *PFN_glDeleteQueries)(GLsizei, const GLuint *);
+typedef void   (APIENTRY *PFN_glBeginQuery)(GLenum, GLuint);
+typedef void   (APIENTRY *PFN_glEndQuery)(GLenum);
+typedef void   (APIENTRY *PFN_glGetQueryObjectui64v)(GLuint, GLenum, GLuint64 *);
+typedef void   (APIENTRY *PFN_glGetQueryObjectiv)(GLuint, GLenum, GLint *);
+#ifndef GL_TIME_ELAPSED
+#define GL_TIME_ELAPSED            0x88BF
+#endif
+#ifndef GL_QUERY_RESULT
+#define GL_QUERY_RESULT            0x8866
+#endif
+#ifndef GL_QUERY_RESULT_AVAILABLE
+#define GL_QUERY_RESULT_AVAILABLE  0x8867
+#endif
 
 static PFN_glCreateShader      p_glCreateShader;
 static PFN_glShaderSource      p_glShaderSource;
@@ -188,6 +204,13 @@ static PFN_glBindFramebuffer   p_glBindFramebuffer;
 static PFN_glFramebufferTexture2D p_glFramebufferTexture2D;
 static PFN_glCheckFramebufferStatus p_glCheckFramebufferStatus;
 static PFN_glBlitFramebuffer   p_glBlitFramebuffer;
+static PFN_glGenQueries          p_glGenQueries;
+static PFN_glDeleteQueries       p_glDeleteQueries;
+static PFN_glBeginQuery          p_glBeginQuery;
+static PFN_glEndQuery            p_glEndQuery;
+static PFN_glGetQueryObjectui64v p_glGetQueryObjectui64v;
+static PFN_glGetQueryObjectiv    p_glGetQueryObjectiv;
+static void gl_perf_init(void);   /* frame_perf — defined below, called from init_gpu_raster */
 static PFN_glGenRenderbuffers  p_glGenRenderbuffers;
 static PFN_glBindRenderbuffer  p_glBindRenderbuffer;
 static PFN_glRenderbufferStorage p_glRenderbufferStorage;
@@ -222,6 +245,14 @@ static int load_modern_gl(void) {
     LOAD(p_glBindRenderbuffer, "glBindRenderbuffer");
     LOAD(p_glRenderbufferStorage, "glRenderbufferStorage");
     LOAD(p_glFramebufferRenderbuffer, "glFramebufferRenderbuffer");
+    /* GPU timer queries — optional (frame_perf). Don't fail the renderer if
+     * absent; gl_perf just stays disabled. */
+    p_glGenQueries          = (void *)SDL_GL_GetProcAddress("glGenQueries");
+    p_glDeleteQueries       = (void *)SDL_GL_GetProcAddress("glDeleteQueries");
+    p_glBeginQuery          = (void *)SDL_GL_GetProcAddress("glBeginQuery");
+    p_glEndQuery            = (void *)SDL_GL_GetProcAddress("glEndQuery");
+    p_glGetQueryObjectui64v = (void *)SDL_GL_GetProcAddress("glGetQueryObjectui64v");
+    p_glGetQueryObjectiv    = (void *)SDL_GL_GetProcAddress("glGetQueryObjectiv");
 #undef LOAD
     return ok;
 }
@@ -1452,6 +1483,7 @@ static int init_gpu_raster(void) {
     g_wide_w = 0; g_wide_off = 0; g_wide_cur = 0; g_wide_cur_base = 0;
 
     s_raster_ok = 1;
+    gl_perf_init();   /* frame_perf GPU/CPU phase timing (no-op if queries absent) */
     fprintf(stdout, "psxrecomp: GL GPU pipeline ready (internal scale %dx, "
             "mask-bit stencil, texture window, GPU copy/upload)\n", s_scale);
     return 1;
@@ -1777,10 +1809,126 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
  * authoritative hr FBO into a letterboxed rect. Deterministic — runs
  * every 15-bit frame regardless of what mix of ops produced it.
  * force_4_3 pins to native 4:3 (15-bit MDEC FMV frames on a wide aspect). */
+/* ===================== frame_perf: per-frame GPU/CPU phase timing ============
+ * Always-on (Release too). Two GL_TIME_ELAPSED queries per frame bracket (a) the
+ * scene draws (all GP0 raster issued between two presents) and (b) the present
+ * clear+blit, giving TRUE GPU time per phase independent of CPU/GPU overlap
+ * (glFinish would only catch the non-overlapped tail and mislead). CPU wall time
+ * (present-to-present total, and the present call) comes from SDL perf counters.
+ * Results are read back GLPERF_NBUF frames late (no pipeline stall) into a ring
+ * the debug server's frame_perf command aggregates. One question this answers:
+ * where does a 16:9 frame go vs 4:3 — scene fill, wide composite, or CPU. */
+#define GLPERF_NBUF 4
+#define GLPERF_RING 256
+typedef struct {
+    double   total_ms;        /* present-entry to present-entry (full frame)  */
+    double   present_wall_ms; /* CPU wall time inside the present call         */
+    double   scene_gpu_ms;    /* GPU: all scene draws this frame               */
+    double   present_gpu_ms;  /* GPU: the present clear+blit                   */
+    int      wide;            /* 1 = native-wide (16:9) present, 0 = 4:3       */
+    uint64_t frame;
+} GlPerfSample;
+
+static int      s_pf_on = 0;
+static GLuint   s_pf_scene_q[GLPERF_NBUF];
+static GLuint   s_pf_present_q[GLPERF_NBUF];
+static int      s_pf_b = 0;            /* buffer for the CURRENT frame         */
+static int      s_pf_scene_active = 0;
+static uint64_t s_pf_count = 0;
+static uint64_t s_pf_freq = 1;
+static uint64_t s_pf_last_enter = 0;
+static uint64_t s_pf_enter = 0;
+static double   s_pf_total_pending = 0.0;
+static double   s_pf_buf_total[GLPERF_NBUF];
+static double   s_pf_buf_pwall[GLPERF_NBUF];
+static int      s_pf_buf_wide[GLPERF_NBUF];
+static uint64_t s_pf_buf_frame[GLPERF_NBUF];
+static GlPerfSample s_pf_ring[GLPERF_RING];
+static uint64_t     s_pf_ring_seq = 0;
+
+static void gl_perf_init(void) {
+    if (!p_glGenQueries || !p_glBeginQuery || !p_glEndQuery || !p_glGetQueryObjectui64v) return;
+    p_glGenQueries(GLPERF_NBUF, s_pf_scene_q);
+    p_glGenQueries(GLPERF_NBUF, s_pf_present_q);
+    s_pf_freq = SDL_GetPerformanceFrequency();
+    if (!s_pf_freq) s_pf_freq = 1;
+    s_pf_b = 0; s_pf_scene_active = 0; s_pf_count = 0; s_pf_ring_seq = 0;
+    s_pf_last_enter = 0;
+    s_pf_on = 1;
+}
+
+/* Top of present (after flush_cpu_upload, before clear/blit). */
+static void gl_perf_present_enter(void) {
+    if (!s_pf_on) return;
+    uint64_t now = SDL_GetPerformanceCounter();
+    s_pf_enter = now;
+    s_pf_total_pending = s_pf_last_enter
+        ? (double)(now - s_pf_last_enter) * 1000.0 / (double)s_pf_freq : 0.0;
+    s_pf_last_enter = now;
+    if (s_pf_scene_active) { p_glEndQuery(GL_TIME_ELAPSED); s_pf_scene_active = 0; } /* end frame b's scene draws */
+    p_glBeginQuery(GL_TIME_ELAPSED, s_pf_present_q[s_pf_b]);                         /* time frame b's present */
+}
+
+/* End of present (after SwapWindow). wide = native-wide path. */
+static void gl_perf_present_exit(int wide) {
+    if (!s_pf_on) return;
+    uint64_t now = SDL_GetPerformanceCounter();
+    p_glEndQuery(GL_TIME_ELAPSED);   /* end present_q[b] */
+    s_pf_buf_total[s_pf_b] = s_pf_total_pending;
+    s_pf_buf_pwall[s_pf_b] = (double)(now - s_pf_enter) * 1000.0 / (double)s_pf_freq;
+    s_pf_buf_wide[s_pf_b]  = wide;
+    s_pf_buf_frame[s_pf_b] = s_pf_count;
+    int rd = (s_pf_b + 1) % GLPERF_NBUF;   /* oldest buffer (frame count+1-NBUF), now done */
+    if (s_pf_count >= (uint64_t)GLPERF_NBUF) {
+        GLuint64 sc = 0, pr = 0;
+        p_glGetQueryObjectui64v(s_pf_scene_q[rd],   GL_QUERY_RESULT, &sc);
+        p_glGetQueryObjectui64v(s_pf_present_q[rd], GL_QUERY_RESULT, &pr);
+        GlPerfSample *s = &s_pf_ring[s_pf_ring_seq % GLPERF_RING];
+        s->total_ms        = s_pf_buf_total[rd];
+        s->present_wall_ms = s_pf_buf_pwall[rd];
+        s->scene_gpu_ms    = (double)sc / 1.0e6;
+        s->present_gpu_ms  = (double)pr / 1.0e6;
+        s->wide            = s_pf_buf_wide[rd];
+        s->frame           = s_pf_buf_frame[rd];
+        s_pf_ring_seq++;
+    }
+    s_pf_count++;
+    s_pf_b = rd;                                          /* reuse oldest for next frame */
+    p_glBeginQuery(GL_TIME_ELAPSED, s_pf_scene_q[s_pf_b]); /* open next frame's scene draws */
+    s_pf_scene_active = 1;
+}
+
+/* Aggregate the ring for the debug server. wide_filter: -1 all, 0 = 4:3, 1 = wide.
+ * out[0]=count, [1]=total_avg, [2]=total_max, [3]=emu_cpu_avg (total-present_wall),
+ * [4]=present_wall_avg, [5]=scene_gpu_avg, [6]=scene_gpu_max, [7]=present_gpu_avg,
+ * [8]=present_gpu_max. Returns the sample count. */
+int gl_renderer_perf_aggregate(int wide_filter, double out[9]) {
+    for (int i = 0; i < 9; i++) out[i] = 0.0;
+    if (!s_pf_on) return 0;
+    int navail = (int)(s_pf_ring_seq < (uint64_t)GLPERF_RING ? s_pf_ring_seq : GLPERF_RING);
+    uint64_t start = s_pf_ring_seq - (uint64_t)navail;
+    int n = 0;
+    for (int i = 0; i < navail; i++) {
+        const GlPerfSample *s = &s_pf_ring[(start + i) % GLPERF_RING];
+        if (wide_filter >= 0 && s->wide != wide_filter) continue;
+        double emu = s->total_ms - s->present_wall_ms; if (emu < 0) emu = 0;
+        out[1] += s->total_ms;       if (s->total_ms     > out[2]) out[2] = s->total_ms;
+        out[3] += emu;
+        out[4] += s->present_wall_ms;
+        out[5] += s->scene_gpu_ms;   if (s->scene_gpu_ms > out[6]) out[6] = s->scene_gpu_ms;
+        out[7] += s->present_gpu_ms; if (s->present_gpu_ms > out[8]) out[8] = s->present_gpu_ms;
+        n++;
+    }
+    if (n) { out[1]/=n; out[3]/=n; out[4]/=n; out[5]/=n; out[7]/=n; }
+    out[0] = (double)n;
+    return n;
+}
+
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3) {
     if (!s_ctx || !s_raster_ok) return;
     flush_cpu_upload();
+    gl_perf_present_enter();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     if (force_4_3)
@@ -1801,6 +1949,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                         GL_COLOR_BUFFER_BIT, linear ? GL_LINEAR : GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     SDL_GL_SwapWindow(s_win);
+    gl_perf_present_exit(0);
     coh_record(GL_COH_PRESENT, disp_x, disp_y, disp_x + w - 1, disp_y + h - 1);
 }
 
@@ -1817,6 +1966,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
         if (s_wide_fbo[i] && s_wide_base[i] == disp_x) { fbo = s_wide_fbo[i]; break; }
     if (!fbo) return 0;
     flush_cpu_upload();
+    gl_perf_present_enter();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
@@ -1834,6 +1984,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
                         GL_COLOR_BUFFER_BIT, linear ? GL_LINEAR : GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
     SDL_GL_SwapWindow(s_win);
+    gl_perf_present_exit(1);
     coh_record(GL_COH_PRESENT, 0, disp_y, g_wide_w - 1, disp_y + disp_h - 1);
     return 1;
 }

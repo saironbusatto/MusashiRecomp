@@ -5245,6 +5245,34 @@ static void handle_ws_margin(int id, const char *json)
              id, v, ws.x_margin, ws.active);
 }
 
+/* frame_perf: per-frame GPU/CPU phase timing (gpu_gl_renderer.c frame_perf ring).
+ * Reports avg/max over the recent ring for ALL frames plus the native-wide (16:9)
+ * and 4:3 subsets, so a 16:9-vs-4:3 A/B reads straight off one query. The GPU
+ * phases are true GL_TIME_ELAPSED times — unaffected by the debug build's CPU
+ * overhead — so scene_gpu (fill) vs present_gpu (wide composite) vs emu_cpu
+ * (guest emulation, frame minus present) pinpoints where the frame goes. */
+static void handle_frame_perf(int id, const char *json)
+{
+    (void)json;
+    double all[9], wide[9], n43[9];
+    int na = gl_renderer_perf_aggregate(-1, all);
+    gl_renderer_perf_aggregate(1, wide);
+    gl_renderer_perf_aggregate(0, n43);
+    if (na <= 0) { send_err(id, "no frame_perf samples (GL timer queries unavailable, or no GL frames yet)"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"samples\":%d,\"wide_frames\":%d,\"frames_4_3\":%d,"
+             "\"all\":{\"total_ms_avg\":%.3f,\"total_ms_max\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
+             "\"present_wall_ms_avg\":%.3f,\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,"
+             "\"present_gpu_ms_avg\":%.3f,\"present_gpu_ms_max\":%.3f},"
+             "\"wide_16_9\":{\"n\":%d,\"total_ms_avg\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
+             "\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,\"present_gpu_ms_avg\":%.3f},"
+             "\"a4_3\":{\"n\":%d,\"total_ms_avg\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
+             "\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,\"present_gpu_ms_avg\":%.3f}}",
+             id, na, (int)wide[0], (int)n43[0],
+             all[1], all[2], all[3], all[4], all[5], all[6], all[7], all[8],
+             (int)wide[0], wide[1], wide[3], wide[5], wide[6], wide[7],
+             (int)n43[0], n43[1], n43[3], n43[5], n43[6], n43[7]);
+}
+
 /* Live GTE widescreen-squash toggle (diagnostic for 8C far-backdrop void):
  * ws_aspect num=<n> den=<d> calls gte_set_display_aspect at runtime so we can
  * compare squash ON (e.g. 16/9) vs OFF (1/1) in-place without a relaunch. */
@@ -8669,6 +8697,7 @@ static const CmdEntry s_commands[] = {
     { "mem_words",         handle_mem_words },
     { "vram_peek",         handle_vram_peek },
     { "gl_coh_ring",       handle_gl_coh_ring },
+    { "frame_perf",        handle_frame_perf },
     { "gl_fbo_peek",       handle_gl_fbo_peek },
     { "gl_vram_diff",      handle_gl_vram_diff },
     { "irq_state",         handle_irq_state },
