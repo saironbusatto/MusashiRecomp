@@ -284,6 +284,9 @@ static GLuint        s_scratch_tex = 0, s_scratch_fbo = 0;
 /* Programs. */
 static GLuint s_geo_prog = 0, s_geo_vao = 0, s_geo_vbo = 0;
 static GLuint s_tex_prog = 0, s_tex_vao = 0, s_tex_vbo = 0;
+/* Textured vertex: pos(2) uv(2) col(4) tpage(2) clut(2) depth(1) raw(1) limits(4)
+ * — per-prim texture state in flat attributes so prims batch (see flush_tex_batch). */
+#define TEXV 18
 static GLuint s_blit_prog = 0, s_blit_vao = 0, s_blit_vbo = 0;
 static GLuint s_pack_prog = 0, s_empty_vao = 0;
 
@@ -437,36 +440,48 @@ static const char *GEO_FS =
  * PS1 *2-around-0x80 modulation. Output alpha = bit15 of the written pixel.
  * Texel coords use floor() to match the software rasterizer's truncation
  * (rounding shifted sampling +1 texel half the time: smeared text). */
+/* Textured program. Per-prim texture state (texpage, clut, depth, raw, uv
+ * limits) is carried in FLAT vertex attributes — constant across a prim's
+ * vertices — instead of uniforms, so consecutive textured prims with the same
+ * blend/mask/texture-window state batch into one draw (see flush_tex_batch).
+ * The remaining uniforms (u_twin/u_maskset/u_filter/u_semipass) are the batch
+ * keys + per-pass state. */
 static const char *TEX_VS =
     "#version 330\n"
     "layout(location=0) in vec2 a_pos;\n"
     "layout(location=1) in vec2 a_uv;\n"
     "layout(location=2) in vec4 a_col;\n"
+    "layout(location=3) in vec2 a_tpage;\n"
+    "layout(location=4) in vec2 a_clut;\n"
+    "layout(location=5) in float a_depth;\n"
+    "layout(location=6) in float a_raw;\n"
+    "layout(location=7) in vec4 a_limits;\n"
     "uniform float u_shift;\n"
     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
     "noperspective out vec2 v_uv; noperspective out vec4 v_col;\n"
+    "flat out ivec2 v_tpage; flat out ivec2 v_clut; flat out int v_depth;\n"
+    "flat out int v_raw; flat out ivec4 v_limits;\n"
     "void main(){ v_uv = a_uv; v_col = a_col;\n"
+    "  v_tpage = ivec2(a_tpage + 0.5); v_clut = ivec2(a_clut + 0.5);\n"
+    "  v_depth = int(a_depth + 0.5); v_raw = int(a_raw + 0.5);\n"
+    "  v_limits = ivec4(floor(a_limits + 0.5));\n"
     "  /* u_shift: align GL's center-sample grid with the PS1 integer grid (see\n"
     "   * GEO_VS) so interpolated uv at a fragment equals the PS1 DDA value. */\n"
     "  gl_Position = vec4((a_pos.x+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
 static const char *TEX_FS =
     "#version 330\n"
     "noperspective in vec2 v_uv; noperspective in vec4 v_col; out vec4 frag;\n"
+    "flat in ivec2 v_tpage;   /* texture page base, VRAM px */\n"
+    "flat in ivec2 v_clut;    /* CLUT base, VRAM px */\n"
+    "flat in int v_depth;     /* 0=4bit 1=8bit 2=15bit */\n"
+    "flat in int v_raw;       /* 1 = no color modulation */\n"
+    "flat in ivec4 v_limits;  /* prim uv sampling bounds (inclusive, post-wrap) */\n"
     "uniform usampler2D u_vram;\n"
-    "uniform ivec2 u_tpage;   /* texture page base, VRAM px */\n"
-    "uniform ivec2 u_clut;    /* CLUT base, VRAM px */\n"
-    "uniform int u_depth;     /* 0=4bit 1=8bit 2=15bit */\n"
-    "uniform int u_raw;       /* 1 = no color modulation */\n"
     "uniform int u_semipass;  /* 0=all texels, 1=STP=0 only, 2=STP=1 only */\n"
     "uniform ivec4 u_twin;    /* texture window: mask_x, mask_y, off_x, off_y */\n"
     "uniform int u_maskset;   /* GP0(E6h) set-mask: OR bit15 into output */\n"
     "uniform int u_filter;    /* 1 = bilinear */\n"
-    "uniform ivec4 u_limits;  /* prim uv sampling bounds (inclusive, post-wrap\n"
-    "                            space): filtered neighbours and S>1 overshoot\n"
-    "                            clamp here so a sample never reads outside the\n"
-    "                            prim's own texture rect (Beetle-PSX model).\n"
-    "                            Ignored while a texture window is active. */\n"
     "int vram_at(int x, int y){\n"
     "  return int(texelFetch(u_vram, ivec2(x & 1023, y & 511), 0).r);\n"
     "}\n"
@@ -476,17 +491,17 @@ static const char *TEX_FS =
     "    u = (u & ~(u_twin.x * 8)) | ((u_twin.z & u_twin.x) * 8);\n"
     "    v = (v & ~(u_twin.y * 8)) | ((u_twin.w & u_twin.y) * 8);\n"
     "  } else {\n"
-    "    u = clamp(u, u_limits.x, u_limits.z);\n"
-    "    v = clamp(v, u_limits.y, u_limits.w);\n"
+    "    u = clamp(u, v_limits.x, v_limits.z);\n"
+    "    v = clamp(v, v_limits.y, v_limits.w);\n"
     "  }\n"
-    "  if (u_depth == 0) {\n"
-    "    int px = vram_at(u_tpage.x + (u >> 2), u_tpage.y + v);\n"
-    "    return vram_at(u_clut.x + ((px >> ((u & 3) * 4)) & 0xF), u_clut.y);\n"
-    "  } else if (u_depth == 1) {\n"
-    "    int px = vram_at(u_tpage.x + (u >> 1), u_tpage.y + v);\n"
-    "    return vram_at(u_clut.x + ((px >> ((u & 1) * 8)) & 0xFF), u_clut.y);\n"
+    "  if (v_depth == 0) {\n"
+    "    int px = vram_at(v_tpage.x + (u >> 2), v_tpage.y + v);\n"
+    "    return vram_at(v_clut.x + ((px >> ((u & 3) * 4)) & 0xF), v_clut.y);\n"
+    "  } else if (v_depth == 1) {\n"
+    "    int px = vram_at(v_tpage.x + (u >> 1), v_tpage.y + v);\n"
+    "    return vram_at(v_clut.x + ((px >> ((u & 1) * 8)) & 0xFF), v_clut.y);\n"
     "  }\n"
-    "  return vram_at(u_tpage.x + u, u_tpage.y + v);\n"
+    "  return vram_at(v_tpage.x + u, v_tpage.y + v);\n"
     "}\n"
     "vec3 col5(int raw){\n"
     "  return vec3(float(raw & 31), float((raw >> 5) & 31), float((raw >> 10) & 31)) / 31.0;\n"
@@ -526,7 +541,7 @@ static const char *TEX_FS =
     "  }\n"
     "  if (u_semipass == 1 && stp == 1) discard;\n"
     "  if (u_semipass == 2 && stp == 0) discard;\n"
-    "  if (u_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
+    "  if (v_raw == 0) rgb = clamp(rgb * v_col.rgb * 2.0, 0.0, 1.0);\n"
     "  frag = vec4(rgb, (stp == 1 || u_maskset == 1) ? 1.0 : 0.0);\n"
     "}\n";
 
@@ -944,16 +959,17 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     flush_pack_if_sampling(base_x, base_y, depth, clut_x, clut_y);
     mark_prim_dirty(xs, ys, 3);
 
-    float verts[3 * 8];
+    float verts[3 * TEXV];
     for (int i = 0; i < 3; i++) {
-        verts[i*8+0] = (float)xs[i];
-        verts[i*8+1] = (float)ys[i];
-        verts[i*8+2] = (float)us[i];
-        verts[i*8+3] = (float)vs[i];
-        verts[i*8+4] = col[i*3+0];
-        verts[i*8+5] = col[i*3+1];
-        verts[i*8+6] = col[i*3+2];
-        verts[i*8+7] = 1.0f;
+        float *vp = &verts[i*TEXV];
+        vp[0] = (float)xs[i];   vp[1] = (float)ys[i];
+        vp[2] = (float)us[i];   vp[3] = (float)vs[i];
+        vp[4] = col[i*3+0];     vp[5] = col[i*3+1];     vp[6] = col[i*3+2];   vp[7] = 1.0f;
+        vp[8]  = (float)base_x;  vp[9]  = (float)base_y;        /* a_tpage  */
+        vp[10] = (float)clut_x;  vp[11] = (float)clut_y;        /* a_clut   */
+        vp[12] = (float)depth;   vp[13] = (float)rawtex;        /* a_depth, a_raw */
+        vp[14] = (float)lim[0];  vp[15] = (float)lim[1];        /* a_limits */
+        vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
     }
 
     hr_begin(1);
@@ -961,14 +977,9 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     p_glActiveTexture(PSXGL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, s_raw_tex);
     p_glUniform1i(s_uVram, 0);
-    p_glUniform2i(s_uTpage, base_x, base_y);
-    p_glUniform2i(s_uClut, clut_x, clut_y);
-    p_glUniform1i(s_uDepth, depth);
-    p_glUniform1i(s_uRaw, rawtex);
     p_glUniform4i(s_uTwin, s_tw_mask_x, s_tw_mask_y, s_tw_off_x, s_tw_off_y);
     p_glUniform1i(s_uMaskset, s_mask_set);
     p_glUniform1i(s_uFilter, s_tex_filter);
-    p_glUniform4i(s_uLimits, lim[0], lim[1], lim[2], lim[3]);
     p_glBindVertexArray(s_tex_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
@@ -1447,12 +1458,17 @@ static int init_gpu_raster(void) {
     p_glBindVertexArray(s_tex_vao);
     p_glGenBuffers(1, &s_tex_vbo);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
-    p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)0);
-    p_glEnableVertexAttribArray(0);
-    p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)(2*sizeof(float)));
-    p_glEnableVertexAttribArray(1);
-    p_glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, 8*sizeof(float), (void*)(4*sizeof(float)));
-    p_glEnableVertexAttribArray(2);
+    {
+        GLsizei st = TEXV * sizeof(float);
+        p_glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, st, (void*)0);                  p_glEnableVertexAttribArray(0); /* pos    */
+        p_glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, st, (void*)(2*sizeof(float)));  p_glEnableVertexAttribArray(1); /* uv     */
+        p_glVertexAttribPointer(2, 4, GL_FLOAT, GL_FALSE, st, (void*)(4*sizeof(float)));  p_glEnableVertexAttribArray(2); /* col    */
+        p_glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, st, (void*)(8*sizeof(float)));  p_glEnableVertexAttribArray(3); /* tpage  */
+        p_glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, st, (void*)(10*sizeof(float))); p_glEnableVertexAttribArray(4); /* clut   */
+        p_glVertexAttribPointer(5, 1, GL_FLOAT, GL_FALSE, st, (void*)(12*sizeof(float))); p_glEnableVertexAttribArray(5); /* depth  */
+        p_glVertexAttribPointer(6, 1, GL_FLOAT, GL_FALSE, st, (void*)(13*sizeof(float))); p_glEnableVertexAttribArray(6); /* raw    */
+        p_glVertexAttribPointer(7, 4, GL_FLOAT, GL_FALSE, st, (void*)(14*sizeof(float))); p_glEnableVertexAttribArray(7); /* limits */
+    }
 
     p_glGenVertexArrays(1, &s_blit_vao);
     p_glBindVertexArray(s_blit_vao);
