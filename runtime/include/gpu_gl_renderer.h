@@ -96,6 +96,10 @@ int gl_renderer_coh_get(uint64_t seq, GlCohEvent *out);
  * GL_TIME_ELAPSED times (CPU-overhead independent). Returns the count. */
 int gl_renderer_perf_aggregate(int wide_filter, double out[10]);
 
+/* Cumulative textured fraction of scene primitives since boot (flat vs textured
+ * batching decision). Sets *out_tex_frac; returns total prim count. */
+uint64_t gl_renderer_perf_prim_split(double *out_tex_frac);
+
 #ifdef __cplusplus
 }
 #endif
