@@ -794,7 +794,9 @@ static void ensure_cpu(void) {
 
 /* ---- GPU primitives ------------------------------------------------------ */
 
+static uint64_t s_scene_prims = 0;   /* frame_perf: scene primitives submitted (pre double-draw) */
 static void mark_prim_dirty(const int *xs, const int *ys, int n) {
+    s_scene_prims++;
     int x0 = xs[0], x1 = xs[0], y0 = ys[0], y1 = ys[0];
     for (int i = 1; i < n; i++) {
         if (xs[i] < x0) x0 = xs[i]; if (xs[i] > x1) x1 = xs[i];
@@ -1825,6 +1827,7 @@ typedef struct {
     double   present_wall_ms; /* CPU wall time inside the present call         */
     double   scene_gpu_ms;    /* GPU: all scene draws this frame               */
     double   present_gpu_ms;  /* GPU: the present clear+blit                   */
+    double   prims;           /* scene primitives submitted this frame         */
     int      wide;            /* 1 = native-wide (16:9) present, 0 = 4:3       */
     uint64_t frame;
 } GlPerfSample;
@@ -1841,8 +1844,11 @@ static uint64_t s_pf_enter = 0;
 static double   s_pf_total_pending = 0.0;
 static double   s_pf_buf_total[GLPERF_NBUF];
 static double   s_pf_buf_pwall[GLPERF_NBUF];
+static double   s_pf_buf_prims[GLPERF_NBUF];
 static int      s_pf_buf_wide[GLPERF_NBUF];
 static uint64_t s_pf_buf_frame[GLPERF_NBUF];
+static uint64_t s_pf_prims_last = 0;
+static double   s_pf_prims_pending = 0.0;
 static GlPerfSample s_pf_ring[GLPERF_RING];
 static uint64_t     s_pf_ring_seq = 0;
 
@@ -1865,6 +1871,8 @@ static void gl_perf_present_enter(void) {
     s_pf_total_pending = s_pf_last_enter
         ? (double)(now - s_pf_last_enter) * 1000.0 / (double)s_pf_freq : 0.0;
     s_pf_last_enter = now;
+    s_pf_prims_pending = (double)(s_scene_prims - s_pf_prims_last);   /* prims drawn this frame */
+    s_pf_prims_last = s_scene_prims;
     if (s_pf_scene_active) { p_glEndQuery(GL_TIME_ELAPSED); s_pf_scene_active = 0; } /* end frame b's scene draws */
     p_glBeginQuery(GL_TIME_ELAPSED, s_pf_present_q[s_pf_b]);                         /* time frame b's present */
 }
@@ -1876,6 +1884,7 @@ static void gl_perf_present_exit(int wide) {
     p_glEndQuery(GL_TIME_ELAPSED);   /* end present_q[b] */
     s_pf_buf_total[s_pf_b] = s_pf_total_pending;
     s_pf_buf_pwall[s_pf_b] = (double)(now - s_pf_enter) * 1000.0 / (double)s_pf_freq;
+    s_pf_buf_prims[s_pf_b] = s_pf_prims_pending;
     s_pf_buf_wide[s_pf_b]  = wide;
     s_pf_buf_frame[s_pf_b] = s_pf_count;
     int rd = (s_pf_b + 1) % GLPERF_NBUF;   /* oldest buffer (frame count+1-NBUF), now done */
@@ -1888,6 +1897,7 @@ static void gl_perf_present_exit(int wide) {
         s->present_wall_ms = s_pf_buf_pwall[rd];
         s->scene_gpu_ms    = (double)sc / 1.0e6;
         s->present_gpu_ms  = (double)pr / 1.0e6;
+        s->prims           = s_pf_buf_prims[rd];
         s->wide            = s_pf_buf_wide[rd];
         s->frame           = s_pf_buf_frame[rd];
         s_pf_ring_seq++;
@@ -1902,8 +1912,8 @@ static void gl_perf_present_exit(int wide) {
  * out[0]=count, [1]=total_avg, [2]=total_max, [3]=emu_cpu_avg (total-present_wall),
  * [4]=present_wall_avg, [5]=scene_gpu_avg, [6]=scene_gpu_max, [7]=present_gpu_avg,
  * [8]=present_gpu_max. Returns the sample count. */
-int gl_renderer_perf_aggregate(int wide_filter, double out[9]) {
-    for (int i = 0; i < 9; i++) out[i] = 0.0;
+int gl_renderer_perf_aggregate(int wide_filter, double out[10]) {
+    for (int i = 0; i < 10; i++) out[i] = 0.0;
     if (!s_pf_on) return 0;
     int navail = (int)(s_pf_ring_seq < (uint64_t)GLPERF_RING ? s_pf_ring_seq : GLPERF_RING);
     uint64_t start = s_pf_ring_seq - (uint64_t)navail;
@@ -1917,9 +1927,10 @@ int gl_renderer_perf_aggregate(int wide_filter, double out[9]) {
         out[4] += s->present_wall_ms;
         out[5] += s->scene_gpu_ms;   if (s->scene_gpu_ms > out[6]) out[6] = s->scene_gpu_ms;
         out[7] += s->present_gpu_ms; if (s->present_gpu_ms > out[8]) out[8] = s->present_gpu_ms;
+        out[9] += s->prims;
         n++;
     }
-    if (n) { out[1]/=n; out[3]/=n; out[4]/=n; out[5]/=n; out[7]/=n; }
+    if (n) { out[1]/=n; out[3]/=n; out[4]/=n; out[5]/=n; out[7]/=n; out[9]/=n; }
     out[0] = (double)n;
     return n;
 }
