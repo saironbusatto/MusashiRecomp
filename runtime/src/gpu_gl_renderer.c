@@ -211,6 +211,7 @@ static PFN_glEndQuery            p_glEndQuery;
 static PFN_glGetQueryObjectui64v p_glGetQueryObjectui64v;
 static PFN_glGetQueryObjectiv    p_glGetQueryObjectiv;
 static void gl_perf_init(void);   /* frame_perf — defined below, called from init_gpu_raster */
+static void flush_tex_batch(void); /* textured-prim batch — defined below, flushed from coherency points */
 static PFN_glGenRenderbuffers  p_glGenRenderbuffers;
 static PFN_glBindRenderbuffer  p_glBindRenderbuffer;
 static PFN_glRenderbufferStorage p_glRenderbufferStorage;
@@ -700,6 +701,7 @@ static void hr_end(void) {
  * next GPU op (or readback/present) preserves PS1 command order. */
 static void flush_cpu_upload(void) {
     if (!s_raster_ok || !s_up_pending.set) return;
+    flush_tex_batch();   /* queued draws must land before this upload writes VRAM */
     int x = s_up_pending.x0, y = s_up_pending.y0;
     int w = s_up_pending.x1 - s_up_pending.x0 + 1;
     int h = s_up_pending.y1 - s_up_pending.y0 + 1;
@@ -786,18 +788,22 @@ static void flush_pack_if_sampling(int tpage_x, int tpage_y, int depth,
     int page_w = depth == 0 ? 64 : depth == 1 ? 128 : 256;  /* VRAM columns */
     if (rect_intersects(&s_pack_dirty, tpage_x, tpage_y,
                         tpage_x + page_w - 1, tpage_y + 255)) {
+        flush_tex_batch();   /* queued draws are part of s_pack_dirty — realise them before packing */
         pack_flush(); return;
     }
     if (depth <= 1) {
         int n = depth == 0 ? 16 : 256;
-        if (rect_intersects(&s_pack_dirty, clut_x, clut_y, clut_x + n - 1, clut_y))
+        if (rect_intersects(&s_pack_dirty, clut_x, clut_y, clut_x + n - 1, clut_y)) {
+            flush_tex_batch();
             pack_flush();
+        }
     }
 }
 
 /* ---- coherency: GPU -> CPU readback -------------------------------------- */
 static void ensure_cpu(void) {
     if (!s_raster_ok || !s_gpu_dirty) return;
+    flush_tex_batch();   /* realise queued textured draws before reading the FBO back */
     flush_cpu_upload();
     pack_flush();
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_raw_fbo);
@@ -857,10 +863,70 @@ static void wide_target_end(GLint uXoff, GLint uXhalf) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
 }
 
+/* ---- textured-prim batching -------------------------------------------- *
+ * Consecutive textured prims sharing blend/mask/texwindow/filter coalesce into
+ * one draw. Per-prim texture state (texpage/clut/depth/raw/uv-limits) rides in
+ * the vertex (TEXV flat attributes), so only `semi` (blend) and the global
+ * mask/twin/filter are batch keys. flush_tex_batch() draws the queued verts; it
+ * is called before any op that reads VRAM, writes it outside the batch, or
+ * changes batch state (see callers: flush_cpu_upload, flush_pack_if_sampling,
+ * every non-textured glb_ wrapper, and the present path). Drawing reads only the
+ * already-coherent texture (per-prim coherency was ensured at append time), so
+ * flush_tex_batch never re-enters those helpers. */
+#define TEXBATCH_MAXV 8190                 /* multiple of 3; ~2730 tris */
+static float s_tb[TEXBATCH_MAXV * TEXV];
+static int   s_tb_n = 0;                    /* verts queued */
+static int   s_tb_semi = -2;
+static int   s_tb_mask = 0, s_tb_filter = 0;
+static int   s_tb_twin[4] = {0, 0, 0, 0};
+
+static void flush_tex_batch(void) {
+    if (s_tb_n == 0) return;
+    int nverts = s_tb_n, semi = s_tb_semi;
+    s_tb_n = 0;                             /* clear first: re-entrancy safe */
+
+    hr_begin(1);
+    p_glUseProgram(s_tex_prog);
+    p_glActiveTexture(PSXGL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+    p_glUniform1i(s_uVram, 0);
+    p_glUniform4i(s_uTwin, s_tb_twin[0], s_tb_twin[1], s_tb_twin[2], s_tb_twin[3]);
+    p_glUniform1i(s_uMaskset, s_tb_mask);
+    p_glUniform1i(s_uFilter, s_tb_filter);
+    p_glBindVertexArray(s_tex_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
+    p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
+
+    glDisable(GL_BLEND);                    /* Pass 1: STP=0 texels */
+    mask_stencil(s_tb_mask);
+    p_glUniform1i(s_uSemipass, 1);
+    glDrawArrays(GL_TRIANGLES, 0, nverts);
+    if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);  /* Pass 2: STP=1 */
+    mask_stencil(1);
+    p_glUniform1i(s_uSemipass, 2);
+    glDrawArrays(GL_TRIANGLES, 0, nverts);
+
+    if (g_wide_cur) {                       /* native-wide mirror (both STP passes) */
+        int dx = wide_dx();
+        wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
+        glDisable(GL_BLEND);
+        mask_stencil(s_tb_mask);
+        p_glUniform1i(s_uSemipass, 1);
+        glDrawArrays(GL_TRIANGLES, 0, nverts);
+        if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
+        mask_stencil(1);
+        p_glUniform1i(s_uSemipass, 2);
+        glDrawArrays(GL_TRIANGLES, 0, nverts);
+        wide_target_end(s_tex_uXoff, s_tex_uXhalf);
+    }
+    hr_end();
+}
+
 /* Flat / gouraud triangles and lines share the GEO program. mode: GL_TRIANGLES
  * or GL_LINES; verts are (x, y, r, g, b) tuples with colors as 1555. */
 static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
                          const uint16_t *cs, int n, int semi) {
+    flush_tex_batch();   /* flat prim: drain queued textured draws first (order + program) */
     flush_cpu_upload();
     mark_prim_dirty(xs, ys, n);
     float verts[3 * 6];
@@ -955,64 +1021,37 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     int base_y = ((texpage >> 4) & 1) * 256;
     int depth  = (texpage >> 7) & 3; if (depth > 2) depth = 2;
 
-    flush_cpu_upload();
-    flush_pack_if_sampling(base_x, base_y, depth, clut_x, clut_y);
+    flush_cpu_upload();   /* if a CPU->VRAM upload is pending it flushes the batch first */
+    flush_pack_if_sampling(base_x, base_y, depth, clut_x, clut_y);  /* flushes batch iff it must pack */
     mark_prim_dirty(xs, ys, 3);
 
-    float verts[3 * TEXV];
-    for (int i = 0; i < 3; i++) {
-        float *vp = &verts[i*TEXV];
-        vp[0] = (float)xs[i];   vp[1] = (float)ys[i];
-        vp[2] = (float)us[i];   vp[3] = (float)vs[i];
-        vp[4] = col[i*3+0];     vp[5] = col[i*3+1];     vp[6] = col[i*3+2];   vp[7] = 1.0f;
-        vp[8]  = (float)base_x;  vp[9]  = (float)base_y;        /* a_tpage  */
-        vp[10] = (float)clut_x;  vp[11] = (float)clut_y;        /* a_clut   */
-        vp[12] = (float)depth;   vp[13] = (float)rawtex;        /* a_depth, a_raw */
-        vp[14] = (float)lim[0];  vp[15] = (float)lim[1];        /* a_limits */
-        vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
+    /* Append to the textured batch. Flush first if this prim's blend/mask/twin/
+     * filter differ from the open batch, or the buffer is full. Per-prim texture
+     * state goes in the vertex; only these keys force a new draw. */
+    {
+        int twx = s_tw_mask_x, twy = s_tw_mask_y, tox = s_tw_off_x, toy = s_tw_off_y;
+        if (s_tb_n > 0 &&
+            (semi != s_tb_semi || s_mask_set != s_tb_mask || s_tex_filter != s_tb_filter ||
+             twx != s_tb_twin[0] || twy != s_tb_twin[1] || tox != s_tb_twin[2] || toy != s_tb_twin[3]))
+            flush_tex_batch();
+        if (s_tb_n + 3 > TEXBATCH_MAXV) flush_tex_batch();
+        if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
+            s_tb_semi = semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter;
+            s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
+        }
+        float *vp = &s_tb[s_tb_n * TEXV];
+        for (int i = 0; i < 3; i++, vp += TEXV) {
+            vp[0] = (float)xs[i];   vp[1] = (float)ys[i];
+            vp[2] = (float)us[i];   vp[3] = (float)vs[i];
+            vp[4] = col[i*3+0];     vp[5] = col[i*3+1];     vp[6] = col[i*3+2];   vp[7] = 1.0f;
+            vp[8]  = (float)base_x;  vp[9]  = (float)base_y;        /* a_tpage  */
+            vp[10] = (float)clut_x;  vp[11] = (float)clut_y;        /* a_clut   */
+            vp[12] = (float)depth;   vp[13] = (float)rawtex;        /* a_depth, a_raw */
+            vp[14] = (float)lim[0];  vp[15] = (float)lim[1];        /* a_limits */
+            vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
+        }
+        s_tb_n += 3;
     }
-
-    hr_begin(1);
-    p_glUseProgram(s_tex_prog);
-    p_glActiveTexture(PSXGL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, s_raw_tex);
-    p_glUniform1i(s_uVram, 0);
-    p_glUniform4i(s_uTwin, s_tw_mask_x, s_tw_mask_y, s_tw_off_x, s_tw_off_y);
-    p_glUniform1i(s_uMaskset, s_mask_set);
-    p_glUniform1i(s_uFilter, s_tex_filter);
-    p_glBindVertexArray(s_tex_vao);
-    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
-    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
-
-    /* Pass 1: STP=0 texels — never blended; written bit15 = set_mask. */
-    glDisable(GL_BLEND);
-    mask_stencil(s_mask_set);
-    p_glUniform1i(s_uSemipass, 1);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-    /* Pass 2: STP=1 texels — blended iff the prim is semi; bit15 = 1. */
-    if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
-    mask_stencil(1);
-    p_glUniform1i(s_uSemipass, 2);
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-
-    /* Native-wide mirror: re-issue BOTH STP passes into the active wide surface
-     * with identical blend / u_semipass state, x-translated by wide_dx. Program/
-     * VAO/VBO/uniforms still bound; only the projection (u_xoff/u_xhalf) and the
-     * target FBO/viewport/scissor change. Canonical passes above untouched. */
-    if (g_wide_cur) {
-        int dx = wide_dx();
-        wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
-        glDisable(GL_BLEND);
-        mask_stencil(s_mask_set);
-        p_glUniform1i(s_uSemipass, 1);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-        if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
-        mask_stencil(1);
-        p_glUniform1i(s_uSemipass, 2);
-        glDrawArrays(GL_TRIANGLES, 0, 3);
-        wide_target_end(s_tex_uXoff, s_tex_uXhalf);
-    }
-    hr_end();
 }
 
 /* Draw a flat-colored rect (GEO program) DIRECTLY into the active wide surface
@@ -1125,6 +1164,7 @@ static void fill_segment(int x, int y, int w, int h, float r, float g, float b) 
 
 static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
     if (w <= 0 || h <= 0) return;
+    flush_tex_batch();
     flush_cpu_upload();
     float r=(c&0x1F)/31.0f, g=((c>>5)&0x1F)/31.0f, b=((c>>10)&0x1F)/31.0f;
     x &= VRAM_W - 1; y &= VRAM_H - 1;
@@ -1152,6 +1192,7 @@ static void gpu_fill(int x,int y,int w,int h,uint16_t c) {
  * mask set/check and the stencil mirror apply, exactly like sw_copy_rect. */
 static void gpu_copy_rect(int sx,int sy,int dx,int dy,int w,int h) {
     if (w <= 0 || h <= 0) return;
+    flush_tex_batch();
     flush_cpu_upload();
     /* Clamp to bounds (the software path wraps; wrapping copies are unused
      * in practice — see the file header). */
@@ -1232,9 +1273,9 @@ static void glb_set_texture_window(uint32_t r) {
     sw_set_texture_window(r);
 }
 static void glb_set_color_modulation(int r,int g,int b,int raw) { s_mod_r=r; s_mod_g=g; s_mod_b=b; s_mod_raw=raw; sw_set_color_modulation(r,g,b,raw); }
-static void glb_set_draw_area(int x1,int y1,int x2,int y2) { s_area_x1=x1; s_area_y1=y1; s_area_x2=x2; s_area_y2=y2; sw_set_draw_area(x1,y1,x2,y2); }
+static void glb_set_draw_area(int x1,int y1,int x2,int y2) { flush_tex_batch(); s_area_x1=x1; s_area_y1=y1; s_area_x2=x2; s_area_y2=y2; sw_set_draw_area(x1,y1,x2,y2); }
 static void glb_get_draw_area(int *x1,int *y1,int *x2,int *y2) { sw_get_draw_area(x1,y1,x2,y2); }
-static void glb_set_draw_offset(int x,int y) { s_off_x=x; s_off_y=y; sw_set_draw_offset(x,y); }
+static void glb_set_draw_offset(int x,int y) { flush_tex_batch(); s_off_x=x; s_off_y=y; sw_set_draw_offset(x,y); }
 
 /* Pre-context draws (s_raster_ok == 0) fall back to the software rasterizer
  * over CPU VRAM; the initial full-VRAM upload at context init folds them in.
@@ -1724,6 +1765,7 @@ static GLuint wide_fbo_for(int base_x) {
  * sw_wide_configure. */
 static void glb_wide_configure(int wide_w, int offset) {
     if (!s_raster_ok) return;
+    flush_tex_batch();   /* a queued batch's wide mirror targets the CURRENT surfaces */
     if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; return; }
     if (wide_w != g_wide_w) wide_free_all();
     g_wide_w = wide_w;
@@ -1733,18 +1775,20 @@ static void glb_wide_configure(int wide_w, int offset) {
 /* Select the wide surface to mirror into for the back buffer at base_x. */
 static void glb_wide_set_target(int base_x) {
     if (!s_raster_ok) { g_wide_cur = 0; return; }
+    flush_tex_batch();   /* drain into the OLD target before switching */
     g_wide_cur = wide_fbo_for(base_x);
     g_wide_cur_base = base_x;
 }
 
 /* Stop mirroring (offscreen draws that don't target a framebuffer). */
-static void glb_wide_disable_target(void) { g_wide_cur = 0; }
+static void glb_wide_disable_target(void) { flush_tex_batch(); g_wide_cur = 0; }
 
 /* Mirror a framebuffer clear: fill the full wide width over [y, y+h) of the
  * surface for base_x, so the revealed margins are clean. Mirrors sw_wide_clear:
  * a scissored glClear with the 1555 color converted to RGBA8 (alpha = bit15). */
 static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
     if (!s_raster_ok) return;
+    flush_tex_batch();
     GLuint fbo = wide_fbo_for(base_x);
     if (!fbo) return;
     int H = VRAM_H * s_scale;
@@ -1790,6 +1834,7 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
     /* Fold any pending CPU->VRAM uploads into the canonical FBO first (uploads
      * are never mirrored to wide, but draws after them are; keep op order) and
      * make sure all wide-FBO draws have completed before the readback. */
+    flush_tex_batch();
     flush_cpu_upload();
     glFinish();
 
@@ -1963,6 +2008,7 @@ int gl_renderer_perf_aggregate(int wide_filter, double out[10]) {
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3) {
     if (!s_ctx || !s_raster_ok) return;
+    flush_tex_batch();
     flush_cpu_upload();
     gl_perf_present_enter();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
@@ -2001,6 +2047,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     for (int i = 0; i < WIDE_MAX_SURF; i++)
         if (s_wide_fbo[i] && s_wide_base[i] == disp_x) { fbo = s_wide_fbo[i]; break; }
     if (!fbo) return 0;
+    flush_tex_batch();
     flush_cpu_upload();
     gl_perf_present_enter();
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
