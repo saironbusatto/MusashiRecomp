@@ -107,6 +107,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             toml::find<std::string>(runtime, "overlay_autocompile_cmd");
         rt.has_overlay_autocompile_cmd = !rt.overlay_autocompile_cmd.empty();
     }
+    if (runtime.contains("overlay_backend")) {
+        rt.overlay_backend = toml::find<std::string>(runtime, "overlay_backend");
+    }
 
     // Optional [video] block — visual enhancement options. Kept on the same
     // RuntimeConfig so main.cpp consumes them alongside the other knobs.

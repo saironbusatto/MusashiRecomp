@@ -189,6 +189,16 @@ static const uint32_t *sr_ptr;
 uint32_t i_stat;  /* 0x1F801070 — interrupt status (AND-acknowledge semantics) */
 uint32_t i_mask;  /* 0x1F801074 — interrupt enable mask */
 
+/* Shadow-diff device-access detector. run_shadow_diff arms g_shadow_mmio_watch
+ * around its single authoritative (interpreter) probe pass; ANY MMIO touch bumps
+ * g_shadow_mmio_hits, so the harness can detect a device-touching function and
+ * SKIP the validation (native) pass — device I/O must never be double-executed
+ * (one spurious card/SIO/DMA write corrupts hardware state). Zero cost when not
+ * watching (adds 0). */
+int      g_shadow_mmio_watch = 0;
+uint64_t g_shadow_mmio_hits  = 0;
+#define SHADOW_NOTE_MMIO()  do { g_shadow_mmio_hits += (uint64_t)g_shadow_mmio_watch; } while (0)
+
 /* ---- Card protocol trace: tracks I_MASK bit 7 transitions ---- */
 #define IMASK_TRACE_CAP 4096
 typedef struct {
@@ -316,6 +326,7 @@ static void unmapped_fatal(uint32_t vaddr, uint32_t phys, const char* op) {
 /* --- MMIO read/write helpers --- */
 
 static uint32_t mmio_read32(uint32_t addr) {
+    SHADOW_NOTE_MMIO();
     /* Memory control: 0x1F801000..0x1F801020 */
     if (addr >= 0x1F801000u && addr <= 0x1F80103Cu) {
         return mem_ctrl[(addr - 0x1F801000u) >> 2];
@@ -361,6 +372,7 @@ static uint32_t mmio_read32(uint32_t addr) {
 }
 
 static void mmio_write32(uint32_t addr, uint32_t val) {
+    SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, val, 4);
     /* Memory control: 0x1F801000..0x1F801020 */
     if (addr >= 0x1F801000u && addr <= 0x1F80103Cu) {
@@ -421,6 +433,7 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
 }
 
 static uint16_t mmio_read16(uint32_t addr) {
+    SHADOW_NOTE_MMIO();
     /* SIO: 0x1F801040..0x1F80105F */
     if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
         return (uint16_t)sio_read(addr);
@@ -451,6 +464,7 @@ static uint16_t mmio_read16(uint32_t addr) {
 }
 
 static void mmio_write16(uint32_t addr, uint16_t val) {
+    SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, (uint32_t)val, 2);
     /* SIO: 0x1F801040..0x1F80105F */
     if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
@@ -493,6 +507,7 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
 }
 
 static uint8_t mmio_read8(uint32_t addr) {
+    SHADOW_NOTE_MMIO();
     /* Interrupts: 0x1F801070..0x1F801077 (I_STAT, I_MASK) */
     if (addr >= 0x1F801070u && addr <= 0x1F801077u) {
         if (addr < 0x1F801074u) sio_tick(0);
@@ -529,6 +544,7 @@ static uint8_t mmio_read8(uint32_t addr) {
 }
 
 static void mmio_write8(uint32_t addr, uint8_t val) {
+    SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, (uint32_t)val, 1);
     /* SIO: 0x1F801040..0x1F80105F */
     if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {

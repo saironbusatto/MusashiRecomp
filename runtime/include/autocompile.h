@@ -16,6 +16,14 @@ extern "C" {
 void autocompile_configure(const char *cmd, const char *cwd);
 int  autocompile_configured(void);
 
+/* Probe whether a C compiler is actually reachable on PATH (gcc/cc/clang) — the
+ * REAL "developer machine" signal, distinct from autocompile_configured() which
+ * only reports that a command STRING is set (the shipped game.toml always sets
+ * one). overlay_backend_resolve uses this so `auto` picks gcc only when the
+ * toolchain can really build a shard, else sljit (toolchain-less production).
+ * Memoized; safe to call repeatedly. */
+int  autocompile_toolchain_available(void);
+
 /* 1 while a compile process is running. */
 int  autocompile_busy(void);
 
