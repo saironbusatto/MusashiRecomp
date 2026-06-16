@@ -77,6 +77,14 @@ struct RuntimeConfig {
     bool                  has_overlay_autocompile_cmd = false;
     std::string           overlay_autocompile_cmd;
 
+    // overlay_backend: Tier-2 codegen backend selection (SLJIT.md §1).
+    // "auto" (default, empty == auto) | "gcc" | "sljit". auto resolves to gcc
+    // when overlay_autocompile_cmd is configured (a dev machine with a
+    // toolchain), else sljit (self-contained / toolchain-less). The env var
+    // PSX_OVERLAY_BACKEND overrides this at runtime. gcc stays the default
+    // until the sljit emitter passes the same-state differential gate.
+    std::string           overlay_backend;
+
     // ---- [video] block — visual enhancement options ----
     // supersampling: internal-resolution SSAA factor (per axis). 1 = native
     // (default, behaves exactly as before). 2..4 render geometry/shading into

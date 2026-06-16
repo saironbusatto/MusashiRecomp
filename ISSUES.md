@@ -559,3 +559,70 @@ Tooling: `tools/crop_launcher_assets.ps1` (crop + knockout),
 `tools/shot_launcher.ps1` (screenshot the GL launcher window). Mockup
 source: `C:\Users\Matthew\Desktop\ef772e04-a7db-4ecd-98bb-eb75a01de0a6.png`
 (1448×1086). Pure-cosmetic; does not block Phase 4/5 wiring.
+
+---
+
+## Issue #7 — sljit live execution is unvalidated (pure-live save-load wedge)
+
+**Status:** open, root-caused — fix in progress (branch `feat/sljit-backend`)
+**Date opened:** 2026-06-15
+**Area:** overlay Tier-2 sljit backend (`runtime/src/overlay_loader.c`,
+`overlay_sljit.c`, `code_provider.c`, `overlay_sljit.c` resolution)
+
+### Symptom
+
+With `PSX_OVERLAY_SLJIT_LIVE=1` (the prototype toolchain-less production path),
+save/load **wedges the guest**: `reason=atexit, pc=0`, dispatch looping a
+BIOS/kernel address (`0xB0`/`0x650`). Reproduces only in live mode — the
+dev differential path (`overlay_diff_on`) is clean (0 divergences / 395 shadow
+calls). Flagged in commit `81cf21b` as Known Bug #1.
+
+### Root cause (NOT the emitter)
+
+The MIPS→sljit emitter + block-local register allocator are **proven correct**
+this session: 66/66 emitter unit, 22/22 `$sp`-balance probe, and byte-identical to
+the pre-regalloc emitter across 313 overlay functions
+(`runtime/tests/sljit_{emit_test,sp_probe,offline_diff}.c`). The crash is in the
+**live-execution wiring**, which bypasses the validation harness:
+
+- `run_shadow_diff` (the device-touch detector + diff gate) is gated on
+  `s_diff_mode`. Live mode sets `s_sljit_live`, not `s_diff_mode`, so in live mode
+  **the diff never runs.** Therefore:
+  - `device_touch` is **never computed** for a live shard → a device-touching
+    function runs its shard and **double-executes** its SIO/memory-card/DMA I/O
+    against real hardware state, corrupting the kernel byte-handler path → the
+    `atexit, pc=0`, kernel-`0xB0/0x650` livelock. *(Known Bug #3 — leading cause.)*
+  - Shards run with `diff_passes == 0`, i.e. **completely unvalidated**.
+    *(Known Bug #2.)*
+- Separately, the verify budget counts **cumulative** (not consecutive) clean
+  passes — `diff_passes` never resets on a divergence — so even in dev mode an
+  intermittently-wrong shard could reach budget on lucky passes.
+
+The historical "`$sp` off by 0x18 at 0x12E478" crash was a **different, already-fixed
+bug** (diff over-scoping the call tree, fixed by per-function isolation in
+`81cf21b`) — not this one, and not a codegen bug.
+
+### Fix (SLJIT.md §11 Phase A) — runtime-only, no regen
+
+Collapse blind-live into validated-live: route live-mode shards through the diff
+gate (`(s_diff_mode || s_sljit_live)` at the dispatch gate), so `device_touch` is
+computed and a shard runs native live ONLY after a clean verify budget; and reset
+`diff_passes` to 0 on any divergence (consecutive-clean = "0 divergences"). After
+this there is no blind path: device + diverging shards stay on the interpreter.
+
+### Related gaps (same area, tracked in SLJIT.md §11 Phases B–C)
+
+- **gcc>sljit precedence not enforced** (LIFO chain order can put an sljit shard
+  ahead of a gcc shard for the same region). → Phase B.
+- **Non-dev machine never triggers sljit generation in normal play** (on-miss hook
+  gated behind a dead env-only flag; `auto` resolves to gcc on every machine because
+  `autocompile_configured()` tests for a config *string*, not a real toolchain). →
+  Phase C.
+
+### End-to-end success criteria (per DEBUG.md end-to-end rule)
+
+`PSX_OVERLAY_SLJIT_LIVE=1` (or `auto`→sljit on a toolchain-less box): play through
+save-load, FMV, menus, and combat with **0 divergences, 0 wedges**, shards
+validated-then-promoted, device functions correctly pinned to the interpreter.
+"Diff is clean" or "shard validated" is NOT success until the full save-load loop
+closes live.

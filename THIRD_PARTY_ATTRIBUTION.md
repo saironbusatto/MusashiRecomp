@@ -1,5 +1,14 @@
 # Third-Party Attribution
 
+## sljit — stack-less JIT compiler (Tier-2 in-process overlay backend)
+
+[sljit](https://github.com/zherczeg/sljit) by Zoltan Herczeg, licensed
+**BSD-2-Clause**. Vendored at `lib/sljit/` (source `lib/sljit/sljit_src/`,
+license `lib/sljit/LICENSE`) and compiled into the runtime as the self-contained
+Tier-2 overlay JIT backend (`runtime/src/overlay_sljit.c`). No external toolchain
+dependency; sljit auto-detects the host architecture. See `SLJIT.md` (repo root /
+workspace) for the backend design.
+
 ## JRickey / gba-recomp — verified-enhancement shadow + screen color science
 
 The verified-enhancement QoL layer (`feat/shadow-enhancements`) reuses two

@@ -1,6 +1,7 @@
 #include "overlay_capture.h"
 #include "overlay_loader.h"
 #include "dirty_ram_interp.h"
+#include "code_provider.h"
 #include "crc32.h"
 #include <stdlib.h>
 #include <string.h>
@@ -309,8 +310,7 @@ void overlay_autocapture_tick(void)
 {
     extern uint64_t s_frame_count;
     extern int cdrom_load_in_progress(void);
-    extern int autocompile_request(void);
-    extern int autocompile_busy(void);
+    const CodeProvider *cp = code_provider_active();
 
     if (!s_autocap_enabled || !s_active) return;
     if (s_frame_count - s_autocap_last_check < AUTOCAP_CHECK_FRAMES) return;
@@ -323,15 +323,19 @@ void overlay_autocapture_tick(void)
 
     if (delta < AUTOCAP_MIN_DISPATCHES) return;
     if (cdrom_load_in_progress()) return;          /* coherent moment only  */
-    if (autocompile_busy()) return;
+    if (cp->busy && cp->busy()) return;
     if (s_autocap_triggers >= AUTOCAP_MAX_TRIGGERS) return;
     if (s_autocap_last_fire != 0 &&
         s_frame_count - s_autocap_last_fire < AUTOCAP_COOLDOWN_FRAMES) return;
 
     s_autocap_last_fire = s_frame_count;
     s_autocap_triggers++;
+    /* Always write the backend-neutral coverage manifest (the player-shareable
+     * contribution file) — then ask the active provider to produce code from it.
+     * gcc spawns the background compile; sljit (sync producer) declines here and
+     * JITs on the dispatch miss instead. */
     overlay_capture_write_json();
-    autocompile_request();
+    if (cp->request) cp->request();
 }
 
 uint32_t overlay_capture_get_region_crc(uint32_t region_start,

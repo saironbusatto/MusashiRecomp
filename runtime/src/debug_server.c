@@ -16,6 +16,8 @@
 #include "debug_server.h"
 #include "overlay_loader.h"
 #include "overlay_capture.h"
+#include "code_provider.h"
+#include "overlay_sljit.h"
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
@@ -85,6 +87,29 @@ static int    s_port    = DEFAULT_DEBUG_PORT;
 #define RECV_BUF_SIZE 8192
 static char s_recv_buf[RECV_BUF_SIZE];
 static int  s_recv_len = 0;
+
+/* ---- Dedicated TCP I/O thread (keeps the socket queryable under emu load) ----
+ * The I/O thread owns accept/recv/send. A command still EXECUTES on the emu
+ * thread at the debug_server_poll() safe point (no state races; the ~200 send
+ * sites are unchanged — send_line buffers into s_resp_buf instead of touching
+ * the socket). The client is one-command-per-connection, so a single in-flight
+ * request slot suffices. A lock-free `ping` fast-path on the I/O thread answers
+ * even while the emu thread is buried (freeze liveness). See debug_server_poll /
+ * io_thread_main. */
+#include <SDL_thread.h>
+enum { IO_IDLE = 0, IO_REQ = 1, IO_RESP = 2 };
+static SDL_Thread *s_io_thread   = NULL;
+static SDL_mutex  *s_io_mutex    = NULL;
+static SDL_cond   *s_io_req_cv   = NULL;   /* emu waits on this for a request   */
+static SDL_cond   *s_io_resp_cv  = NULL;   /* I/O waits on this for a response  */
+static volatile int s_io_state   = IO_IDLE;
+static volatile int s_io_running  = 0;
+static char  s_io_req[RECV_BUF_SIZE];      /* request line (I/O -> emu)         */
+static char *s_resp_buf = NULL;            /* response bytes (emu -> I/O)       */
+static size_t s_resp_len = 0, s_resp_cap = 0;
+static int    s_resp_overflow = 0;
+static int    s_in_command = 0;            /* 1 while emu runs process_command  */
+static int    io_thread_main(void *arg);   /* defined near debug_server_poll    */
 
 /* ---- Frame counter (set by record_frame caller) ---- */
 /* Non-static so other instrumentation (e.g. dirty_ram_interp.c) can stamp
@@ -3379,18 +3404,30 @@ static int send_all_blocking(sock_t sock, const char *data, size_t len)
     return ok;
 }
 
+/* Append a response line to s_resp_buf (the I/O thread sends it). Only active
+ * while the emu thread is processing a command; async pushes (e.g. watchpoint
+ * events) have no persistent client under the one-command-per-connection
+ * protocol and are dropped — matching the prior near-no-op behaviour. */
 void debug_server_send_line(const char *json)
 {
-    if (s_client == SOCK_INVALID) return;
+    if (!s_in_command) return;
     size_t len = strlen(json);
-    if (send_all_blocking(s_client, json, len) != 0 ||
-        send_all_blocking(s_client, "\n", 1) != 0) {
-        /* Client stopped draining — drop the connection, keep the
-         * runtime. The next poll() accepts a fresh client. */
-        sock_close(s_client);
-        s_client = SOCK_INVALID;
-        s_tcp_clients_dropped++;
+    size_t need = s_resp_len + len + 2;          /* + '\n' + NUL */
+    if (need > s_resp_cap) {
+        size_t cap = s_resp_cap ? s_resp_cap : 65536;
+        while (cap < need) cap *= 2;
+        if (cap > (8u * 1024u * 1024u)) {         /* hard cap: drop the overflow */
+            s_resp_overflow = 1;
+            return;
+        }
+        char *nb = (char *)realloc(s_resp_buf, cap);
+        if (!nb) { s_resp_overflow = 1; return; }
+        s_resp_buf = nb; s_resp_cap = cap;
     }
+    memcpy(s_resp_buf + s_resp_len, json, len);
+    s_resp_len += len;
+    s_resp_buf[s_resp_len++] = '\n';
+    s_resp_buf[s_resp_len] = '\0';
 }
 
 void debug_server_send_fmt(const char *fmt, ...)
@@ -7806,13 +7843,58 @@ static void handle_autocompile_status(int id, const char *json)
              id, ac_en, trig, (unsigned long long)delta, comp);
 }
 
-/* autocompile_run: manually kick the configured background compile. */
+/* sljit_status: Tier-2 in-process JIT backend state. Runs the codegen smoke
+ * test on first query (JITs a trivial leaf and executes it), reports the
+ * resolved overlay backend (gcc/sljit/auto) and the shard compile/decline
+ * counters. */
+static void handle_sljit_status(int id, const char *json)
+{
+    /* Declarations come from overlay_sljit.h (included above). */
+    extern unsigned int overlay_loader_sljit_registered(void);
+    extern unsigned int overlay_loader_sljit_obsoleted(void);
+    extern int overlay_loader_get_sljit_live(void);
+    (void)json;
+    int selftest = overlay_sljit_selftest();
+    int available = 0, st_ok = 0;
+    unsigned long long compiles = 0, declines = 0, bytes = 0;
+    overlay_sljit_get_status(&available, &st_ok, &compiles, &declines, &bytes);
+    send_fmt("{\"id\":%d,\"ok\":true,\"backend\":\"%s\",\"available\":%d,"
+             "\"selftest_ok\":%d,\"live\":%d,\"compiles\":%llu,\"declines\":%llu,"
+             "\"bytes_emitted\":%llu,\"shards_registered\":%u,\"obsoleted\":%u}\n",
+             id, overlay_backend_name(overlay_backend_active()), available,
+             selftest, overlay_loader_get_sljit_live(), compiles, declines, bytes,
+             overlay_loader_sljit_registered(),
+             overlay_loader_sljit_obsoleted());
+}
+
+/* sljit_try <hex_addr>: force a one-shot JIT of the leaf function at a phys
+ * address from live RAM (bypasses the diff gate — a probe) and report whether
+ * the emitter accepted it. Lets the leaf emitter be exercised against a known
+ * function without waiting for a dispatch miss. */
+static void handle_sljit_try(int id, const char *json)
+{
+    extern void overlay_loader_sljit_probe(uint32_t addr, OverlaySljitResult *out);
+    uint32_t addr = 0;
+    const char *p = strstr(json, "\"addr\"");
+    if (p) { p = strchr(p, ':'); if (p) addr = (uint32_t)strtoul(p + 1, NULL, 0); }
+    if (!addr) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"need addr\"}\n", id); return; }
+    OverlaySljitResult r = {0};
+    overlay_loader_sljit_probe(addr, &r);
+    send_fmt("{\"id\":%d,\"ok\":true,\"addr\":\"0x%08X\",\"compiled\":%d,"
+             "\"insns\":%u,\"code_lo\":\"0x%08X\",\"code_len\":%u}\n",
+             id, addr, r.fn ? 1 : 0, r.insns, r.code_lo, r.code_len);
+}
+
+/* autocompile_run: manually kick the active code provider's batch production
+ * (gcc: spawn the configured background compile; sljit: inert, it produces
+ * synchronously on a dispatch miss). */
 static void handle_autocompile_run(int id, const char *json)
 {
-    extern int autocompile_request(void);
     (void)json;
-    int started = autocompile_request();
-    send_fmt("{\"id\":%d,\"ok\":true,\"started\":%d}\n", id, started);
+    const CodeProvider *cp = code_provider_active();
+    int started = (cp->request) ? cp->request() : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"started\":%d,\"backend\":\"%s\"}\n",
+             id, started, cp->name);
 }
 
 /* overlay_rescan: re-scan the DLL cache and clear the checked-regions memo
@@ -8706,6 +8788,8 @@ static const CmdEntry s_commands[] = {
     { "cdrom_bursts",         handle_cdrom_bursts },
     { "turbo_loads",          handle_turbo_loads },
     { "autocompile_status",   handle_autocompile_status },
+    { "sljit_status",         handle_sljit_status },
+    { "sljit_try",            handle_sljit_try },
     { "autocompile_run",      handle_autocompile_run },
     { "overlay_rescan",       handle_overlay_rescan },
     { NULL, NULL }
@@ -8779,7 +8863,19 @@ void debug_server_init(int port)
      * 16 leaves room for a few probes to queue while we investigate. This
      * is observability infrastructure, not a freeze fix. */
     listen(s_listen, 16);
-    set_nonblocking(s_listen);
+    /* Blocking accept — the dedicated I/O thread waits on it (no busy-poll). */
+
+    /* Start the TCP I/O thread + its handoff primitives. */
+    s_io_mutex   = SDL_CreateMutex();
+    s_io_req_cv  = SDL_CreateCond();
+    s_io_resp_cv = SDL_CreateCond();
+    s_resp_cap   = 65536;
+    s_resp_buf   = (char *)malloc(s_resp_cap);
+    if (s_io_mutex && s_io_req_cv && s_io_resp_cv && s_resp_buf) {
+        s_io_running = 1;
+        s_io_thread = SDL_CreateThread(io_thread_main, "psx-dbg-io", NULL);
+        if (!s_io_thread) s_io_running = 0;
+    }
 
     if (!s_frame_history) {
         s_frame_history = (PSXFrameRecord *)calloc(FRAME_HISTORY_CAP, sizeof(PSXFrameRecord));
@@ -9063,6 +9159,77 @@ void debug_server_init(int port)
     memset(s_snapshot_active, 0, sizeof(s_snapshot_active));
 }
 
+/* Read one '\n'-terminated line from a blocking socket into buf. Returns the
+ * line length (NUL-terminated, newline stripped), or -1 on close/error. */
+static int recv_line(sock_t c, char *buf, int cap)
+{
+    int len = 0;
+    while (len < cap - 1) {
+        int n = recv(c, buf + len, cap - 1 - len, 0);
+        if (n <= 0) return -1;
+        len += n;
+        buf[len] = '\0';
+        char *nl = strchr(buf, '\n');
+        if (nl) { *nl = '\0'; return (int)(nl - buf); }
+    }
+    buf[cap - 1] = '\0';
+    return cap - 1;   /* over-long line: take what we have */
+}
+
+/* The TCP I/O thread: owns accept/recv/send. Hands each request to the emu
+ * thread (processed in debug_server_poll at a safe point) and sends the
+ * buffered response. `ping` is answered directly here so liveness is queryable
+ * even when the emu thread is buried or frozen. */
+static int io_thread_main(void *arg)
+{
+    (void)arg;
+    while (s_io_running) {
+        struct sockaddr_in caddr;
+        int clen = sizeof(caddr);
+        sock_t c = accept(s_listen, (struct sockaddr *)&caddr, &clen);
+        if (c == SOCK_INVALID) { if (!s_io_running) break; SDL_Delay(5); continue; }
+
+        char req[RECV_BUF_SIZE];
+        int rl = recv_line(c, req, sizeof(req));
+        if (rl < 0) { sock_close(c); continue; }
+        if (rl > 0 && req[rl - 1] == '\r') req[rl - 1] = '\0';
+
+        /* Lock-free liveness fast-path (survives an emu-thread freeze). */
+        if (strstr(req, "\"ping\"")) {
+            const char *pong = "{\"id\":0,\"ok\":true,\"pong\":true,\"io_thread\":true}\n";
+            send_all_blocking(c, pong, strlen(pong));
+            sock_close(c);
+            continue;
+        }
+
+        /* Hand the request to the emu thread and wait (bounded) for its reply. */
+        SDL_LockMutex(s_io_mutex);
+        strncpy(s_io_req, req, sizeof(s_io_req) - 1);
+        s_io_req[sizeof(s_io_req) - 1] = '\0';
+        s_io_state = IO_REQ;
+        SDL_CondSignal(s_io_req_cv);
+        int waited = 0;
+        while (s_io_state != IO_RESP && s_io_running) {
+            if (SDL_CondWaitTimeout(s_io_resp_cv, s_io_mutex, 1000) == SDL_MUTEX_TIMEDOUT) {
+                waited += 1000;
+                if (waited >= 30000) break;   /* emu wedged: give up on this one */
+            }
+        }
+        if (s_io_state == IO_RESP) {
+            if (s_resp_len > 0) send_all_blocking(c, s_resp_buf, s_resp_len);
+            s_io_state = IO_IDLE;
+        } else {
+            const char *busy = "{\"ok\":false,\"err\":\"emu busy or frozen\"}\n";
+            send_all_blocking(c, busy, strlen(busy));
+            /* leave state as IO_REQ; the emu's poll discards it (state!=IO_REQ
+             * check) once it finally finishes — handled in debug_server_poll. */
+        }
+        SDL_UnlockMutex(s_io_mutex);
+        sock_close(c);
+    }
+    return 0;
+}
+
 void debug_server_poll(void)
 {
     /* Phase 1.0e-e2 starvation watchdog heartbeat. Refreshes the
@@ -9071,60 +9238,30 @@ void debug_server_poll(void)
     extern void starvation_watchdog_heartbeat(void);
     starvation_watchdog_heartbeat();
 
-    if (s_listen == SOCK_INVALID) return;
+    if (!s_io_mutex || s_in_command) return;   /* no server, or re-entrant */
 
-    if (s_client == SOCK_INVALID) {
-        struct sockaddr_in caddr;
-        int clen = sizeof(caddr);
-        sock_t c = accept(s_listen, (struct sockaddr *)&caddr, &clen);
-        if (c != SOCK_INVALID) {
-            s_client = c;
-            set_nonblocking(s_client);
-            s_recv_len = 0;
-        }
-        return;
-    }
+    SDL_LockMutex(s_io_mutex);
+    if (s_io_state != IO_REQ) { SDL_UnlockMutex(s_io_mutex); return; }
+    char req[RECV_BUF_SIZE];
+    strncpy(req, s_io_req, sizeof(req) - 1);
+    req[sizeof(req) - 1] = '\0';
+    SDL_UnlockMutex(s_io_mutex);
 
-    int space = RECV_BUF_SIZE - s_recv_len - 1;
-    if (space > 0) {
-        int n = recv(s_client, s_recv_buf + s_recv_len, space, 0);
-        if (n > 0) {
-            s_recv_len += n;
-            s_recv_buf[s_recv_len] = '\0';
-        } else if (n == 0) {
-            sock_close(s_client);
-            s_client = SOCK_INVALID;
-            return;
-        } else {
-            int err = sock_error();
-#ifdef _WIN32
-            if (err != WSAEWOULDBLOCK) {
-#else
-            if (err != EAGAIN && err != EWOULDBLOCK) {
-#endif
-                sock_close(s_client);
-                s_client = SOCK_INVALID;
-                /* Don't reset s_input_override here. A scheduled press
-                 * (s_input_frames > 0) must continue to hold across the
-                 * client disconnect — Python clients open a fresh socket
-                 * per command, so clearing on every connection close
-                 * would truncate every press to a 1-frame edge. */
-                return;
-            }
-        }
-    }
+    /* Execute on the emu thread (safe point). send_line appends to s_resp_buf. */
+    s_resp_len = 0;
+    s_resp_overflow = 0;
+    s_in_command = 1;
+    if (req[0]) process_command(req);
+    s_in_command = 0;
 
-    char *nl;
-    while ((nl = strchr(s_recv_buf, '\n')) != NULL) {
-        *nl = '\0';
-        if (nl > s_recv_buf && *(nl - 1) == '\r')
-            *(nl - 1) = '\0';
-        if (s_recv_buf[0] != '\0')
-            process_command(s_recv_buf);
-        int consumed = (int)(nl - s_recv_buf) + 1;
-        s_recv_len -= consumed;
-        memmove(s_recv_buf, nl + 1, s_recv_len + 1);
+    SDL_LockMutex(s_io_mutex);
+    /* Only deliver if the I/O thread is still waiting (it may have timed out and
+     * moved on, in which case the response is discarded). */
+    if (s_io_state == IO_REQ) {
+        s_io_state = IO_RESP;
+        SDL_CondSignal(s_io_resp_cv);
     }
+    SDL_UnlockMutex(s_io_mutex);
 }
 
 void debug_server_record_frame(void)
@@ -9229,13 +9366,21 @@ void debug_server_check_watchpoints(void)
 
 void debug_server_shutdown(void)
 {
-    if (s_client != SOCK_INVALID) {
-        sock_close(s_client);
-        s_client = SOCK_INVALID;
-    }
+    /* Stop the I/O thread: clear the flag, close the listen socket to break the
+     * blocking accept(), then join. */
+    s_io_running = 0;
     if (s_listen != SOCK_INVALID) {
         sock_close(s_listen);
         s_listen = SOCK_INVALID;
+    }
+    if (s_io_thread) {
+        if (s_io_mutex) { SDL_LockMutex(s_io_mutex); SDL_CondSignal(s_io_resp_cv); SDL_UnlockMutex(s_io_mutex); }
+        SDL_WaitThread(s_io_thread, NULL);
+        s_io_thread = NULL;
+    }
+    if (s_client != SOCK_INVALID) {
+        sock_close(s_client);
+        s_client = SOCK_INVALID;
     }
 #ifdef _WIN32
     WSACleanup();

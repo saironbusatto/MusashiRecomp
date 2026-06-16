@@ -24,6 +24,11 @@ extern "C" {
  * game_id:   product code (e.g. "SCUS-94236") */
 void overlay_loader_init(const char *cache_dir, const char *game_id);
 
+/* Apply the sljit live-execution policy once the Tier-2 backend is resolved.
+ * Call AFTER code_provider_init(). Default live ON iff the resolved backend is
+ * sljit (validated-live production); PSX_OVERLAY_SLJIT_LIVE env overrides. */
+void overlay_loader_apply_live_policy(void);
+
 /* Called from overlay_capture_on_dma after the capture-set insert.
  * Computes CRC32 of bytes, checks cache, loads DLL if present.
  * load_addr: physical RAM address, size/bytes: the transferred data. */

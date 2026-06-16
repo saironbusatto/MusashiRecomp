@@ -1,5 +1,7 @@
 #include "overlay_loader.h"
 #include "overlay_api.h"
+#include "code_provider.h"
+#include "overlay_sljit.h"
 #include "crc32.h"
 #include "dirty_ram_interp.h"
 #include "interrupts.h"
@@ -60,7 +62,19 @@ typedef struct {
     int       state;                     /* ENTRY_VALID/INVALID/BLACKLIST      */
     int       dll;                       /* source DLL index                   */
     int       next;                      /* next candidate at same addr, -1 end*/
+    uint32_t  diff_passes;               /* clean same-state diffs (verify budget)*/
+    int       device_touch;              /* 1 = touches MMIO; never run its shard,
+                                          * always interp (shadow diff can't safely
+                                          * double-execute device I/O). */
 } Candidate;
+
+/* Same-state differential verify budget: diff a candidate this many times with
+ * 0 divergence, then trust it (stop diffing — run it normally). Bounds the
+ * differential's cost to ~(distinct functions × budget) instead of every
+ * dispatch forever, making a validation playtest playable; a DIVERGING
+ * candidate never reaches the budget, so it stays diff-gated (interp result
+ * kept) and never executes native live. */
+#define OVERLAY_DIFF_BUDGET 32u
 
 #define CAND_CAP   16384
 static Candidate s_cand[CAND_CAP];
@@ -128,6 +142,15 @@ uint32_t overlay_loader_get_inprogress(void) { return s_native_inprogress; }
 /* Same-state differential — defined fully below; declared here for dispatch. */
 static int  s_diff_mode = 0;
 static int  s_in_shadow = 0;
+/* Live sljit mode (PSX_OVERLAY_SLJIT_LIVE / sljit_live debug cmd): JIT overlay
+ * functions on-miss and run them LIVE without the per-shard differential — the
+ * production model (sljit is the sync on-miss producer; safety is the emitter's
+ * decline-on-unsupported contract, validated broadly). Off by default; the diff
+ * gate above stays the dev path. Lets a developer feel the real toolchain-less
+ * player experience (pure sljit + interp floor, no gcc, no diff overhead). */
+static int  s_sljit_live = 0;
+void overlay_loader_set_sljit_live(int on) { s_sljit_live = on ? 1 : 0; }
+int  overlay_loader_get_sljit_live(void)   { return s_sljit_live; }
 static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr);
 
 /* ---- Counters (surfaced via overlay_loader_status) --------------------- */
@@ -143,6 +166,8 @@ static uint32_t s_rehash_miss    = 0;   /* hashes that didn't match crc_code  */
 static uint32_t s_last_crc       = 0;
 static uint32_t s_no_manifest    = 0;   /* exports skipped (no manifest range)*/
 static uint32_t s_selfmod        = 0;   /* entries blacklisted (self-mod)     */
+static uint32_t s_sljit_registered = 0; /* sljit Tier-2 shards registered     */
+static uint32_t s_sljit_obsoleted  = 0; /* sljit shards superseded by a gcc DLL*/
 static uint32_t s_last_write_pc   = 0;
 static uint32_t s_last_write_addr = 0;
 static uint32_t s_last_write_size = 0;
@@ -232,6 +257,8 @@ static ManFn *man_find(ManFn *arr, int n, uint32_t entry) {
 
 /* ---- Candidate registration -------------------------------------------- */
 
+static void loader_log(const char *fmt, ...);   /* defined below */
+
 static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) {
     if (s_cand_n >= CAND_CAP) return;
     int idx = s_cand_n++;
@@ -267,6 +294,107 @@ static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) 
     c->next    = idx_head(phys);
     idx_set_head(phys, idx);
     if (c->state == ENTRY_VALID) s_valid_count++;
+
+    /* Obsolescence (load priority: static > gcc shard > sljit shard > interp). A
+     * gcc DLL is the optimized, dev-validated artifact and OUTRANKS an sljit shard
+     * a user machine JIT'd for the same function. Once this gcc candidate is in the
+     * chain it already wins dispatch (it's at the head, ahead of the older sljit
+     * shard, and content-keyed dispatch picks the first match), but we also
+     * explicitly retire the superseded sljit shard so it can never run — even if
+     * this gcc candidate is later self-mod-blacklisted.
+     *
+     * "Same function/content" is keyed on CURRENT LIVE-RAM VALIDITY, not crc_code
+     * equality: the two backends hash DIFFERENT byte ranges for the same function
+     * (sljit hashes its contiguous JIT fragment [entry, terminator]; the gcc
+     * .ranges manifest hashes the recompiler's per-function instruction walk, with
+     * interleaved jump-tables/data excised), so their crc_code values legitimately
+     * differ even for identical source bytes. The backend-independent test is: this
+     * gcc candidate matches live RAM (c->state == VALID, computed above) AND the
+     * sljit shard at the same entry also matches live RAM right now — i.e. both
+     * describe the CURRENTLY-LIVE variant. An sljit shard for a DIFFERENT overlay
+     * variant at this address does NOT match live and is kept (distinct coverage). */
+    if (c->state == ENTRY_VALID) {
+        for (int j = c->next; j >= 0; j = s_cand[j].next) {
+            Candidate *o = &s_cand[j];
+            if (o->dll == -1 && o->state != ENTRY_BLACKLIST &&
+                cand_crc(o) == o->crc_code) {        /* o matches live => same variant */
+                if (o->state == ENTRY_VALID && s_valid_count > 0) s_valid_count--;
+                o->state = ENTRY_BLACKLIST;
+                s_sljit_obsoleted++;
+                loader_log("sljit shard 0x%08X obsoleted by gcc DLL", o->addr);
+            }
+        }
+    }
+}
+
+/* ---- sljit Tier-2 shard registration (SLJIT.md §7 step 5) -------------- */
+/* Register an in-process JIT shard as a native candidate, parallel to
+ * cand_register but without a .ranges manifest: the shard was JIT'd from the
+ * live RAM bytes over [lo, lo+len), so crc_code is hashed from those same bytes
+ * — a later dispatch runs the shard iff the code is still byte-identical
+ * (reload-on-return / self-mod safety, the same live-byte contract gcc
+ * candidates obey). */
+static void register_sljit_candidate(uint32_t phys, OverlayFn fn,
+                                     uint32_t lo, uint32_t len) {
+    if (s_cand_n >= CAND_CAP || len == 0) return;
+    int idx = s_cand_n++;
+    Candidate *c = &s_cand[idx];
+    c->addr        = phys & 0x1FFFFFFFu;
+    c->fn          = fn;
+    c->dll         = -1;            /* sentinel: sljit shard, not a DLL */
+    c->nranges     = 1;
+    c->range_lo[0] = lo & 0x1FFFFFFFu;
+    c->range_len[0] = len;
+    extern void overlay_watch_set_range(uint32_t phys, uint32_t len);
+    overlay_watch_set_range(c->range_lo[0], c->range_len[0]);
+    c->crc_code = cand_crc(c);      /* live bytes == the bytes we JIT'd from */
+    c->val_gen  = cand_gensum(c);
+    c->state    = ENTRY_VALID;
+    c->diff_passes = 0;
+    c->device_touch = 0;
+    c->next     = idx_head(c->addr);
+    idx_set_head(c->addr, idx);
+    s_valid_count++;
+    s_sljit_registered++;
+    loader_log("sljit shard registered 0x%08X [%u bytes]", c->addr, len);
+}
+
+/* JIT-on-miss memo: phys entries already attempted (compiled or declined), so a
+ * declined fragment isn't re-attempted every dispatch. */
+#define MAX_SLJIT_TRIED 512
+static uint32_t s_sljit_tried[MAX_SLJIT_TRIED];
+static int      s_sljit_tried_n = 0;
+static int sljit_already_tried(uint32_t phys) {
+    for (int i = 0; i < s_sljit_tried_n; i++)
+        if (s_sljit_tried[i] == phys) return 1;
+    return 0;
+}
+static void sljit_mark_tried(uint32_t phys) {
+    if (s_sljit_tried_n < MAX_SLJIT_TRIED) s_sljit_tried[s_sljit_tried_n++] = phys;
+}
+
+/* Attempt an in-process JIT of the leaf function at `phys` from live RAM, and
+ * register the shard as a candidate on success. Gated by the caller to the
+ * validation configuration only (backend==sljit + diff_mode); see the dispatch
+ * hook. Decodes from live RAM exactly as the interpreter does. */
+static void try_sljit_region(uint32_t addr) {
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    const CodeProvider *cp = code_provider_active();
+    if (!cp->compile_fragment) return;
+    if (sljit_already_tried(phys)) return;
+    extern int dirty_ram_is_dirty(uint32_t phys);
+    if (!dirty_ram_is_dirty(phys)) return;   /* only JIT real runtime code */
+    sljit_mark_tried(phys);
+    uint8_t *ram = memory_get_ram_ptr();
+    if (!ram) return;
+    CompiledFragment frag = {0};
+    /* Decode from live RAM: bytes = RAM base, image_base_vram = 0 ⇒ byte offset =
+     * (entry & 0x1FFFFFFF) = phys. Pass the VIRTUAL entry so return_pc and
+     * jal/J targets carry the KSEG bits the guest uses — the interpreter computes
+     * pc from the virtual address, and saved $ra values must match byte-exact. */
+    cp->compile_fragment(addr, ram, 2u * 1024u * 1024u, 0u, &frag);
+    if (frag.fn)
+        register_sljit_candidate(phys, (OverlayFn)frag.fn, frag.code_lo, frag.code_len);
 }
 
 /* ---- Global state ------------------------------------------------------ */
@@ -301,10 +429,37 @@ static int cache_idx_has_path(const char *path) {
     return 0;
 }
 
-static void scan_cache_dir(void) {
+/* Canonical cache arch-abi tag (see SLJIT.md §4 — caches are namespaced per
+ * backend AND per target so a Windows-x64 gcc DLL and, later, a same-OS arm64
+ * or an sljit blob for the same fragment never comingle). compile_overlays.py
+ * computes the IDENTICAL string from platform.system()/machine(); keep the two
+ * mappings in lockstep ("<os>-<arch>": win|linux|macos + x64|arm64|x86). */
+#if defined(_WIN32)
+#  define PSX_OL_OS "win"
+#elif defined(__APPLE__)
+#  define PSX_OL_OS "macos"
+#else
+#  define PSX_OL_OS "linux"
+#endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+#  define PSX_OL_ARCH "arm64"
+#elif defined(__x86_64__) || defined(_M_X64)
+#  define PSX_OL_ARCH "x64"
+#elif defined(__i386__) || defined(_M_IX86)
+#  define PSX_OL_ARCH "x86"
+#else
+#  define PSX_OL_ARCH "unknown"
+#endif
+#define PSX_OVERLAY_ARCH_ABI PSX_OL_OS "-" PSX_OL_ARCH
+
+const char *overlay_loader_arch_abi(void) { return PSX_OVERLAY_ARCH_ABI; }
+
+/* Scan one directory for <addr8>_<crc8>.dll cache entries into the index.
+ * `dir` is a full directory path. Idempotent (skips already-indexed paths). */
+static void scan_one_cache_dir(const char *dir) {
 #ifdef _WIN32
     char pattern[768];
-    snprintf(pattern, sizeof(pattern), "%s/%s/*_*.dll", s_cache_dir, s_game_id);
+    snprintf(pattern, sizeof(pattern), "%s/*_*.dll", dir);
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -323,15 +478,30 @@ static void scan_cache_dir(void) {
         uint32_t addr = (uint32_t)strtoul(fd.cFileName, NULL, 16);
         if (s_cache_idx_count >= CACHE_IDX_CAP) break;
         char full[768];
-        snprintf(full, sizeof(full), "%s/%s/%s",
-                 s_cache_dir, s_game_id, fd.cFileName);
+        snprintf(full, sizeof(full), "%s/%s", dir, fd.cFileName);
         if (cache_idx_has_path(full)) continue;  /* rescan idempotence */
         CacheEntry *e = &s_cache_idx[s_cache_idx_count++];
         e->region_start = addr;
         snprintf(e->path, sizeof(e->path), "%s", full);
     } while (FindNextFileA(h, &fd));
     FindClose(h);
+#else
+    (void)dir;
 #endif
+}
+
+/* Scan the namespaced gcc cache (gcc/<arch-abi>/) AND the legacy flat layout
+ * (<game_id>/*.dll) for back-compat — existing caches keep loading with no
+ * migration. The sljit/<arch-abi>/ namespace is reserved (no on-disk blobs in
+ * v1: sljit re-JITs from the coverage manifest; see SLJIT.md §5.3). */
+static void scan_cache_dir(void) {
+    char dir[768];
+    snprintf(dir, sizeof(dir), "%s/%s/gcc/%s",
+             s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI);
+    scan_one_cache_dir(dir);
+    /* Legacy flat layout (pre-namespacing). */
+    snprintf(dir, sizeof(dir), "%s/%s", s_cache_dir, s_game_id);
+    scan_one_cache_dir(dir);
 }
 
 /* True if the cache holds a DLL for this region compiled from an image with
@@ -533,7 +703,27 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
     strncpy(s_game_id,   game_id,   sizeof(s_game_id)   - 1);
     init_callbacks();
     scan_cache_dir();
+    /* Live-mode policy is applied later via overlay_loader_apply_live_policy(),
+     * AFTER code_provider_init resolves the backend (the default depends on it). */
     s_active = 1;
+}
+
+/* Apply the sljit live-execution policy once the Tier-2 backend is resolved
+ * (call AFTER code_provider_init). Default: live ON when the resolved backend is
+ * sljit (the toolchain-less production model — JIT on miss, VALIDATE via the
+ * same-state diff, promote to native only on a clean verify budget; device +
+ * diverging shards stay on the interpreter), OFF otherwise. The
+ * PSX_OVERLAY_SLJIT_LIVE env var overrides either way (0 forces off, nonzero
+ * forces on) — a dev escape hatch. NOTE: "live" here is VALIDATED-live, not the
+ * old blind path; see overlay_loader_dispatch's diff gate. */
+void overlay_loader_apply_live_policy(void) {
+    int live = (overlay_backend_active() == OVERLAY_BACKEND_SLJIT) ? 1 : 0;
+    const char *e = getenv("PSX_OVERLAY_SLJIT_LIVE");
+    if (e && *e) live = (*e != '0') ? 1 : 0;
+    s_sljit_live = live;
+    loader_log("sljit live policy: backend=%s env=%s -> live=%d",
+               overlay_backend_name(overlay_backend_active()),
+               e && *e ? e : "(unset)", live);
 }
 
 void overlay_loader_check_cache(uint32_t load_addr, uint32_t size,
@@ -648,6 +838,16 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
     if (head < 0 && s_active && overlay_cache_window_contains(phys)) {
         try_load_region(phys);
         head = idx_head(phys);
+        /* sljit JIT-on-miss (SLJIT.md §7 step 5). Fires when the active backend is
+         * sljit and EITHER the same-state differential is armed (dev validation
+         * path — shards created then diffed vs interp) OR live mode is on (the
+         * production model — shards created and run live, no per-shard diff).
+         * Never inside a shadow run. */
+        if (head < 0 && (s_diff_mode || s_sljit_live) && !s_in_shadow &&
+            overlay_backend_active() == OVERLAY_BACKEND_SLJIT) {
+            try_sljit_region(addr);   /* virtual entry (carries KSEG bits) */
+            head = idx_head(phys);
+        }
     }
 
     for (int i = head; i >= 0; i = s_cand[i].next) {
@@ -671,10 +871,30 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
                 s_revalidations++;              /* reload-on-return */
                 s_valid_count++;
             }
+            /* Device-touching functions never run their shard: the shadow diff
+             * can't safely double-execute MMIO/SIO/DMA to validate them, so they
+             * always fall to the interpreter (the authoritative single path). */
+            if (c->device_touch) { s_disp_interp++; return 0; }
             /* Same-state differential: run native+interp from identical state,
              * compare, keep the interp result. Takes precedence over the A/B
-             * toggle. */
-            if (s_diff_mode && !s_in_shadow) { run_shadow_diff(cpu, c, addr); return 1; }
+             * toggle. Verify-budget: once a candidate has passed cleanly enough
+             * times it's trusted and falls through to normal execution, so the
+             * diff cost stays bounded (a diverging candidate never reaches the
+             * budget — it keeps being diff-gated and never runs native live).
+             *
+             * VALIDATED-LIVE: live sljit mode (s_sljit_live) is NOT a separate
+             * "JIT and run blind" path — it routes its sljit SHARDS (dll < 0)
+             * through the SAME diff gate, so a shard runs native live only after a
+             * clean verify budget, and run_shadow_diff's interp-first pass computes
+             * device_touch (device functions get pinned to interp, never double-
+             * executing I/O — the save-load wedge). gcc candidates (dll >= 0) are
+             * the trusted tier (validated at dev time) and run native directly;
+             * they are diffed only in explicit dev diff mode. */
+            int want_diff = s_diff_mode || (s_sljit_live && c->dll < 0);
+            if (want_diff && !s_in_shadow && c->diff_passes < OVERLAY_DIFF_BUDGET) {
+                run_shadow_diff(cpu, c, addr);
+                return 1;
+            }
 
             /* A/B: prove whether native EXECUTION is the cause. When off, the
              * candidate matched (byte-exact) but we DON'T run native — interp
@@ -805,6 +1025,27 @@ void overlay_loader_get_reload_debug(int *r0_valid, uint32_t *r0_writes,
 
 int overlay_loader_registered_count(void) { return s_valid_count; }
 
+/* sljit Tier-2 shards registered as candidates this session (diagnostics). */
+uint32_t overlay_loader_sljit_registered(void) { return s_sljit_registered; }
+
+/* sljit shards superseded by a higher-priority gcc DLL (same content). */
+uint32_t overlay_loader_sljit_obsoleted(void) { return s_sljit_obsoleted; }
+
+/* Force a one-shot sljit JIT attempt of the leaf function at `addr` from live
+ * RAM and register it on success (bypasses the diff-mode gate — a probe). For
+ * the sljit_try debug command. Returns via the result struct. */
+void overlay_loader_sljit_probe(uint32_t addr, OverlaySljitResult *out) {
+    out->fn = NULL; out->code_lo = 0; out->code_len = 0; out->insns = 0;
+    uint8_t *ram = memory_get_ram_ptr();
+    if (!ram) return;
+    /* Virtual entry so return_pc / jal targets carry the KSEG bits (see
+     * try_sljit_region); byte offset is still (entry & 0x1FFFFFFF) = phys. */
+    overlay_sljit_try_compile(addr, ram, 2u * 1024u * 1024u, 0u, out);
+    if (out->fn)
+        register_sljit_candidate(addr & 0x1FFFFFFFu, (OverlayFn)out->fn,
+                                 out->code_lo, out->code_len);
+}
+
 /* ---- Native↔interp execution fingerprint differential (§5-E) ----------- */
 /* For each CANDIDATE function execution we record the FULL register file at
  * entry and exit (plus the guest cycle), tagged native vs interp. Run once
@@ -842,7 +1083,10 @@ int overlay_loader_is_candidate(uint32_t phys) {
 #define SHADOW_SPAD_SIZE 1024u
 static uint8_t  s_ram0[SHADOW_RAM_SIZE];   /* pre-call main-RAM snapshot  */
 static uint8_t  s_ramN[SHADOW_RAM_SIZE];   /* post-native main-RAM        */
+static uint8_t  s_ramI[SHADOW_RAM_SIZE];   /* post-interp main-RAM (kept) */
 static uint8_t  s_spad0[SHADOW_SPAD_SIZE]; /* pre-call scratchpad snapshot*/
+static uint8_t  s_spadI[SHADOW_SPAD_SIZE]; /* post-interp scratchpad (kept)*/
+static uint64_t s_shadow_skipped_dev = 0;  /* candidates skipped: touch MMIO */
 /* s_diff_mode / s_in_shadow declared above (before dispatch). */
 
 typedef struct {
@@ -872,77 +1116,136 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     extern uint8_t *memory_get_ram_ptr(void);
     extern uint8_t *memory_get_scratchpad_ptr(void);
     extern int dirty_ram_dispatch(CPUState *cpu, uint32_t addr, uint32_t stop_addr);
+    extern int      g_shadow_mmio_watch;   /* memory.c — device-access detector */
+    extern uint64_t g_shadow_mmio_hits;
     uint8_t *ram  = memory_get_ram_ptr();
     uint8_t *spad = memory_get_scratchpad_ptr();
 
     s_in_shadow = 1;
     int saved_supp = s_suppress_irq;
     s_suppress_irq = 1;                 /* isolate computation; longjmp-safe */
+    /* Validate ONE function at a time: nested OVERLAY calls run via the
+     * INTERPRETER on BOTH passes (s_native_exec=0). Otherwise the native pass
+     * dispatches each callee as its own native shard while the interp pass runs
+     * it interp, so the diff compares the whole call TREE and a callee that bails
+     * or diverges is misattributed to this candidate (e.g. a contract bail that
+     * skips THIS function's epilogue -> $sp off by the frame size). Per-function
+     * isolation proves exactly this shard's codegen vs the interp oracle; whole-
+     * tree soundness then follows by induction. */
+    int sv = s_native_exec;
+    s_native_exec = 0;
 
     CPUState cpu0 = *cpu;
     memcpy(s_ram0,  ram,  SHADOW_RAM_SIZE);
     memcpy(s_spad0, spad, SHADOW_SPAD_SIZE);
 
-    /* Native (discarded). Nested calls run native (native_exec on). */
-    c->fn(cpu);
-    CPUState cpuN = *cpu;
-    memcpy(s_ramN, ram, SHADOW_RAM_SIZE);
+    /* PASS 1 — INTERPRETER, the authoritative single execution, with the device
+     * detector armed. Running interp FIRST (not native) guarantees device I/O
+     * happens AT MOST ONCE and only via the trusted path: if this function (or a
+     * callee) touches ANY MMIO we abandon the native pass entirely — device I/O
+     * must never be double-executed (one spurious card/SIO/DMA write corrupts
+     * hardware state and wedges the guest, e.g. the save-load crash). */
+    uint64_t mmio0 = g_shadow_mmio_hits;
+    g_shadow_mmio_watch++;
+    dirty_ram_dispatch(cpu, addr, cpu->gpr[31]);
+    g_shadow_mmio_watch--;
+    s_shadow_calls++;
 
-    /* Restore CPU + main RAM + scratchpad, then run interpreter (kept). Restoring
-     * scratchpad is essential — these functions use it as working memory, and
-     * leaving native's mutations there would make the interp pass diverge
-     * spuriously. (Device/DMA/cycle state still isn't restored; functions that
-     * read those may still show as divergent — treated as suspect, not proof.) */
+    if (g_shadow_mmio_hits != mmio0) {
+        /* Device-touching: keep the interp result live (already in *cpu/ram/spad),
+         * mark the candidate so it ALWAYS runs via the interpreter (never its
+         * shard, never re-diffed). sljit covers the pure-compute majority; device
+         * functions stay on the interpreter — safe by construction, no double I/O. */
+        c->device_touch = 1;
+        s_shadow_skipped_dev++;
+        g_psx_call_bail = 0;
+        s_native_exec  = sv;
+        s_suppress_irq = saved_supp;
+        s_in_shadow    = 0;
+        return;
+    }
+
+    /* Device-free: preserve the interp result, then run the NATIVE shard from the
+     * same input and compare. No device I/O on either pass (proven clean above). */
+    CPUState cpuI = *cpu;
+    memcpy(s_ramI,  ram,  SHADOW_RAM_SIZE);
+    memcpy(s_spadI, spad, SHADOW_SPAD_SIZE);
+
     *cpu = cpu0;
     memcpy(ram,  s_ram0,  SHADOW_RAM_SIZE);
     memcpy(spad, s_spad0, SHADOW_SPAD_SIZE);
-    int sv = s_native_exec;
-    s_native_exec = 0;
-    /* Shadow run executes the candidate to its return: the entry $ra is the
-     * stop contract, same as the live dispatch path. */
-    dirty_ram_dispatch(cpu, addr, cpu->gpr[31]);  /* runs interp (guarded) */
-    s_native_exec = sv;
 
-    s_shadow_calls++;
-
-    /* Compare native (cpuN/s_ramN) vs interp (*cpu/ram) under identical input. */
-    int reg = -1;
-    for (int r = 1; r < 32; r++) if (cpuN.gpr[r] != cpu->gpr[r]) { reg = r; break; }
-    int hidiff = (cpuN.hi != cpu->hi), lodiff = (cpuN.lo != cpu->lo);
-    int64_t ramoff = -1;
-    if (memcmp(s_ramN, ram, SHADOW_RAM_SIZE) != 0) {
-        for (uint32_t a = 0; a < SHADOW_RAM_SIZE; a++)
-            if (s_ramN[a] != ram[a]) { ramoff = (int64_t)a; break; }
+    uint32_t stop_ra = cpu->gpr[31];   /* entry $ra = the function's return point */
+    c->fn(cpu);
+    /* A shard that ends in a computed `jr rX` (jump table) exits with cpu->pc =
+     * target rather than running to the return; chain through tail-transfers to
+     * the same stop the interp used, so we compare FULL native vs FULL interp. */
+    {
+        int guard = 0;
+        while (cpu->pc != 0 && !g_psx_call_bail && guard++ < 8192) {
+            uint32_t tv = cpu->pc;
+            if ((tv & 0x1FFFFFFFu) == (stop_ra & 0x1FFFFFFFu)) break;  /* returned */
+            cpu->pc = 0;
+            if (!dirty_ram_dispatch(cpu, tv, stop_ra)) { cpu->pc = tv; break; }
+        }
     }
-    if (reg >= 0 || hidiff || lodiff || ramoff >= 0) {
+    CPUState cpuN = *cpu;
+    memcpy(s_ramN, ram, SHADOW_RAM_SIZE);
+
+    /* Compare native (cpuN/s_ramN) vs interp (cpuI/s_ramI) under identical input. */
+    int reg = -1;
+    for (int r = 1; r < 32; r++) if (cpuN.gpr[r] != cpuI.gpr[r]) { reg = r; break; }
+    int hidiff = (cpuN.hi != cpuI.hi), lodiff = (cpuN.lo != cpuI.lo);
+    int64_t ramoff = -1;
+    if (memcmp(s_ramN, s_ramI, SHADOW_RAM_SIZE) != 0) {
+        for (uint32_t a = 0; a < SHADOW_RAM_SIZE; a++)
+            if (s_ramN[a] != s_ramI[a]) { ramoff = (int64_t)a; break; }
+    }
+    if (reg < 0 && !hidiff && !lodiff && ramoff < 0) {
+        /* Clean pass: credit the verify budget. */
+        if (c->diff_passes < OVERLAY_DIFF_BUDGET) c->diff_passes++;
+    } else {
+        /* Divergence: reset the budget. Promotion to live requires N CONSECUTIVE
+         * clean passes (the spec's "0 divergences over the budget"), so an
+         * intermittently-wrong shard can never accumulate enough lucky passes to be
+         * trusted — it stays diff-gated (interp result kept) and never runs live. */
+        c->diff_passes = 0;
         s_shadow_divs++;
         if (!s_detail_captured) {
             s_detail_captured = 1;
             s_detail_addr = c->addr;
             for (int r = 0; r < 32; r++) {
                 s_detail_nat_gpr[r] = cpuN.gpr[r];
-                s_detail_int_gpr[r] = cpu->gpr[r];
+                s_detail_int_gpr[r] = cpuI.gpr[r];
             }
             s_detail_nat_hi = cpuN.hi; s_detail_nat_lo = cpuN.lo;
-            s_detail_int_hi = cpu->hi; s_detail_int_lo = cpu->lo;
+            s_detail_int_hi = cpuI.hi; s_detail_int_lo = cpuI.lo;
         }
         if (s_sdiv_n < SDIV_CAP) {
             ShadowDiv *d = &s_sdiv[s_sdiv_n++];
             d->seq = s_shadow_calls; d->addr = c->addr;
             d->reg = reg;
             d->reg_native = (reg >= 0) ? cpuN.gpr[reg] : 0;
-            d->reg_interp = (reg >= 0) ? cpu->gpr[reg] : 0;
+            d->reg_interp = (reg >= 0) ? cpuI.gpr[reg] : 0;
             d->hi_diff = hidiff; d->lo_diff = lodiff;
             d->ram_off = ramoff;
             if (ramoff >= 0) {
                 uint32_t a = (uint32_t)ramoff & ~3u;
                 d->ram_native = *(uint32_t *)&s_ramN[a];
-                d->ram_interp = *(uint32_t *)&ram[a];
+                d->ram_interp = *(uint32_t *)&s_ramI[a];
             }
         }
     }
+    /* Restore the interp result as the authoritative live state (native discarded).
+     * A bail raised by the shadow run must never leak into live execution (a
+     * spurious in-progress unwind wedges the guest). */
+    *cpu = cpuI;
+    memcpy(ram,  s_ramI,  SHADOW_RAM_SIZE);
+    memcpy(spad, s_spadI, SHADOW_SPAD_SIZE);
+    g_psx_call_bail = 0;
+    s_native_exec  = sv;
     s_suppress_irq = saved_supp;
-    s_in_shadow = 0;
+    s_in_shadow    = 0;
 }
 
 int overlay_loader_dump_shadow_detail(char *out, int cap) {
@@ -969,9 +1272,11 @@ int overlay_loader_dump_shadow_detail(char *out, int cap) {
 int overlay_loader_dump_shadow(char *out, int cap) {
     int n = 0;
     n += snprintf(out + n, cap - n,
-        "{\"diff_mode\":%d,\"shadow_calls\":%llu,\"divergences\":%llu,\"records\":[",
+        "{\"diff_mode\":%d,\"shadow_calls\":%llu,\"divergences\":%llu,"
+        "\"skipped_device\":%llu,\"records\":[",
         s_diff_mode, (unsigned long long)s_shadow_calls,
-        (unsigned long long)s_shadow_divs);
+        (unsigned long long)s_shadow_divs,
+        (unsigned long long)s_shadow_skipped_dev);
     for (int i = 0; i < s_sdiv_n && n < cap - 200; i++) {
         ShadowDiv *d = &s_sdiv[i];
         n += snprintf(out + n, cap - n,
@@ -1045,6 +1350,104 @@ int overlay_loader_call_native(CPUState *cpu, uint32_t addr) {
     return 1;
 }
 
+/* ---- jal/jalr call helper for sljit shards (SLJIT.md §7) ---------------- */
+/* A JIT'd shard calls this at every jal/jalr site instead of open-coding the
+ * call contract. It reproduces the dirty-RAM interpreter's call path EXACTLY
+ * (see exec_one cases 0x03 / SPECIAL 0x09 and dispatch_nonlocal_call), so a
+ * shard-issued call behaves identically to an interpreted one — including the
+ * wild-return / bail unwind that the contract guards (Bug A/C/D family). The
+ * one principled difference from the interpreter's local-dirty fast path: a
+ * native shard cannot resume itself block-by-block, so a not-yet-native callee
+ * is run as a UNIT via psx_dispatch_call (which handles interp/dirty callees to
+ * the return contract) rather than the interpreter's pc-chain. See overlay_sljit.h. */
+int psx_sljit_call(CPUState *cpu, uint32_t target, uint32_t return_pc,
+                   int check_contract) {
+    uint32_t site_sp = cpu->gpr[29];   /* sp at the call (after the delay slot) */
+#ifdef PSX_HAS_GAME_DISPATCH
+    {
+        extern int psx_dispatch_game_compiled(CPUState *cpu, uint32_t addr);
+        cpu->pc = 0;
+        if (psx_dispatch_game_compiled(cpu, target)) {
+            if (g_psx_call_bail) return 1;
+            if (cpu->pc != 0) return 1;
+            if (check_contract && psx_call_contract(cpu, return_pc, site_sp)) return 1;
+            return 0;
+        }
+    }
+#endif
+    cpu->pc = 0;
+    if (overlay_loader_call_native(cpu, target)) {
+        if (g_psx_call_bail) return 1;
+        if (cpu->pc != 0) return 1;
+        if (check_contract && psx_call_contract(cpu, return_pc, site_sp)) return 1;
+        return 0;
+    }
+    /* Not a resolved compiled/native unit: dispatch the callee as a unit (the
+     * interpreter's nonlocal path — handles interp/dirty callees + the return
+     * contract internally). */
+    cpu->pc = 0;
+    psx_dispatch_call(cpu, target, return_pc);
+    if (g_psx_call_bail) return 1;
+    if (cpu->pc != 0) return 1;
+    return 0;
+}
+
+/* COP2/GTE helper — mirrors dirty_ram_interp.c case 0x12 + LWC2/SWC2. */
+void psx_sljit_cop2(CPUState *cpu, uint32_t insn) {
+    uint32_t op = (insn >> 26) & 0x3Fu, rs = (insn >> 21) & 0x1Fu;
+    uint32_t rt = (insn >> 16) & 0x1Fu, rd = (insn >> 11) & 0x1Fu;
+    if (op == 0x12) {                              /* COP2 */
+        uint32_t cop_op = rs;
+        if      (cop_op == 0x00) { cpu->gpr[rt] = gte_read_data(cpu, (uint8_t)rd); cpu->gpr[0] = 0; } /* MFC2 */
+        else if (cop_op == 0x02) { cpu->gpr[rt] = gte_read_ctrl(cpu, (uint8_t)rd); cpu->gpr[0] = 0; } /* CFC2 */
+        else if (cop_op == 0x04) { gte_write_data(cpu, (uint8_t)rd, cpu->gpr[rt]); }                  /* MTC2 */
+        else if (cop_op == 0x06) { gte_write_ctrl(cpu, (uint8_t)rd, cpu->gpr[rt]); }                  /* CTC2 */
+        else if (cop_op & 0x10)  { gte_execute(cpu, insn & 0x1FFFFFFu); }                             /* GTE cmd */
+        return;
+    }
+    int32_t  simm = (int32_t)(int16_t)(insn & 0xFFFFu);
+    uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+    if      (op == 0x32) { gte_write_data(cpu, (uint8_t)rt, cpu->read_word(addr)); }   /* LWC2 */
+    else if (op == 0x3A) { cpu->write_word(addr, gte_read_data(cpu, (uint8_t)rt)); }   /* SWC2 */
+}
+
+/* Unaligned load/store helper — mirrors dirty_ram_interp.c interp_lwl/lwr/swl/swr
+ * + cases 0x22/0x26/0x2A/0x2E. */
+void psx_sljit_memx(CPUState *cpu, uint32_t insn) {
+    uint32_t op = (insn >> 26) & 0x3Fu, rs = (insn >> 21) & 0x1Fu, rt = (insn >> 16) & 0x1Fu;
+    int32_t  simm = (int32_t)(int16_t)(insn & 0xFFFFu);
+    uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+    uint32_t aligned = addr & ~3u;
+    uint32_t word = cpu->read_word(aligned);
+    uint32_t sh = addr & 3u, rtv = cpu->gpr[rt], v;
+    switch (op) {
+    case 0x22: /* LWL */
+        switch (sh) { case 0: v = (rtv & 0x00FFFFFFu) | (word << 24); break;
+                      case 1: v = (rtv & 0x0000FFFFu) | (word << 16); break;
+                      case 2: v = (rtv & 0x000000FFu) | (word << 8);  break;
+                      default: v = word; }
+        cpu->gpr[rt] = v; cpu->gpr[0] = 0; break;
+    case 0x26: /* LWR */
+        switch (sh) { case 0: v = word; break;
+                      case 1: v = (rtv & 0xFF000000u) | (word >> 8);  break;
+                      case 2: v = (rtv & 0xFFFF0000u) | (word >> 16); break;
+                      default: v = (rtv & 0xFFFFFF00u) | (word >> 24); }
+        cpu->gpr[rt] = v; cpu->gpr[0] = 0; break;
+    case 0x2A: /* SWL */
+        switch (sh) { case 0: word = (word & 0xFFFFFF00u) | (rtv >> 24); break;
+                      case 1: word = (word & 0xFFFF0000u) | (rtv >> 16); break;
+                      case 2: word = (word & 0xFF000000u) | (rtv >> 8);  break;
+                      default: word = rtv; }
+        cpu->write_word(aligned, word); break;
+    case 0x2E: /* SWR */
+        switch (sh) { case 0: word = rtv; break;
+                      case 1: word = (word & 0x000000FFu) | (rtv << 8);  break;
+                      case 2: word = (word & 0x0000FFFFu) | (rtv << 16); break;
+                      default: word = (word & 0x00FFFFFFu) | (rtv << 24); }
+        cpu->write_word(aligned, word); break;
+    }
+}
+
 /* Write the whole fingerprint log to a file (no TCP size limit). Returns the
  * number of entries written, or -1 on open failure. */
 int overlay_loader_write_fp_file(const char *path) {
@@ -1114,10 +1517,10 @@ int overlay_loader_dump_candidates(char *out, int cap) {
         n += snprintf(out + n, cap - n,
             "%s{\"addr\":\"0x%08X\",\"state\":%d,\"nranges\":%d,"
             "\"crc\":\"0x%08X\",\"live\":\"0x%08X\",\"match\":%d,"
-            "\"val_gen\":%u,\"gen\":%u,\"dll\":%d}",
+            "\"val_gen\":%u,\"gen\":%u,\"dll\":%d,\"diff_passes\":%u}",
             i ? "," : "", c->addr, c->state, c->nranges,
             c->crc_code, live, (live == c->crc_code) ? 1 : 0,
-            c->val_gen, sum, c->dll);
+            c->val_gen, sum, c->dll, c->diff_passes);
     }
     n += snprintf(out + n, cap - n, "]");
     return n;
