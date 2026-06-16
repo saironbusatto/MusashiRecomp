@@ -35,6 +35,14 @@ struct CodeGenConfig {
     bool optimize_zero_reg;       // Optimize away $zero assignments
     bool use_switch_for_blocks;   // Use switch instead of goto labels
     bool split_mid_function_targets; // Split branch targets into funcs for legacy main-EXE analysis
+    // True when compiling an overlay image (psxrecomp-game --overlay). Overlay
+    // regions hold different scene VARIANTS at the same addresses (the same addr
+    // is backdrop code in one scene, unrelated code/data in another), so an
+    // explicit per-address widescreen site (x_sites / cull_* sites) authored for
+    // one variant won't match the bytes in another. In overlay mode such a shape
+    // mismatch is EXPECTED (apply the transform only where the bytes match, skip
+    // it elsewhere) rather than a hard config error.
+    bool overlay_mode = false;
     std::string indent;           // Indentation string (default: "    ")
     // Widescreen sprite-tag hooks ([widescreen] sprite_tag_funcs): functions
     // that get a psx_ws_sprite_tag(cpu) callback emitted at entry, so the
@@ -66,6 +74,14 @@ struct CodeGenConfig {
     // (≈100 sites in Tomba) through one helper with no per-address list, and is
     // generic to any PSX GTE title. The vertical (0xE0) bound is never touched.
     bool ws_auto_screen_x_cull = false;
+
+    // Widescreen automatic far-backdrop column PRELOAD ([widescreen.cull]
+    // auto_backdrop). When true, every scrolling-backdrop column-window generator
+    // is auto-detected by its invariant (see ws_backdrop_detect.h) and its window
+    // START/END finalize instructions are emitted through psx_ws_backdrop_value()
+    // so the whole finite tile row preloads in 16:9 (0 at 4:3 => byte-identical).
+    // Generators are overlay-resident, so this must reach the overlay compile.
+    bool ws_auto_backdrop_preload = false;
 
     // Widescreen backdrop screenX squash ([widescreen.backdrop] x_sites). Each
     // address is a `sh rt,off(base)` storing a parallax 2D backdrop layer's
@@ -170,6 +186,18 @@ private:
     // reject (`sltiu …,0x140` or `…,0x141`) and a screen-height reject
     // (`sltiu …,0xE0` or `…,0xF1`) — the uniform GTE per-vertex trivial-reject.
     bool func_has_screen_extent_cull(const ControlFlowGraph& cfg) const;
+
+    // Backdrop-preload rewrite sites for the CURRENT function ([widescreen.cull]
+    // auto_backdrop). Maps each detected window-bound instruction address to
+    // {kind (WS_BD_START / WS_BD_END), window_cols (|addiu offset|, the widen
+    // margin scale)}. Repopulated per function by detect_backdrop_windows()
+    // (gated on config_.ws_auto_backdrop_preload) and consulted by
+    // translate_instruction; cleared every function so it never leaks.
+    std::map<uint32_t, std::pair<int,int>> ws_backdrop_sites_;
+
+    // Populate ws_backdrop_sites_ from the shared psx_ws_find_backdrop_windows()
+    // detector over this function's instruction words; returns the window count.
+    int detect_backdrop_windows(const ControlFlowGraph& cfg);
 
     // Instruction translation
     std::string translate_instruction(uint32_t addr, uint32_t instr);

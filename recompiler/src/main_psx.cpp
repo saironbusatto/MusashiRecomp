@@ -98,6 +98,7 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_backdrop_unsquash; // [widescreen.backdrop] unsquash_funcs
     bool                  ws_auto_screen_x_cull = false; // [widescreen.cull] auto_screen_x
     std::set<uint32_t>    persist_init_sites;   // [persist_options] init-store hooks (game_options.toml)
+    bool                  ws_auto_backdrop_preload = false; // [widescreen.cull] auto_backdrop
     std::filesystem::path out_dir = "generated";
 
     if (!config_path.empty()) {
@@ -114,6 +115,7 @@ int main(int argc, char** argv) {
         ws_backdrop_x.insert(cfg.ws_backdrop_x_sites.begin(), cfg.ws_backdrop_x_sites.end());
         ws_backdrop_unsquash.insert(cfg.ws_backdrop_unsquash_funcs.begin(), cfg.ws_backdrop_unsquash_funcs.end());
         ws_auto_screen_x_cull = ws_auto_screen_x_cull || cfg.ws_auto_screen_x_cull;
+        ws_auto_backdrop_preload = ws_auto_backdrop_preload || cfg.ws_auto_backdrop_preload;
         // [persist_options] init-store hook sites live in a dedicated
         // game_options.toml next to game.toml (the game's own native OPTION
         // settings, kept separate from game.toml/settings.toml). Best-effort:
@@ -180,6 +182,7 @@ int main(int argc, char** argv) {
         ws_backdrop_x.insert(wscfg.ws_backdrop_x_sites.begin(), wscfg.ws_backdrop_x_sites.end());
         ws_backdrop_unsquash.insert(wscfg.ws_backdrop_unsquash_funcs.begin(), wscfg.ws_backdrop_unsquash_funcs.end());
         ws_auto_screen_x_cull = ws_auto_screen_x_cull || wscfg.ws_auto_screen_x_cull;
+        ws_auto_backdrop_preload = ws_auto_backdrop_preload || wscfg.ws_auto_backdrop_preload;
         fmt::print("ws-config:      {} (backdrop_x sites={}, unsquash funcs={})\n",
                    ws_config_path.string(), ws_backdrop_x.size(), ws_backdrop_unsquash.size());
     }
@@ -672,6 +675,7 @@ int main(int argc, char** argv) {
     codegen_config.emit_comments = true;
     codegen_config.emit_line_numbers = true;
     codegen_config.split_mid_function_targets = !overlay_mode;
+    codegen_config.overlay_mode = overlay_mode;
     codegen_config.ws_sprite_tag_funcs = ws_tag_funcs;
     codegen_config.ws_cull_bias_sites  = ws_cull_bias;
     codegen_config.ws_cull_range_sites = ws_cull_range;
@@ -680,10 +684,13 @@ int main(int argc, char** argv) {
     codegen_config.ws_backdrop_unsquash_funcs = ws_backdrop_unsquash;
     codegen_config.ws_auto_screen_x_cull = ws_auto_screen_x_cull;
     codegen_config.persist_init_store_sites = persist_init_sites;
+    codegen_config.ws_auto_backdrop_preload = ws_auto_backdrop_preload;
     if (ws_auto_screen_x_cull)
         fmt::print("  ws_auto_screen_x_cull = ON (render-funnel FOV widening)\n");
     if (!persist_init_sites.empty())
         fmt::print("  persist_options = {} init-store hook(s)\n", persist_init_sites.size());
+    if (ws_auto_backdrop_preload)
+        fmt::print("  ws_auto_backdrop_preload = ON (far-backdrop column preload)\n");
 
     // Load per-game annotations: annotations/<exe_stem>_annotations.csv
     // Silently skipped if the file doesn't exist.

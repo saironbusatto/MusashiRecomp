@@ -530,6 +530,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     // Optional [widescreen.cull] block — world-space draw-cull widening.
     std::vector<uint32_t> ws_cull_bias_sites, ws_cull_range_sites, ws_cull_a1_sites;
     bool ws_auto_screen_x_cull = false;
+    bool ws_auto_backdrop_preload = false;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("cull")) {
@@ -544,6 +545,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             load_sites("a1_sites",    ws_cull_a1_sites);
             if (cull.contains("auto_screen_x"))
                 ws_auto_screen_x_cull = toml::find<bool>(cull, "auto_screen_x");
+            if (cull.contains("auto_backdrop"))
+                ws_auto_backdrop_preload = toml::find<bool>(cull, "auto_backdrop");
         }
     }
 
@@ -595,6 +598,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_backdrop_x_sites*/   ws_backdrop_x_sites,
         /*ws_backdrop_unsquash_funcs*/ ws_backdrop_unsquash_funcs,
         /*ws_auto_screen_x_cull*/ ws_auto_screen_x_cull,
+        /*ws_auto_backdrop_preload*/ ws_auto_backdrop_preload,
     };
 }
 

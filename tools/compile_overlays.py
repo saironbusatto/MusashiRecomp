@@ -839,6 +839,11 @@ int psx_ws_x_margin(void) {
 void psx_ws_sprite_tag(CPUState *cpu) {
     if (g_cbs.ws_sprite_tag) g_cbs.ws_sprite_tag(cpu);
 }
+/* Widescreen backdrop column-preload value (ABI v4). Identity fallback if the
+ * host predates the callback, so the DLL stays correct (4:3) on an older host. */
+uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols) {
+    return g_cbs.ws_backdrop_value ? g_cbs.ws_backdrop_value(orig, is_end, window_cols) : orig;
+}
 /* ----------------------------------------------------------------------- */
 
 """

@@ -128,6 +128,18 @@ int  psx_ws_func_has_screen_cull(const uint32_t *words, int n);
  * Pulls far backdrop pieces in from past the 320px edge to cover the 16:9 FOV. */
 int  psx_ws_backdrop_x(int x);
 
+/* Backdrop PRELOAD ([widescreen.cull] auto_backdrop). psx_ws_backdrop_preload()
+ * is nonzero only while native-wide widescreen is engaged (0 at 4:3 / boot /
+ * FMV / full-2D), so the rewrite is byte-identical when off. psx_ws_backdrop_value()
+ * is the one value substitution shared by the gcc emit, the sljit JIT, and the
+ * interpreter for a detected window bound: it returns `orig` unless preload is
+ * engaged, in which case it widens the camera-tracked window by the 16:9 reveal
+ * (START bound -> orig - margin, END bound -> orig + margin; margin in columns
+ * scales with window_cols). Draws only the now-visible columns; the generator's
+ * own clamps still bound it at level edges. */
+int      psx_ws_backdrop_preload(void);
+uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);
+
 /* Backdrop store-site registry: the runtime registers the [widescreen.backdrop]
  * x_sites here (from game.toml) so the dirty-RAM interpreter applies the same
  * psx_ws_backdrop_x() squash at those `sh` PCs that the recompiler emits into

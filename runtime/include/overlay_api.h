@@ -23,8 +23,13 @@
  *     version is the cache discriminator: bumping it forces the loader to
  *     reject pre-backdrop DLLs so autocompile regenerates them with the squash.
  *     (The deferred follow-up is to auto-derive this tag from a hash of the
- *     widescreen config + emit headers; until then it's a manual bump.) */
-#define PSX_OVERLAY_ABI_VERSION 3
+ *     widescreen config + emit headers; until then it's a manual bump.)
+ * v4: widescreen backdrop column PRELOAD ([widescreen.cull] auto_backdrop) —
+ *     overlay backdrop generators now emit psx_ws_backdrop_value() at the
+ *     window START/END finalize, and the callback struct grows a
+ *     ws_backdrop_value pointer (appended last). Bumping rejects pre-preload
+ *     DLLs (which lack both the emit and a host that supplies the callback). */
+#define PSX_OVERLAY_ABI_VERSION 4
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -58,8 +63,11 @@
  * (compile_overlays.py) parses this same constant from this header, so the two
  * sides can never drift. BUMP THIS when you change code_generator.cpp emit in a
  * way that alters overlay output (e.g. the auto_screen_x widescreen widening).
- *   1: baseline + auto_screen_x render-funnel cull via psx_ws_cull_sltiu. */
-#define PSX_OVERLAY_CODEGEN_VER 1
+ *   1: baseline + auto_screen_x render-funnel cull via psx_ws_cull_sltiu.
+ *   2: + auto_backdrop far-backdrop column preload via psx_ws_backdrop_value.
+ *   3: auto_backdrop switched to camera-tracked window WIDENING
+ *      (psx_ws_backdrop_value gains a window_cols arg). */
+#define PSX_OVERLAY_CODEGEN_VER 3
 
 typedef struct {
     /* Core dispatch: routes call_by_address() and out-of-overlay jal */
@@ -95,6 +103,14 @@ typedef struct {
     int  (*ws_backdrop_x)(int x);
     int  (*ws_x_margin)(void);
     void (*ws_sprite_tag)(CPUState *cpu);
+    /* Widescreen backdrop column-preload value substitution (ABI v4). Overlay
+     * backdrop generators call this at a detected window START/END bound; the
+     * runtime returns `orig` unless native-wide is engaged, in which case it
+     * widens the camera-tracked window by the 16:9 reveal (START -> orig-margin,
+     * END -> orig+margin; margin scales with window_cols). Appended LAST (struct
+     * grows back-compatibly); may be NULL on a host that predates it — the DLL
+     * glue falls back to orig. */
+    uint32_t (*ws_backdrop_value)(uint32_t orig, int is_end, int window_cols);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

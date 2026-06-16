@@ -1,5 +1,10 @@
 #include "code_generator.h"
 #include "control_flow.h"
+// Shared widescreen backdrop-window detector (single source of truth across the
+// recompiler, the interpreter, and the sljit emitter). Self-contained C header;
+// included via relative path to avoid an include-dir collision (recompiler and
+// runtime both ship a gte.h).
+#include "../../runtime/include/ws_backdrop_detect.h"
 #include <fmt/format.h>
 #include <algorithm>
 #include <set>
@@ -679,43 +684,91 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
 
     std::string code;
 
+    // Widescreen automatic far-backdrop column PRELOAD ([widescreen.cull]
+    // auto_backdrop). At a detected window's START/END finalize, route the value
+    // through psx_ws_backdrop_value(orig, is_end): identity at 4:3, but in
+    // native-wide it forces START->0 / END->0x100, so the generator's own low/
+    // high clamps preload the whole finite tile row (filling the revealed 16:9
+    // margin). ws_backdrop_sites_ is populated per function by
+    // detect_backdrop_windows() only when config_.ws_auto_backdrop_preload is
+    // set — inert and byte-identical when the feature is off. The instruction
+    // shape is verified; a mismatch is a loud build error (detector/codegen drift).
+    if (!ws_backdrop_sites_.empty()) {
+        auto bd = ws_backdrop_sites_.find(addr);
+        if (bd != ws_backdrop_sites_.end()) {
+            int is_end = (bd->second.first == WS_BD_END) ? 1 : 0;
+            int wcols  = bd->second.second;
+            const char* tag = is_end ? "END" : "START";
+            if (opcode == 0x00 && (funct == 0x21 || funct == 0x25)) {  // addu/or (move)
+                uint32_t rd = get_rd(instr), rs = get_rs(instr), rt = get_rt(instr);
+                uint32_t src = (rt == 0) ? rs : rt;
+                return fmt::format("{} = psx_ws_backdrop_value({}, {}, {});"
+                                   "  /* ws backdrop preload {} */{}",
+                                   reg_name(rd), reg_name(src), is_end, wcols, tag, comment);
+            }
+            if (opcode == 0x09 || opcode == 0x08) {  // addiu / addi
+                uint32_t rs = get_rs(instr), rt = get_rt(instr);
+                int16_t imm = get_imm16(instr);
+                std::string orig = (rs == 0)
+                    ? fmt::format("(uint32_t){}", (int)imm)
+                    : fmt::format("(uint32_t)({} + {})", reg_name(rs), (int)imm);
+                return fmt::format("{} = psx_ws_backdrop_value({}, {}, {});"
+                                   "  /* ws backdrop preload {} */{}",
+                                   reg_name(rt), orig, is_end, wcols, tag, comment);
+            }
+            fmt::print(stderr, "ERROR: [widescreen.cull] auto_backdrop site 0x{:08X} "
+                       "is not addu/or/addiu (opcode 0x{:02X} funct 0x{:02X})\n",
+                       addr, opcode, funct);
+            std::exit(1);
+        }
+    }
+
     // Widescreen cull-margin widening ([widescreen.cull] sites). Emit the
     // window immediate with a runtime margin term psx_ws_x_margin() — 0 at
     // 4:3/boot/menu/FMV, ~half-the-extra-width when stretching — so the world-
     // space draw cull tracks the aspect and one build serves both. Each site's
-    // instruction type is verified; a mismatch is a loud build error (a bad
-    // address would silently mis-emit otherwise).
+    // instruction type is verified; a mismatch is a loud build error in main-EXE
+    // mode (a bad address would silently mis-emit otherwise). In OVERLAY mode the
+    // same address holds different code across scene variants, so a mismatch is
+    // expected — apply the transform only where the bytes match, else fall
+    // through to the vanilla translation (see CodeGenConfig::overlay_mode).
     if (config_.ws_cull_bias_sites.count(addr)) {
-        if (opcode != 0x08 && opcode != 0x09) {  // addi / addiu
+        if (opcode == 0x08 || opcode == 0x09) {  // addi / addiu
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            int16_t imm = get_imm16(instr);
+            return fmt::format("{} = {} + ((int32_t){} + psx_ws_x_margin());{}",
+                               reg_name(rt), reg_name(rs), imm, comment);
+        } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] bias site 0x{:08X} is not "
                        "addi/addiu (opcode 0x{:02X})\n", addr, opcode);
             std::exit(1);
         }
-        uint32_t rs = get_rs(instr), rt = get_rt(instr);
-        int16_t imm = get_imm16(instr);
-        return fmt::format("{} = {} + ((int32_t){} + psx_ws_x_margin());{}",
-                           reg_name(rt), reg_name(rs), imm, comment);
+        // overlay variant: addr is different code here — fall through to vanilla.
     }
     if (config_.ws_cull_range_sites.count(addr)) {
-        if (opcode != 0x0B) {  // sltiu
+        if (opcode == 0x0B) {  // sltiu
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            int16_t imm = get_imm16(instr);
+            return fmt::format("{} = ({} < (uint32_t)((int32_t){} + 2*psx_ws_x_margin())) ? 1 : 0;{}",
+                               reg_name(rt), reg_name(rs), imm, comment);
+        } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] range site 0x{:08X} is not "
                        "sltiu (opcode 0x{:02X})\n", addr, opcode);
             std::exit(1);
         }
-        uint32_t rs = get_rs(instr), rt = get_rt(instr);
-        int16_t imm = get_imm16(instr);
-        return fmt::format("{} = ({} < (uint32_t)((int32_t){} + 2*psx_ws_x_margin())) ? 1 : 0;{}",
-                           reg_name(rt), reg_name(rs), imm, comment);
+        // overlay variant: addr is different code here — fall through to vanilla.
     }
     if (config_.ws_cull_a1_sites.count(addr)) {
-        if (instr != 0x00000000u) {  // must be a nop we can safely repurpose
+        if (instr == 0x00000000u) {  // must be a nop we can safely repurpose
+            // a1 = $5: widen the caller-supplied margin (param-margin classifiers).
+            return fmt::format("cpu->gpr[5] = cpu->gpr[5] + psx_ws_x_margin();"
+                               "  /* ws cull a1 bias */{}", comment);
+        } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.cull] a1 site 0x{:08X} is not a "
                        "nop (0x{:08X})\n", addr, instr);
             std::exit(1);
         }
-        // a1 = $5: widen the caller-supplied margin (param-margin classifiers).
-        return fmt::format("cpu->gpr[5] = cpu->gpr[5] + psx_ws_x_margin();"
-                           "  /* ws cull a1 bias */{}", comment);
+        // overlay variant: addr is different code here — fall through to vanilla.
     }
     // Widescreen automatic horizontal-FOV cull widening ([widescreen.cull]
     // auto_screen_x). ws_auto_cull_func_ is set when this function carries the
@@ -746,18 +799,20 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
     // un-GTE'd backdrop tracks the 16:9 FOV (psx_ws_backdrop_x is identity at
     // 4:3). Instruction type is verified; a mismatch is a loud build error.
     if (config_.ws_backdrop_x_sites.count(addr)) {
-        if (opcode != 0x29) {  // sh
+        if (opcode == 0x29) {  // sh
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            int16_t offset = get_imm16(instr);
+            if (offset == 0)
+                return fmt::format("cpu->write_half({}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
+                                   reg_name(rs), reg_name(rt), comment);
+            return fmt::format("cpu->write_half({} + {}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
+                               reg_name(rs), offset, reg_name(rt), comment);
+        } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.backdrop] x site 0x{:08X} is not "
                        "sh (opcode 0x{:02X})\n", addr, opcode);
             std::exit(1);
         }
-        uint32_t rs = get_rs(instr), rt = get_rt(instr);
-        int16_t offset = get_imm16(instr);
-        if (offset == 0)
-            return fmt::format("cpu->write_half({}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
-                               reg_name(rs), reg_name(rt), comment);
-        return fmt::format("cpu->write_half({} + {}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
-                           reg_name(rs), offset, reg_name(rt), comment);
+        // overlay variant: addr is different code here — fall through to vanilla.
     }
 
     // Persistent game-option init store ([persist_options] in game_options.toml).
@@ -1420,6 +1475,32 @@ bool CodeGenerator::func_has_screen_extent_cull(const ControlFlowGraph& cfg) con
     return false;
 }
 
+int CodeGenerator::detect_backdrop_windows(const ControlFlowGraph& cfg) {
+    // Always clear so a stale map from the previous function can never leak.
+    ws_backdrop_sites_.clear();
+    if (!config_.ws_auto_backdrop_preload) return 0;
+
+    // Build a contiguous word image of the whole function range so the shared
+    // detector's absolute-PC math (base_pc + i*4) lands on real addresses; any
+    // non-code gap (jump table / constant pool) simply never matches the
+    // invariant and is harmless. base_pc = function_start.
+    uint32_t lo = cfg.function_start, hi = cfg.function_end;
+    if (hi <= lo || (hi - lo) > 0x40000u) return 0;   // sanity bound
+    std::vector<uint32_t> words;
+    words.reserve((hi - lo) / 4u);
+    for (uint32_t a = lo; a < hi; a += 4) {
+        auto io = exe_.read_word(a);
+        words.push_back(io.has_value() ? *io : 0u);
+    }
+
+    WsBackdropSite sites[64];
+    int ns = psx_ws_find_backdrop_windows(words.data(), (int)words.size(), lo,
+                                          sites, 64);
+    for (int i = 0; i < ns; i++)
+        ws_backdrop_sites_[sites[i].pc] = { sites[i].kind, sites[i].window_cols };
+    return ns;
+}
+
 GeneratedFunction CodeGenerator::generate_function(
     const Function& func,
     const ControlFlowGraph& cfg,
@@ -1434,6 +1515,16 @@ GeneratedFunction CodeGenerator::generate_function(
     // every function so it never leaks across functions.
     ws_auto_cull_func_ = config_.ws_auto_screen_x_cull &&
                          func_has_screen_extent_cull(cfg);
+
+    // Widescreen backdrop preload (gated): detect each scrolling-backdrop column
+    // window so translate_instruction rewrites its START/END finalize. Cleared +
+    // repopulated per function so sites never leak across functions.
+    {
+        int bd_windows = detect_backdrop_windows(cfg);
+        if (bd_windows > 0)
+            fmt::print("  [ws backdrop] {} site(s) in {} (0x{:08X})\n",
+                       bd_windows, func.name, func.start_addr);
+    }
 
     std::stringstream body_ss;
     body_ss << "{\n";
@@ -1582,6 +1673,15 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     // generate_function() call can't leak into this body. (See generate_function.)
     ws_auto_cull_func_ = config_.ws_auto_screen_x_cull &&
                          func_has_screen_extent_cull(cfg);
+
+    // Backdrop preload sites for this alias group's shared CFG (see
+    // generate_function). Set per-group so a stale map can't leak in.
+    {
+        int bd_windows = detect_backdrop_windows(cfg);
+        if (bd_windows > 0)
+            fmt::print("  [ws backdrop] {} site(s) in alias host 0x{:08X}\n",
+                       bd_windows, host);
+    }
 
     // Jump-table edges + mid-block labels for this host's CFG.
     extra_labels_.clear();
@@ -1785,6 +1885,7 @@ std::string CodeGenerator::generate_file(
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n";
     ss << "extern int  psx_game_option_store(uint32_t addr, int val);  /* persisted OPTION restore-at-init (game_options.c) */\n";
+    ss << "extern uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);  /* ws backdrop preload (gpu.c) */\n";
     ss << "extern void gte_ws_set_suppress(int on);  /* widescreen far-backdrop un-squash (gte.cpp) */\n\n";
 
     // Emit reference implementations for unaligned memory helpers.

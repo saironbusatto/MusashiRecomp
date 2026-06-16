@@ -29,6 +29,7 @@
 #include "interrupts.h"
 #include "psx_cycles.h"
 #include "gpu.h"   /* psx_ws_is_backdrop_site / psx_ws_backdrop_x (interp hook) */
+#include "ws_backdrop_detect.h"  /* shared backdrop-window detector (auto_backdrop) */
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -170,6 +171,34 @@ static int ws_cull_site(uint32_t pc) {
     int flag = psx_ws_func_has_screen_cull(words, n);
     cache[slot].pc = pc; cache[slot].flag = (int8_t)flag;
     return flag;
+}
+
+/* Widescreen far-backdrop column-PRELOAD site classification for the interpreter
+ * ([widescreen.cull] auto_backdrop). The scrolling-backdrop column-window
+ * generators run interpreted in the dev build, so the recompiler emit can't
+ * reach them; the interp re-derives the same START/END rewrite sites via the
+ * shared detector over a +/-512-byte window around the PC (physical space, so
+ * the detector's absolute-PC math matches the masked PC), cached per-PC so a hot
+ * generator pays the scan once. Returns WS_BD_NONE / WS_BD_START_ZERO /
+ * WS_BD_END_WIDEN. Single-threaded interp => static buffers are safe. */
+static int ws_backdrop_site_kind(uint32_t pc, int *out_cols) {
+    enum { WIN = 128 };                          /* +/- 128 words = +/- 512 bytes */
+    static struct { uint32_t pc; int8_t kind; int16_t cols; } cache[256];
+    uint32_t slot = (pc >> 2) & 255u;
+    if (cache[slot].pc == pc) { if (out_cols) *out_cols = cache[slot].cols; return cache[slot].kind; }
+    uint32_t phys = pc & 0x1FFFFFFFu;
+    uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
+    uint32_t hi = phys + (uint32_t)(WIN * 4 + 4);
+    if (hi > 0x200000u) hi = 0x200000u;          /* 2 MB main RAM */
+    static uint32_t words[2 * WIN + 2];
+    int n = 0;
+    for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 2); a += 4u)
+        words[n++] = fetch_word(a);
+    int cols = 0;
+    int kind = psx_ws_backdrop_kind_at(words, n, lo, phys, &cols);  /* all physical-space */
+    cache[slot].pc = pc; cache[slot].kind = (int8_t)kind; cache[slot].cols = (int16_t)cols;
+    if (out_cols) *out_cols = cols;
+    return kind;
 }
 
 static void dirty_ram_log_instruction(CPUState *cpu, uint32_t pc, uint32_t insn,
@@ -434,6 +463,32 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     /* Update last-store PC tracker so SIO PC tracer attribution stays
      * coherent through interpreted stubs. */
     g_debug_last_store_pc = pc;
+
+    /* Widescreen far-backdrop column PRELOAD (auto_backdrop). At a detected
+     * window START/END finalize, force the loop bound (START->0 / END->0x100) so
+     * the generator's own clamps preload the whole finite tile row into the
+     * revealed 16:9 margin. The site is a move/addiu that writes exactly one GPR
+     * and has no other effect, so substituting the value and advancing pc+4 is
+     * complete. Gated on the runtime predicate first => 4:3 pays nothing. */
+    if (psx_ws_backdrop_preload()) {
+        int wcols = 0;
+        int bk = ws_backdrop_site_kind(pc, &wcols);
+        if (bk != WS_BD_NONE) {
+            uint32_t dest = (opc == 0x00u && (fnt == 0x21u || fnt == 0x25u)) ? rd
+                          : (opc == 0x09u || opc == 0x08u)                   ? rt
+                          : 0xFFFFFFFFu;
+            if (dest != 0xFFFFFFFFu) {
+                /* orig = the instruction's normal result, so the widen shifts the
+                 * real camera-tracked bound (move: gpr[src]; addiu: gpr[rs]+simm). */
+                uint32_t orig = (opc == 0x00u)
+                    ? ((rt == 0u) ? cpu->gpr[rs] : cpu->gpr[rt])
+                    : (cpu->gpr[rs] + (uint32_t)simm);
+                cpu->gpr[dest] = psx_ws_backdrop_value(orig, bk == WS_BD_END, wcols);
+                cpu->gpr[0] = 0;
+                return 0;
+            }
+        }
+    }
 
     switch (opc) {
     case 0x00: /* SPECIAL */

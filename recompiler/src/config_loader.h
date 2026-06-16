@@ -302,6 +302,19 @@ struct GameConfig {
     // per-site address list needed. 0 at 4:3 ⇒ byte-identical. Off by default;
     // a regen is required. (Vertical 0xE0 bound is left untouched.)
     bool ws_auto_screen_x_cull = false;
+
+    // [widescreen.cull] auto_backdrop — automatic far-backdrop column PRELOAD.
+    // Scrolling 2D backdrop layers (sky/ground/cloud/flower-field tile rows)
+    // generate only a camera-windowed ~4:3 range of tile columns, so the 16:9
+    // revealed margin shows void until the camera moves. When true the recompiler
+    // auto-detects each column-window generator by its invariant (the /96 magic
+    // 0x66666667 dividing the 0x176 camera-X, the sra-by-5 divide tail, and the
+    // move/addiu loop-bound finalize — see ws_backdrop_detect.h) and rewrites the
+    // window START to 0 and END high via psx_ws_backdrop_value(); the generator's
+    // own low/high clamps then pin the loop to the whole finite row. Generators
+    // are overlay-resident, so the overlay compile must see this (--ws-config).
+    // 0 at 4:3 (native-wide inactive) => byte-identical. Off by default; regen.
+    bool ws_auto_backdrop_preload = false;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

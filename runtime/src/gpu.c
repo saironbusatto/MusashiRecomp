@@ -231,6 +231,32 @@ int psx_ws_backdrop_x(int x) {
     return ws_scale_about((int16_t)x, cx);
 }
 
+/* Backdrop PRELOAD predicate + value substitution ([widescreen.cull]
+ * auto_backdrop). The recompiler/sljit/interp detect each scrolling-backdrop
+ * column-window generator (see ws_backdrop_detect.h) and route its window START
+ * and END bounds through psx_ws_backdrop_value(). When native-wide is engaged we
+ * WIDEN the camera-tracked window by the 16:9 reveal: the START (left) bound
+ * moves left by `margin`, the END (right) bound moves right by `margin`, where
+ * margin is the per-side reveal in COLUMNS. The window of window_cols columns
+ * spans (at least) the full display width, so reveal_cols = window_cols *
+ * reveal_px / display_px = window_cols * nw_offset / disp_w (+slack). This draws
+ * ONLY the now-visible columns (no whole-row overdraw, no fixed cap), and the
+ * generator's own low/high clamps still bound it at the level edges. Gated on
+ * native-wide only (NOT squash: that path uses psx_ws_backdrop_x()). Returns
+ * `orig` unchanged at 4:3 / squash / boot / FMV, so 4:3 stays byte-identical. */
+int psx_ws_backdrop_preload(void) { return ws_native_wide_active(); }
+
+uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols) {
+    if (!psx_ws_backdrop_preload()) return orig;
+    if (window_cols < 0) window_cols = -window_cols;
+    int dispw  = ws_disp_w();
+    /* +2 slack covers integer truncation and the generator's own pop-in margin;
+     * over-covering a couple columns is bounded by the window so it never
+     * approaches whole-row cost. */
+    int margin = (dispw > 0) ? (window_cols * ws_nw_offset()) / dispw + 2 : 2;
+    return is_end ? (orig + (uint32_t)margin) : (orig - (uint32_t)margin);
+}
+
 /* Backdrop store-site registry. The [widescreen.backdrop] x_sites are emitted
  * into native cache-DLL code by the recompiler, but overlay code very often
  * runs INTERPRETED (no DLL loaded), where the emit can't reach. So the runtime

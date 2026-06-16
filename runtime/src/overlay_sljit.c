@@ -18,6 +18,7 @@
 #include <stdlib.h>
 
 #include "sljitLir.h"
+#include "ws_backdrop_detect.h"  /* shared backdrop-window detector (auto_backdrop) */
 
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
@@ -177,6 +178,16 @@ static uint32_t s_gpr_lru;
  * overlay widens identically to the gcc cache + interp (widescreen FOV). */
 static int      s_frag_ws_cull;
 extern int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* gpu.c — shared widen */
+#define SLJIT_MAX_FRAG_INSNS 2048u
+#define SLJIT_MAX_FRAG_CTRL  512u   /* branches/jumps per fragment cap */
+/* Per-fragment (PASS 1) backdrop-preload site map ([widescreen.cull]
+ * auto_backdrop): s_bd_kind[i] = WS_BD_START_ZERO/END_WIDEN for the window
+ * START/END finalize at fragment word i, else WS_BD_NONE. emit_one routes those
+ * move/addiu through psx_ws_backdrop_value so a JIT'd backdrop generator
+ * preloads the whole tile row identically to the gcc cache + interp. */
+static uint8_t  s_bd_kind[SLJIT_MAX_FRAG_INSNS];
+static int16_t  s_bd_cols[SLJIT_MAX_FRAG_INSNS];   /* window width (cols) per site */
+extern uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);  /* gpu.c — shared widen */
 
 static inline sljit_s32 slot_reg(int k) { return SLJIT_S(k + 2); } /* S2.. */
 
@@ -391,11 +402,50 @@ enum { EMIT_OK = 0, EMIT_TERM = 1, EMIT_ABORT = 2 };
  * is `jr $ra` (the only terminator this slice supports — caller then emits the
  * delay slot + the shard return), or EMIT_ABORT for anything outside the slice
  * (any other control transfer, or an unsupported opcode). */
-static int emit_one(struct sljit_compiler *C, uint32_t insn) {
+static int emit_one(struct sljit_compiler *C, uint32_t insn, int bd_kind, int bd_cols) {
     uint32_t op = f_op(insn), rs = f_rs(insn), rt = f_rt(insn);
     uint32_t rd = f_rd(insn), sh = f_sh(insn), fn = f_fn(insn);
     uint32_t imm = f_imm(insn);
     sljit_sw simm = f_simm(insn);
+
+    /* Widescreen far-backdrop column PRELOAD (auto_backdrop): this move/addiu is
+     * a detected window START/END bound — route its value through
+     * psx_ws_backdrop_value(orig, is_end, window_cols) so native-wide widens the
+     * camera-tracked window by the 16:9 reveal (identity at 4:3). The helper
+     * reads only its three args (+ runtime widescreen state), not cpu->gpr[], so
+     * the GPR cache survives the icall — same discipline as emit_ws_cull. Three
+     * args (R0/R1/R2) means the fn ptr goes in R3 to avoid clobbering arg2. */
+    if (bd_kind != WS_BD_NONE) {
+        int is_end = (bd_kind == WS_BD_END);
+        sljit_s32 a; sljit_sw aw;
+        if (op == 0x00u && (fn == 0x21u || fn == 0x25u)) {           /* move (addu/or rD,rS,$0) */
+            uint32_t src = (rt == 0u) ? rs : rt;
+            gpr_src(C, src, &a, &aw);
+            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, a, aw);      /* orig -> R0 */
+            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, (sljit_sw)is_end);
+            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, (sljit_sw)bd_cols);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_IMM, (sljit_sw)(uintptr_t)psx_ws_backdrop_value);
+            sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3(32, 32, 32, 32), SLJIT_R3, 0);
+            sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, rd), 0, SLJIT_R0, 0);
+            gpr_unpin();
+            return EMIT_OK;
+        }
+        if (op == 0x08u || op == 0x09u) {                           /* addiu/addi rT,rS,N */
+            gpr_src(C, rs, &a, &aw);
+            if (a == SLJIT_IMM)
+                sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_IMM, aw + simm);   /* orig = N */
+            else
+                sljit_emit_op2(C, SLJIT_ADD32, SLJIT_R0, 0, a, aw, SLJIT_IMM, simm); /* orig = rS+N */
+            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, (sljit_sw)is_end);
+            sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, (sljit_sw)bd_cols);
+            sljit_emit_op1(C, SLJIT_MOV, SLJIT_R3, 0, SLJIT_IMM, (sljit_sw)(uintptr_t)psx_ws_backdrop_value);
+            sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS3(32, 32, 32, 32), SLJIT_R3, 0);
+            sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, rt), 0, SLJIT_R0, 0);
+            gpr_unpin();
+            return EMIT_OK;
+        }
+        /* Unexpected shape for a detected site: fall through to normal emit. */
+    }
 
     switch (op) {
     case 0x00: /* SPECIAL */
@@ -708,9 +758,6 @@ static uint32_t gpr_ref_mask(uint32_t insn) {
     return m & ~1u;                         /* $0 is never cached */
 }
 
-#define SLJIT_MAX_FRAG_INSNS 2048u
-#define SLJIT_MAX_FRAG_CTRL  512u   /* branches/jumps per fragment cap */
-
 void overlay_sljit_try_compile(uint32_t entry,
                                const uint8_t *bytes, uint32_t size,
                                uint32_t image_base_vram,
@@ -797,6 +844,31 @@ void overlay_sljit_try_compile(uint32_t entry,
         }
     }
     s_frag_ws_cull = ws_hx && ws_hy;
+
+    /* Backdrop-preload window detection ([widescreen.cull] auto_backdrop): scan
+     * the fragment for column-window generators and mark the START/END finalize
+     * words so emit_one routes them through psx_ws_backdrop_value. base_pc =
+     * entry (virtual) so a site PC maps to its fragment word index. A window
+     * whose magic load falls outside this fragment is simply not detected here
+     * (the contiguous case body is the common shape; the interp/gcc paths cover
+     * the rest), so the worst case is a missed widen, never a mis-compile. */
+    for (uint32_t i = 0; i < frag_words && i < SLJIT_MAX_FRAG_INSNS; i++) {
+        s_bd_kind[i] = WS_BD_NONE; s_bd_cols[i] = 0;
+    }
+    {
+        static uint32_t bdwords[SLJIT_MAX_FRAG_INSNS];
+        for (uint32_t i = 0; i < frag_words; i++) bdwords[i] = img_word(bytes, off0 + i * 4u);
+        WsBackdropSite bds[16];
+        int nb = psx_ws_find_backdrop_windows(bdwords, (int)frag_words, entry, bds, 16);
+        for (int b = 0; b < nb; b++) {
+            uint32_t idx = (bds[b].pc - entry) / 4u;
+            if (idx < frag_words) {
+                s_bd_kind[idx] = (uint8_t)bds[b].kind;
+                s_bd_cols[idx] = (int16_t)bds[b].window_cols;
+            }
+        }
+    }
+
     int distinct = 0;
     for (uint32_t m = used_mask; m; m &= m - 1u) distinct++;
     s_gpr_slots = (distinct < GPR_SLOTS_MAX) ? distinct : GPR_SLOTS_MAX;
@@ -895,7 +967,7 @@ void overlay_sljit_try_compile(uint32_t entry,
                 pending = PEND_CALL;
                 continue;
             }
-            if (emit_one(C, insn) != EMIT_OK) { aborted = 1; break; }
+            if (emit_one(C, insn, s_bd_kind[i], s_bd_cols[i]) != EMIT_OK) { aborted = 1; break; }
         } else {
             /* This instruction is the delay slot of the pending control insn;
              * it must be a plain, supported, non-control op (the constraint the
@@ -905,7 +977,7 @@ void overlay_sljit_try_compile(uint32_t entry,
              * the pending transfer. */
             int32_t dummy = 0;
             if (classify_control(insn, i * 4u, entry_phys, &dummy) != CTRL_NONE) { aborted = 1; break; }
-            if (emit_one(C, insn) != EMIT_OK) { aborted = 1; break; }
+            if (emit_one(C, insn, s_bd_kind[i], s_bd_cols[i]) != EMIT_OK) { aborted = 1; break; }
             gpr_flush(C);
             if (pending == PEND_RET) {
                 sljit_emit_return_void(C);
