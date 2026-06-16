@@ -1335,7 +1335,12 @@ static void sdl_vblank_present(void) {
          * the PSX_GL_FORCE_CPU_PRESENT diagnostic sync the FBO down and use
          * the CPU readout below. */
 #ifndef PSX_SDL_NO_RENDER
-        if (g_gl_active && g_gl_fbo_present && !di.depth24) {
+        /* Native-wide GL present: the wide compositor lives in separate per-base
+         * FBOs that the deterministic VRAM-FBO present can't read, so a wide
+         * frame falls through to the CPU readout path below (gr_render_wide_
+         * display -> sdl_pixel_buf -> gl_renderer_present). 4:3 / FMV / non-wide
+         * frames keep the fast VRAM-FBO present (early return) unchanged. */
+        if (g_gl_active && g_gl_fbo_present && !di.depth24 && !wide_present) {
             gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
                                      (int)present_w, (int)h, g_video_aa ? 1 : 0,
                                      fmv_frame ? 1 : 0);

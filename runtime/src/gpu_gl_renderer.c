@@ -144,6 +144,7 @@ typedef void   (APIENTRY *PFN_glBufferData)(GLenum, ptrdiff_t, const void *, GLe
 typedef void   (APIENTRY *PFN_glVertexAttribPointer)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void *);
 typedef void   (APIENTRY *PFN_glEnableVertexAttribArray)(GLuint);
 typedef void   (APIENTRY *PFN_glGenFramebuffers)(GLsizei, GLuint *);
+typedef void   (APIENTRY *PFN_glDeleteFramebuffers)(GLsizei, const GLuint *);
 typedef void   (APIENTRY *PFN_glBindFramebuffer)(GLenum, GLuint);
 typedef void   (APIENTRY *PFN_glFramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
 typedef GLenum (APIENTRY *PFN_glCheckFramebufferStatus)(GLenum);
@@ -182,6 +183,7 @@ static PFN_glBufferData        p_glBufferData;
 static PFN_glVertexAttribPointer p_glVertexAttribPointer;
 static PFN_glEnableVertexAttribArray p_glEnableVertexAttribArray;
 static PFN_glGenFramebuffers   p_glGenFramebuffers;
+static PFN_glDeleteFramebuffers p_glDeleteFramebuffers;
 static PFN_glBindFramebuffer   p_glBindFramebuffer;
 static PFN_glFramebufferTexture2D p_glFramebufferTexture2D;
 static PFN_glCheckFramebufferStatus p_glCheckFramebufferStatus;
@@ -212,6 +214,7 @@ static int load_modern_gl(void) {
     LOAD(p_glVertexAttribPointer, "glVertexAttribPointer");
     LOAD(p_glEnableVertexAttribArray, "glEnableVertexAttribArray");
     LOAD(p_glGenFramebuffers, "glGenFramebuffers"); LOAD(p_glBindFramebuffer, "glBindFramebuffer");
+    LOAD(p_glDeleteFramebuffers, "glDeleteFramebuffers");
     LOAD(p_glFramebufferTexture2D, "glFramebufferTexture2D");
     LOAD(p_glCheckFramebufferStatus, "glCheckFramebufferStatus");
     LOAD(p_glBlitFramebuffer, "glBlitFramebuffer");
@@ -257,6 +260,12 @@ static GLuint s_pack_prog = 0, s_empty_vao = 0;
 static GLint s_uVram = -1, s_uTpage = -1, s_uClut = -1, s_uDepth = -1;
 static GLint s_uRaw = -1, s_uSemipass = -1, s_uTwin = -1, s_uMaskset = -1, s_uFilter = -1;
 static GLint s_uLimits = -1;
+/* Native-wide x-projection uniforms (per program). u_xoff = x translation in
+ * native px (0 canonical), u_xhalf = x clip half-extent in native px (512
+ * canonical). When wide is off these stay 0 / 512 so the canonical pass is
+ * bit-identical to the pre-native-wide projection. */
+static GLint s_geo_uXoff = -1, s_geo_uXhalf = -1;
+static GLint s_tex_uXoff = -1, s_tex_uXhalf = -1;
 /* BLIT program uniforms. */
 static GLint s_uBlitSrc = -1, s_uBlitPass = -1, s_uBlitMaskset = -1;
 static GLint s_uBlitSrcDiv = -1, s_uBlitSrcOff = -1;
@@ -279,6 +288,30 @@ static int s_mod_r = 128, s_mod_g = 128, s_mod_b = 128, s_mod_raw = 0;
 static int s_mask_set = 0, s_mask_check = 0;
 static int s_tw_mask_x = 0, s_tw_mask_y = 0, s_tw_off_x = 0, s_tw_off_y = 0;
 static int s_tex_filter = 0;
+
+/* ---- native-wide compositor (mirrors gpu_sw_renderer.c g_wide_*) ----------
+ * Canonical VRAM (the hr FBO) stays 100% faithful. Native-wide lives in
+ * SEPARATE wide FBOs keyed by framebuffer base_x; each framebuffer-targeting
+ * primitive is mirrored into the active wide surface at local x = vram_x -
+ * base_x + OFFSET. Present reads the displayed buffer's wide surface. Textures
+ * always sample canonical VRAM (s_raw_tex). 4:3 / non-opted games never call
+ * wide_configure, so g_wide_cur stays 0 and the wide pass never runs. */
+#define WIDE_MAX_SURF 4
+static GLuint s_wide_tex[WIDE_MAX_SURF];     /* color tex per surface (0 = free) */
+static GLuint s_wide_fbo[WIDE_MAX_SURF];     /* FBO per surface */
+static int    s_wide_base[WIDE_MAX_SURF];    /* base_x per surface (-1 = free) */
+static int    g_wide_w        = 0;           /* wide width (native px); 0 = disabled */
+static int    g_wide_off      = 0;           /* centering OFFSET (native px) */
+static GLuint g_wide_cur      = 0;           /* active mirror FBO (0 = no mirror) */
+static int    g_wide_cur_base = 0;           /* base_x of g_wide_cur */
+/* Set by gpu_flat_rect for the full-screen-overlay case so the generic
+ * gpu_geometry wide mirror is skipped and the flat path emits its own
+ * full-wide-width pass instead (mirrors sw_draw_flat_rect). */
+static int    s_wide_suppress = 0;
+
+/* X-translation (native px) from canonical VRAM space into the active wide
+ * surface: local_x = vram_x - base_x + OFFSET. Same as SW wide_dx(). */
+static inline int wide_dx(void) { return g_wide_off - g_wide_cur_base; }
 
 /* ---- dirty-rect helpers ------------------------------------------------- */
 static void rect_clear(DirtyRect *r) { r->set = 0; }
@@ -358,9 +391,11 @@ static const char *GEO_VS =
     "layout(location=0) in vec2 a_pos;\n"
     "layout(location=1) in vec4 a_col;\n"
     "uniform float u_shift;\n"
+    "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
+    "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
     "noperspective out vec4 v_col;\n"
     "void main(){ v_col = a_col;\n"
-    "  gl_Position = vec4((a_pos.x+u_shift)/512.0 - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+    "  gl_Position = vec4((a_pos.x+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
 static const char *GEO_FS =
     "#version 330\n"
     "noperspective in vec4 v_col; out vec4 frag;\n"
@@ -377,11 +412,13 @@ static const char *TEX_VS =
     "layout(location=1) in vec2 a_uv;\n"
     "layout(location=2) in vec4 a_col;\n"
     "uniform float u_shift;\n"
+    "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
+    "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
     "noperspective out vec2 v_uv; noperspective out vec4 v_col;\n"
     "void main(){ v_uv = a_uv; v_col = a_col;\n"
     "  /* u_shift: align GL's center-sample grid with the PS1 integer grid (see\n"
     "   * GEO_VS) so interpolated uv at a fragment equals the PS1 DDA value. */\n"
-    "  gl_Position = vec4((a_pos.x+u_shift)/512.0 - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+    "  gl_Position = vec4((a_pos.x+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
 static const char *TEX_FS =
     "#version 330\n"
     "noperspective in vec2 v_uv; noperspective in vec4 v_col; out vec4 frag;\n"
@@ -741,6 +778,36 @@ static void mark_prim_dirty(const int *xs, const int *ys, int n) {
     coh_record(GL_COH_DRAW, x0, y0, x1, y1);
 }
 
+/* ---- native-wide mirror pass plumbing ----------------------------------- *
+ * Re-issue an already-set-up draw (program/VAO/VBO/blend/stencil bound) into
+ * the active wide surface. The geometry positions are identical on the host
+ * side; the x translation (wide_dx) and the wider clip are applied entirely in
+ * the vertex shader via u_xoff / u_xhalf, so the SAME glDrawArrays produces the
+ * shifted copy. wide_target_begin binds the wide FBO + viewport + scissor and
+ * sets the projection uniforms; wide_target_end restores u_xoff=0/u_xhalf=512
+ * on the active program so the next canonical pass is bit-identical. The
+ * caller stays inside hr_begin/hr_end; hr_end unbinds and the next hr_begin
+ * resets the viewport, so no viewport restore is needed mid-function.
+ *
+ * The scissor is the FULL wide surface (NOT the draw area): the SW reference
+ * (rt_wide()) clips the wide pass only to the surface bounds, deliberately
+ * letting the shifted geometry fill the revealed 16:9 margins that lie OUTSIDE
+ * the game's 4:3 draw-area x-range. Scissoring to the (translated) draw area
+ * would crop exactly the margin content native-wide exists to reveal. */
+static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
+    glViewport(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+    p_glUniform1f(uXoff, (float)dx);
+    p_glUniform1f(uXhalf, (float)g_wide_w / 2.0f);
+}
+static void wide_target_end(GLint uXoff, GLint uXhalf) {
+    p_glUniform1f(uXoff, 0.0f);
+    p_glUniform1f(uXhalf, 512.0f);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
+}
+
 /* Flat / gouraud triangles and lines share the GEO program. mode: GL_TRIANGLES
  * or GL_LINES; verts are (x, y, r, g, b) tuples with colors as 1555. */
 static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
@@ -766,6 +833,18 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(n * 6 * sizeof(float)), verts, PSXGL_STREAM_DRAW);
     glDrawArrays(mode, 0, n);
+
+    /* Native-wide mirror pass: re-issue the same draw into the active wide
+     * surface, x-translated by wide_dx (program/VAO/VBO/blend/stencil still
+     * bound). Geometry positions are unchanged on the host side — the x shift
+     * is applied in the vertex shader via u_xoff, and the wider clip via
+     * u_xhalf. Canonical pass above is untouched (u_xoff=0/u_xhalf=512). */
+    if (g_wide_cur && !s_wide_suppress) {
+        int dx = wide_dx();
+        wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
+        glDrawArrays(mode, 0, n);
+        wide_target_end(s_geo_uXoff, s_geo_uXhalf);
+    }
     hr_end();
 }
 
@@ -869,13 +948,94 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     mask_stencil(1);
     p_glUniform1i(s_uSemipass, 2);
     glDrawArrays(GL_TRIANGLES, 0, 3);
+
+    /* Native-wide mirror: re-issue BOTH STP passes into the active wide surface
+     * with identical blend / u_semipass state, x-translated by wide_dx. Program/
+     * VAO/VBO/uniforms still bound; only the projection (u_xoff/u_xhalf) and the
+     * target FBO/viewport/scissor change. Canonical passes above untouched. */
+    if (g_wide_cur) {
+        int dx = wide_dx();
+        wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
+        glDisable(GL_BLEND);
+        mask_stencil(s_mask_set);
+        p_glUniform1i(s_uSemipass, 1);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
+        mask_stencil(1);
+        p_glUniform1i(s_uSemipass, 2);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        wide_target_end(s_tex_uXoff, s_tex_uXhalf);
+    }
     hr_end();
+}
+
+/* Draw a flat-colored rect (GEO program) DIRECTLY into the active wide surface
+ * at wide-space coords [wx, wx+ww) × [y, y+h). Used only by the full-screen-
+ * overlay path; positions are already in wide space so u_xoff stays 0. Mirrors
+ * raster_flat_rect(&wt, ...) in sw_draw_flat_rect. Caller stays inside
+ * hr_begin/hr_end. */
+static void wide_flat_rect_direct(int wx, int y, int ww, int h, uint16_t c, int semi) {
+    if (ww <= 0 || h <= 0) return;
+    float r = ((c & 0x1F) << 3) / 255.0f;
+    float g = (((c >> 5) & 0x1F) << 3) / 255.0f;
+    float b = (((c >> 10) & 0x1F) << 3) / 255.0f;
+    float a = s_mask_set ? 1.0f : 0.0f;
+    float fx0 = (float)wx, fy0 = (float)y, fx1 = (float)(wx + ww), fy1 = (float)(y + h);
+    float verts[6 * 6] = {
+        fx0,fy0,r,g,b,a,  fx1,fy0,r,g,b,a,  fx0,fy1,r,g,b,a,
+        fx1,fy0,r,g,b,a,  fx0,fy1,r,g,b,a,  fx1,fy1,r,g,b,a,
+    };
+    /* Wide target: positions already wide-space so u_xoff = 0; full-width
+     * scissor; u_xhalf = g_wide_w/2. */
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
+    glViewport(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);  /* full surface (rt_wide) */
+    if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
+    mask_stencil(s_mask_set);
+    p_glUseProgram(s_geo_prog);
+    p_glUniform1f(s_geo_uXoff, 0.0f);
+    p_glUniform1f(s_geo_uXhalf, (float)g_wide_w / 2.0f);
+    p_glBindVertexArray(s_geo_vao);
+    p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_geo_vbo);
+    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    p_glUniform1f(s_geo_uXoff, 0.0f);
+    p_glUniform1f(s_geo_uXhalf, 512.0f);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
 }
 
 static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
     if (w <= 0 || h <= 0) return;
+    /* Full-screen 2D overlay (pause gray-filter / load fade): a flat rect
+     * spanning the whole 4:3 framebuffer must cover the whole wide surface too,
+     * else the revealed 16:9 margins are left undimmed/unfaded. Same detection
+     * as sw_draw_flat_rect: native_w = the 4:3 framebuffer width (g_wide_w less
+     * the per-side reveal on both sides); the rect's native screen-X span
+     * (x - base) must cover [0, native_w). When it does, the two canonical
+     * triangles are drawn WITHOUT the per-triangle wide mirror (suppressed) and
+     * a single full-width rect is drawn into the wide surface instead; every
+     * other rect mirrors 1:1 via the generic gpu_geometry path. Only runs in
+     * native-wide (g_wide_cur != 0), so 4:3 is unaffected. */
+    int overlay = 0;
+    if (g_wide_cur) {
+        int native_w = g_wide_w - 2 * g_wide_off;
+        int lx = x - g_wide_cur_base, rx = x + w - g_wide_cur_base;
+        overlay = (native_w > 0 && lx <= 0 && rx >= native_w);
+    }
+    if (overlay) s_wide_suppress = 1;
     gpu_triangle(x,   y,   c, x+w, y,   c, x,   y+h, c, semi);
     gpu_triangle(x+w, y,   c, x,   y+h, c, x+w, y+h, c, semi);
+    if (overlay) {
+        s_wide_suppress = 0;
+        /* The two canonical triangles drew into the hr FBO already (each
+         * gpu_triangle ran its own hr_begin/hr_end). Re-open the bracket just
+         * for the full-width wide pass so blend/scissor/program state is
+         * clean. */
+        hr_begin(0);
+        wide_flat_rect_direct(0, y, g_wide_w, h, c, semi);
+        hr_end();
+    }
 }
 
 static void gpu_textured_rect(int x,int y,int w,int h,
@@ -1205,6 +1365,10 @@ static int init_gpu_raster(void) {
     s_uBlitSrcOff  = p_glGetUniformLocation(s_blit_prog, "u_src_off");
     s_uPackHr    = p_glGetUniformLocation(s_pack_prog, "u_hr");
     s_uPackScale = p_glGetUniformLocation(s_pack_prog, "u_scale");
+    s_geo_uXoff  = p_glGetUniformLocation(s_geo_prog, "u_xoff");
+    s_geo_uXhalf = p_glGetUniformLocation(s_geo_prog, "u_xhalf");
+    s_tex_uXoff  = p_glGetUniformLocation(s_tex_prog, "u_xoff");
+    s_tex_uXhalf = p_glGetUniformLocation(s_tex_prog, "u_xhalf");
 
     /* Sample-grid alignment shift: half an HR pixel, set once (S is fixed
      * for the lifetime of the pipeline). Backed off by 1/64 native px so
@@ -1217,8 +1381,16 @@ static int init_gpu_raster(void) {
         float shift = 0.5f / (float)s_scale - 1.0f / 64.0f;
         p_glUseProgram(s_geo_prog);
         p_glUniform1f(p_glGetUniformLocation(s_geo_prog, "u_shift"), shift);
+        /* Native-wide projection defaults: x translation 0, clip half-extent
+         * 512 — so the GEO_VS x term reduces to (x+u_shift)/512-1, bit-identical
+         * to the pre-native-wide projection. The wide passes set these, then
+         * restore these defaults. */
+        p_glUniform1f(s_geo_uXoff, 0.0f);
+        p_glUniform1f(s_geo_uXhalf, 512.0f);
         p_glUseProgram(s_tex_prog);
         p_glUniform1f(p_glGetUniformLocation(s_tex_prog, "u_shift"), shift);
+        p_glUniform1f(s_tex_uXoff, 0.0f);
+        p_glUniform1f(s_tex_uXhalf, 512.0f);
         p_glUseProgram(s_blit_prog);
         p_glUniform1f(p_glGetUniformLocation(s_blit_prog, "u_shift"), shift);
         p_glUseProgram(0);
@@ -1268,6 +1440,13 @@ static int init_gpu_raster(void) {
     rect_clear(&s_up_pending);
     rect_add(&s_up_pending, 0, 0, VRAM_W - 1, VRAM_H - 1);
     s_gpu_dirty = 0;
+
+    /* Native-wide compositor surfaces start unallocated (lazily created when a
+     * widescreen game calls wide_configure + wide_set_target). */
+    for (int i = 0; i < WIDE_MAX_SURF; i++) {
+        s_wide_tex[i] = 0; s_wide_fbo[i] = 0; s_wide_base[i] = -1;
+    }
+    g_wide_w = 0; g_wide_off = 0; g_wide_cur = 0; g_wide_cur_base = 0;
 
     s_raster_ok = 1;
     fprintf(stdout, "psxrecomp: GL GPU pipeline ready (internal scale %dx, "
@@ -1439,6 +1618,153 @@ void gl_renderer_diag(int *gpu_dirty, int pending[5], int pack[5]) {
     }
 }
 
+/* ------------------------------------------------------------------------- *
+ * Native-wide compositor (GL). Mirrors gpu_sw_renderer.c's wide functions:
+ * canonical VRAM (the hr FBO) is untouched; framebuffer draws are also mirrored
+ * into per-base_x wide FBOs (see the draw funcs' wide passes). Present reads the
+ * displayed buffer's wide FBO via glReadPixels into the CPU present buffer, then
+ * the existing CPU present path uploads/letterboxes it (Option B: reuse the CPU
+ * present path). Self-gates on the GL pipeline being live; never runs for
+ * 4:3 / non-opted games (gpu.c never calls wide_configure for those).
+ * ------------------------------------------------------------------------- */
+
+static void wide_free_all(void) {
+    for (int i = 0; i < WIDE_MAX_SURF; i++) {
+        if (s_wide_fbo[i]) { p_glDeleteFramebuffers(1, &s_wide_fbo[i]); s_wide_fbo[i] = 0; }
+        if (s_wide_tex[i]) { glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0; }
+        s_wide_base[i] = -1;
+    }
+    g_wide_cur = 0;
+}
+
+/* Lazily allocate (or find) the wide FBO+tex for base_x. Returns the FBO id, or
+ * 0 on failure / more distinct buffers than WIDE_MAX_SURF. */
+static GLuint wide_fbo_for(int base_x) {
+    if (g_wide_w <= 0) return 0;
+    for (int i = 0; i < WIDE_MAX_SURF; i++)
+        if (s_wide_fbo[i] && s_wide_base[i] == base_x) return s_wide_fbo[i];
+    for (int i = 0; i < WIDE_MAX_SURF; i++) {
+        if (!s_wide_fbo[i]) {
+            int w = g_wide_w * s_scale, h = VRAM_H * s_scale;
+            s_wide_tex[i] = make_tex(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
+            if (!make_fbo(&s_wide_fbo[i], s_wide_tex[i], 0)) {
+                glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0;
+                return 0;
+            }
+            /* Clear to black so unwritten margins are clean (not stale). */
+            p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_wide_fbo[i]);
+            glDisable(GL_SCISSOR_TEST);
+            glClearColor(0, 0, 0, 0);
+            glClear(GL_COLOR_BUFFER_BIT);
+            p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+            s_wide_base[i] = base_x;
+            return s_wide_fbo[i];
+        }
+    }
+    return 0;  /* more distinct buffers than WIDE_MAX_SURF — shouldn't happen */
+}
+
+/* Enable native-wide with a wide width + centering offset (native px), or
+ * disable (wide_w <= 0). Re-allocates if the width changed. Mirrors
+ * sw_wide_configure. */
+static void glb_wide_configure(int wide_w, int offset) {
+    if (!s_raster_ok) return;
+    if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; return; }
+    if (wide_w != g_wide_w) wide_free_all();
+    g_wide_w = wide_w;
+    g_wide_off = offset;
+}
+
+/* Select the wide surface to mirror into for the back buffer at base_x. */
+static void glb_wide_set_target(int base_x) {
+    if (!s_raster_ok) { g_wide_cur = 0; return; }
+    g_wide_cur = wide_fbo_for(base_x);
+    g_wide_cur_base = base_x;
+}
+
+/* Stop mirroring (offscreen draws that don't target a framebuffer). */
+static void glb_wide_disable_target(void) { g_wide_cur = 0; }
+
+/* Mirror a framebuffer clear: fill the full wide width over [y, y+h) of the
+ * surface for base_x, so the revealed margins are clean. Mirrors sw_wide_clear:
+ * a scissored glClear with the 1555 color converted to RGBA8 (alpha = bit15). */
+static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
+    if (!s_raster_ok) return;
+    GLuint fbo = wide_fbo_for(base_x);
+    if (!fbo) return;
+    int H = VRAM_H * s_scale;
+    int y0 = y * s_scale, y1 = (y + h) * s_scale;
+    if (y0 < 0) y0 = 0;
+    if (y1 > H) y1 = H;
+    if (y1 <= y0) return;
+    float r = (color & 0x1F) / 31.0f;
+    float g = ((color >> 5) & 0x1F) / 31.0f;
+    float b = ((color >> 10) & 0x1F) / 31.0f;
+    float a = (color >> 15) & 1 ? 1.0f : 0.0f;
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, fbo);
+    glViewport(0, 0, g_wide_w * s_scale, H);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, y0, g_wide_w * s_scale, y1 - y0);
+    glClearColor(r, g, b, a);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glDisable(GL_SCISSOR_TEST);
+    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+}
+
+/* Present source: read the wide FBO for the displayed buffer (base_x) into the
+ * CPU present buffer as ARGB8888, byte-identical to sw_render_wide_display's
+ * output so the shared CPU present path consumes it the same way. Output is
+ * (g_wide_w*scale) wide × (disp_h*scale) tall. Returns pixel count (>0), or 0
+ * if no surface exists for base_x (caller falls back to the canonical present).
+ *
+ * PIXEL FORMAT: glReadPixels(GL_BGRA, GL_UNSIGNED_BYTE) yields, per pixel, the
+ * little-endian uint32 0xAARRGGBB == ARGB8888 — exactly what rgb555_to_argb
+ * produces and what upload_present_tex feeds to glTexImage2D(GL_BGRA,...). The
+ * SW path forces alpha to 0xFF; we OR it in to match (present ignores alpha, but
+ * we keep the two paths bit-identical). GL's read origin is bottom-left, so the
+ * block is read bottom-to-top and copied into `out` reversed (out row 0 = the
+ * display's top scanline, as the SW path and the PRESENT_VS V-flip expect). */
+static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
+                                   int disp_y, int disp_h) {
+    if (!s_raster_ok || !s_ctx || g_wide_w <= 0) return 0;
+    GLuint fbo = 0;
+    for (int i = 0; i < WIDE_MAX_SURF; i++)
+        if (s_wide_fbo[i] && s_wide_base[i] == base_x) { fbo = s_wide_fbo[i]; break; }
+    if (!fbo) return 0;
+
+    /* Fold any pending CPU->VRAM uploads into the canonical FBO first (uploads
+     * are never mirrored to wide, but draws after them are; keep op order) and
+     * make sure all wide-FBO draws have completed before the readback. */
+    flush_cpu_upload();
+    glFinish();
+
+    int W = g_wide_w * s_scale;
+    int H = VRAM_H * s_scale;
+    int out_h = disp_h * s_scale;
+    int ry0 = disp_y * s_scale;
+    if (ry0 < 0) ry0 = 0;
+    if (ry0 + out_h > H) out_h = H - ry0;
+    if (out_h <= 0) return 0;
+
+    uint32_t *tmp = (uint32_t *)malloc((size_t)W * out_h * sizeof(uint32_t));
+    if (!tmp) return 0;
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    glReadPixels(0, ry0, W, out_h, GL_BGRA, GL_UNSIGNED_BYTE, tmp);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+
+    /* tmp row 0 is the bottom-most scanline (ry0); flip into `out` so out row 0
+     * is the top (ry0 + out_h - 1). Force alpha = 0xFF (match SW). */
+    int count = 0;
+    for (int row = 0; row < out_h; row++) {
+        const uint32_t *src = tmp + (size_t)(out_h - 1 - row) * W;
+        uint32_t *dst = (uint32_t *)((uint8_t *)out + (size_t)row * pitch);
+        for (int col = 0; col < W; col++) { dst[col] = src[col] | 0xFF000000u; count++; }
+    }
+    free(tmp);
+    return count;
+}
+
 /* THE present path for 15-bit frames: blit the display region from the
  * authoritative hr FBO into a letterboxed rect. Deterministic — runs
  * every 15-bit frame regardless of what mix of ops produced it.
@@ -1488,6 +1814,11 @@ static const GpuRenderBackend GL_BACKEND = {
     .vram_transfer_in = glb_vram_transfer_in, .vram_transfer_out = glb_vram_transfer_out,
     .set_draw_area = glb_set_draw_area, .get_draw_area = glb_get_draw_area,
     .set_draw_offset = glb_set_draw_offset,
+    .wide_configure = glb_wide_configure,
+    .wide_set_target = glb_wide_set_target,
+    .wide_disable_target = glb_wide_disable_target,
+    .wide_clear = glb_wide_clear,
+    .render_wide_display = glb_render_wide_display,
 };
 
 const GpuRenderBackend *gl_backend_get(void) { return &GL_BACKEND; }
