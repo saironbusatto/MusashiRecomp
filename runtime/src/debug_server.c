@@ -50,6 +50,10 @@
 #  define WIN32_LEAN_AND_MEAN
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+#  if defined(__x86_64__) || defined(_M_X64)
+#    include <intrin.h>     /* __readgsqword — native stack-overflow guard */
+#    define PSX_STACK_GUARD 1
+#  endif
    typedef SOCKET sock_t;
 #  define SOCK_INVALID INVALID_SOCKET
 #  define sock_close closesocket
@@ -1629,7 +1633,45 @@ static int is_chain_epilogue(uint32_t phys) {
  * psx_dispatch (e.g. shell -> firstfile -> bu_read -> card_read).  The shadow
  * stack is owned by function_trace_record and is only meaningful for
  * indirect dispatches; direct calls return through the native C stack. */
+/* Native stack-overflow guard. The host C stack mirrors the guest call graph,
+ * and an in-range guest `jal` emits a DIRECT func_X(cpu) call — so a runaway
+ * guest recursion (a corrupt jump-table that loops a handler back on itself,
+ * the seesaw/Bug-D wild-call family) grows the native stack WITHOUT going
+ * through psx_dispatch_impl, leaving g_psx_dispatch_depth (and the depth-counter
+ * guard in dirty_ram_dispatch) blind to it — crash reports show a STACK_OVERFLOW
+ * with dispatch_depth=0. This reads the running fiber's actual stack bounds from
+ * the x64 TEB (StackBase = GS:[0x08], DeallocationStack/reserve-low = GS:[0x1478])
+ * and, when the remaining headroom runs low, halts gracefully via psx_fatal_halt
+ * (captured crash report + halt-and-serve in debug / clean exit + report in
+ * release) BEFORE the host stack overflows — on EVERY dispatch path, in both
+ * builds. Guest fibers are 1 MB (traps.c); the headroom (¼ of the stack) only
+ * trips on runaway recursion (thousands of frames), never on legitimate
+ * gameplay call depth (~hundreds of KB at most). TENTATIVE containment + better
+ * diagnostics, NOT a root fix: the upstream data corruption that produces the
+ * wild recursion is unaddressed (needs an oracle repro — see crash report's
+ * dirty_block cycle for the recursing PCs). */
+#ifdef PSX_STACK_GUARD
+static void psx_native_stack_guard(void) {
+    char probe;
+    uintptr_t sp      = (uintptr_t)&probe;
+    uintptr_t base    = (uintptr_t)__readgsqword(0x08);    /* TEB StackBase (high) */
+    uintptr_t dealloc = (uintptr_t)__readgsqword(0x1478);  /* TEB DeallocationStack (reserve low) */
+    if (base <= dealloc) return;                            /* implausible TEB read — skip */
+    uintptr_t headroom = (base - dealloc) / 4;             /* ¼ stack (256 KB on a 1 MB fiber) */
+    if (headroom < (128u << 10)) headroom = 128u << 10;
+    if (sp > dealloc && (sp - dealloc) < headroom) {
+        extern void psx_fatal_halt(const char *reason);
+        psx_fatal_halt("native stack guard tripped — runaway guest recursion "
+                       "(direct func_X dispatch; g_psx_dispatch_depth is blind to it "
+                       "— see stack_scan + the dirty_block cycle for the recursing PCs)");
+    }
+}
+#endif
+
 void debug_server_log_call_entry(uint32_t func_addr) {
+#ifdef PSX_STACK_GUARD
+    psx_native_stack_guard();   /* runs in debug AND release (before the early-return) */
+#endif
 #ifdef PSX_NO_DEBUG_TOOLS
     /* Hottest call site in the binary — called at the top of every
      * recompiled function. Early-return makes it a 1-instruction
