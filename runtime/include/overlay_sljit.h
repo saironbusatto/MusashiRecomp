@@ -115,6 +115,11 @@ int psx_sljit_call(CPUState *cpu, uint32_t target, uint32_t return_pc,
 void psx_sljit_cop2(CPUState *cpu, uint32_t insn);
 void psx_sljit_memx(CPUState *cpu, uint32_t insn);
 
+/* Populate cpu->sljit_helpers[] with the host-helper addresses the JIT calls
+ * through (cpu-relative, so shard LIR is position-independent — see Stage 1 in
+ * SLJIT_PERSIST_CACHE.md). Call once at startup after CPUState is wired. */
+void overlay_sljit_init_helpers(CPUState *cpu);
+
 #ifdef __cplusplus
 }
 #endif

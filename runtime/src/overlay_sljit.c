@@ -342,13 +342,28 @@ static void emit_store(struct sljit_compiler *C, size_t fnoff,
  * interpreted by a parity-exact runtime helper (GTE/COP2, unaligned mem) rather
  * than inlined. The helper READS and WRITES cpu->gpr[] in memory, so the cache
  * is flushed before and dropped after. cpu in R0, insn in R1, helper in R2. */
-static void emit_helper2(struct sljit_compiler *C, void *fn, uint32_t insn) {
+/* helper_idx is a SLJIT_HLP_* index into cpu->sljit_helpers (cpu-relative, NOT a
+ * baked pointer) so the emitted LIR is position-independent — see Stage 1 in
+ * SLJIT_PERSIST_CACHE.md. */
+static void emit_helper2(struct sljit_compiler *C, int helper_idx, uint32_t insn) {
     gpr_flush(C);
     sljit_emit_op1(C, SLJIT_MOV,   SLJIT_R0, 0, R_CPU, 0);
     sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, (sljit_sw)insn);
-    sljit_emit_op1(C, SLJIT_MOV,   SLJIT_R2, 0, SLJIT_IMM, (sljit_sw)(uintptr_t)fn);
+    sljit_emit_op1(C, SLJIT_MOV,   SLJIT_R2, 0, SLJIT_MEM1(R_CPU),
+                   (sljit_sw)(offsetof(CPUState, sljit_helpers)
+                              + (size_t)helper_idx * sizeof(void *)));
     sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2V(P, 32), SLJIT_R2, 0);
     gpr_reset();
+}
+
+/* Populate the cpu-relative host-helper table the emitter calls through (Stage 1
+ * of the persisted sljit cache). Order MUST match the SLJIT_HLP_* enum. Called
+ * once at startup, after CPUState's memory fn-pointers are wired. */
+void overlay_sljit_init_helpers(CPUState *cpu) {
+    cpu->sljit_helpers[SLJIT_HLP_MEMX]    = (void *)psx_sljit_memx;
+    cpu->sljit_helpers[SLJIT_HLP_COP2]    = (void *)psx_sljit_cop2;
+    cpu->sljit_helpers[SLJIT_HLP_WS_CULL] = (void *)psx_ws_cull_sltiu;
+    cpu->sljit_helpers[SLJIT_HLP_CALL]    = (void *)psx_sljit_call;
 }
 
 /* Emit `rt = psx_ws_cull_sltiu(gpr[rs], imm)` for a flagged auto_screen_x cull
@@ -362,7 +377,9 @@ static void emit_ws_cull(struct sljit_compiler *C, uint32_t rt, uint32_t rs, uin
     gpr_src(C, rs, &a, &aw);
     sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, a, aw);                 /* sx  -> R0 (arg0) */
     sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, (sljit_sw)imm); /* imm -> R1 (arg1) */
-    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, (sljit_sw)(uintptr_t)psx_ws_cull_sltiu);
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_MEM1(R_CPU),           /* fn (cpu-relative) */
+                   (sljit_sw)(offsetof(CPUState, sljit_helpers)
+                              + (size_t)SLJIT_HLP_WS_CULL * sizeof(void *)));
     sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2(32, 32, 32), SLJIT_R2, 0); /* R0 = verdict */
     sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, rt), 0, SLJIT_R0, 0);
     gpr_unpin();
@@ -557,11 +574,11 @@ static int emit_one(struct sljit_compiler *C, uint32_t insn) {
     case 0x29: emit_store(C, offsetof(CPUState, write_half), rt, rs, simm); return EMIT_OK; /* SH */
     case 0x2B: emit_store(C, offsetof(CPUState, write_word), rt, rs, simm); return EMIT_OK; /* SW */
     case 0x22: case 0x26: case 0x2A: case 0x2E:   /* LWL/LWR/SWL/SWR */
-        emit_helper2(C, (void *)psx_sljit_memx, insn);
+        emit_helper2(C, SLJIT_HLP_MEMX, insn);
         return EMIT_OK;
     case 0x12:                                     /* COP2 (MFC2/CFC2/MTC2/CTC2/cmd) */
     case 0x32: case 0x3A:                          /* LWC2 / SWC2 */
-        emit_helper2(C, (void *)psx_sljit_cop2, insn);
+        emit_helper2(C, SLJIT_HLP_COP2, insn);
         return EMIT_OK;
     default: return EMIT_ABORT;
     }
@@ -917,8 +934,9 @@ void overlay_sljit_try_compile(uint32_t entry,
                     sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, (sljit_sw)pend_call_target);
                 sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R2, 0, SLJIT_IMM, (sljit_sw)pend_call_return);
                 sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R3, 0, SLJIT_IMM, (sljit_sw)pend_call_check);
-                sljit_emit_op1(C, SLJIT_MOV,   SLJIT_R4, 0,
-                               SLJIT_IMM, (sljit_sw)(uintptr_t)psx_sljit_call);
+                sljit_emit_op1(C, SLJIT_MOV,   SLJIT_R4, 0, SLJIT_MEM1(R_CPU),
+                               (sljit_sw)(offsetof(CPUState, sljit_helpers)
+                                          + (size_t)SLJIT_HLP_CALL * sizeof(void *)));
                 sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS4(32, P, 32, 32, 32), SLJIT_R4, 0);
                 /* helper returned nonzero ⇒ transfer/bail in progress: return now,
                  * propagating cpu->pc / g_psx_call_bail to the dispatch loop. */

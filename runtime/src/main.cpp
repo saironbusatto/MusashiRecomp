@@ -14,6 +14,7 @@
 #include "overlay_loader.h"
 #include "autocompile.h"
 #include "code_provider.h"
+#include "overlay_sljit.h"
 #include "gpu.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
@@ -2144,6 +2145,10 @@ int main(int argc, char** argv) {
     cpu.write_half = psx_write_half;
     cpu.read_byte  = psx_read_byte;
     cpu.write_byte = psx_write_byte;
+    /* Wire the sljit JIT host-helper table (cpu-relative => position-independent
+     * shards; prerequisite for the persisted sljit shard cache). Harmless when
+     * sljit isn't the active backend. */
+    overlay_sljit_init_helpers(&cpu);
 
     /* Fast boot: try to restore a previously-captured BIOS handoff snapshot.
      * First launch runs BIOS normally (logos visible) and captures state at

@@ -18,6 +18,22 @@
 extern "C" {
 #endif
 
+/* sljit shard host-helper table — see SLJIT_PERSIST_CACHE.md Stage 1. The sljit
+ * JIT routes its host-helper calls through this cpu-relative table (indexed by
+ * the enum below) instead of baking absolute function pointers as SLJIT_IMM
+ * operands, so a serialized shard's LIR contains zero absolute host addresses —
+ * the prerequisite for persisting shards to disk (a reloaded process is at a
+ * different ASLR base, so baked pointers would be stale). The ENUM ORDER is part
+ * of the on-disk shard format: never reorder, only append, and bump the sljit
+ * serialization tag when it changes. gcc codegen does NOT use this table. */
+enum {
+    SLJIT_HLP_MEMX = 0,   /* psx_sljit_memx    — LWL/LWR/SWL/SWR              */
+    SLJIT_HLP_COP2,       /* psx_sljit_cop2    — COP2/GTE, LWC2/SWC2          */
+    SLJIT_HLP_WS_CULL,    /* psx_ws_cull_sltiu — widescreen render-funnel cull */
+    SLJIT_HLP_CALL,       /* psx_sljit_call    — jal/jalr call contract       */
+    SLJIT_HLP_COUNT
+};
+
 typedef struct CPUState {
     uint32_t gpr[32];   /* $0..$31; gpr[0] is hardwired zero, never written */
     uint32_t pc;        /* program counter */
@@ -33,6 +49,12 @@ typedef struct CPUState {
     void     (*write_half)(uint32_t addr, uint16_t value);
     uint8_t  (*read_byte)(uint32_t addr);
     void     (*write_byte)(uint32_t addr, uint8_t value);
+
+    /* sljit host-helper pointer table (indexed by the SLJIT_HLP_* enum above).
+     * Appended at the END of CPUState so existing field offsets are unchanged —
+     * precompiled gcc overlay DLLs (which bake field offsets) are unaffected;
+     * only the sljit JIT reads it. Populated once at startup. */
+    void *sljit_helpers[SLJIT_HLP_COUNT];
 } CPUState;
 
 /* Trap trampolines — defined in runtime/src/traps.c */
