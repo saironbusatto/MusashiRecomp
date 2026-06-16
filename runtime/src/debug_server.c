@@ -5336,9 +5336,16 @@ static void handle_ws_margin(int id, const char *json)
 static void handle_synth_recurse(int id, const char *json)
 {
     (void)json;
+    /* The self-test (debug_server_synth_recurse_arm + its machinery) is compiled
+     * only with the debug tools; guard the call so the Release build — where this
+     * handler is dead code (the TCP server never starts) — still links. */
+#ifndef PSX_NO_DEBUG_TOOLS
     extern void debug_server_synth_recurse_arm(void);
     debug_server_synth_recurse_arm();
     send_fmt("{\"id\":%d,\"ok\":true,\"armed\":true}", id);
+#else
+    (void)id;
+#endif
 }
 
 static void handle_frame_perf(int id, const char *json)
