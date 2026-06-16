@@ -182,6 +182,37 @@ int psx_ws_x_margin(void) {
     return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
 }
 
+/* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x),
+ * called identically by the gcc emit, the sljit JIT, and the interpreter so every
+ * overlay execution path widens the same way. sx = the GTE screen-X as loaded by
+ * the guest's lhu (low 16 bits significant); imm = the original bound (0x140 /
+ * 0x141). Returns the sltiu verdict (1 = on-screen/keep). Sign-extends sx and
+ * shifts by +margin so BOTH 16:9 margins pass; at 4:3 margin==0 so it reduces
+ * bit-for-bit to the vanilla `(uint16)sx < imm`. */
+int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm) {
+    int m = psx_ws_x_margin();
+    return ((uint32_t)((int32_t)(int16_t)(uint16_t)sx + m)
+            < (uint32_t)((int32_t)imm + 2 * m)) ? 1 : 0;
+}
+
+/* Detect the GTE per-vertex trivial-reject signature in a run of instruction
+ * words: at least one `sltiu …,0x140/0x141` (width) AND one `sltiu …,0xE0/0xF1`
+ * (height). Lets the sljit JIT + interpreter gate the cull-widening to real
+ * render funnels (a lone sltiu 0x140 elsewhere must stay vanilla). Mirrors the
+ * recompiler's func_has_screen_extent_cull. */
+int psx_ws_func_has_screen_cull(const uint32_t *words, int n) {
+    int has_x = 0, has_y = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t w = words[i];
+        if ((w & 0xFC000000u) != 0x2C000000u) continue;  /* sltiu */
+        uint32_t imm = w & 0xFFFFu;
+        if (imm == 0x140 || imm == 0x141) has_x = 1;
+        else if (imm == 0xE0 || imm == 0xF1) has_y = 1;
+        if (has_x && has_y) return 1;
+    }
+    return 0;
+}
+
 /* Widescreen backdrop screen-X correction ([widescreen.backdrop] x_sites).
  * The parallax 2D backdrop layer (ocean/cloud/mountain/grass — overlay actor
  * handlers e.g. 0x801216BC) computes its screen-X in pure integer math

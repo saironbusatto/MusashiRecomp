@@ -70,3 +70,9 @@ void code_provider_init(const char *cfg_backend, int gcc_configured) {
 }
 
 const CodeProvider *code_provider_active(void) { return s_active; }
+
+/* sljit provider for the synchronous JIT-on-miss gap-fill, regardless of which
+ * provider is "active". NULL when sljit isn't available so callers fall to interp. */
+const CodeProvider *code_provider_sljit(void) {
+    return (s_sljit.available && s_sljit.available()) ? &s_sljit : NULL;
+}

@@ -147,6 +147,31 @@ static inline uint32_t fetch_word(uint32_t phys) {
          | ((uint32_t)ram[phys + 3] << 24);
 }
 
+/* Widescreen render-funnel cull detection for the interpreter ([widescreen.cull]
+ * auto_screen_x). A `sltiu …,0x140/0x141` is widened ONLY when its enclosing
+ * render function also carries a `sltiu …,0xE0/0xF1` (the GTE per-vertex trivial-
+ * reject signature) — a lone 0x140 elsewhere stays vanilla. The interp has no
+ * function boundaries, so we scan a +/-512-byte window around the site (clamped
+ * to main RAM) via the shared psx_ws_func_has_screen_cull, cached per-PC so a
+ * hot render loop pays the scan once. Single-threaded interp => static buffers ok. */
+static int ws_cull_site(uint32_t pc) {
+    enum { WIN = 128 };                       /* +/- 128 words = +/- 512 bytes */
+    static struct { uint32_t pc; int8_t flag; } cache[256];
+    uint32_t slot = (pc >> 2) & 255u;
+    if (cache[slot].pc == pc) return cache[slot].flag;
+    uint32_t phys = pc & 0x1FFFFFFFu;
+    uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
+    uint32_t hi = phys + (uint32_t)(WIN * 4);
+    if (hi > 0x200000u) hi = 0x200000u;       /* 2 MB main RAM */
+    static uint32_t words[2 * WIN + 1];
+    int n = 0;
+    for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
+        words[n++] = fetch_word(a);
+    int flag = psx_ws_func_has_screen_cull(words, n);
+    cache[slot].pc = pc; cache[slot].flag = (int8_t)flag;
+    return flag;
+}
+
 static void dirty_ram_log_instruction(CPUState *cpu, uint32_t pc, uint32_t insn,
                                       uint32_t before_s0, uint32_t next_pc,
                                       uint32_t target, int transferred) {
@@ -684,7 +709,14 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         cpu->gpr[0] = 0;
         return 0;
     case 0x0B: /* SLTIU */
-        cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;
+        /* Widescreen render-funnel cull widening (auto_screen_x): always apply
+         * the shared helper for a flagged render-cull site — it is byte-identical
+         * to the vanilla compare at 4:3 (margin 0) and widens at 16:9, so the one
+         * code path serves both aspects (no widescreen-specific caching). */
+        if ((imm == 0x140 || imm == 0x141) && ws_cull_site(pc))
+            cpu->gpr[rt] = (uint32_t)psx_ws_cull_sltiu(cpu->gpr[rs], imm);
+        else
+            cpu->gpr[rt] = (cpu->gpr[rs] < (uint32_t)simm) ? 1u : 0u;
         cpu->gpr[0] = 0;
         return 0;
     case 0x0C: /* ANDI */

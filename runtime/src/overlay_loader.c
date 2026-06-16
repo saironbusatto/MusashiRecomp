@@ -379,8 +379,11 @@ static void sljit_mark_tried(uint32_t phys) {
  * hook. Decodes from live RAM exactly as the interpreter does. */
 static void try_sljit_region(uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
-    const CodeProvider *cp = code_provider_active();
-    if (!cp->compile_fragment) return;
+    /* Use the sljit provider specifically (not the active one): gcc is the
+     * primary/batch provider with compile_fragment == NULL, so the synchronous
+     * JIT-on-miss gap-fill must go through sljit even when gcc is "active". */
+    const CodeProvider *cp = code_provider_sljit();
+    if (!cp || !cp->compile_fragment) return;
     if (sljit_already_tried(phys)) return;
     extern int dirty_ram_is_dirty(uint32_t phys);
     if (!dirty_ram_is_dirty(phys)) return;   /* only JIT real runtime code */
@@ -490,17 +493,16 @@ static void scan_one_cache_dir(const char *dir) {
 #endif
 }
 
-/* Scan the namespaced gcc cache (gcc/<arch-abi>/) AND the legacy flat layout
- * (<game_id>/*.dll) for back-compat — existing caches keep loading with no
- * migration. The sljit/<arch-abi>/ namespace is reserved (no on-disk blobs in
- * v1: sljit re-JITs from the coverage manifest; see SLJIT.md §5.3). */
+/* Scan the namespaced gcc cache: gcc/<arch-abi>/cg<codegen-ver>/. The codegen
+ * version segment means a build with new emitter output reads a FRESH directory
+ * and never picks up a stale DLL (old versions coexist on disk, no migration).
+ * The sljit/<arch-abi>/ namespace is reserved (no on-disk blobs: sljit re-JITs
+ * from the coverage manifest; see SLJIT.md §5.3). (Pre-1.0: no legacy fallback —
+ * older flat / unversioned caches are simply ignored and regenerated.) */
 static void scan_cache_dir(void) {
     char dir[768];
-    snprintf(dir, sizeof(dir), "%s/%s/gcc/%s",
-             s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI);
-    scan_one_cache_dir(dir);
-    /* Legacy flat layout (pre-namespacing). */
-    snprintf(dir, sizeof(dir), "%s/%s", s_cache_dir, s_game_id);
+    snprintf(dir, sizeof(dir), "%s/%s/gcc/%s/cg%d",
+             s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER);
     scan_one_cache_dir(dir);
 }
 
@@ -717,13 +719,19 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
  * forces on) — a dev escape hatch. NOTE: "live" here is VALIDATED-live, not the
  * old blind path; see overlay_loader_dispatch's diff gate. */
 void overlay_loader_apply_live_policy(void) {
-    int live = (overlay_backend_active() == OVERLAY_BACKEND_SLJIT) ? 1 : 0;
+    /* DEFAULT-ON (validated): sljit is live whenever it is AVAILABLE, so it fills
+     * gcc-absent overlay regions even on a gcc dev box (gcc > sljit > interp).
+     * "Live" is VALIDATED-live — shards still route through the same-state diff
+     * gate (see overlay_loader_dispatch) and device-touching / diverging shards
+     * stay on the interpreter, so default-on cannot reintroduce the save-load
+     * wedge. The PSX_OVERLAY_SLJIT_LIVE env var still overrides (0 forces off). */
+    int live = (code_provider_sljit() != NULL) ? 1 : 0;
     const char *e = getenv("PSX_OVERLAY_SLJIT_LIVE");
     if (e && *e) live = (*e != '0') ? 1 : 0;
     s_sljit_live = live;
-    loader_log("sljit live policy: backend=%s env=%s -> live=%d",
+    loader_log("sljit live policy: active_backend=%s sljit_avail=%d env=%s -> live=%d",
                overlay_backend_name(overlay_backend_active()),
-               e && *e ? e : "(unset)", live);
+               code_provider_sljit() != NULL, e && *e ? e : "(unset)", live);
 }
 
 void overlay_loader_check_cache(uint32_t load_addr, uint32_t size,
@@ -844,7 +852,12 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
          * production model — shards created and run live, no per-shard diff).
          * Never inside a shadow run. */
         if (head < 0 && (s_diff_mode || s_sljit_live) && !s_in_shadow &&
-            overlay_backend_active() == OVERLAY_BACKEND_SLJIT) {
+            code_provider_sljit() != NULL) {
+            /* head < 0 == no gcc DLL (or any candidate) registered for this region
+             * after the cache-load attempt above => gcc-absent => sljit fills the
+             * gap (priority gcc > sljit > interp). Fires whenever sljit is
+             * AVAILABLE, not only when it is the exclusive backend, so sljit and
+             * gcc run complementarily. */
             try_sljit_region(addr);   /* virtual entry (carries KSEG bits) */
             head = idx_head(phys);
         }

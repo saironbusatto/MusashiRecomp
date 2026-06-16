@@ -171,6 +171,12 @@ typedef struct { int reg; int dirty; int pinned; uint32_t lru; } GprSlot;
 static GprSlot  s_gpr[GPR_SLOTS_MAX];
 static int      s_gpr_slots;     /* active slots this compile (<= GPR_SLOTS_MAX)*/
 static uint32_t s_gpr_lru;
+/* Set per-fragment (PASS 1) when this fragment carries the GTE render-funnel
+ * screen-extent reject signature (sltiu 0x140/0x141 + sltiu 0xE0/0xF1). When
+ * set, SLTIU 0x140/0x141 is routed through psx_ws_cull_sltiu so a sljit-JIT'd
+ * overlay widens identically to the gcc cache + interp (widescreen FOV). */
+static int      s_frag_ws_cull;
+extern int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* gpu.c — shared widen */
 
 static inline sljit_s32 slot_reg(int k) { return SLJIT_S(k + 2); } /* S2.. */
 
@@ -345,6 +351,23 @@ static void emit_helper2(struct sljit_compiler *C, void *fn, uint32_t insn) {
     gpr_reset();
 }
 
+/* Emit `rt = psx_ws_cull_sltiu(gpr[rs], imm)` for a flagged auto_screen_x cull
+ * site, so a sljit-JIT'd overlay widens the render-funnel screen-X reject the
+ * same way the gcc backend does. The helper reads only its two args (+ the
+ * runtime widescreen margin); it does NOT touch cpu->gpr[], so the GPR cache
+ * survives — same icall discipline as emit_load (materialise the source into a
+ * scratch before the call, write the result into rt after). */
+static void emit_ws_cull(struct sljit_compiler *C, uint32_t rt, uint32_t rs, uint32_t imm) {
+    sljit_s32 a; sljit_sw aw;
+    gpr_src(C, rs, &a, &aw);
+    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, a, aw);                 /* sx  -> R0 (arg0) */
+    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, SLJIT_IMM, (sljit_sw)imm); /* imm -> R1 (arg1) */
+    sljit_emit_op1(C, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, (sljit_sw)(uintptr_t)psx_ws_cull_sltiu);
+    sljit_emit_icall(C, SLJIT_CALL, SLJIT_ARGS2(32, 32, 32), SLJIT_R2, 0); /* R0 = verdict */
+    sljit_emit_op1(C, SLJIT_MOV32, gpr_dst(C, rt), 0, SLJIT_R0, 0);
+    gpr_unpin();
+}
+
 enum { EMIT_OK = 0, EMIT_TERM = 1, EMIT_ABORT = 2 };
 
 /* Emit ONE non-control instruction. Returns EMIT_OK, or EMIT_TERM iff `insn`
@@ -507,7 +530,10 @@ static int emit_one(struct sljit_compiler *C, uint32_t insn) {
         emit_slt(C, SLJIT_SUB32 | SLJIT_SET_SIG_LESS, SLJIT_SIG_LESS, rt, rs, 0, 0, simm);
         return EMIT_OK;
     case 0x0B: /* SLTIU (unsigned, simm sign-extended then compared unsigned) */
-        emit_slt(C, SLJIT_SUB32 | SLJIT_SET_LESS, SLJIT_LESS, rt, rs, 0, 0, simm);
+        if (s_frag_ws_cull && (imm == 0x140 || imm == 0x141))
+            emit_ws_cull(C, rt, rs, imm);   /* widescreen render-funnel cull widen (auto_screen_x) */
+        else
+            emit_slt(C, SLJIT_SUB32 | SLJIT_SET_LESS, SLJIT_LESS, rt, rs, 0, 0, simm);
         return EMIT_OK;
     case 0x0C: case 0x0D: case 0x0E: { /* ANDI / ORI / XORI (zero-extended imm) */
         sljit_s32 a, d; sljit_sw aw;
@@ -742,8 +768,17 @@ void overlay_sljit_try_compile(uint32_t entry,
      * see gpr_ref_mask). distinct >= the max regs in any single instruction, so
      * gpr_alloc always finds a slot. */
     uint32_t used_mask = 0;
-    for (uint32_t i = 0; i < frag_words; i++)
-        used_mask |= gpr_ref_mask(img_word(bytes, off0 + i * 4u));
+    int ws_hx = 0, ws_hy = 0;   /* render-funnel screen-cull signature (auto_screen_x) */
+    for (uint32_t i = 0; i < frag_words; i++) {
+        uint32_t w = img_word(bytes, off0 + i * 4u);
+        used_mask |= gpr_ref_mask(w);
+        if ((w & 0xFC000000u) == 0x2C000000u) {     /* sltiu */
+            uint32_t im = w & 0xFFFFu;
+            if (im == 0x140 || im == 0x141) ws_hx = 1;
+            else if (im == 0xE0 || im == 0xF1) ws_hy = 1;
+        }
+    }
+    s_frag_ws_cull = ws_hx && ws_hy;
     int distinct = 0;
     for (uint32_t m = used_mask; m; m &= m - 1u) distinct++;
     s_gpr_slots = (distinct < GPR_SLOTS_MAX) ? distinct : GPR_SLOTS_MAX;

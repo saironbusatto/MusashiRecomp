@@ -77,9 +77,18 @@ typedef struct CodeProvider {
  * at overlay-cache init, on the emu thread, before the run loop starts. */
 void code_provider_init(const char *cfg_backend, int gcc_configured);
 
-/* The active provider. Never NULL — defaults to the gcc provider before
- * code_provider_init() runs, so any early caller is safe. */
+/* The active/primary provider (owns the batch path + default selection). Never
+ * NULL — defaults to the gcc provider before code_provider_init() runs. */
 const CodeProvider *code_provider_active(void);
+
+/* The sljit provider IF it is available, else NULL. gcc and sljit are
+ * COMPLEMENTARY, not exclusive: gcc fills the cache via the async batch path +
+ * prebuilt DLLs and never JITs synchronously (compile_fragment == NULL), while
+ * sljit is the synchronous JIT-on-miss that fills the gaps gcc has not (yet)
+ * covered. The dispatch path uses this — independent of which provider is
+ * "active" — so on a gcc dev box sljit still JITs gcc-absent regions
+ * (priority gcc > sljit > interp). NULL => sljit unavailable, gaps fall to interp. */
+const CodeProvider *code_provider_sljit(void);
 
 #ifdef __cplusplus
 }

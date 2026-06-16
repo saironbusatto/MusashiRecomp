@@ -111,6 +111,16 @@ int  gpu_ws_present_native_43(void);
  * cull immediates by the recompiler ([widescreen.cull]); 0 unless stretching. */
 int  psx_ws_x_margin(void);
 
+/* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x):
+ * the gcc emit, the sljit JIT, and the interpreter all route a flagged
+ * `sltiu rt, sx, 0x140/0x141` through this one helper so every overlay execution
+ * path widens identically. Returns the sltiu verdict (1 = keep). 0 at 4:3. */
+int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);
+/* True if a run of instruction words carries the screen-extent reject signature
+ * (a sltiu 0x140/0x141 AND a sltiu 0xE0/0xF1). Used by sljit/interp to gate the
+ * widening to real render funnels. */
+int  psx_ws_func_has_screen_cull(const uint32_t *words, int n);
+
 /* Backdrop screen-X correction ([widescreen.backdrop] x_sites). The parallax
  * 2D backdrop layer computes screen-X without the GTE, so it misses the
  * widescreen squash; the recompiler emits this on each backdrop handler's

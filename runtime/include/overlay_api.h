@@ -48,6 +48,19 @@
 #define PSX_OVERLAY_ABI_TAG \
     ((int)((PSX_OVERLAY_ABI_VERSION & 0xFFFF) | ((PSX_OVERLAY_FLAVOR & 0xFFFF) << 16)))
 
+/* Codegen version — bumped whenever the recompiler emits DIFFERENT bytes for the
+ * same guest overlay WITHOUT an ABI change (the load-time overlay_abi() gate only
+ * catches ABI/flavor changes; a pure-emitter change produces a different DLL the
+ * gate would happily accept). The cache is namespaced by this version
+ * (gcc/<arch-abi>/cg<N>/), so a build with new codegen writes + reads a FRESH
+ * directory and never reuses a stale DLL; old versions coexist on disk (no
+ * auto-delete — a user who downgrades still finds their matching cache). Python
+ * (compile_overlays.py) parses this same constant from this header, so the two
+ * sides can never drift. BUMP THIS when you change code_generator.cpp emit in a
+ * way that alters overlay output (e.g. the auto_screen_x widescreen widening).
+ *   1: baseline + auto_screen_x render-funnel cull via psx_ws_cull_sltiu. */
+#define PSX_OVERLAY_CODEGEN_VER 1
+
 typedef struct {
     /* Core dispatch: routes call_by_address() and out-of-overlay jal */
     void (*dispatch_call)(CPUState *cpu, uint32_t addr, uint32_t ra);

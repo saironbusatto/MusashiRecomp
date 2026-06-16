@@ -42,6 +42,20 @@ except ImportError:
 
 import json
 import platform
+import re
+
+
+def codegen_ver(runtime_include: str) -> int:
+    """Parse PSX_OVERLAY_CODEGEN_VER from overlay_api.h so the cache path version
+    is the SAME value the runtime (overlay_loader.c) uses — the two can't drift.
+    The cache is namespaced gcc/<arch-abi>/cg<N>/, so a build with new emitter
+    output reads+writes a FRESH dir and never reuses a stale DLL."""
+    hdr = os.path.join(runtime_include, 'overlay_api.h')
+    with open(hdr) as f:
+        m = re.search(r'#define\s+PSX_OVERLAY_CODEGEN_VER\s+(\d+)', f.read())
+    if not m:
+        raise SystemExit(f'PSX_OVERLAY_CODEGEN_VER not found in {hdr}')
+    return int(m.group(1))
 
 
 def cache_arch_abi() -> str:
@@ -1126,13 +1140,14 @@ def main():
             return
         os.makedirs(args.out_dir, exist_ok=True)
     else:
-        # Namespaced gcc cache (SLJIT.md §4 — no comingling). Legacy flat layout
-        # (<out-dir>/<game_id>/) is still READ by the loader and for prior-ranges
-        # coverage merge below, so existing caches keep working with no migration.
-        legacy_cache_dir = os.path.join(args.out_dir, game_id)
-        cache_dir = os.path.join(legacy_cache_dir, 'gcc', cache_arch_abi())
+        # Namespaced + versioned gcc cache: <game_id>/gcc/<arch-abi>/cg<N>/
+        # (SLJIT.md §4 — no comingling; cg<N> = codegen version so a new emitter
+        # build never reuses a stale DLL, old versions coexist). MUST match
+        # overlay_loader.c scan_cache_dir(). Pre-1.0: no legacy fallback.
+        cg = codegen_ver(args.runtime_include)
+        cache_dir = os.path.join(args.out_dir, game_id, 'gcc', cache_arch_abi(), f'cg{cg}')
         os.makedirs(cache_dir, exist_ok=True)
-        print(f'Cache dir: {cache_dir}')
+        print(f'Cache dir: {cache_dir}  (codegen ver {cg})')
 
     with open(args.captures) as f:
         captures = json.load(f)
@@ -1160,12 +1175,6 @@ def main():
         if not args.static:
             ranges_name = f'{phys_addr:08X}_{crc32:08X}.ranges'
             prior_ranges = os.path.join(cache_dir, ranges_name)
-            # Fall back to the legacy flat layout so coverage from pre-namespacing
-            # builds still merges forward (don't regress a fresh build).
-            if not os.path.exists(prior_ranges):
-                legacy_prior = os.path.join(legacy_cache_dir, ranges_name)
-                if os.path.exists(legacy_prior):
-                    prior_ranges = legacy_prior
             if os.path.exists(prior_ranges):
                 prior_entries = []
                 with open(prior_ranges) as pf:

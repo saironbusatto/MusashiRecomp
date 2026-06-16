@@ -730,16 +730,12 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         uint16_t uimm = get_imm16_u(instr);
         if (uimm == 0x140 || uimm == 0x141) {
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
-            // SX is a 16-bit GTE screen coord loaded via lhu, so an off-LEFT
-            // vertex is a large unsigned value (e.g. -30 -> 0xFFE2). A plain
-            // `SX <u (imm+2m)` widen therefore reveals only the RIGHT margin —
-            // the left stays culled. Sign-extend SX and shift by +margin so the
-            // verdict is the wide window (-margin <= SX < imm+margin): both the
-            // left AND right 16:9 margins pass, and geometry past the wide
-            // surface on either side is still rejected. At margin=0 this reduces
-            // exactly to the vanilla `SX <u imm` verdict (byte-identical).
-            return fmt::format("{} = ((uint32_t)((int32_t)(int16_t){} + psx_ws_x_margin()) "
-                               "< (uint32_t)((int32_t){} + 2*psx_ws_x_margin())) ? 1 : 0;"
+            // Route through the shared runtime helper psx_ws_cull_sltiu so the
+            // gcc emit, the sljit JIT, and the interpreter all widen identically.
+            // It sign-extends SX and shifts by +margin (wide window
+            // -margin <= SX < imm+margin, both edges); at margin=0 it reduces
+            // bit-for-bit to the vanilla `SX <u imm` verdict (4:3 byte-identical).
+            return fmt::format("{} = psx_ws_cull_sltiu({}, {});"
                                "  /* ws auto screen-x cull (both edges) */{}",
                                reg_name(rt), reg_name(rs), (int)uimm, comment);
         }
@@ -1760,6 +1756,7 @@ std::string CodeGenerator::generate_file(
     ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
+    ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n";
     ss << "extern void gte_ws_set_suppress(int on);  /* widescreen far-backdrop un-squash (gte.cpp) */\n\n";
 
