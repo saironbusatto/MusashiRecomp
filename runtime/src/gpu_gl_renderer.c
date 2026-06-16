@@ -1804,6 +1804,40 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     coh_record(GL_COH_PRESENT, disp_x, disp_y, disp_x + w - 1, disp_y + h - 1);
 }
 
+/* GPU-direct native-wide present: blit the displayed buffer's wide FBO straight
+ * to the window (no glReadPixels / glFinish CPU round-trip). The wide surface is
+ * g_wide_w wide × VRAM_H tall (at scale S); present its [0,g_wide_w] × [disp_y,
+ * disp_y+disp_h] region into the letterbox, V-flipped like present_vram (FBO y
+ * bottom-origin → window top). Returns 0 if there's no wide surface for base_x
+ * (caller falls back). disp_x is the displayed buffer base (the wide-surface key). */
+int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear) {
+    if (!s_ctx || !s_raster_ok || g_wide_w <= 0) return 0;
+    GLuint fbo = 0;
+    for (int i = 0; i < WIDE_MAX_SURF; i++)
+        if (s_wide_fbo[i] && s_wide_base[i] == disp_x) { fbo = s_wide_fbo[i]; break; }
+    if (!fbo) return 0;
+    flush_cpu_upload();
+    int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
+    int lx, ly, lw, lh;
+    letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
+
+    p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glViewport(0, 0, ww, wh);
+    glClearColor(0.f, 0.f, 0.f, 1.f); glClear(GL_COLOR_BUFFER_BIT);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
+    int S = s_scale;
+    /* Source: full wide width [0, g_wide_w], displayed Y band [disp_y, +disp_h].
+     * V-flip the dst (ly+lh .. ly) so the top scanline lands at the rect top. */
+    p_glBlitFramebuffer(0, disp_y * S, g_wide_w * S, (disp_y + disp_h) * S,
+                        lx, ly + lh, lx + lw, ly,
+                        GL_COLOR_BUFFER_BIT, linear ? GL_LINEAR : GL_NEAREST);
+    p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    SDL_GL_SwapWindow(s_win);
+    coh_record(GL_COH_PRESENT, 0, disp_y, g_wide_w - 1, disp_y + disp_h - 1);
+    return 1;
+}
+
 static const GpuRenderBackend GL_BACKEND = {
     .name = "opengl",
     .init = glb_init, .set_scale = glb_set_scale, .scale = glb_scale,

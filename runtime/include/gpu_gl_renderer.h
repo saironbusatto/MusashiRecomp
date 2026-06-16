@@ -41,6 +41,11 @@ void gl_renderer_sync_cpu(void);
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3);
 
+/* GPU-direct native-wide present: blit the displayed buffer's wide FBO (key =
+ * disp_x) straight to the window, no CPU readback. Returns 0 if no wide surface
+ * exists for disp_x (caller falls back to the CPU readout path). */
+int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear);
+
 /* Display aspect for the present letterbox (default 4:3). A wide aspect
  * stretches the 4:3 frame; pair with gte_set_display_aspect (cpu_state.h)
  * for the widescreen field-of-view hack. */

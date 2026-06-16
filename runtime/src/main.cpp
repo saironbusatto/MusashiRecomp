@@ -1335,16 +1335,24 @@ static void sdl_vblank_present(void) {
          * the PSX_GL_FORCE_CPU_PRESENT diagnostic sync the FBO down and use
          * the CPU readout below. */
 #ifndef PSX_SDL_NO_RENDER
-        /* Native-wide GL present: the wide compositor lives in separate per-base
-         * FBOs that the deterministic VRAM-FBO present can't read, so a wide
-         * frame falls through to the CPU readout path below (gr_render_wide_
-         * display -> sdl_pixel_buf -> gl_renderer_present). 4:3 / FMV / non-wide
-         * frames keep the fast VRAM-FBO present (early return) unchanged. */
-        if (g_gl_active && g_gl_fbo_present && !di.depth24 && !wide_present) {
-            gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
-                                     (int)present_w, (int)h, g_video_aa ? 1 : 0,
-                                     fmv_frame ? 1 : 0);
-            return;
+        if (g_gl_active && g_gl_fbo_present && !di.depth24) {
+            if (wide_present) {
+                /* GPU-direct native-wide present: blit the displayed buffer's
+                 * wide FBO straight to the window (GPU-side, like the canonical
+                 * present_vram). This avoids the glFinish + glReadPixels CPU
+                 * round-trip the old path did EVERY frame — that readback was the
+                 * GL-only slowdown (SW's wide path is pure CPU, no GPU sync, so
+                 * SW stayed smooth). Falls through to the CPU readout path only if
+                 * the wide surface for this buffer doesn't exist yet. */
+                if (gl_renderer_present_wide_fbo((int)di.display_x, (int)di.display_y,
+                                                 (int)h, g_video_aa ? 1 : 0))
+                    return;
+            } else {
+                gl_renderer_present_vram((int)di.display_x, (int)di.display_y,
+                                         (int)present_w, (int)h, g_video_aa ? 1 : 0,
+                                         fmv_frame ? 1 : 0);
+                return;
+            }
         }
         if (g_gl_active) gl_renderer_sync_cpu();
 #endif
