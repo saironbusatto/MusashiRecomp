@@ -826,8 +826,18 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
              * toggle. Verify-budget: once a candidate has passed cleanly enough
              * times it's trusted and falls through to normal execution, so the
              * diff cost stays bounded (a diverging candidate never reaches the
-             * budget — it keeps being diff-gated and never runs native live). */
-            if (s_diff_mode && !s_in_shadow && c->diff_passes < OVERLAY_DIFF_BUDGET) {
+             * budget — it keeps being diff-gated and never runs native live).
+             *
+             * VALIDATED-LIVE: live sljit mode (s_sljit_live) is NOT a separate
+             * "JIT and run blind" path — it routes its sljit SHARDS (dll < 0)
+             * through the SAME diff gate, so a shard runs native live only after a
+             * clean verify budget, and run_shadow_diff's interp-first pass computes
+             * device_touch (device functions get pinned to interp, never double-
+             * executing I/O — the save-load wedge). gcc candidates (dll >= 0) are
+             * the trusted tier (validated at dev time) and run native directly;
+             * they are diffed only in explicit dev diff mode. */
+            int want_diff = s_diff_mode || (s_sljit_live && c->dll < 0);
+            if (want_diff && !s_in_shadow && c->diff_passes < OVERLAY_DIFF_BUDGET) {
                 run_shadow_diff(cpu, c, addr);
                 return 1;
             }
@@ -1138,6 +1148,11 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
         /* Clean pass: credit the verify budget. */
         if (c->diff_passes < OVERLAY_DIFF_BUDGET) c->diff_passes++;
     } else {
+        /* Divergence: reset the budget. Promotion to live requires N CONSECUTIVE
+         * clean passes (the spec's "0 divergences over the budget"), so an
+         * intermittently-wrong shard can never accumulate enough lucky passes to be
+         * trusted — it stays diff-gated (interp result kept) and never runs live. */
+        c->diff_passes = 0;
         s_shadow_divs++;
         if (!s_detail_captured) {
             s_detail_captured = 1;
