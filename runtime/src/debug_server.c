@@ -8779,8 +8779,18 @@ void debug_server_freeze_dump_dirty_block_json(FILE *f, uint32_t max_count)
 typedef void (*CmdHandler)(int id, const char *json);
 typedef struct { const char *name; CmdHandler handler; } CmdEntry;
 
+static void handle_game_options(int id, const char *json)
+{
+    (void)json;
+    extern int game_options_debug_json(char *out, int cap);
+    char buf[3072];
+    game_options_debug_json(buf, sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,\"go\":%s}", id, buf);
+}
+
 static const CmdEntry s_commands[] = {
     { "ping",              handle_ping },
+    { "game_options",      handle_game_options },
     { "frame",             handle_frame },
     { "get_registers",     handle_get_registers },
     { "read_ram",          handle_read_ram },

@@ -27,6 +27,7 @@
 #include "crash_trace.h"
 #include "freeze_heartbeat.h"
 #include "config_loader.h"
+#include "game_options.h"
 #include "crc32.h"
 #include "disc_identity.h"
 #if defined(PSX_LAUNCHER)
@@ -1048,9 +1049,21 @@ static uint16_t controller_pad_buttons(SDL_GameController* h) {
     return buttons;
 }
 
-/* Map an SDL axis (-32768..32767) to a PSX analog byte (0..255, 0x80 centred). */
+/* Map an SDL axis (-32768..32767) to a PSX analog byte (0..255, 0x80 centred),
+ * applying the configured centre deadzone: travel within controller_deadzone
+ * reads as centred (0x80) and the remaining travel is rescaled to the full range
+ * so the stick still reaches the extremes. Gives clean variable analog speed
+ * with no centre drift. */
 static uint8_t axis_to_pad_byte(int16_t v) {
-    int b = ((int)v + 32768) >> 8;  /* 0..255 */
+    const int dz = controller_deadzone;
+    int av = v < 0 ? -(int)v : (int)v;        /* |v|, 0..32768 */
+    if (av <= dz) return 0x80;                /* inside deadzone -> centred */
+    int range = 32767 - dz;
+    if (range < 1) range = 1;
+    int mag = (av - dz) * 32767 / range;      /* 0..32767 past the deadzone */
+    if (mag > 32767) mag = 32767;
+    int sv = v < 0 ? -mag : mag;
+    int b = (sv + 32768) >> 8;                /* 0..255 */
     if (b < 0) b = 0; else if (b > 255) b = 255;
     return (uint8_t)b;
 }
@@ -1062,14 +1075,35 @@ static uint16_t pad_buttons_for(const PlayerInput& p) {
     return 0xFFFF;
 }
 
-/* Analog stick bytes (lx,ly,rx,ry) for a player; centred if no live source. */
+/* Analog stick bytes (lx,ly,rx,ry) for a player; centred if no live source.
+ *
+ * The host left stick maps to the LEFT analog axes (variable). The physical
+ * D-pad (and, for a keyboard player, the arrow keys) is ALSO folded onto the
+ * left axes at full deflection, so an analog-mode game whose movement reads only
+ * the stick magnitude (e.g. Tomba) still responds to the D-pad/keyboard. This is
+ * the faithful "seamless" behaviour the Special Edition exposes: the stick gives
+ * variable speed, the D-pad gives full speed, and both work at once. Only the
+ * PHYSICAL D-pad is folded in (not the stick->d-pad button mapping), so the
+ * stick keeps its true variable magnitude rather than snapping to full. */
 static void pad_sticks_for(const PlayerInput& p, uint8_t out[4]) {
     out[0] = out[1] = out[2] = out[3] = 0x80;
+    if (p.kind == 1) {
+        const Uint8* keys = SDL_GetKeyboardState(NULL);
+        if (keys[SDL_SCANCODE_LEFT])  out[0] = 0x00;
+        if (keys[SDL_SCANCODE_RIGHT]) out[0] = 0xFF;
+        if (keys[SDL_SCANCODE_UP])    out[1] = 0x00;
+        if (keys[SDL_SCANCODE_DOWN])  out[1] = 0xFF;
+        return;
+    }
     if (p.kind == 2 && p.handle) {
         out[0] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTX));
         out[1] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTY));
         out[2] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTX));
         out[3] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTY));
+        if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  out[0] = 0x00;
+        if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) out[0] = 0xFF;
+        if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_UP))    out[1] = 0x00;
+        if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  out[1] = 0xFF;
     }
 }
 
@@ -1517,6 +1551,7 @@ int main(int argc, char** argv) {
     std::string p2_device = "none";
     bool p1_analog = false;
     bool p2_analog = false;
+    int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     std::filesystem::path resolved_disc;
     std::string window_title = PSX_WINDOW_TITLE;
     uint16_t   debug_port    = (uint16_t)DEFAULT_DEBUG_PORT;
@@ -1565,6 +1600,13 @@ int main(int argc, char** argv) {
                                           (int)gc.ws_backdrop_x_sites.size());
             g_audio_spu_hq     = gc.runtime.audio_spu_hq;
             g_auto_skip_fmv    = gc.runtime.video_auto_skip_fmv ? 1 : 0;
+            /* [controller] game-declared input defaults (settings.toml/launcher
+             * still override below). */
+            if (gc.runtime.has_default_analog) {
+                p1_analog = gc.runtime.default_p1_analog;
+                p2_analog = gc.runtime.default_p2_analog;
+            }
+            if (gc.runtime.has_deadzone) resolved_deadzone = gc.runtime.deadzone;
             { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
@@ -1658,12 +1700,45 @@ int main(int argc, char** argv) {
         if (us.has_p2_device) p2_device = us.p2_device;
         if (us.has_p1_analog) p1_analog = us.p1_analog;
         if (us.has_p2_analog) p2_analog = us.p2_analog;
+        if (us.has_deadzone)  resolved_deadzone = us.deadzone;
     }
 
     /* Resolve the effective memory-card directory now (before the launcher) so
      * the launcher can introspect the real card files. The same default is used
      * by the runtime below. */
     if (memcard_dir.empty()) memcard_dir = default_memcard_dir(argv[0]);
+
+    /* The game's OWN native OPTION settings (game_options.toml, next to
+     * game.toml) — persisted across launches, kept separate from game.toml
+     * (recomp config) and settings.toml (launcher). Values are saved to
+     * <memcard_dir>/<game_id>.options. Best-effort: a malformed file disables
+     * the feature, it never blocks boot. */
+    if (game_config_path) {
+        try {
+            std::filesystem::path go_path =
+                std::filesystem::path(game_config_path).parent_path() / "game_options.toml";
+            const PSXRecompV4::GameOptions go = PSXRecompV4::load_game_options(go_path);
+            if (!go.options.empty()) {
+                std::vector<uint32_t>    go_addrs;
+                std::vector<uint8_t>     go_sizes;
+                std::vector<const char*> go_names;
+                for (const auto& o : go.options) {
+                    go_addrs.push_back(o.addr);
+                    go_sizes.push_back((uint8_t)o.size);
+                    go_names.push_back(o.name.c_str());
+                }
+                std::string go_state = (memcard_dir /
+                    ((game_id.empty() ? std::string("game") : game_id) + ".options")).string();
+                game_options_configure(go_state.c_str(), go_addrs.data(), go_sizes.data(),
+                                       go_names.data(), (int)go_addrs.size());
+                std::fprintf(stdout,
+                    "psxrecomp: game options persistence armed (%d field(s)) -> %s\n",
+                    (int)go_addrs.size(), go_state.c_str());
+            }
+        } catch (const std::exception& ex) {
+            std::fprintf(stderr, "psxrecomp: game_options.toml ignored: %s\n", ex.what());
+        }
+    }
 
 #if defined(PSX_LAUNCHER)
     /* Integrated launcher: shown in its own GL window before the emulator
@@ -1703,6 +1778,8 @@ int main(int argc, char** argv) {
             seed.p2_device = p2_device; seed.has_p2_device = true;
             seed.p1_analog = p1_analog; seed.has_p1_analog = true;
             seed.p2_analog = p2_analog; seed.has_p2_analog = true;
+            seed.deadzone = resolved_deadzone >= 0 ? resolved_deadzone : 12000;
+            seed.has_deadzone = true;
             seed.window_width = g_video_win_w; seed.has_window_width = true;
 
             SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
@@ -1768,6 +1845,7 @@ int main(int argc, char** argv) {
                 if (seed.has_memcard2_path) memcard2_path = seed.memcard2_path;
                 p1_device = seed.p1_device; p2_device = seed.p2_device;
                 p1_analog = seed.p1_analog; p2_analog = seed.p2_analog;
+                if (seed.has_deadzone) resolved_deadzone = seed.deadzone;
                 g_video_win_w = seed.window_width;
                 /* Persist the user's choices next to the exe. */
                 PSXRecompV4::save_user_settings(
@@ -1887,6 +1965,10 @@ int main(int argc, char** argv) {
         memcard_init_slots(memcard_dir_str.c_str(), slots);
     }
     std::atexit(memcard_flush_all);
+    /* Persist the game's native OPTION settings on any exit path (belt-and-
+     * suspenders; save-on-change already persists them live). No-op if not yet
+     * armed, so it can't overwrite the saved file with boot defaults. */
+    std::atexit(game_options_save_now);
 #ifndef PSX_NO_DEBUG_TOOLS
     debug_server_init(debug_port);
 #else
@@ -1915,6 +1997,11 @@ int main(int argc, char** argv) {
         return 1;
     }
     load_input_config(argv[0]);
+    /* The launcher / settings.toml / game.toml deadzone (when set) is the
+     * user-facing authority; apply it over the input.ini value here, after
+     * load_input_config has read input.ini. */
+    if (resolved_deadzone >= 0)
+        controller_deadzone = std::max(0, std::min(32767, resolved_deadzone));
     refresh_player_devices();  /* open SDL handles to match the player config */
 #ifndef PSX_SDL_NO_AUDIO
     if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {

@@ -760,6 +760,32 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                            reg_name(rs), offset, reg_name(rt), comment);
     }
 
+    // Persistent game-option init store ([persist_options] in game_options.toml).
+    // The site is the boot-init sb/sh that writes a config global's DEFAULT value
+    // (Tomba MESSAGE / SOUND / VIBRATION / ADJUST SCREEN). Route the stored value
+    // through psx_game_option_store(addr, val): it returns a value persisted from a
+    // prior session for that address, else `val` unchanged — so the saved setting
+    // overrides the default exactly once, at initialization, and a fresh install
+    // (no saved file) is byte-identical. The in-OPTION write is a different
+    // instruction (option overlay), untouched, so the player can still change it.
+    // Verified sb/sh; a mismatch is a loud build error.
+    if (config_.persist_init_store_sites.count(addr)) {
+        uint32_t rs = get_rs(instr), rt = get_rt(instr);
+        int16_t offset = get_imm16(instr);
+        std::string aexpr = (offset != 0)
+            ? fmt::format("({} + {})", reg_name(rs), offset)
+            : std::string(reg_name(rs));
+        if (opcode == 0x28)  // sb
+            return fmt::format("cpu->write_byte({0}, (uint8_t)psx_game_option_store({0}, (int){1}));{2}",
+                               aexpr, reg_name(rt), comment);
+        if (opcode == 0x29)  // sh
+            return fmt::format("cpu->write_half({0}, (uint16_t)psx_game_option_store({0}, (int){1}));{2}",
+                               aexpr, reg_name(rt), comment);
+        fmt::print(stderr, "ERROR: [persist_options] init site 0x{:08X} is not sb/sh "
+                   "(opcode 0x{:02X})\n", addr, opcode);
+        std::exit(1);
+    }
+
     // SPECIAL opcode (0x00)
     if (opcode == 0x00) {
         switch (funct) {
@@ -1758,6 +1784,7 @@ std::string CodeGenerator::generate_file(
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n";
+    ss << "extern int  psx_game_option_store(uint32_t addr, int val);  /* persisted OPTION restore-at-init (game_options.c) */\n";
     ss << "extern void gte_ws_set_suppress(int on);  /* widescreen far-backdrop un-squash (gte.cpp) */\n\n";
 
     // Emit reference implementations for unaligned memory helpers.

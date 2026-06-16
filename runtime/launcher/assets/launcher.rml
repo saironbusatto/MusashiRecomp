@@ -328,6 +328,11 @@ button:hover { background-color: #232d3c; }
 				<button class="toggle" data-event-click="toggle_spu"><span class="value" data-if="spu_hq">On</span><span class="value" data-if="spu_hq == false">Off</span></button></span></div>
 		</div>
 		<div class="panel">
+			<div class="eyebrow">CONTROLLER</div>
+			<div class="set-row"><span class="set-lbl">Analog stick deadzone</span><span class="set-ctl">
+				<button class="toggle" data-event-click="cycle_deadzone"><span class="value">{{deadzone_pct}}%</span></button></span></div>
+		</div>
+		<div class="panel">
 			<div class="eyebrow">SYSTEM</div>
 			<div class="set-row"><span class="set-lbl">BIOS</span><span class="set-ctl">
 				<button data-event-click="browse_bios">Browse</button>

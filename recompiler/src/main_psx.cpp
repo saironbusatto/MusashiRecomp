@@ -97,6 +97,7 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    ws_backdrop_x;        // [widescreen.backdrop] x_sites
     std::set<uint32_t>    ws_backdrop_unsquash; // [widescreen.backdrop] unsquash_funcs
     bool                  ws_auto_screen_x_cull = false; // [widescreen.cull] auto_screen_x
+    std::set<uint32_t>    persist_init_sites;   // [persist_options] init-store hooks (game_options.toml)
     std::filesystem::path out_dir = "generated";
 
     if (!config_path.empty()) {
@@ -113,6 +114,19 @@ int main(int argc, char** argv) {
         ws_backdrop_x.insert(cfg.ws_backdrop_x_sites.begin(), cfg.ws_backdrop_x_sites.end());
         ws_backdrop_unsquash.insert(cfg.ws_backdrop_unsquash_funcs.begin(), cfg.ws_backdrop_unsquash_funcs.end());
         ws_auto_screen_x_cull = ws_auto_screen_x_cull || cfg.ws_auto_screen_x_cull;
+        // [persist_options] init-store hook sites live in a dedicated
+        // game_options.toml next to game.toml (the game's own native OPTION
+        // settings, kept separate from game.toml/settings.toml). Best-effort:
+        // a missing/bad file just means no persistence hooks this build.
+        try {
+            std::filesystem::path go_path =
+                std::filesystem::path(config_path).parent_path() / "game_options.toml";
+            const auto goc = PSXRecompV4::load_game_options(go_path);
+            for (const auto& o : goc.options)
+                if (o.init_store_pc) persist_init_sites.insert(o.init_store_pc);
+        } catch (const std::exception& e) {
+            fmt::print(stderr, "  game_options.toml ignored: {}\n", e.what());
+        }
         fmt::print("config:         {}\n", config_path.string());
         fmt::print("  exe         = {}\n", exe_path.string());
         fmt::print("  seeds       = {}\n", extra_funcs_storage);
@@ -665,8 +679,11 @@ int main(int argc, char** argv) {
     codegen_config.ws_backdrop_x_sites = ws_backdrop_x;
     codegen_config.ws_backdrop_unsquash_funcs = ws_backdrop_unsquash;
     codegen_config.ws_auto_screen_x_cull = ws_auto_screen_x_cull;
+    codegen_config.persist_init_store_sites = persist_init_sites;
     if (ws_auto_screen_x_cull)
         fmt::print("  ws_auto_screen_x_cull = ON (render-funnel FOV widening)\n");
+    if (!persist_init_sites.empty())
+        fmt::print("  persist_options = {} init-store hook(s)\n", persist_init_sites.size());
 
     // Load per-game annotations: annotations/<exe_stem>_annotations.csv
     // Silently skipped if the file doesn't exist.
