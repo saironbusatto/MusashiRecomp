@@ -173,6 +173,33 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
     }
 
+    // Optional [controller] block — game-declared input defaults.
+    if (cfg.contains("controller")) {
+        const toml::value& ct = toml::find(cfg, "controller");
+        if (ct.contains("default_analog")) {
+            const bool a = toml::find<bool>(ct, "default_analog");
+            rt.default_p1_analog = a;
+            rt.default_p2_analog = a;
+            rt.has_default_analog = true;
+        }
+        if (ct.contains("p1_analog")) {
+            rt.default_p1_analog = toml::find<bool>(ct, "p1_analog");
+            rt.has_default_analog = true;
+        }
+        if (ct.contains("p2_analog")) {
+            rt.default_p2_analog = toml::find<bool>(ct, "p2_analog");
+            rt.has_default_analog = true;
+        }
+        if (ct.contains("deadzone")) {
+            const auto n = toml::find<int64_t>(ct, "deadzone");
+            if (n < 0 || n > 32767)
+                throw std::runtime_error(fmt::format(
+                    "[controller] deadzone out of range (0..32767): {}", n));
+            rt.deadzone = static_cast<int>(n);
+            rt.has_deadzone = true;
+        }
+    }
+
     return rt;
 }
 
@@ -571,6 +598,33 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     };
 }
 
+// ---- GameOptions (game_options.toml) — the game's own native settings ----
+
+GameOptions load_game_options(const fs::path& path) {
+    GameOptions go;
+    std::error_code ec;
+    if (path.empty() || !fs::exists(path, ec)) return go;
+
+    const toml::value doc = toml::parse(path.string());
+    if (!doc.contains("option")) return go;
+    const auto& arr = toml::find<toml::array>(doc, "option");
+    for (const auto& item : arr) {
+        GameOption o;
+        o.name = toml::find<std::string>(item, "name");
+        o.addr = parse_hex(toml::find<std::string>(item, "addr"),
+                           fmt::format("game_options [[option]] '{}' addr", o.name));
+        o.size = static_cast<int>(toml::find<int64_t>(item, "size"));
+        if (o.size != 1 && o.size != 2)
+            throw std::runtime_error(fmt::format(
+                "game_options [[option]] '{}' size must be 1 or 2: {}", o.name, o.size));
+        if (item.contains("init_store_pc"))
+            o.init_store_pc = parse_hex(toml::find<std::string>(item, "init_store_pc"),
+                                        fmt::format("game_options '{}' init_store_pc", o.name));
+        go.options.push_back(o);
+    }
+    return go;
+}
+
 // ---- UserSettings (settings.toml) — launcher-written override layer ----
 
 UserSettings load_user_settings(const fs::path& path) {
@@ -693,6 +747,10 @@ UserSettings load_user_settings(const fs::path& path) {
         if (ct.contains("p2_analog")) try_get([&]{
             s.p2_analog = toml::find<bool>(ct, "p2_analog"); s.has_p2_analog = true;
         });
+        if (ct.contains("deadzone")) try_get([&]{
+            const auto n = toml::find<int64_t>(ct, "deadzone");
+            if (n >= 0 && n <= 32767) { s.deadzone = (int)n; s.has_deadzone = true; }
+        });
     }
     return s;
 }
@@ -759,7 +817,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
             f << "enable2 = " << (s.memcard2_enabled ? "true" : "false") << "\n";
     }
 
-    if (s.has_p1_device || s.has_p2_device || s.has_p1_analog || s.has_p2_analog) {
+    if (s.has_p1_device || s.has_p2_device || s.has_p1_analog || s.has_p2_analog ||
+        s.has_deadzone) {
         f << "\n[controller]\n";
         if (s.has_p1_device)
             f << "p1_device = \"" << s.p1_device << "\"\n";
@@ -769,6 +828,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
             f << "p2_device = \"" << s.p2_device << "\"\n";
         if (s.has_p2_analog)
             f << "p2_analog = " << (s.p2_analog ? "true" : "false") << "\n";
+        if (s.has_deadzone)
+            f << "deadzone = " << s.deadzone << "\n";
     }
 
     return f.good();

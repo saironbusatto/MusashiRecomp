@@ -74,6 +74,14 @@ struct CodeGenConfig {
     // FOV (identity at 4:3). Overlay-resident; see config_loader.h. Empty=default.
     std::set<uint32_t> ws_backdrop_x_sites;
 
+    // Persistent game-option init-store hooks ([persist_options] in
+    // game_options.toml). Each entry is the PC of a boot-init sb/sh that writes a
+    // config global's DEFAULT value; the store is rewritten to route the value
+    // through psx_game_option_store(addr,val), so a value persisted from a prior
+    // session overrides the default at initialization (issue #5). Identity when
+    // nothing is persisted, so a fresh install is byte-identical. Empty=default.
+    std::set<uint32_t> persist_init_store_sites;
+
     CodeGenConfig()
         : emit_comments(true)
         , emit_line_numbers(true)

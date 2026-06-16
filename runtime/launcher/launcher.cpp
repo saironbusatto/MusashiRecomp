@@ -135,6 +135,7 @@ struct LauncherModel {
     int  p2_dev_index = 0;
     bool p1_analog    = false; // DualShock (analog) vs digital pad
     bool p2_analog    = false;
+    int  deadzone_pct = 37;    // analog-stick deadzone 0-100% (raw = pct*32767/100)
     Rml::String p1_dev_label = "Keyboard";
     Rml::String p2_dev_label = "None";
     Rml::String p1_status, p2_status;        // resolved status line
@@ -616,6 +617,7 @@ Result run(SDL_Window* window, void* gl_context,
     std::vector<DeviceOption> dev_opts = enumerate_devices();
     m.p1_analog = io.has_p1_analog ? io.p1_analog : false;
     m.p2_analog = io.has_p2_analog ? io.p2_analog : false;
+    m.deadzone_pct = io.has_deadzone ? (io.deadzone * 100 / 32767) : 37;
     if (io.has_p1_device) {
         m.p1_dev_index = find_or_add_device_index(dev_opts, io.p1_device);
     } else {
@@ -660,6 +662,7 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("view",           &m.view);
     c.Bind("p1_analog",      &m.p1_analog);
     c.Bind("p2_analog",      &m.p2_analog);
+    c.Bind("deadzone_pct",   &m.deadzone_pct);
     c.Bind("p1_dev_label",   &m.p1_dev_label);
     c.Bind("p2_dev_label",   &m.p2_dev_label);
     c.Bind("p1_status",      &m.p1_status);
@@ -822,6 +825,14 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.p2_analog = !m.p2_analog; refresh_player(m, 1, dev_opts); dirty_player(1);
         });
+    /* Analog-stick deadzone, stepped 0..50% (wraps). Applies to both the
+     * stick->d-pad threshold and the analog centre dead-band. */
+    c.BindEventCallback("cycle_deadzone",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.deadzone_pct += 5;
+            if (m.deadzone_pct > 50) m.deadzone_pct = 0;
+            handle.DirtyVariable("deadzone_pct");
+        });
     c.BindEventCallback("toggle_mc1",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.mc1_enabled = !m.mc1_enabled; handle.DirtyVariable("mc1_enabled");
@@ -943,6 +954,7 @@ Result run(SDL_Window* window, void* gl_context,
         io.p2_device = device_string(dev_opts[i2]); io.has_p2_device = true;
         io.p1_analog = m.p1_analog; io.has_p1_analog = true;
         io.p2_analog = m.p2_analog; io.has_p2_analog = true;
+        io.deadzone = m.deadzone_pct * 32767 / 100; io.has_deadzone = true;
     }
 
     Rml::Shutdown();

@@ -136,6 +136,24 @@ struct RuntimeConfig {
     // byte-identical to the canon hardware mix when off. The PSX_AUDIO_SHADOW
     // env var overrides this at runtime (debug path).
     bool                  audio_spu_hq = false;
+
+    // ---- [controller] block — game-declared input defaults ----
+    // default_analog: present a DualShock/analog pad (id 0x73) by default for
+    // this game, so a stick-capable title (e.g. Tomba, which gives variable run
+    // speed through the analog stick) feels right out of the box without the
+    // user toggling DualShock in the launcher. Per-install settings.toml
+    // [controller] p1_analog/p2_analog still override. Default off (digital 0x41).
+    // `default_analog = true` sets both ports; `p1_analog`/`p2_analog` set one.
+    bool                  has_default_analog = false;
+    bool                  default_p1_analog  = false;
+    bool                  default_p2_analog  = false;
+
+    // deadzone: default analog-stick deadzone in raw SDL axis units (0..32767).
+    // Applied both to the stick->d-pad press threshold and the analog-axis centre
+    // dead-band. Absent => runtime default (12000). Overridden per-install by
+    // settings.toml [controller] deadzone and by input.ini.
+    bool                  has_deadzone = false;
+    int                   deadzone     = 0;
 };
 
 // One entry from [[recompiler.bios_vectors]].
@@ -336,7 +354,33 @@ struct UserSettings {
     bool has_p2_device = false; std::string p2_device = "none";
     bool has_p1_analog = false; bool p1_analog = false;
     bool has_p2_analog = false; bool p2_analog = false;
+    // Analog-stick deadzone, raw SDL axis units (0..32767). The launcher edits
+    // this as 0-100% (raw = pct*32767/100), mirroring snesrecomp's GamepadDeadzone.
+    bool has_deadzone  = false; int  deadzone  = 12000;
 };
+
+// GameOptions — the game's OWN native OPTION-screen settings, declared in a
+// dedicated, self-contained `game_options.toml` next to game.toml. Kept entirely
+// separate from GameConfig (recompiler/aftermarket config) and UserSettings
+// (launcher overrides): these describe the GAME's settings, persisted across
+// launches because some titles keep them only in a per-boot RAM global with no
+// memory-card config block (issue #5). See game_options.{h,c} for the runtime.
+struct GameOption {
+    std::string name;          // key written to the saved-values state file
+    uint32_t    addr = 0;      // guest RAM address of the canonical config global
+    int         size = 1;      // 1 or 2 bytes
+    uint32_t    init_store_pc = 0; // PC of the boot-init sb/sh that writes this
+                                   // global's default; the recompiler rewrites it
+                                   // to apply the persisted value (restore-at-init).
+};
+struct GameOptions {
+    std::vector<GameOption> options;     // empty => feature off for this game
+};
+
+// Load game_options.toml ([[option]] array of {name, addr, size}). Returns an
+// empty GameOptions if the file is missing/unreadable; throws on a malformed
+// declared entry (bad addr / size) so a typo is surfaced, not silently dropped.
+GameOptions load_game_options(const std::filesystem::path& path);
 
 // Load settings.toml. Returns an all-defaults (all has_*=false) struct if the
 // file is missing or unreadable. Malformed values are skipped (best-effort:
