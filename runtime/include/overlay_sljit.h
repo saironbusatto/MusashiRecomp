@@ -73,6 +73,12 @@ typedef struct {
     uint32_t       code_lo;   /* phys start of compiled code range            */
     uint32_t       code_len;  /* byte length of compiled code range           */
     uint32_t       insns;     /* MIPS instructions compiled (diagnostics)     */
+    /* Serialized (position-independent) LIR of this shard for the persisted
+     * cache (Stage 2). Allocated by sljit_serialize_compiler; the caller writes
+     * it to disk then frees it via overlay_sljit_free_serialized(). NULL if not
+     * serialized. */
+    void          *serialized;
+    unsigned long  serialized_size;
 } OverlaySljitResult;
 
 /* Attempt to JIT the leaf function at `entry` (guest vram) by decoding from
@@ -119,6 +125,15 @@ void psx_sljit_memx(CPUState *cpu, uint32_t insn);
  * through (cpu-relative, so shard LIR is position-independent — see Stage 1 in
  * SLJIT_PERSIST_CACHE.md). Call once at startup after CPUState is wired. */
 void overlay_sljit_init_helpers(CPUState *cpu);
+
+/* Reload a serialized shard blob (persisted cache, Stage 2) into a runnable
+ * native fn for THIS process. Returns NULL on failure. The blob's LIR is
+ * position-independent (Stage 1), so the regenerated code reaches host helpers
+ * via the cpu-relative table — correct at this process's ASLR base. */
+OverlaySljitFn overlay_sljit_deserialize(const void *blob, unsigned long blob_size);
+
+/* Free a buffer returned in OverlaySljitResult.serialized (sljit allocator). */
+void overlay_sljit_free_serialized(void *p);
 
 #ifdef __cplusplus
 }

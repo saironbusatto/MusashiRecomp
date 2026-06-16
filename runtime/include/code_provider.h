@@ -46,6 +46,11 @@ typedef struct {
     CodeProviderFn fn;        /* NULL = declined */
     uint32_t       code_lo;   /* phys start of compiled code range */
     uint32_t       code_len;  /* byte length of compiled code range */
+    /* sljit: position-independent serialized LIR for the persisted shard cache
+     * (the caller writes it to disk then frees it via the sljit free helper);
+     * NULL for providers/results that don't serialize. */
+    void          *serialized;
+    unsigned long  serialized_size;
 } CompiledFragment;
 
 typedef struct CodeProvider {

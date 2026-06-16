@@ -334,8 +334,13 @@ static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) 
  * — a later dispatch runs the shard iff the code is still byte-identical
  * (reload-on-return / self-mod safety, the same live-byte contract gcc
  * candidates obey). */
+/* crc_override: 0 => hash the crc from live RAM (an in-session JIT, where the
+ * overlay bytes ARE loaded). Non-zero => use it verbatim — a shard RELOADED from
+ * the persisted cache at init, where the overlay code may not be in RAM yet; the
+ * blob header carries the crc it was compiled from, and dispatch re-hashes live
+ * RAM against it so the shard only runs once the identical bytes are present. */
 static void register_sljit_candidate(uint32_t phys, OverlayFn fn,
-                                     uint32_t lo, uint32_t len) {
+                                     uint32_t lo, uint32_t len, uint32_t crc_override) {
     if (s_cand_n >= CAND_CAP || len == 0) return;
     int idx = s_cand_n++;
     Candidate *c = &s_cand[idx];
@@ -347,7 +352,7 @@ static void register_sljit_candidate(uint32_t phys, OverlayFn fn,
     c->range_len[0] = len;
     extern void overlay_watch_set_range(uint32_t phys, uint32_t len);
     overlay_watch_set_range(c->range_lo[0], c->range_len[0]);
-    c->crc_code = cand_crc(c);      /* live bytes == the bytes we JIT'd from */
+    c->crc_code = crc_override ? crc_override : cand_crc(c);  /* live bytes == JIT'd-from bytes */
     c->val_gen  = cand_gensum(c);
     c->state    = ENTRY_VALID;
     c->diff_passes = 0;
@@ -373,6 +378,11 @@ static void sljit_mark_tried(uint32_t phys) {
     if (s_sljit_tried_n < MAX_SLJIT_TRIED) s_sljit_tried[s_sljit_tried_n++] = phys;
 }
 
+/* Persist a freshly-JIT'd shard's serialized LIR to the on-disk cache (defined
+ * below, after the cache-path globals). */
+static void persist_sljit_shard(uint32_t entry_phys, uint32_t lo, uint32_t len,
+                                const void *blob, unsigned long blob_size);
+
 /* Attempt an in-process JIT of the leaf function at `phys` from live RAM, and
  * register the shard as a candidate on success. Gated by the caller to the
  * validation configuration only (backend==sljit + diff_mode); see the dispatch
@@ -396,8 +406,14 @@ static void try_sljit_region(uint32_t addr) {
      * jal/J targets carry the KSEG bits the guest uses — the interpreter computes
      * pc from the virtual address, and saved $ra values must match byte-exact. */
     cp->compile_fragment(addr, ram, 2u * 1024u * 1024u, 0u, &frag);
-    if (frag.fn)
-        register_sljit_candidate(phys, (OverlayFn)frag.fn, frag.code_lo, frag.code_len);
+    if (frag.fn) {
+        register_sljit_candidate(phys, (OverlayFn)frag.fn, frag.code_lo, frag.code_len, 0);
+        /* Persist the position-independent shard so a later (possibly toolchain-
+         * less) session reloads it instead of re-JITing through the interpreter. */
+        persist_sljit_shard(phys, frag.code_lo, frag.code_len,
+                            frag.serialized, frag.serialized_size);
+    }
+    if (frag.serialized) overlay_sljit_free_serialized(frag.serialized);
 }
 
 /* ---- Global state ------------------------------------------------------ */
@@ -504,6 +520,132 @@ static void scan_cache_dir(void) {
     snprintf(dir, sizeof(dir), "%s/%s/gcc/%s/cg%d",
              s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER);
     scan_one_cache_dir(dir);
+}
+
+/* ---- Persisted sljit shard cache (Stage 2, SLJIT_PERSIST_CACHE.md) -------- */
+/* JIT'd sljit shards are serialized (position-independent LIR — Stage 1) and
+ * written to <cache>/<game_id>/sljit/<arch-abi>/cg<N>/<entry8>_<crc8>.sljit; at
+ * init they are deserialized + regenerated for THIS process and registered as
+ * dll<0 candidates. The arch-abi + codegen-version + helper-order tags namespace
+ * and invalidate stale blobs. Priority is unchanged (gcc > sljit > interp): a gcc
+ * DLL covering the same live function still supersedes a reloaded shard via the
+ * obsolete path. Safety is unchanged too: a reloaded shard re-earns trust each
+ * session through the same per-dispatch crc re-hash + same-state diff gate. */
+#define SLJIT_BLOB_MAGIC       0x534A4C53u   /* 'SLJS' */
+#define SLJIT_BLOB_FORMAT_VER  2u   /* v2: serialized with debug info (options=0) */
+#define SLJIT_HELPER_ORDER_VER 1u            /* bump if the SLJIT_HLP_* order changes */
+
+typedef struct {
+    uint32_t magic, format_ver, helper_order_ver;
+    uint32_t entry_phys, code_lo, code_len, crc_code, blob_size;
+} SljitBlobHeader;
+
+static int      s_sljit_persist  = 0;        /* write JIT'd shards to disk        */
+static uint32_t s_sljit_reloaded = 0;        /* shards loaded from disk at init   */
+static uint32_t s_sljit_persist_calls = 0;   /* persist_sljit_shard entered        */
+static uint32_t s_sljit_persist_writes = 0;  /* blobs actually written             */
+static int      s_persist_dbg = 0;           /* last persist exit reason (1..6)    */
+static uint32_t s_reload_seen = 0;           /* .sljit files matched by the scan   */
+static uint32_t s_reload_hdrbad = 0;         /* files rejected on header validation */
+static uint32_t s_reload_deserfail = 0;      /* files that failed deserialize       */
+uint32_t overlay_loader_sljit_reload_seen(void)     { return s_reload_seen; }
+uint32_t overlay_loader_sljit_reload_hdrbad(void)   { return s_reload_hdrbad; }
+uint32_t overlay_loader_sljit_reload_deserfail(void){ return s_reload_deserfail; }
+uint32_t overlay_loader_sljit_reloaded(void) { return s_sljit_reloaded; }
+uint32_t overlay_loader_sljit_persist_calls(void) { return s_sljit_persist_calls; }
+uint32_t overlay_loader_sljit_persist_writes(void) { return s_sljit_persist_writes; }
+int      overlay_loader_sljit_persist_on(void) { return s_sljit_persist; }
+int      overlay_loader_sljit_persist_dbg(void) { return s_persist_dbg; }
+
+static void sljit_cache_dir(char *buf, size_t n) {
+    snprintf(buf, n, "%s/%s/sljit/%s/cg%d",
+             s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER);
+}
+
+#ifdef _WIN32
+static void sljit_mkdir_p(const char *path) {
+    char tmp[768];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/' || *p == '\\') { char sep = *p; *p = '\0'; CreateDirectoryA(tmp, NULL); *p = sep; }
+    }
+    CreateDirectoryA(tmp, NULL);
+}
+#endif
+
+static void persist_sljit_shard(uint32_t entry_phys, uint32_t lo, uint32_t len,
+                                const void *blob, unsigned long blob_size) {
+#ifdef _WIN32
+    s_sljit_persist_calls++;
+    if (!s_sljit_persist)            { s_persist_dbg = 1; return; }
+    if (!blob || blob_size == 0)     { s_persist_dbg = 2; return; }
+    if (len == 0)                    { s_persist_dbg = 3; return; }
+    const uint8_t *ram = memory_get_ram_ptr();
+    if (!ram)                        { s_persist_dbg = 4; return; }
+    /* crc over the live bytes the shard was JIT'd from — identical to cand_crc()
+     * for this single range, so the reloaded candidate's crc matches what
+     * dispatch re-hashes. */
+    uint32_t crc = crc32_update(0xFFFFFFFFu, ram + (lo & 0x1FFFFFFFu), len) ^ 0xFFFFFFFFu;
+    char dir[768]; sljit_cache_dir(dir, sizeof(dir));
+    sljit_mkdir_p(dir);
+    char path[860];
+    snprintf(path, sizeof(path), "%s/%08X_%08X.sljit", dir, entry_phys & 0x1FFFFFFFu, crc);
+    FILE *f = fopen(path, "wb");
+    if (!f)                          { s_persist_dbg = 5; return; }
+    SljitBlobHeader hh;
+    hh.magic = SLJIT_BLOB_MAGIC; hh.format_ver = SLJIT_BLOB_FORMAT_VER;
+    hh.helper_order_ver = SLJIT_HELPER_ORDER_VER;
+    hh.entry_phys = entry_phys & 0x1FFFFFFFu; hh.code_lo = lo & 0x1FFFFFFFu;
+    hh.code_len = len; hh.crc_code = crc; hh.blob_size = (uint32_t)blob_size;
+    fwrite(&hh, sizeof(hh), 1, f);
+    fwrite(blob, 1, blob_size, f);
+    fclose(f);
+    s_sljit_persist_writes++;
+    s_persist_dbg = 6;
+    loader_log("sljit shard persisted %08X_%08X [%lu bytes]",
+               entry_phys & 0x1FFFFFFFu, crc, blob_size);
+#else
+    (void)entry_phys; (void)lo; (void)len; (void)blob; (void)blob_size;
+#endif
+}
+
+/* Reload persisted shards at init: deserialize + regenerate + register. The crc
+ * comes from the blob header (overlay RAM may not be loaded yet; dispatch
+ * re-hashes live RAM against it before ever running the shard). */
+static void scan_sljit_cache_dir(void) {
+#ifdef _WIN32
+    char dir[768]; sljit_cache_dir(dir, sizeof(dir));
+    char pattern[860];
+    snprintf(pattern, sizeof(pattern), "%s/*.sljit", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE fh = FindFirstFileA(pattern, &fd);
+    if (fh == INVALID_HANDLE_VALUE) return;
+    do {
+        s_reload_seen++;
+        char full[900];
+        snprintf(full, sizeof(full), "%s/%s", dir, fd.cFileName);
+        FILE *f = fopen(full, "rb");
+        if (!f) continue;
+        SljitBlobHeader hd;
+        if (fread(&hd, sizeof(hd), 1, f) != 1) { fclose(f); s_reload_hdrbad++; continue; }
+        if (hd.magic != SLJIT_BLOB_MAGIC || hd.format_ver != SLJIT_BLOB_FORMAT_VER ||
+            hd.helper_order_ver != SLJIT_HELPER_ORDER_VER ||
+            hd.blob_size == 0 || hd.blob_size > (4u * 1024u * 1024u)) { fclose(f); s_reload_hdrbad++; continue; }
+        void *blob = malloc(hd.blob_size);
+        if (!blob) { fclose(f); continue; }
+        size_t got = fread(blob, 1, hd.blob_size, f);
+        fclose(f);
+        if (got != hd.blob_size) { free(blob); s_reload_hdrbad++; continue; }
+        OverlaySljitFn fn = overlay_sljit_deserialize(blob, hd.blob_size);
+        free(blob);
+        if (!fn) { s_reload_deserfail++; continue; }
+        register_sljit_candidate(hd.entry_phys, (OverlayFn)fn,
+                                 hd.code_lo, hd.code_len, hd.crc_code);
+        s_sljit_reloaded++;
+    } while (FindNextFileA(fh, &fd));
+    FindClose(fh);
+    if (s_sljit_reloaded) loader_log("sljit cache: reloaded %u shard(s)", s_sljit_reloaded);
+#endif
 }
 
 /* True if the cache holds a DLL for this region compiled from an image with
@@ -705,6 +847,12 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
     strncpy(s_game_id,   game_id,   sizeof(s_game_id)   - 1);
     init_callbacks();
     scan_cache_dir();
+    /* Persisted sljit shard cache (Stage 2): the cache is enabled (this init only
+     * runs when [runtime] overlay_cache is on), so persist JIT'd shards and reload
+     * any from a prior session now. Reloaded shards register as dll<0 candidates
+     * and re-earn trust via the normal per-dispatch crc + diff gate. */
+    s_sljit_persist = 1;
+    scan_sljit_cache_dir();
     /* Live-mode policy is applied later via overlay_loader_apply_live_policy(),
      * AFTER code_provider_init resolves the backend (the default depends on it). */
     s_active = 1;
@@ -1054,9 +1202,13 @@ void overlay_loader_sljit_probe(uint32_t addr, OverlaySljitResult *out) {
     /* Virtual entry so return_pc / jal targets carry the KSEG bits (see
      * try_sljit_region); byte offset is still (entry & 0x1FFFFFFF) = phys. */
     overlay_sljit_try_compile(addr, ram, 2u * 1024u * 1024u, 0u, out);
-    if (out->fn)
+    if (out->fn) {
         register_sljit_candidate(addr & 0x1FFFFFFFu, (OverlayFn)out->fn,
-                                 out->code_lo, out->code_len);
+                                 out->code_lo, out->code_len, 0);
+        persist_sljit_shard(addr & 0x1FFFFFFFu, out->code_lo, out->code_len,
+                            out->serialized, out->serialized_size);
+    }
+    if (out->serialized) { overlay_sljit_free_serialized(out->serialized); out->serialized = NULL; }
 }
 
 /* ---- Native↔interp execution fingerprint differential (§5-E) ----------- */

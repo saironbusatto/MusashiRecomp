@@ -1,5 +1,18 @@
 # Persisted sljit shard cache — design + work to be done
 
+> **STATUS (implemented):** Stage 1 (position-independent shards via the
+> cpu-relative `CPUState.sljit_helpers` table) and Stage 2 (serialize on JIT →
+> `<cache>/<game>/sljit/<arch-abi>/cg<N>/<entry8>_<crc8>.sljit`, reload + regenerate
+> at init, re-validate through the existing dispatch crc + diff gate) are both
+> done and validated: a clean two-launch test reloaded 12 shards from disk and ran
+> them at a fresh ASLR base with no stale-pointer crash, gameplay rendering
+> correctly. KEY GOTCHA found in testing: `sljit_serialize_compiler` must run
+> BEFORE `sljit_generate_code` (generate finalizes the compiler → `compiler->error
+> = SLJIT_ERR_COMPILED` → serialize then returns NULL), and serialize with
+> `options = 0` (NOT `IGNORE_DEBUG`) so an argument-checks build can deserialize.
+> Persist timing is write-on-generate (negligible cost, crash-safe). The notes
+> below are the original design.
+
 Branch: `feat/sljit-persist-cache` (off `master` @ 0c1f005). Deferred from the
 2026-06-15 sljit-default-on session because it has an **ASLR prerequisite** that
 makes it a focused feature, not a quick add. In-session sljit re-JIT already

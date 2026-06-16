@@ -45,6 +45,8 @@ static void sljit_compile_fragment(uint32_t entry, const uint8_t *bytes,
     out->fn       = (CodeProviderFn)r.fn;
     out->code_lo  = r.code_lo;
     out->code_len = r.code_len;
+    out->serialized      = r.serialized;       /* for the persisted shard cache */
+    out->serialized_size = r.serialized_size;
 }
 
 static const CodeProvider s_sljit = {

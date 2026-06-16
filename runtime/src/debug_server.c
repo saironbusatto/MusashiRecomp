@@ -8039,6 +8039,14 @@ static void handle_sljit_status(int id, const char *json)
     /* Declarations come from overlay_sljit.h (included above). */
     extern unsigned int overlay_loader_sljit_registered(void);
     extern unsigned int overlay_loader_sljit_obsoleted(void);
+    extern unsigned int overlay_loader_sljit_reloaded(void);
+    extern unsigned int overlay_loader_sljit_reload_seen(void);
+    extern unsigned int overlay_loader_sljit_reload_hdrbad(void);
+    extern unsigned int overlay_loader_sljit_reload_deserfail(void);
+    extern unsigned int overlay_loader_sljit_persist_calls(void);
+    extern unsigned int overlay_loader_sljit_persist_writes(void);
+    extern int overlay_loader_sljit_persist_on(void);
+    extern int overlay_loader_sljit_persist_dbg(void);
     extern int overlay_loader_get_sljit_live(void);
     (void)json;
     int selftest = overlay_sljit_selftest();
@@ -8047,11 +8055,22 @@ static void handle_sljit_status(int id, const char *json)
     overlay_sljit_get_status(&available, &st_ok, &compiles, &declines, &bytes);
     send_fmt("{\"id\":%d,\"ok\":true,\"backend\":\"%s\",\"available\":%d,"
              "\"selftest_ok\":%d,\"live\":%d,\"compiles\":%llu,\"declines\":%llu,"
-             "\"bytes_emitted\":%llu,\"shards_registered\":%u,\"obsoleted\":%u}\n",
+             "\"bytes_emitted\":%llu,\"shards_registered\":%u,\"obsoleted\":%u,"
+             "\"reloaded\":%u,\"reload_seen\":%u,\"reload_hdrbad\":%u,\"reload_deserfail\":%u,"
+             "\"persist_on\":%d,\"persist_calls\":%u,\"persist_writes\":%u,"
+             "\"persist_dbg\":%d}\n",
              id, overlay_backend_name(overlay_backend_active()), available,
              selftest, overlay_loader_get_sljit_live(), compiles, declines, bytes,
              overlay_loader_sljit_registered(),
-             overlay_loader_sljit_obsoleted());
+             overlay_loader_sljit_obsoleted(),
+             overlay_loader_sljit_reloaded(),
+             overlay_loader_sljit_reload_seen(),
+             overlay_loader_sljit_reload_hdrbad(),
+             overlay_loader_sljit_reload_deserfail(),
+             overlay_loader_sljit_persist_on(),
+             overlay_loader_sljit_persist_calls(),
+             overlay_loader_sljit_persist_writes(),
+             overlay_loader_sljit_persist_dbg());
 }
 
 /* sljit_try <hex_addr>: force a one-shot JIT of the leaf function at a phys

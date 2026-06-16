@@ -716,6 +716,7 @@ void overlay_sljit_try_compile(uint32_t entry,
                                uint32_t image_base_vram,
                                OverlaySljitResult *out) {
     out->fn = NULL; out->code_lo = 0; out->code_len = 0; out->insns = 0;
+    out->serialized = NULL; out->serialized_size = 0;
     if (!bytes) { s_declines++; return; }
 
     uint32_t entry_phys = entry & 0x1FFFFFFFu;
@@ -960,10 +961,32 @@ void overlay_sljit_try_compile(uint32_t entry,
         sljit_set_label(jmps[k].j, labels[jmps[k].tw]);
     }
 
+    /* Serialize the (position-independent) LIR for the persisted cache BEFORE
+     * generate_code: generate_code finalizes the compiler (sets compiler->error =
+     * SLJIT_ERR_COMPILED), and sljit_serialize_compiler bails on any error, so it
+     * MUST run first. It doesn't modify the LIR, so code generation continues
+     * normally afterward. A serialize failure just means this shard isn't
+     * persisted; in-session use is unaffected. */
+    {
+        /* options = 0 (NOT SLJIT_SERIALIZE_IGNORE_DEBUG): when this build has
+         * sljit argument-checks/debug enabled, a buffer serialized WITHOUT debug
+         * info cannot be deserialized. With checks off, no debug info exists and
+         * 0 behaves identically — so 0 is correct for any build config. */
+        sljit_uw ssz = 0;
+        sljit_uw *sbuf = sljit_serialize_compiler(C, 0, &ssz);
+        out->serialized      = (void *)sbuf;
+        out->serialized_size = sbuf ? (unsigned long)ssz : 0;
+    }
     void *code = sljit_generate_code(C, 0, NULL);
     sljit_uw csz = sljit_get_generated_code_size(C);
     sljit_free_compiler(C);
-    if (!code) { s_declines++; sljit_log("compile: generate_code failed @0x%08X", entry); return; }
+    if (!code) {
+        if (out->serialized) {
+            overlay_sljit_free_serialized(out->serialized);
+            out->serialized = NULL; out->serialized_size = 0;
+        }
+        s_declines++; sljit_log("compile: generate_code failed @0x%08X", entry); return;
+    }
 
     out->fn       = (OverlaySljitFn)code;
     out->code_lo  = entry_phys;
@@ -974,6 +997,27 @@ void overlay_sljit_try_compile(uint32_t entry,
     sljit_log("compile ok @0x%08X: %u insns (%d br, %d call) -> %lu bytes host",
               entry, frag_words, nbr, ncalls, (unsigned long)csz);
 }
+
+/* Reload a serialized shard (persisted cache, Stage 2): deserialize the LIR and
+ * regenerate host code for THIS process. The LIR is position-independent (Stage
+ * 1 routes helper calls through the cpu-relative table), so the regenerated code
+ * is correct at this process's base. Returns NULL on any failure (caller falls
+ * back to JIT/interp). */
+OverlaySljitFn overlay_sljit_deserialize(const void *blob, unsigned long blob_size) {
+    if (!blob || blob_size == 0) return NULL;
+    struct sljit_compiler *C =
+        sljit_deserialize_compiler((sljit_uw *)blob, (sljit_uw)blob_size, 0, NULL);
+    if (!C) { sljit_log("deserialize: failed"); return NULL; }
+    void *code = sljit_generate_code(C, 0, NULL);
+    sljit_uw csz = sljit_get_generated_code_size(C);
+    sljit_free_compiler(C);
+    if (!code) { sljit_log("deserialize: generate_code failed"); return NULL; }
+    s_bytes += (uint64_t)csz;
+    return (OverlaySljitFn)code;
+}
+
+/* Free a serialize buffer (sljit default allocator == malloc). */
+void overlay_sljit_free_serialized(void *p) { if (p) free(p); }
 
 void overlay_sljit_get_status(int *available, int *selftest_ok,
                               uint64_t *compiles, uint64_t *declines,
