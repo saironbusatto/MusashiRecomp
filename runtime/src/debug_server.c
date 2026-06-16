@@ -7767,17 +7767,20 @@ static void handle_sljit_status(int id, const char *json)
 {
     /* Declarations come from overlay_sljit.h (included above). */
     extern unsigned int overlay_loader_sljit_registered(void);
+    extern unsigned int overlay_loader_sljit_obsoleted(void);
+    extern int overlay_loader_get_sljit_live(void);
     (void)json;
     int selftest = overlay_sljit_selftest();
     int available = 0, st_ok = 0;
     unsigned long long compiles = 0, declines = 0, bytes = 0;
     overlay_sljit_get_status(&available, &st_ok, &compiles, &declines, &bytes);
     send_fmt("{\"id\":%d,\"ok\":true,\"backend\":\"%s\",\"available\":%d,"
-             "\"selftest_ok\":%d,\"compiles\":%llu,\"declines\":%llu,"
-             "\"bytes_emitted\":%llu,\"shards_registered\":%u}\n",
+             "\"selftest_ok\":%d,\"live\":%d,\"compiles\":%llu,\"declines\":%llu,"
+             "\"bytes_emitted\":%llu,\"shards_registered\":%u,\"obsoleted\":%u}\n",
              id, overlay_backend_name(overlay_backend_active()), available,
-             selftest, compiles, declines, bytes,
-             overlay_loader_sljit_registered());
+             selftest, overlay_loader_get_sljit_live(), compiles, declines, bytes,
+             overlay_loader_sljit_registered(),
+             overlay_loader_sljit_obsoleted());
 }
 
 /* sljit_try <hex_addr>: force a one-shot JIT of the leaf function at a phys

@@ -167,6 +167,7 @@ static uint32_t s_last_crc       = 0;
 static uint32_t s_no_manifest    = 0;   /* exports skipped (no manifest range)*/
 static uint32_t s_selfmod        = 0;   /* entries blacklisted (self-mod)     */
 static uint32_t s_sljit_registered = 0; /* sljit Tier-2 shards registered     */
+static uint32_t s_sljit_obsoleted  = 0; /* sljit shards superseded by a gcc DLL*/
 static uint32_t s_last_write_pc   = 0;
 static uint32_t s_last_write_addr = 0;
 static uint32_t s_last_write_size = 0;
@@ -256,6 +257,8 @@ static ManFn *man_find(ManFn *arr, int n, uint32_t entry) {
 
 /* ---- Candidate registration -------------------------------------------- */
 
+static void loader_log(const char *fmt, ...);   /* defined below */
+
 static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) {
     if (s_cand_n >= CAND_CAP) return;
     int idx = s_cand_n++;
@@ -291,10 +294,31 @@ static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) 
     c->next    = idx_head(phys);
     idx_set_head(phys, idx);
     if (c->state == ENTRY_VALID) s_valid_count++;
+
+    /* Obsolescence (load priority: static > gcc shard > sljit shard > interp). A
+     * gcc DLL is the optimized, dev-validated artifact and OUTRANKS an sljit shard
+     * a user machine JIT'd for the SAME content. Once this gcc candidate is in the
+     * chain it already wins dispatch (it's at the head, ahead of the older sljit
+     * shard, and content-keyed dispatch picks the first match), but we also
+     * explicitly retire the superseded sljit shard so it can never run — even if
+     * this gcc candidate is later self-mod-blacklisted. Precise by content: only a
+     * shard JIT'd from the IDENTICAL bytes (same crc_code) is superseded; an sljit
+     * shard for a DIFFERENT overlay variant at this address is distinct coverage
+     * and is kept. */
+    for (int j = c->next; j >= 0; j = s_cand[j].next) {
+        Candidate *o = &s_cand[j];
+        if (o->dll == -1 && o->state != ENTRY_BLACKLIST &&
+            o->crc_code == c->crc_code) {
+            if (o->state == ENTRY_VALID && s_valid_count > 0) s_valid_count--;
+            o->state = ENTRY_BLACKLIST;
+            s_sljit_obsoleted++;
+            loader_log("sljit shard 0x%08X obsoleted by gcc DLL (crc 0x%08X)",
+                       o->addr, o->crc_code);
+        }
+    }
 }
 
 /* ---- sljit Tier-2 shard registration (SLJIT.md §7 step 5) -------------- */
-static void loader_log(const char *fmt, ...);   /* defined below */
 /* Register an in-process JIT shard as a native candidate, parallel to
  * cand_register but without a .ranges manifest: the shard was JIT'd from the
  * live RAM bytes over [lo, lo+len), so crc_code is hashed from those same bytes
@@ -973,6 +997,9 @@ int overlay_loader_registered_count(void) { return s_valid_count; }
 
 /* sljit Tier-2 shards registered as candidates this session (diagnostics). */
 uint32_t overlay_loader_sljit_registered(void) { return s_sljit_registered; }
+
+/* sljit shards superseded by a higher-priority gcc DLL (same content). */
+uint32_t overlay_loader_sljit_obsoleted(void) { return s_sljit_obsoleted; }
 
 /* Force a one-shot sljit JIT attempt of the leaf function at `addr` from live
  * RAM and register it on success (bypasses the diff-mode gate — a probe). For
