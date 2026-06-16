@@ -228,3 +228,36 @@ F:/Projects/psxrecomp/psxrecomp/recompiler/build/psxrecomp-game.exe --config gam
 ```
 `build-stable` is RelWithDebInfo + debug tools (TCP port 4470) + launcher ON.
 Always `taskkill /F /IM psx-runtime.exe` before relaunching.
+
+## Native-wide 16:9 (shipped) and 21:9 (stubbed, hidden)
+
+The shipped enhancement is **native-wide 16:9**, exposed as the launcher's
+experimental Widescreen On/Off toggle (software renderer only; hidden on
+OpenGL). It is off by default (`game.toml [video] aspect_ratio = "4:3"`), so the
+default build is byte-identical to faithful. On = `16:9`. The dominant fix is
+`[widescreen.cull] auto_screen_x` — the recompiler auto-detects the GTE
+render-funnel screen-extent reject (`sltiu …,0x140` width paired with
+`sltiu …,0xE0` height) and widens every width compare through
+`psx_ws_x_margin()`, sign-extended so both margins reveal. Full-screen 2D
+overlays (pause dim, load fade) are extended across the wide compositor surface.
+
+**21:9 is intentionally stubbed and hidden.** Everything numeric is
+aspect-derived (`ws_nw_offset` etc.), so `aspect_ratio = "21:9"` already widens
+the cull, compositor, and present correctly — the **3D world and foreground fill
+21:9 for free**. It is *not* offered in the UI because two layers don't reach
+21:9:
+- **Background** — the parallax + far-backdrop pipeline only *generates* ~16:9
+  of coverage (per-layer spawn windows in the `FUN_80027600` builders +
+  `FUN_801216BC`-family overlay handlers). The per-prim cull already widens past
+  this; the tiles simply aren't produced, so 21:9 voids the far background. This
+  is the 8C generation work, and may hit the game's *authored* coverage limit
+  (beyond which only tile/stretch/void remain) — which is what caps clean
+  widescreen at 16:9.
+- **Foreground edge tips** — the cull widens exactly to the display surface
+  edge; fixable by over-rendering (decouple the render aspect from the display
+  aspect) — low effort, but pointless until the background is solved.
+
+To enable 21:9 later: widen the backdrop generation, then promote the launcher's
+2-state toggle to a 3-way Off / 16:9 / 21:9 (the `cycle_aspect` callback already
+cycles `aspect_index` 0/1/2 and is the scaffold). Full feasibility analysis in
+the session memory `native_wide_fov_autocull.md`.

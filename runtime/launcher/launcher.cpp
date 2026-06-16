@@ -728,8 +728,15 @@ Result run(SDL_Window* window, void* gl_context,
             handle.DirtyVariable("winsize_label");  /* height follows aspect */
         });
     // EXPERIMENTAL widescreen On/Off (software renderer only). On => 16:9 native-
-    // wide (aspect_index 1), Off => 4:3. The toggle is hidden when ws_eligible is
-    // false (non-software renderer), so this is a no-op there as a safety net.
+    // wide (aspect_index 1), Off => 4:3 (aspect_index 0). Hidden when ws_eligible
+    // is false (non-software renderer), so this is a no-op there as a safety net.
+    //
+    // 21:9 (kAspects[2]) is STUBBED but intentionally hidden: the engine handles
+    // it (offset / cull / compositor are all aspect-derived), but the parallax +
+    // far-backdrop pipeline only generates ~16:9 of coverage, so 21:9 voids the
+    // far background. When that pipeline is widened, promote this 2-state toggle
+    // to a 3-way Off / 16:9 / 21:9 — the existing cycle_aspect callback already
+    // cycles aspect_index 0/1/2 and is the scaffold for it.
     c.BindEventCallback("toggle_widescreen",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             if (m.renderer != 0) return;                       // SW-only
