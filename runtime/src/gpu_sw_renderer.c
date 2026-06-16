@@ -1131,7 +1131,20 @@ void sw_draw_flat_rect(int x, int y, int w, int h, uint16_t color) {
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
-        raster_flat_rect(&wt, (x+dx)*s, y*s, w*s, h*s, color);
+        /* Full-screen 2D overlay (pause gray-filter / load fade): a flat rect
+         * spanning the whole 4:3 framebuffer must cover the whole wide surface
+         * too, else the revealed 16:9 margins are left undimmed/unfaded. Detect
+         * a rect whose native screen-X span (x - base) covers [0, native_w) and
+         * extend its wide pass across the full surface; every other rect mirrors
+         * 1:1 as before. native_w = the 4:3 framebuffer width (g_wide_w less the
+         * per-side reveal on both sides); g_wide_cur_base is its VRAM left edge.
+         * Only runs in native-wide (g_wide_cur != NULL), so 4:3 is unaffected. */
+        int native_w = g_wide_w - 2 * g_wide_off;
+        int lx = x - g_wide_cur_base, rx = x + w - g_wide_cur_base;
+        if (native_w > 0 && lx <= 0 && rx >= native_w)
+            raster_flat_rect(&wt, 0, y*s, g_wide_w*s, h*s, color);
+        else
+            raster_flat_rect(&wt, (x+dx)*s, y*s, w*s, h*s, color);
     }
 }
 
