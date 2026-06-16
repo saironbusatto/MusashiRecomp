@@ -794,7 +794,8 @@ static void ensure_cpu(void) {
 
 /* ---- GPU primitives ------------------------------------------------------ */
 
-static uint64_t s_scene_prims = 0;   /* frame_perf: scene primitives submitted (pre double-draw) */
+static uint64_t s_scene_prims = 0;     /* frame_perf: scene primitives submitted (pre double-draw) */
+static uint64_t s_scene_prims_tex = 0; /* frame_perf: of which textured (vs flat geometry)         */
 static void mark_prim_dirty(const int *xs, const int *ys, int n) {
     s_scene_prims++;
     int x0 = xs[0], x1 = xs[0], y0 = ys[0], y1 = ys[0];
@@ -934,6 +935,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
                                   int semi, const int *lim) {
     int lim_buf[4];
     if (!lim) { tri_uv_limits(xs, ys, us, vs, lim_buf); lim = lim_buf; }
+    s_scene_prims_tex++;
     int base_x = (texpage & 0xF) * 64;
     int base_y = ((texpage >> 4) & 1) * 256;
     int depth  = (texpage >> 7) & 3; if (depth > 2) depth = 2;
@@ -1912,6 +1914,13 @@ static void gl_perf_present_exit(int wide) {
  * out[0]=count, [1]=total_avg, [2]=total_max, [3]=emu_cpu_avg (total-present_wall),
  * [4]=present_wall_avg, [5]=scene_gpu_avg, [6]=scene_gpu_max, [7]=present_gpu_avg,
  * [8]=present_gpu_max. Returns the sample count. */
+/* Cumulative textured fraction of scene prims (decides flat vs textured batching
+ * priority). out_tex_frac = textured/total since boot; returns total prim count. */
+uint64_t gl_renderer_perf_prim_split(double *out_tex_frac) {
+    if (out_tex_frac) *out_tex_frac = s_scene_prims ? (double)s_scene_prims_tex / (double)s_scene_prims : 0.0;
+    return s_scene_prims;
+}
+
 int gl_renderer_perf_aggregate(int wide_filter, double out[10]) {
     for (int i = 0; i < 10; i++) out[i] = 0.0;
     if (!s_pf_on) return 0;
