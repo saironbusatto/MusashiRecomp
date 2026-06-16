@@ -1169,7 +1169,10 @@ static void glb_set_scale(int s) {
     s_req_scale = s;
     sw_renderer_set_scale(1);
 }
-static int  glb_scale(void) { return 1; }
+static int  glb_scale(void) { return s_scale; }   /* real internal SSAA scale (was a stub 1; the
+                                                      native-wide CPU present path + gr_scale() callers
+                                                      need the true scale — the FBO-direct present is
+                                                      unaffected since it never reads gr_scale()) */
 static void glb_set_texture_filter(int b) { s_tex_filter = b ? 1 : 0; sw_set_texture_filter(b); }
 static int  glb_texture_filter(void) { return s_tex_filter; }
 
@@ -1753,11 +1756,16 @@ static int glb_render_wide_display(uint32_t *out, int pitch, int base_x,
     glReadPixels(0, ry0, W, out_h, GL_BGRA, GL_UNSIGNED_BYTE, tmp);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
 
-    /* tmp row 0 is the bottom-most scanline (ry0); flip into `out` so out row 0
-     * is the top (ry0 + out_h - 1). Force alpha = 0xFF (match SW). */
+    /* Orientation: the wide FBO stores PS1 y inverted (geo shader maps vram_y=0
+     * to NDC y=-1 = FBO BOTTOM), and glReadPixels reads bottom-up — the two
+     * inversions CANCEL, so glReadPixels row 0 already = PS1 top scanline. Copy
+     * straight (NO flip) so `out` is top-down, matching sw_render_wide_display
+     * (which the shared CPU present path + its PRESENT_VS V-flip expect). Force
+     * alpha = 0xFF (match SW). [An earlier reversal here made the frame
+     * upside-down.] */
     int count = 0;
     for (int row = 0; row < out_h; row++) {
-        const uint32_t *src = tmp + (size_t)(out_h - 1 - row) * W;
+        const uint32_t *src = tmp + (size_t)row * W;
         uint32_t *dst = (uint32_t *)((uint8_t *)out + (size_t)row * pitch);
         for (int col = 0; col < W; col++) { dst[col] = src[col] | 0xFF000000u; count++; }
     }

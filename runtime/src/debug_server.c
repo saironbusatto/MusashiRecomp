@@ -5834,6 +5834,67 @@ static void handle_screenshot_file(int id, const char *json)
              id, path, w, h);
 }
 
+/* wide_shot: capture the NATIVE-WIDE present surface (post-compositor, what the
+ * window actually shows in 16:9) to a PNG — unlike screenshot_file, which dumps
+ * the canonical 320 VRAM region (pre-compositor). Pulls the exact buffer the
+ * present path uses (gr_render_wide_display into a scratch buffer), so the dump
+ * reflects the composited wide frame 1:1, orientation included. Errors if the
+ * active backend has no wide compositor or native-wide isn't engaged. */
+static void handle_wide_shot(int id, const char *json)
+{
+    extern int gr_wide_supported(void);
+    extern int gr_scale(void);
+    extern int gr_render_wide_display(uint32_t *out, int pitch, int base_x,
+                                      int disp_y, int disp_h);
+    extern void gl_renderer_sync_cpu(void);
+    gl_renderer_sync_cpu();   /* no-op on SW / when no GL frame pending */
+
+    if (!gr_wide_supported()) { send_err(id, "active backend has no wide compositor"); return; }
+    int extra = ws_nw_extra();
+    if (extra <= 0) { send_err(id, "native-wide not engaged (extra=0; need a wide game frame)"); return; }
+
+    GpuDisplayInfo di;
+    gpu_get_display_info(&di);
+    if (di.disabled || di.width == 0 || di.height == 0) { send_err(id, "display disabled"); return; }
+
+    int scale = gr_scale(); if (scale < 1) scale = 1;
+    int present_w = (int)di.width + extra;
+    int W = present_w * scale, H = (int)di.height * scale;
+
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, "psx_wide.png", sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+
+    uint32_t *buf = (uint32_t *)malloc((size_t)W * H * sizeof(uint32_t));
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    int n = gr_render_wide_display(buf, W * (int)sizeof(uint32_t),
+                                   (int)di.display_x, (int)di.display_y, (int)di.height);
+    if (n <= 0) { free(buf); send_err(id, "no wide surface for displayed buffer"); return; }
+
+    /* ARGB8888 (0xAARRGGBB) -> RGB, written in the buffer's row order (so the
+     * PNG shows exactly the present orientation — the point of this probe). */
+    uint8_t *rgb = (uint8_t *)malloc((size_t)W * H * 3);
+    if (!rgb) { free(buf); send_err(id, "alloc failed"); return; }
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            uint32_t px = buf[(size_t)y * W + x];
+            uint8_t *p = rgb + ((size_t)y * W + x) * 3;
+            p[0] = (uint8_t)((px >> 16) & 0xFF);
+            p[1] = (uint8_t)((px >> 8) & 0xFF);
+            p[2] = (uint8_t)(px & 0xFF);
+        }
+    }
+    free(buf);
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(rgb); send_err(id, "cannot open file"); return; }
+    int ok = png_write_rgb(f, rgb, (uint32_t)W, (uint32_t)H);
+    free(rgb); fclose(f);
+    if (!ok) { send_err(id, "png encode failed"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%d,\"height\":%d}",
+             id, path, W, H);
+}
+
 static void handle_vram_peek(int id, const char *json)
 {
     int x = json_get_int(json, "x", 0);
@@ -8740,6 +8801,7 @@ static const CmdEntry s_commands[] = {
     { "get_snapshots",     handle_get_snapshots },
     { "screenshot",        handle_screenshot_file },
     { "screenshot_file",   handle_screenshot_file },   /* alias */
+    { "wide_shot",         handle_wide_shot },
     { "gpu_opcodes",       handle_gpu_opcodes },
     { "gpu_ring_stats",    handle_gpu_ring_stats },
     { "gpu_frame_dump",    handle_gpu_frame_dump },
