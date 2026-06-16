@@ -148,6 +148,9 @@ button:hover { background-color: #232d3c; }
 .toggle { width: 132dp; text-align: center; }
 .toggle.wide { width: 164dp; }
 .value { color: #ffffff; font-weight: bold; }
+.exp-tag { display: inline-block; font-size: 10dp; color: #d29922; background-color: #2a2410;
+	border: 1dp #5c4a12; border-radius: 4dp; padding: 0dp 5dp; margin-left: 8dp; font-weight: bold; }
+.ws-hint { color: #7d8590; font-size: 12dp; margin-left: 12dp; }
 .path { flex: 1 1 auto; min-width: 0dp; margin-left: 12dp; color: #7d8590;
 	white-space: nowrap; overflow: hidden; }
 .path.empty { color: #f85149; }
@@ -301,8 +304,6 @@ button:hover { background-color: #232d3c; }
 	<div data-if="view == 'settings'">
 		<div class="panel">
 			<div class="eyebrow">VIDEO</div>
-			<div class="set-row"><span class="set-lbl">Aspect ratio</span><span class="set-ctl">
-				<button class="toggle" data-event-click="cycle_aspect"><span class="value">{{aspect_label}}</span></button></span></div>
 			<div class="set-row"><span class="set-lbl">Window size</span><span class="set-ctl">
 				<button class="toggle wide" data-event-click="cycle_winsize"><span class="value">{{winsize_label}}</span></button></span></div>
 			<div class="set-row"><span class="set-lbl">Renderer</span><span class="set-ctl">
@@ -317,6 +318,9 @@ button:hover { background-color: #232d3c; }
 				<button class="toggle" data-event-click="cycle_crt"><span class="value">{{crt_label}}</span></button></span></div>
 				<div class="set-row"><span class="set-lbl">Skip FMVs</span><span class="set-ctl">
 					<button class="toggle" data-event-click="toggle_skip_fmv"><span class="value" data-if="auto_skip_fmv">On</span><span class="value" data-if="auto_skip_fmv == false">Off</span></button></span></div>
+			<div class="set-row" data-if="ws_eligible"><span class="set-lbl">Widescreen <span class="exp-tag">EXPERIMENTAL</span></span><span class="set-ctl">
+				<button class="toggle" data-event-click="toggle_widescreen"><span class="value" data-if="widescreen">On</span><span class="value" data-if="widescreen == false">Off</span></button>
+				<span class="ws-hint" data-if="widescreen">16:9 native field-of-view</span></span></div>
 		</div>
 		<div class="panel">
 			<div class="eyebrow">AUDIO</div>
