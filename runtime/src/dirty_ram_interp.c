@@ -501,8 +501,19 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                     int      count  = (int)((cpu->read_word(s0a & ~3u) >> ((s0a & 3u) * 8u)) & 0xFFu);
                     /* base = s4 (gpr[20]) = backdrop data ptr (extent@+0, table@+4);
                      * dl = s0 (gpr[16]) = the ordering-table object. */
+                    uint32_t a1 = cpu->gpr[20];
                     psx_ws_backdrop_ring_note(pc, bk, wcols, orig, finalv, extent, camx,
-                                              count, cpu->gpr[20], cpu->gpr[16]);
+                                              count, a1, cpu->gpr[16]);
+                    /* Publish the backdrop structure's address range so the GL
+                     * 2D-stretch gate can match tile prims by gp0_cmd_source_addr.
+                     * Tiles live at a1 + table[col]; bound by the LAST table entry
+                     * (table is ascending) + packet slack. */
+                    if (extent > 0 && extent <= 256) {
+                        extern uint32_t g_ws_backdrop_lo, g_ws_backdrop_hi;
+                        uint32_t tbl_last = cpu->read_word(a1 + 4u + (uint32_t)(extent - 1) * 4u);
+                        g_ws_backdrop_lo = a1;
+                        g_ws_backdrop_hi = a1 + tbl_last + 0x400u;
+                    }
                 }
                 return 0;
             }
