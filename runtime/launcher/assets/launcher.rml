@@ -232,7 +232,7 @@ button:hover { background-color: #232d3c; }
 				<div class="card-head">
 					<span class="card-name">PLAYER 1</span>
 					<div class="seg">
-						<span class="seg-opt hybrid" data-class-on="p1_mode == 0" data-event-click="set_mode_p1(0)">Hybrid<span class="seg-tip">Mirrors Tomba Special Edition: nudge the analog stick for smooth analog movement, or use the D-pad for classic digital control. It switches automatically based on what you touch.</span></span>
+						<span class="seg-opt hybrid" data-class-on="p1_mode == 0" data-event-click="set_mode_p1(0)">Hybrid<span class="seg-tip">Nudge the analog stick for smooth analog movement, or use the D-pad for classic digital control. It switches automatically based on what you touch.</span></span>
 						<span class="seg-opt" data-class-on="p1_mode == 1" data-event-click="set_mode_p1(1)">Analog</span>
 						<span class="seg-opt" data-class-on="p1_mode == 2" data-event-click="set_mode_p1(2)">D-Pad</span>
 					</div>
@@ -256,7 +256,7 @@ button:hover { background-color: #232d3c; }
 				<div class="card-head">
 					<span class="card-name">PLAYER 2</span>
 					<div class="seg">
-						<span class="seg-opt hybrid" data-class-on="p2_mode == 0" data-event-click="set_mode_p2(0)">Hybrid<span class="seg-tip">Mirrors Tomba Special Edition: nudge the analog stick for smooth analog movement, or use the D-pad for classic digital control. It switches automatically based on what you touch.</span></span>
+						<span class="seg-opt hybrid" data-class-on="p2_mode == 0" data-event-click="set_mode_p2(0)">Hybrid<span class="seg-tip">Nudge the analog stick for smooth analog movement, or use the D-pad for classic digital control. It switches automatically based on what you touch.</span></span>
 						<span class="seg-opt" data-class-on="p2_mode == 1" data-event-click="set_mode_p2(1)">Analog</span>
 						<span class="seg-opt" data-class-on="p2_mode == 2" data-event-click="set_mode_p2(2)">D-Pad</span>
 					</div>

@@ -164,6 +164,40 @@ static inline RTarget rt_wide(void) {
  * surface: local_x = vram_x - base_x + OFFSET. */
 static inline int wide_dx(void) { return g_wide_off - g_wide_cur_base; }
 
+/* Native-wide 2D-backdrop X-stretch (SW renderer), mirroring the GL
+ * wide_set_bd_scale exactly. The far 2D backdrop (sprite-tagged tile grid: sky
+ * band + flower field) bypasses the GTE, so in native-wide it stays 4:3-width and
+ * leaves a void; this scales its VRAM x about the 4:3 screen centre by
+ * g_wide_w/native_w so it fills the widened frame. Gated per prim by
+ * psx_ws_prim_in_backdrop() (native-wide + sprite-tagged + background-phase) so
+ * Tomba/HUD/3D are untouched. wide_bd_get() resolves the per-prim scale once. */
+typedef struct { int on; float scale, center; } WideBd;
+static inline WideBd wide_bd_get(void) {
+    WideBd b; b.on = 0; b.scale = 1.0f; b.center = 0.0f;
+    extern int psx_ws_prim_in_backdrop(void);
+    extern int g_ws_bd_stretch_on, g_ws_bd_stretch_pct;
+    if (g_ws_bd_stretch_on && g_wide_w > 0 && g_wide_cur && psx_ws_prim_in_backdrop()) {
+        int native_w = g_wide_w - 2 * g_wide_off;
+        if (native_w > 0) {
+            b.on = 1;
+            b.scale = g_ws_bd_stretch_pct > 0 ? (float)g_ws_bd_stretch_pct / 100.0f
+                                              : (float)g_wide_w / (float)native_w;
+            b.center = (float)g_wide_cur_base + (float)native_w / 2.0f;
+        }
+    }
+    return b;
+}
+static inline int wide_bd_x(const WideBd *b, int x) {
+    if (!b->on) return x;
+    float v = ((float)x - b->center) * b->scale + b->center;
+    return (int)(v < 0.0f ? v - 0.5f : v + 0.5f);   /* round half away from zero */
+}
+/* Fwd decl: the backdrop-stretch path in sw_draw_textured_rect routes through the
+ * scaled rasterizer (defined later) so a widened sprite stretches, not tiles. */
+static void raster_textured_rect_scaled(const RTarget *t, int x, int y, int w, int h,
+                                        int u0, int v0, int u1, int v1,
+                                        uint16_t clut_x, uint16_t clut_y, uint16_t texpage);
+
 /* ------------------------------------------------------------------ */
 /* Semi-transparency blending                                         */
 /* ------------------------------------------------------------------ */
@@ -694,7 +728,8 @@ void sw_draw_flat_triangle(int x0, int y0, int x1, int y1,
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
-        raster_flat_triangle(&wt, (x0+dx)*s, y0*s, (x1+dx)*s, y1*s, (x2+dx)*s, y2*s, color);
+        WideBd bd = wide_bd_get();
+        raster_flat_triangle(&wt, (wide_bd_x(&bd,x0)+dx)*s, y0*s, (wide_bd_x(&bd,x1)+dx)*s, y1*s, (wide_bd_x(&bd,x2)+dx)*s, y2*s, color);
     }
 }
 
@@ -811,7 +846,8 @@ void sw_draw_gouraud_triangle(int x0, int y0, uint16_t c0,
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
-        raster_gouraud_triangle(&wt, (x0+dx)*s, y0*s, c0, (x1+dx)*s, y1*s, c1, (x2+dx)*s, y2*s, c2);
+        WideBd bd = wide_bd_get();
+        raster_gouraud_triangle(&wt, (wide_bd_x(&bd,x0)+dx)*s, y0*s, c0, (wide_bd_x(&bd,x1)+dx)*s, y1*s, c1, (wide_bd_x(&bd,x2)+dx)*s, y2*s, c2);
     }
 }
 
@@ -931,9 +967,10 @@ void sw_draw_textured_triangle(int x0, int y0, int u0, int v0,
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
-        raster_textured_triangle(&wt, (x0+dx)*s, y0*s, u0, v0,
-                                 (x1+dx)*s, y1*s, u1, v1,
-                                 (x2+dx)*s, y2*s, u2, v2, clut_x, clut_y, texpage);
+        WideBd bd = wide_bd_get();
+        raster_textured_triangle(&wt, (wide_bd_x(&bd,x0)+dx)*s, y0*s, u0, v0,
+                                 (wide_bd_x(&bd,x1)+dx)*s, y1*s, u1, v1,
+                                 (wide_bd_x(&bd,x2)+dx)*s, y2*s, u2, v2, clut_x, clut_y, texpage);
     }
 }
 
@@ -1093,10 +1130,11 @@ void sw_draw_shaded_textured_triangle(int x0, int y0, int u0, int v0,
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
+        WideBd bd = wide_bd_get();
         raster_shaded_textured_triangle(&wt,
-            (x0+dx)*s, y0*s, u0, v0, r0, g0, b0,
-            (x1+dx)*s, y1*s, u1, v1, r1, g1, b1,
-            (x2+dx)*s, y2*s, u2, v2, r2, g2, b2,
+            (wide_bd_x(&bd,x0)+dx)*s, y0*s, u0, v0, r0, g0, b0,
+            (wide_bd_x(&bd,x1)+dx)*s, y1*s, u1, v1, r1, g1, b1,
+            (wide_bd_x(&bd,x2)+dx)*s, y2*s, u2, v2, r2, g2, b2,
             clut_x, clut_y, texpage, raw_texture);
     }
 }
@@ -1141,9 +1179,13 @@ void sw_draw_flat_rect(int x, int y, int w, int h, uint16_t color) {
          * Only runs in native-wide (g_wide_cur != NULL), so 4:3 is unaffected. */
         int native_w = g_wide_w - 2 * g_wide_off;
         int lx = x - g_wide_cur_base, rx = x + w - g_wide_cur_base;
+        WideBd bd = wide_bd_get();
         if (native_w > 0 && lx <= 0 && rx >= native_w)
             raster_flat_rect(&wt, 0, y*s, g_wide_w*s, h*s, color);
-        else
+        else if (bd.on) {
+            int xl = wide_bd_x(&bd, x), xr = wide_bd_x(&bd, x + w);
+            raster_flat_rect(&wt, (xl+dx)*s, y*s, (xr-xl)*s, h*s, color);
+        } else
             raster_flat_rect(&wt, (x+dx)*s, y*s, w*s, h*s, color);
     }
 }
@@ -1199,7 +1241,16 @@ void sw_draw_textured_rect(int x, int y, int w, int h,
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
-        raster_textured_rect(&wt, (x+dx)*s, y*s, w*s, h*s, u, v, clut_x, clut_y, texpage);
+        WideBd bd = wide_bd_get();
+        if (bd.on) {
+            /* Stretch about screen centre: widen the destination span and map the
+             * native texel footprint across it via the SCALED rasterizer (the
+             * 1:1 sampler would TILE a widened rect instead of stretching it). */
+            int xl = wide_bd_x(&bd, x), xr = wide_bd_x(&bd, x + w);
+            raster_textured_rect_scaled(&wt, (xl+dx)*s, y*s, (xr-xl)*s, h*s,
+                                        u, v, u + w, v + h, clut_x, clut_y, texpage);
+        } else
+            raster_textured_rect(&wt, (x+dx)*s, y*s, w*s, h*s, u, v, clut_x, clut_y, texpage);
     }
 }
 
@@ -1256,7 +1307,9 @@ void sw_draw_textured_rect_scaled(int x, int y, int w, int h,
     if (g_wide_cur) {
         int s = g_scale, dx = wide_dx();
         RTarget wt = rt_wide();
-        raster_textured_rect_scaled(&wt, (x+dx)*s, y*s, w*s, h*s, u0, v0, u1, v1,
+        WideBd bd = wide_bd_get();
+        int xl = wide_bd_x(&bd, x), xr = wide_bd_x(&bd, x + w);
+        raster_textured_rect_scaled(&wt, (xl+dx)*s, y*s, (xr-xl)*s, h*s, u0, v0, u1, v1,
                                     clut_x, clut_y, texpage);
     }
 }
