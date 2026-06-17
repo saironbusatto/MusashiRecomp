@@ -101,6 +101,18 @@ button:hover { background-color: #232d3c; }
 .knob { display: block; width: 16dp; height: 16dp; border-radius: 8dp; background-color: #e6e9ef; margin: 3dp 0dp 0dp 3dp; }
 .switch.on .knob { margin-left: 23dp; }
 
+/* Pad-mode 3-way segmented selector (Hybrid | Analog | D-Pad). */
+.seg { display: flex; flex-direction: row; align-items: center; position: relative;
+	background-color: #161d28; border: 1dp #2b3543; border-radius: 7dp; }
+.seg-opt { display: block; padding: 5dp 11dp; color: #8b949e; font-size: 12dp; border-radius: 6dp; }
+.seg-opt:hover { color: #cdd5df; }
+.seg-opt.on { background-color: #2563eb; color: #ffffff; }
+/* Hybrid carries the explanatory tooltip, revealed on hover. */
+.seg-tip { display: none; position: absolute; top: 34dp; right: 0dp; width: 250dp; z-index: 80;
+	background-color: #0d1219; border: 1dp #3b82f6; border-radius: 7dp;
+	padding: 10dp 12dp; color: #cdd5df; font-size: 11dp; line-height: 16dp; }
+.seg-opt.hybrid:hover .seg-tip { display: block; }
+
 .card-body { display: flex; flex-direction: row; align-items: center; }
 .card-body.disabled { opacity: 0.4; }
 /* Player card body is a fixed height so toggling the pad type never reflows. */
@@ -219,11 +231,14 @@ button:hover { background-color: #232d3c; }
 			<div class="card left">
 				<div class="card-head">
 					<span class="card-name">PLAYER 1</span>
-					<span class="enable-lbl">DualShock</span>
-					<span class="switch" data-class-on="p1_analog" data-event-click="toggle_ds_p1"><span class="knob"></span></span>
+					<div class="seg">
+						<span class="seg-opt hybrid" data-class-on="p1_mode == 0" data-event-click="set_mode_p1(0)">Hybrid<span class="seg-tip">Mirrors Tomba Special Edition: nudge the analog stick for smooth analog movement, or use the D-pad for classic digital control. It switches automatically based on what you touch.</span></span>
+						<span class="seg-opt" data-class-on="p1_mode == 1" data-event-click="set_mode_p1(1)">Analog</span>
+						<span class="seg-opt" data-class-on="p1_mode == 2" data-event-click="set_mode_p1(2)">D-Pad</span>
+					</div>
 				</div>
 				<div class="card-body player">
-					<div class="pad-art" data-class-analog="p1_analog" data-class-digital="p1_analog == false"></div>
+					<div class="pad-art" data-class-analog="p1_mode != 2" data-class-digital="p1_mode == 2"></div>
 					<div class="card-col">
 						<div class="field-lbl">Device</div>
 						<div class="dropdown-wrap">
@@ -240,11 +255,14 @@ button:hover { background-color: #232d3c; }
 			<div class="card right">
 				<div class="card-head">
 					<span class="card-name">PLAYER 2</span>
-					<span class="enable-lbl">DualShock</span>
-					<span class="switch" data-class-on="p2_analog" data-event-click="toggle_ds_p2"><span class="knob"></span></span>
+					<div class="seg">
+						<span class="seg-opt hybrid" data-class-on="p2_mode == 0" data-event-click="set_mode_p2(0)">Hybrid<span class="seg-tip">Mirrors Tomba Special Edition: nudge the analog stick for smooth analog movement, or use the D-pad for classic digital control. It switches automatically based on what you touch.</span></span>
+						<span class="seg-opt" data-class-on="p2_mode == 1" data-event-click="set_mode_p2(1)">Analog</span>
+						<span class="seg-opt" data-class-on="p2_mode == 2" data-event-click="set_mode_p2(2)">D-Pad</span>
+					</div>
 				</div>
 				<div class="card-body player">
-					<div class="pad-art" data-class-analog="p2_analog" data-class-digital="p2_analog == false"></div>
+					<div class="pad-art" data-class-analog="p2_mode != 2" data-class-digital="p2_mode == 2"></div>
 					<div class="card-col">
 						<div class="field-lbl">Device</div>
 						<div class="dropdown-wrap">

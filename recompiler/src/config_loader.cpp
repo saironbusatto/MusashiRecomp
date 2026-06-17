@@ -17,6 +17,27 @@ namespace PSXRecompV4 {
 
 namespace fs = std::filesystem;
 
+// Pad mode <-> string. Accepts "hybrid"/"analog"/"digital" (case-insensitive);
+// returns `fallback` for anything unrecognised so a typo never silently flips
+// the pad type.
+int pad_mode_from_string(const std::string& s, int fallback) {
+    std::string l;
+    l.reserve(s.size());
+    for (char c : s) l.push_back((char)std::tolower((unsigned char)c));
+    if (l == "hybrid")  return PAD_MODE_HYBRID;
+    if (l == "analog")  return PAD_MODE_ANALOG;
+    if (l == "digital") return PAD_MODE_DIGITAL;
+    return fallback;
+}
+
+const char* pad_mode_to_string(int mode) {
+    switch (mode) {
+        case PAD_MODE_ANALOG:  return "analog";
+        case PAD_MODE_DIGITAL: return "digital";
+        default:               return "hybrid";
+    }
+}
+
 // Parse a hex string ("0x...") to uint32_t. Throws on malformed input.
 static uint32_t parse_hex(const std::string& s, const std::string& field) {
     try {
@@ -176,19 +197,40 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     // Optional [controller] block — game-declared input defaults.
     if (cfg.contains("controller")) {
         const toml::value& ct = toml::find(cfg, "controller");
+        // Legacy boolean form (true->analog, false->digital), read first so the
+        // new string `*_mode` keys win when both are present.
         if (ct.contains("default_analog")) {
-            const bool a = toml::find<bool>(ct, "default_analog");
-            rt.default_p1_analog = a;
-            rt.default_p2_analog = a;
-            rt.has_default_analog = true;
+            const int m = toml::find<bool>(ct, "default_analog")
+                              ? PAD_MODE_ANALOG : PAD_MODE_DIGITAL;
+            rt.default_p1_mode = rt.default_p2_mode = m;
+            rt.has_default_mode = true;
         }
         if (ct.contains("p1_analog")) {
-            rt.default_p1_analog = toml::find<bool>(ct, "p1_analog");
-            rt.has_default_analog = true;
+            rt.default_p1_mode = toml::find<bool>(ct, "p1_analog")
+                                     ? PAD_MODE_ANALOG : PAD_MODE_DIGITAL;
+            rt.has_default_mode = true;
         }
         if (ct.contains("p2_analog")) {
-            rt.default_p2_analog = toml::find<bool>(ct, "p2_analog");
-            rt.has_default_analog = true;
+            rt.default_p2_mode = toml::find<bool>(ct, "p2_analog")
+                                     ? PAD_MODE_ANALOG : PAD_MODE_DIGITAL;
+            rt.has_default_mode = true;
+        }
+        // Preferred string form.
+        if (ct.contains("default_mode")) {
+            const int m = pad_mode_from_string(
+                toml::find<std::string>(ct, "default_mode"), PAD_MODE_HYBRID);
+            rt.default_p1_mode = rt.default_p2_mode = m;
+            rt.has_default_mode = true;
+        }
+        if (ct.contains("p1_mode")) {
+            rt.default_p1_mode = pad_mode_from_string(
+                toml::find<std::string>(ct, "p1_mode"), PAD_MODE_HYBRID);
+            rt.has_default_mode = true;
+        }
+        if (ct.contains("p2_mode")) {
+            rt.default_p2_mode = pad_mode_from_string(
+                toml::find<std::string>(ct, "p2_mode"), PAD_MODE_HYBRID);
+            rt.has_default_mode = true;
         }
         if (ct.contains("deadzone")) {
             const auto n = toml::find<int64_t>(ct, "deadzone");
@@ -741,11 +783,27 @@ UserSettings load_user_settings(const fs::path& path) {
             const auto v = toml::find<std::string>(ct, "p2_device");
             if (!v.empty()) { s.p2_device = v; s.has_p2_device = true; }
         });
+        // Legacy boolean form first (true->analog, false->digital); the new
+        // string `*_mode` keys override when present.
         if (ct.contains("p1_analog")) try_get([&]{
-            s.p1_analog = toml::find<bool>(ct, "p1_analog"); s.has_p1_analog = true;
+            s.p1_mode = toml::find<bool>(ct, "p1_analog")
+                            ? PAD_MODE_ANALOG : PAD_MODE_DIGITAL;
+            s.has_p1_mode = true;
         });
         if (ct.contains("p2_analog")) try_get([&]{
-            s.p2_analog = toml::find<bool>(ct, "p2_analog"); s.has_p2_analog = true;
+            s.p2_mode = toml::find<bool>(ct, "p2_analog")
+                            ? PAD_MODE_ANALOG : PAD_MODE_DIGITAL;
+            s.has_p2_mode = true;
+        });
+        if (ct.contains("p1_mode")) try_get([&]{
+            s.p1_mode = pad_mode_from_string(
+                toml::find<std::string>(ct, "p1_mode"), PAD_MODE_HYBRID);
+            s.has_p1_mode = true;
+        });
+        if (ct.contains("p2_mode")) try_get([&]{
+            s.p2_mode = pad_mode_from_string(
+                toml::find<std::string>(ct, "p2_mode"), PAD_MODE_HYBRID);
+            s.has_p2_mode = true;
         });
         if (ct.contains("deadzone")) try_get([&]{
             const auto n = toml::find<int64_t>(ct, "deadzone");
@@ -817,19 +875,19 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
             f << "enable2 = " << (s.memcard2_enabled ? "true" : "false") << "\n";
     }
 
-    if (s.has_p1_device || s.has_p2_device || s.has_p1_analog || s.has_p2_analog ||
+    if (s.has_p1_device || s.has_p2_device || s.has_p1_mode || s.has_p2_mode ||
         s.has_deadzone) {
         f << "\n[controller]\n";
         if (s.has_p1_device)
             f << "p1_device = \"" << s.p1_device << "\"\n";
-        if (s.has_p1_analog)
-            f << "p1_analog = " << (s.p1_analog ? "true" : "false") << "\n";
+        if (s.has_p1_mode)
+            f << "p1_mode   = \"" << pad_mode_to_string(s.p1_mode) << "\"\n";
         if (s.has_p2_device)
             f << "p2_device = \"" << s.p2_device << "\"\n";
-        if (s.has_p2_analog)
-            f << "p2_analog = " << (s.p2_analog ? "true" : "false") << "\n";
+        if (s.has_p2_mode)
+            f << "p2_mode   = \"" << pad_mode_to_string(s.p2_mode) << "\"\n";
         if (s.has_deadzone)
-            f << "deadzone = " << s.deadzone << "\n";
+            f << "deadzone  = " << s.deadzone << "\n";
     }
 
     return f.good();

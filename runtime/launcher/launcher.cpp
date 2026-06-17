@@ -133,8 +133,10 @@ struct LauncherModel {
     // Keyboard / a plugged-in SDL controller) and a pad type (DualShock=analog).
     int  p1_dev_index = 1;     // index into the shared device option list
     int  p2_dev_index = 0;
-    bool p1_analog    = false; // DualShock (analog) vs digital pad
-    bool p2_analog    = false;
+    // Pad input mode (PSXRecompV4::PadMode): 0=hybrid (default), 1=analog,
+    // 2=digital. Bound to the segmented 3-way selector in each player card.
+    int  p1_mode      = 0;
+    int  p2_mode      = 0;
     int  deadzone_pct = 37;    // analog-stick deadzone 0-100% (raw = pct*32767/100)
     Rml::String p1_dev_label = "Keyboard";
     Rml::String p2_dev_label = "None";
@@ -316,14 +318,16 @@ void refresh_player(LauncherModel& m, int player, const std::vector<DeviceOption
     Rml::String& status = player == 0 ? m.p1_status    : m.p2_status;
     Rml::String& dot    = player == 0 ? m.p1_dot       : m.p2_dot;
     Rml::String& options= player == 0 ? m.p1_options   : m.p2_options;
-    const bool   analog = player == 0 ? m.p1_analog    : m.p2_analog;
+    const int    mode   = player == 0 ? m.p1_mode      : m.p2_mode;
 
     if (idx < 0 || idx >= (int)opts.size()) idx = 0;
     const DeviceOption& o = opts[idx];
     label   = o.label;
     options = build_options_rml(player, opts);
 
-    const char* type = analog ? "DualShock (analog)" : "digital pad";
+    const char* type = mode == 1 ? "DualShock (analog)"
+                     : mode == 2 ? "digital pad"
+                                 : "hybrid (auto analog/d-pad)";
     if (o.kind == 0)      { status = "No device — port empty"; dot = "off"; }
     else if (o.kind == 1) { status = Rml::String("Keyboard \xE2\x80\x94 ") + type; dot = ""; }
     else                  { status = o.label + Rml::String(" \xE2\x80\x94 ") + type; dot = ""; }
@@ -615,8 +619,8 @@ Result run(SDL_Window* window, void* gl_context,
 
     // ---- Seed the controller slots: enumerate devices, resolve selections ----
     std::vector<DeviceOption> dev_opts = enumerate_devices();
-    m.p1_analog = io.has_p1_analog ? io.p1_analog : false;
-    m.p2_analog = io.has_p2_analog ? io.p2_analog : false;
+    m.p1_mode = io.has_p1_mode ? io.p1_mode : PSXRecompV4::PAD_MODE_HYBRID;
+    m.p2_mode = io.has_p2_mode ? io.p2_mode : PSXRecompV4::PAD_MODE_HYBRID;
     m.deadzone_pct = io.has_deadzone ? (io.deadzone * 100 / 32767) : 37;
     if (io.has_p1_device) {
         m.p1_dev_index = find_or_add_device_index(dev_opts, io.p1_device);
@@ -660,8 +664,8 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("verdict_detail", &m.verdict_detail);
     c.Bind("verdict_state",  &m.verdict_state);
     c.Bind("view",           &m.view);
-    c.Bind("p1_analog",      &m.p1_analog);
-    c.Bind("p2_analog",      &m.p2_analog);
+    c.Bind("p1_mode",        &m.p1_mode);
+    c.Bind("p2_mode",        &m.p2_mode);
     c.Bind("deadzone_pct",   &m.deadzone_pct);
     c.Bind("p1_dev_label",   &m.p1_dev_label);
     c.Bind("p2_dev_label",   &m.p2_dev_label);
@@ -787,10 +791,10 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.view = "dashboard"; handle.DirtyVariable("view");
         });
-    // ---- controller: device dropdown + DualShock toggle ----
+    // ---- controller: device dropdown + pad-mode segmented selector ----
     auto dirty_player = [handle](int player) mutable {
-        const char* v0[] = {"p1_dev_label","p1_status","p1_dot","p1_options","p1_analog"};
-        const char* v1[] = {"p2_dev_label","p2_status","p2_dot","p2_options","p2_analog"};
+        const char* v0[] = {"p1_dev_label","p1_status","p1_dot","p1_options","p1_mode"};
+        const char* v1[] = {"p2_dev_label","p2_status","p2_dot","p2_options","p2_mode"};
         for (const char* v : (player == 0 ? v0 : v1)) handle.DirtyVariable(v);
     };
     // dev_opts is captured by value: the device list is fixed for the launcher
@@ -817,13 +821,17 @@ Result run(SDL_Window* window, void* gl_context,
             dirty_player(player);
             handle.DirtyVariable("dd_open");
         });
-    c.BindEventCallback("toggle_ds_p1",
-        [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.p1_analog = !m.p1_analog; refresh_player(m, 0, dev_opts); dirty_player(0);
+    // Pad-mode segmented selector: each segment passes its mode (0=hybrid,
+    // 1=analog, 2=digital) so any mode is one click away.
+    c.BindEventCallback("set_mode_p1",
+        [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
+            if (args.empty()) return;
+            m.p1_mode = (int)args[0].Get<int>(); refresh_player(m, 0, dev_opts); dirty_player(0);
         });
-    c.BindEventCallback("toggle_ds_p2",
-        [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.p2_analog = !m.p2_analog; refresh_player(m, 1, dev_opts); dirty_player(1);
+    c.BindEventCallback("set_mode_p2",
+        [&m, handle, dev_opts, dirty_player](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) mutable {
+            if (args.empty()) return;
+            m.p2_mode = (int)args[0].Get<int>(); refresh_player(m, 1, dev_opts); dirty_player(1);
         });
     /* Analog-stick deadzone, stepped 0..50% (wraps). Applies to both the
      * stick->d-pad threshold and the analog centre dead-band. */
@@ -952,8 +960,8 @@ Result run(SDL_Window* window, void* gl_context,
         const int i2 = (m.p2_dev_index >= 0 && m.p2_dev_index < (int)dev_opts.size()) ? m.p2_dev_index : 0;
         io.p1_device = device_string(dev_opts[i1]); io.has_p1_device = true;
         io.p2_device = device_string(dev_opts[i2]); io.has_p2_device = true;
-        io.p1_analog = m.p1_analog; io.has_p1_analog = true;
-        io.p2_analog = m.p2_analog; io.has_p2_analog = true;
+        io.p1_mode = m.p1_mode; io.has_p1_mode = true;
+        io.p2_mode = m.p2_mode; io.has_p2_mode = true;
         io.deadzone = m.deadzone_pct * 32767 / 100; io.has_deadzone = true;
     }
 
