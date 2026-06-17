@@ -21,6 +21,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <intrin.h>     /* __readgsqword — fiber TEB stack bounds for native_stack walk */
 #endif
 
 #include <stdint.h>
@@ -131,6 +132,123 @@ static const char *s_exit_origin = "unknown";
 void psx_crash_trace_set_exit_origin(const char *origin) {
     if (origin) s_exit_origin = origin;
 }
+
+/* ── Native call-stack snapshot ──────────────────────────────────────────
+ *
+ * The recent_fn ring is TIME-ORDERED (function entries over time), so for a
+ * runaway recursion its tail is dominated by whatever leaf was churning at the
+ * trip — it does NOT show the actual recursion CYCLE. This walks the running
+ * fiber's native stack at the fatal instant and recovers the true cycle:
+ *
+ *   - Walk from the current/faulting RSP up to the fiber StackBase (TEB GS:[8]).
+ *   - Keep only qwords that are genuine return addresses: a value pointing into
+ *     this module's .text whose immediately-preceding bytes are a `call`
+ *     instruction (filters spilled function pointers / stale data that merely
+ *     look like code addresses).
+ *   - Run-length-collapse consecutive equal frames and emit module-relative
+ *     RVAs, plus a small frequency histogram (the recursion participants each
+ *     appear ~depth times and dominate it).
+ *
+ * Emitted RVAs are build-relative (module base + RVA). Symbolize offline against
+ * the exact binary with nm (see _freeze_specimens/analyze_named.py, which reads
+ * this `native_stack` block directly). Works on BOTH the SEH path (uses the
+ * faulting ContextRecord->Rsp) and the graceful stack-guard halt path (walks the
+ * current frame), in debug and release — no minidump required. */
+#ifdef _WIN32
+static int crash_is_retaddr(uintptr_t v, uintptr_t text_lo, uintptr_t text_hi) {
+    if (v < text_lo + 7u || v >= text_hi) return 0;
+    const unsigned char *p = (const unsigned char *)(v - 7);
+    if (p[2] == 0xE8) return 1;                       /* call rel32  -> E8 at v-5 */
+    unsigned char m = p[5];                            /* byte at v-2 */
+    if (p[4] == 0xFF && ((m >= 0xD0 && m <= 0xD7) ||   /* call reg            */
+                         (m >= 0x10 && m <= 0x17)))    /* call [reg]          */
+        return 1;
+    if (p[1] == 0xFF && p[2] == 0x15) return 1;        /* call [rip+disp32]   */
+    if (p[3] == 0xFF && p[4] >= 0x50 && p[4] <= 0x57)  /* call [reg+disp8]    */
+        return 1;
+    return 0;
+}
+
+static void append_native_stack(char *buf, size_t cap, size_t *pos, uintptr_t start_sp) {
+    HMODULE h = GetModuleHandleW(NULL);
+    uintptr_t mb = (uintptr_t)h;
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)h;
+    IMAGE_NT_HEADERS *nt  = (IMAGE_NT_HEADERS *)((BYTE *)h + dos->e_lfanew);
+    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    uintptr_t text_lo = 0, text_hi = 0;
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (!memcmp(sec[i].Name, ".text", 5)) {
+            text_lo = mb + sec[i].VirtualAddress;
+            text_hi = text_lo + sec[i].Misc.VirtualSize;
+            break;
+        }
+    }
+    uintptr_t base = (uintptr_t)__readgsqword(0x08);   /* fiber StackBase (high) */
+    char probe;
+    if (start_sp == 0) start_sp = (uintptr_t)&probe;
+    start_sp &= ~(uintptr_t)7;
+
+    append_fmt(buf, cap, pos,
+        "  \"native_stack\": {\n"
+        "    \"module_base\": \"0x%llX\",\n"
+        "    \"text_lo_rva\": \"0x%llX\",\n"
+        "    \"text_hi_rva\": \"0x%llX\",\n"
+        "    \"frames\": [",
+        (unsigned long long)mb,
+        (unsigned long long)(text_lo - mb),
+        (unsigned long long)(text_hi - mb));
+
+    enum { HCAP = 24, MAX_RUNS = 256 };
+    uint32_t hk[HCAP]; uint32_t hc[HCAP]; int hn = 0;
+    uint32_t prev_rva = 0; int run = 0, emitted = 0, total = 0;
+
+    /* This runs in the crash/halt path, so it MUST never fault: bound every
+     * read with VirtualQuery and stop at the first non-committed / non-readable
+     * page or the PAGE_GUARD page (touching it would re-arm the overflow). The
+     * fiber StackBase (base) is only a hint — if it's stale/bogus the region
+     * walk terminates safely at the real committed-stack top anyway. */
+    if (text_lo && start_sp) {
+        MEMORY_BASIC_INFORMATION mbi;
+        uintptr_t region_end = 0;
+        for (uintptr_t a = start_sp; total < 300000; a += 8) {
+            if (base > start_sp && a + 8 > base) break;       /* don't pass a good StackBase */
+            if (a + 8 > region_end) {                          /* (re)validate the page region */
+                if (!VirtualQuery((void *)a, &mbi, sizeof(mbi))) break;
+                if (!(mbi.State & MEM_COMMIT)) break;
+                if (mbi.Protect & PAGE_GUARD) break;
+                DWORD pr = mbi.Protect & 0xFFu;
+                if (!(pr & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+                    break;
+                region_end = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+            }
+            uintptr_t v = *(uintptr_t *)a;
+            if (!crash_is_retaddr(v, text_lo, text_hi)) continue;
+            uint32_t rva = (uint32_t)(v - mb);
+            total++;
+            int found = 0;
+            for (int k = 0; k < hn; k++) { if (hk[k] == rva) { hc[k]++; found = 1; break; } }
+            if (!found && hn < HCAP) { hk[hn] = rva; hc[hn] = 1; hn++; }
+            if (total > 1 && rva == prev_rva) { run++; continue; }
+            if (run > 0 && emitted < MAX_RUNS) {
+                append_fmt(buf, cap, pos, "%s{\"rva\":\"0x%X\",\"n\":%d}",
+                           emitted ? "," : "", prev_rva, run);
+                emitted++;
+            }
+            prev_rva = rva; run = 1;
+        }
+        if (run > 0 && emitted < MAX_RUNS)
+            append_fmt(buf, cap, pos, "%s{\"rva\":\"0x%X\",\"n\":%d}",
+                       emitted ? "," : "", prev_rva, run);
+    }
+    append_fmt(buf, cap, pos,
+        "],\n    \"total_frames\": %d,\n    \"runs_emitted\": %d,\n    \"histogram\": [",
+        total, emitted);
+    for (int k = 0; k < hn; k++)
+        append_fmt(buf, cap, pos, "%s{\"rva\":\"0x%X\",\"n\":%u}", k ? "," : "", hk[k], hc[k]);
+    append_str(buf, cap, pos, "]\n  },\n");
+}
+#endif /* _WIN32 */
 
 /* ── Main entry ──────────────────────────────────────────────────────── */
 
@@ -290,6 +408,17 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         }
         append_str(buf, sizeof(buf), &pos, "]\n  },\n");
     }
+
+    /* Native call-stack snapshot — the TRUE recursion cycle (recent_fn above is
+     * time-ordered and shows leaf churn, not the recursing frames). */
+#ifdef _WIN32
+    {
+        uintptr_t sp = 0;
+        if (seh_info)
+            sp = (uintptr_t)((EXCEPTION_POINTERS *)seh_info)->ContextRecord->Rsp;
+        append_native_stack(buf, sizeof(buf), &pos, sp);
+    }
+#endif
 
     /* dispatch_ring tail (last 256) */
     {
