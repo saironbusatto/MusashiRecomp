@@ -133,12 +133,27 @@ int  psx_ws_backdrop_x(int x);
  * FMV / full-2D), so the rewrite is byte-identical when off. psx_ws_backdrop_value()
  * is the one value substitution shared by the gcc emit, the sljit JIT, and the
  * interpreter for a detected window bound: it returns `orig` unless preload is
- * engaged, in which case it widens the camera-tracked window by the 16:9 reveal
- * (START bound -> orig - margin, END bound -> orig + margin; margin in columns
- * scales with window_cols). Draws only the now-visible columns; the generator's
- * own clamps still bound it at level edges. */
+ * engaged, in which case it forces the bound to preload the WHOLE finite tile
+ * row (START -> 0, END -> large sentinel pinned by the generator's high clamp to
+ * extent-1). Every column is submitted, so the widened 16:9 viewport never gaps;
+ * the generator's clamps + the byte-sized row extent keep it bounded. */
 int      psx_ws_backdrop_preload(void);
 uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);
+
+/* auto_backdrop diagnostic ring (always-on). The interpreter records every
+ * window rewrite (with the live extent / DL count / camera-X); `ws_backdrop_ring`
+ * dumps it. psx_ws_backdrop_ring_json() formats the recent entries into `buf`
+ * (returns bytes written, excluding the caller's JSON envelope). */
+void psx_ws_backdrop_ring_note(uint32_t pc, int kind, int wcols, uint32_t orig,
+                               uint32_t finalv, int extent, int camx, int count,
+                               uint32_t base, uint32_t dl);
+int  psx_ws_backdrop_ring_json(char *buf, int cap);
+
+/* Live-tunable backdrop widen amount (ws_backdrop_margin command): <0 whole-row,
+ * 0 off, >0 N-column widen. g_ws_bd_from_interp is the interp's one-shot
+ * "I will record the rich entry myself" flag (see gpu.c / dirty_ram_interp.c). */
+extern int g_ws_bd_margin;
+extern int g_ws_bd_from_interp;
 
 /* Backdrop store-site registry: the runtime registers the [widescreen.backdrop]
  * x_sites here (from game.toml) so the dirty-RAM interpreter applies the same

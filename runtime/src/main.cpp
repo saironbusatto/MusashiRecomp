@@ -970,7 +970,8 @@ static void refresh_player_devices(void) {
         PlayerInput& p = g_players[s];
         if (p.kind != 2) close_player(p);           /* keyboard/none: no handle */
         else open_player(p, g_players[s ^ 1]);
-        sio_set_pad_connected(s, p.kind != 0 ? 1 : 0);
+        /* Slot 0 is always connected: the keyboard always drives player 1. */
+        sio_set_pad_connected(s, (s == 0 || p.kind != 0) ? 1 : 0);
         sio_set_pad_analog(s, p.analog ? 1 : 0, 0x80, 0x80, 0x80, 0x80);
     }
 }
@@ -1182,11 +1183,33 @@ static void sdl_vblank_present(void) {
     } else {
         for (int s = 0; s < 2; s++) {
             const PlayerInput& p = g_players[s];
-            if (p.kind == 0) continue;  /* no device in this port */
-            sio_set_pad_state_slot(s, pad_buttons_for(p));
+            /* Player 1 (slot 0): the keyboard ALWAYS drives the pad, OR'd with
+             * any assigned controller (which still works) -- so port 1 stays
+             * keyboard-controllable regardless of the configured device. Other
+             * ports use only their assigned device. */
+            const bool kb_always = (s == 0);
+            if (p.kind == 0 && !kb_always) continue;  /* no device in this port */
+
+            /* Button word: 0 bit = pressed, so AND of the release-masks unions
+             * the presses from both sources. */
+            uint16_t buttons = (p.kind != 0) ? pad_buttons_for(p) : 0xFFFF;
+            if (kb_always) buttons &= pad_from_keyboard();
+            sio_set_pad_state_slot(s, buttons);
+
             if (p.analog) {
                 uint8_t st[4];
                 pad_sticks_for(p, st);
+                /* Also fold the keyboard arrows onto the left stick (full
+                 * deflection) for an analog-mode controller P1, so it can be
+                 * steered from the keyboard too. (kind==1 already does this in
+                 * pad_sticks_for, so skip to avoid redundant work.) */
+                if (kb_always && p.kind != 1) {
+                    const Uint8* keys = SDL_GetKeyboardState(NULL);
+                    if (keys[SDL_SCANCODE_LEFT])  st[0] = 0x00;
+                    if (keys[SDL_SCANCODE_RIGHT]) st[0] = 0xFF;
+                    if (keys[SDL_SCANCODE_UP])    st[1] = 0x00;
+                    if (keys[SDL_SCANCODE_DOWN])  st[1] = 0xFF;
+                }
                 sio_set_pad_analog(s, 1, st[0], st[1], st[2], st[3]);
             }
         }
@@ -1932,7 +1955,8 @@ int main(int argc, char** argv) {
     set_player_device(g_players[0], p1_device, p1_analog);
     set_player_device(g_players[1], p2_device, p2_analog);
     for (int s = 0; s < 2; s++) {
-        sio_set_pad_connected(s, g_players[s].kind != 0 ? 1 : 0);
+        /* Slot 0 is always connected: the keyboard always drives player 1. */
+        sio_set_pad_connected(s, (s == 0 || g_players[s].kind != 0) ? 1 : 0);
         sio_set_pad_analog(s, g_players[s].analog ? 1 : 0, 0x80, 0x80, 0x80, 0x80);
     }
     /* SPU float-shadow gate must be set before spu_init() (which runs

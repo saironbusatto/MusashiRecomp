@@ -1,5 +1,11 @@
 # Generic backdrop preload (widescreen) — design + implementation plan
 
+> **2026-06-16: ROOT CAUSE CORRECTED — read the "2026-06-16" section at the bottom
+> FIRST.** The column-preload design below was the wrong lever for the 16:9 void;
+> the real cause is native-wide 2D-backdrop POSITIONING and the fix is a GL
+> wide-mirror geometric stretch gated to the backdrop (mechanism proven; precise
+> classification via `gp0_cmd_source_addr` / sprite-tag is the remaining step).
+
 Branch: `feat/ws-backdrop-coverage` (both repos, off master). Goal: in 16:9,
 Tomba's far-BACKGROUND tile grid (sky/ground/cloud/flower-field layers) only
 generates a camera-centered ~4:3 window of tile columns, so the revealed right
@@ -183,3 +189,108 @@ of killing the whole overlay-variant compile; main-EXE mode keeps the hard error
 - Merge `feat/ws-backdrop-coverage` → master (both repos), bump Tomba pin, push.
 - sljit coverage is fragment-local (a window whose magic load falls in a different
   fragment than its mult isn't detected on the sljit path — interp/gcc cover it).
+
+---
+
+# 2026-06-16 — ROOT CAUSE CORRECTED. The column-preload above was the WRONG LEVER.
+
+Everything above (auto_backdrop column preload: force START→0 / END→extent to draw
+the whole finite tile row) is **superseded as the fix for the 16:9 void.** It is
+not wrong code, but it does not address the symptom. Live RE on the dwarf/cursed
+flower-field scene, debug-instrumented, debunked the premise.
+
+## DEBUNKED: the void is NOT a column-loading problem
+Always-on `ws_backdrop_ring` on the live scene: the active flower-field generator
+fires exactly ONE window (wcols=9, extent=41). Forcing whole-row (START→0,
+END→clamped 40 — the entire 41-col row loaded every frame) and the cyan void
+**still persists**. Loading more columns is irrelevant. The `ws_backdrop_margin`
+knob (live column-widen: <0 whole-row, 0 off, >0 N-cols) confirms this: off vs
+whole-row are pixel-identical on the void.
+
+## ACTUAL ROOT CAUSE: native-wide 2D-backdrop POSITIONING (3 confirmations)
+1. The flower-field is a **fixed-screen-position 2D tile field**: static GPU
+   primitive vertices (signed-11-bit SCREEN coords — read the same at cam 1585 AND
+   1550, they do NOT move with the camera), ~4:3 width (X extent ≈ -92..252 ≈
+   344px). The "scroll" swaps which columns fill the fixed slots (the camera
+   window), it does not move the slots.
+2. Native-wide widens **3D via the GTE** (the un-squash generates wider geometry at
+   the source). The 2D backdrop **bypasses the GTE**, so it stays 4:3-width and
+   cannot span the 426px native-wide frame → the layer behind (cyan) shows on the
+   trailing margin. `psx_ws_backdrop_x` (the existing 2D-backdrop screen-X widen) is
+   SQUASH-only (`ws_active()`); in native-wide `gpu_state` shows `configured=0,
+   active=0` → it is a no-op.
+3. The GL native-wide compositor mirrors each prim into the wider FBO by
+   **translation only** (`wide_dx() = g_wide_off - base_x`, gpu_gl_renderer.c). 3D
+   fills the FBO because it is pre-widened; the 2D backdrop is centred → margins.
+
+## THE FIX — mechanism PROVEN, classification is the remaining work
+**Scale the 2D-backdrop prims about screen-centre in the GL wide-mirror**: a
+geometric scale in the vertex shader `x' = (x - u_xcenter)*u_xscale + u_xcenter`,
+scale = g_wide_w/native_w ≈ 1.33. This stretches the layer — tiles widen AND
+spread together, no inter-tile gaps. **PROVEN (user-confirmed): with the gate
+disabled, the backdrop fully fills the 16:9 frame, void gone.** Shipped runtime-
+tunable: `ws_backdrop_stretch [on] [pct] [thresh] [mode]` (live).
+Implementation (gpu_gl_renderer.c, this branch, uncommitted→committed checkpoint):
+u_xscale/u_xcenter uniforms in the geo+tex programs (default 1.0/0 = bit-identical
+no-op) + `wide_set_bd_scale` in both wide-mirror passes; per-frame phase reset in
+`gl_perf_present_enter` (NOT `present_vram` — that is the 4:3-fallback present; the
+native-wide present is `gl_renderer_present_wide_fbo`, and the per-frame hook must
+be in the common `gl_perf_present_enter` both call).
+
+### The remaining problem: stretch ONLY the background
+Stretching everything also stretches Tomba + HUD + 3D (user-rejected). Draw-order
+"phase" heuristics FAILED because:
+- the far-parallax backdrop (ocean/cloud/mountain, FUN_8004db3c, GTE-projected) is
+  WIDE and draws FIRST — and is ALREADY correctly widened by the 8C un-squash, so
+  it must NOT be re-stretched; the flower-field (2D, narrow) draws AFTER it; so
+  "first wide prim ends the phase" clears on the far-parallax before the flowers.
+- Tomba/HUD draw last but are WITHIN 4:3 (narrow), so "narrow" includes them.
+
+### BREAKTHROUGH — draw-time classification IS possible (the path forward)
+The draw path HAS the per-prim **source address via `gp0_cmd_source_addr`** (gpu.c)
+— that is how `ws_tagged_anchor` does the HUD pivot at draw time. So:
+- Tomba/HUD/characters are **sprite-tagged** (`psx_ws_sprite_tag` stores
+  prim_ptr→anchor in `ws_tags`, keyed by `$a0 & 0x1FFFFC`). At draw time
+  `ws_tagged_anchor(gp0_cmd_source_addr)` matches them → foreground → DON'T stretch.
+- The flower-field tiles live in the backdrop data structure `a1` (e.g.
+  0x801a603c: extent byte @+0, table of packet offsets @+4, packets at
+  a1+table[col]); their `gp0_cmd_source_addr` falls inside that structure's range
+  (capturable from the generator's a1 via the ring).
+- **PROPOSED GATE** for `wide_set_bd_scale`: stretch a wide-mirror prim iff
+  native-wide AND NOT sprite-tagged (invert `ws_tagged_anchor` on
+  `gp0_cmd_source_addr`) AND narrow/not-GTE-wide. (Or match `gp0_cmd_source_addr`
+  against the known backdrop-structure address range.) This is the next concrete
+  step — wire `gp0_cmd_source_addr` into the GL wide-mirror gate. NOTE: this needs
+  the GL path to receive `gp0_cmd_source_addr` per prim (it is gpu.c state today).
+
+## GENERATOR (RE'd via Ghidra `overlay_flowerfield.bin`)
+0x80116808: extent s7=[a1+0] (byte); dispatch by backdrop type (jumptable
+0x8011523c, 5 types); each type computes a column window then `j` to the SHARED
+emit loop 0x80116e6c, which clamps START<0→0 / END≥extent→extent-1 and stores
+packet pointers (a1+table[col]) into the OT object (a0, count byte @a0+3). One
+window per call. No code xref / no caller in RAM (main-EXE tail-dispatch; not a
+function pointer in the EXE/overlay binaries either).
+
+## FREEZE in this area — INDEPENDENT of widescreen (dedicated read-only RE pass)
+The recurring fatal wedge is the pre-existing Tomba **wild-call / runaway-recursion
+family** (seesaw / Bug-D), NOT a kernel livelock (the 0x2104 thread thrash + epc
+0x80000048 are the HEALTHY VSync scheduler; I was wrong to suspect a livelock).
+Chain: seesaw entity loop func_8001DFD4 → interaction-queue dispatcher FUN_80054D60
+→ a WILD jal in overlay handler 0x80123EE0. The Bug-D contract contains it but
+never resolves (bail_resolved=0, ~93K flattens) → infinite per-frame storm →
+eventually exhausts a fiber stack (report "native stack guard — runaway recursion",
+recursion_func 0x8004DEE0) OR func_80056E08 derefs a garbage interaction-queue slot
+→ MMIO READ8 @ 0x1F803C00 (the LOAD-MENU crash). Root fix = Beetle-oracle
+data-divergence hunt for the corruptor; containment = skip the dead entity in the
+flatten path (full_function_emitter.cpp). See TombaRecomp/ISSUES.md.
+
+## DEBUG TOOLING SHIPPED (runtime-only, this branch)
+- `overlay_cache=false` (all overlays interpreted; no native-DLL blind spots) —
+  game.toml DEBUG toggle (revert before merge).
+- `ws_backdrop_ring` — always-on rewrite ring (pc, kind, wcols, orig, final,
+  extent, camx, count, a1/dl).
+- `ws_backdrop_margin [m]` — live column-widen (proven irrelevant to the void).
+- `ws_backdrop_stretch [on] [pct] [thresh] [mode]` — live 2D-stretch tuning + a
+  per-frame dbg block (applied/prims/clearx/wide_cur/base/wide_w/off).
+- Keyboard ALWAYS drives player 1 (OR'd with any controller; main.cpp) — debug
+  convenience, unconditional.

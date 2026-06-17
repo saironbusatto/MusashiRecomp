@@ -465,11 +465,13 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     g_debug_last_store_pc = pc;
 
     /* Widescreen far-backdrop column PRELOAD (auto_backdrop). At a detected
-     * window START/END finalize, force the loop bound (START->0 / END->0x100) so
-     * the generator's own clamps preload the whole finite tile row into the
+     * window START/END finalize, force the loop bound (START->0 / END->sentinel)
+     * so the generator's own clamps preload the WHOLE finite tile row into the
      * revealed 16:9 margin. The site is a move/addiu that writes exactly one GPR
      * and has no other effect, so substituting the value and advancing pc+4 is
-     * complete. Gated on the runtime predicate first => 4:3 pays nothing. */
+     * complete. Gated on the runtime predicate first => 4:3 pays nothing. Each
+     * rewrite is recorded to the always-on backdrop ring with the live extent
+     * (s7), camera-X (scratchpad 0x176) and DL count for `ws_backdrop_ring`. */
     if (psx_ws_backdrop_preload()) {
         int wcols = 0;
         int bk = ws_backdrop_site_kind(pc, &wcols);
@@ -483,8 +485,25 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                 uint32_t orig = (opc == 0x00u)
                     ? ((rt == 0u) ? cpu->gpr[rs] : cpu->gpr[rt])
                     : (cpu->gpr[rs] + (uint32_t)simm);
-                cpu->gpr[dest] = psx_ws_backdrop_value(orig, bk == WS_BD_END, wcols);
+                /* Tell psx_ws_backdrop_value the interp will record the rich ring
+                 * entry (it skips its own note when this flag is set). */
+                g_ws_bd_from_interp = 1;
+                uint32_t finalv = psx_ws_backdrop_value(orig, bk == WS_BD_END, wcols);
+                cpu->gpr[dest] = finalv;
                 cpu->gpr[0] = 0;
+                /* Rich snapshot for the ring: s7 (gpr[23]) = byte tile-row extent;
+                 * s0 (gpr[16]) = DL object, count byte at +3; camera-X = scratchpad
+                 * halfword 0x176. */
+                {
+                    int      extent = (int)(int16_t)cpu->gpr[23];
+                    int      camx   = (int)(int16_t)(cpu->read_word(0x1F800174u) >> 16);
+                    uint32_t s0a    = cpu->gpr[16] + 3u;
+                    int      count  = (int)((cpu->read_word(s0a & ~3u) >> ((s0a & 3u) * 8u)) & 0xFFu);
+                    /* base = s4 (gpr[20]) = backdrop data ptr (extent@+0, table@+4);
+                     * dl = s0 (gpr[16]) = the ordering-table object. */
+                    psx_ws_backdrop_ring_note(pc, bk, wcols, orig, finalv, extent, camx,
+                                              count, cpu->gpr[20], cpu->gpr[16]);
+                }
                 return 0;
             }
         }

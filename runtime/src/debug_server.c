@@ -5407,6 +5407,56 @@ static void handle_ws_nw(int id, const char *json)
              id, psx_ws_get_native_wide(), ws.mode, ws.nw_extra);
 }
 
+/* ws_backdrop_ring: dump the always-on auto_backdrop rewrite ring (which windows
+ * fire, live extent/camera/DL-count, orig vs final bound). Read-only; small
+ * heap envelope so the per-byte stall of a giant read is never in play. */
+static void handle_ws_backdrop_ring(int id, const char *json)
+{
+    (void)json;
+    size_t cap = 1u << 16;                    /* 64 KB: 512 entries * ~90 chars */
+    char *buf = (char *)malloc(cap);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    int hdr  = snprintf(buf, cap, "{\"id\":%d,\"ok\":true,", id);
+    int body = psx_ws_backdrop_ring_json(buf + hdr, (int)cap - hdr - 4);
+    snprintf(buf + hdr + body, cap - (size_t)(hdr + body), "}");
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+/* ws_backdrop_margin [m=<N>]: live-tune the far-backdrop widen strategy without
+ * a rebuild. m<0 = whole-row preload, m=0 = off, m>0 = widen N columns each side.
+ * No m= just reports the current value. */
+static void handle_ws_backdrop_margin(int id, const char *json)
+{
+    int m = json_get_int(json, "m", -123456789);   /* sentinel = no change */
+    if (m != -123456789) g_ws_bd_margin = m;
+    send_fmt("{\"id\":%d,\"ok\":true,\"margin\":%d,\"mode\":\"%s\"}",
+             id, g_ws_bd_margin,
+             g_ws_bd_margin < 0 ? "whole-row" : (g_ws_bd_margin == 0 ? "off" : "widen-cols"));
+}
+
+/* ws_backdrop_stretch [on=0/1] [pct=N] [thresh=N]: live-tune the native-wide
+ * 2D-backdrop x-stretch (GL renderer). on toggles the feature; pct=0 auto-fits
+ * (g_wide_w/native_w), else pct/100 is the scale; thresh = px past 4:3 that ends
+ * the per-frame backdrop phase. No args = report. */
+static void handle_ws_backdrop_stretch(int id, const char *json)
+{
+    extern int g_ws_bd_stretch_on, g_ws_bd_stretch_pct, g_ws_bd_phase_thresh, g_ws_bd_phase_mode;
+    extern int g_bdg_applied, g_bdg_prims, g_bdg_clearx, g_bdg_cur, g_bdg_base, g_bdg_w, g_bdg_off;
+    int on  = json_get_int(json, "on", -1);
+    int pct = json_get_int(json, "pct", -1);
+    int th  = json_get_int(json, "thresh", -1);
+    int md  = json_get_int(json, "mode", -1);
+    if (on  >= 0) g_ws_bd_stretch_on   = on;
+    if (pct >= 0) g_ws_bd_stretch_pct  = pct;
+    if (th  >= 0) g_ws_bd_phase_thresh = th;
+    if (md  >= 0) g_ws_bd_phase_mode   = md;
+    send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d,\"pct\":%d,\"thresh\":%d,\"mode\":%d,"
+             "\"dbg\":{\"applied\":%d,\"prims\":%d,\"clearx\":%d,\"wide_cur\":%d,\"base\":%d,\"wide_w\":%d,\"off\":%d}}",
+             id, g_ws_bd_stretch_on, g_ws_bd_stretch_pct, g_ws_bd_phase_thresh, g_ws_bd_phase_mode,
+             g_bdg_applied, g_bdg_prims, g_bdg_clearx, g_bdg_cur, g_bdg_base, g_bdg_w, g_bdg_off);
+}
+
 /* 8C far-backdrop depth split. ws_far_threshold [t=<SZ>] sets the SZ cutoff
  * above which backdrop-driver geometry is un-squashed (near props stay
  * squashed). With no t=, just reports the observed SZ stats since last read so
@@ -8828,6 +8878,9 @@ static const CmdEntry s_commands[] = {
     { "ws_margin",         handle_ws_margin },
     { "ws_aspect",         handle_ws_aspect },
     { "ws_nw",             handle_ws_nw },
+    { "ws_backdrop_ring",  handle_ws_backdrop_ring },
+    { "ws_backdrop_margin", handle_ws_backdrop_margin },
+    { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
     { "ws_far_threshold",  handle_ws_far_threshold },
     { "ws_census",         handle_ws_census },
     { "mem_words",         handle_mem_words },

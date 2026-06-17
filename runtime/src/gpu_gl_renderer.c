@@ -301,6 +301,33 @@ static GLint s_uLimits = -1;
  * bit-identical to the pre-native-wide projection. */
 static GLint s_geo_uXoff = -1, s_geo_uXhalf = -1;
 static GLint s_tex_uXoff = -1, s_tex_uXhalf = -1;
+/* Native-wide 2D-backdrop x-stretch uniforms. The far 2D backdrop layer is a
+ * ~4:3-width set of static prims scrolled by the draw offset; native-wide widens
+ * 3D via the GTE but never these, so they leave a void in the 16:9 margins. The
+ * wide mirror scales them about screen centre (u_xscale, u_xcenter) to fill it.
+ * Applied only to "backdrop-phase" prims (drawn before the first clearly-wide
+ * prim each frame). 1.0 / 0.0 => no-op, so the canonical pass stays identical. */
+static GLint s_geo_uXscale = -1, s_geo_uXcenter = -1;
+static GLint s_tex_uXscale = -1, s_tex_uXcenter = -1;
+/* Runtime controls (ws_backdrop_stretch debug command). */
+int g_ws_bd_stretch_on   = 1;   /* feature on (gated by native-wide + phase) */
+int g_ws_bd_stretch_pct  = 0;   /* 0 = auto (g_wide_w/native_w); else pct/100 */
+int g_ws_bd_phase_thresh = 24;  /* px beyond 4:3 that ends the backdrop phase */
+int g_ws_bd_phase_mode   = 1;   /* 0 = any wide prim ends phase; 1 = only a wide
+                                 * TEXTURED prim does (the flat full-width sky
+                                 * draws first and must NOT end the backdrop phase;
+                                 * the 3D foreground is textured-and-wide). */
+static int s_bd_phase = 1;      /* 1 while still drawing the far 2D backdrop */
+/* ws_backdrop_stretch diagnostics: per-frame snapshot reported by the command. */
+int g_bdg_applied = 0, g_bdg_prims = 0, g_bdg_clearx = -999999;
+int g_bdg_cur = 0, g_bdg_base = 0, g_bdg_w = 0, g_bdg_off = 0;
+static int s_bdg_applied = 0, s_bdg_prims = 0, s_bdg_clearx = -999999;
+/* per-prim draw-order trace (ws_backdrop_trace): x-extent + textured flag, in
+ * draw order, for the last frame -- so we can SEE where the background sits. */
+typedef struct { short x0, x1, y0, y1; unsigned char tex; } PrimRec;
+#define PTRACE_CAP 200
+static PrimRec s_ptrace[PTRACE_CAP]; static int s_ptrace_n = 0;
+PrimRec g_ptrace[PTRACE_CAP]; int g_ptrace_n = 0;   /* snapshot (extern) */
 /* BLIT program uniforms. */
 static GLint s_uBlitSrc = -1, s_uBlitPass = -1, s_uBlitMaskset = -1;
 static GLint s_uBlitSrcDiv = -1, s_uBlitSrcOff = -1;
@@ -428,9 +455,12 @@ static const char *GEO_VS =
     "uniform float u_shift;\n"
     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
+    "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
+    "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
     "noperspective out vec4 v_col;\n"
     "void main(){ v_col = a_col;\n"
-    "  gl_Position = vec4((a_pos.x+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+    "  float xb = (a_pos.x - u_xcenter)*u_xscale + u_xcenter;\n"
+    "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
 static const char *GEO_FS =
     "#version 330\n"
     "noperspective in vec4 v_col; out vec4 frag;\n"
@@ -460,6 +490,8 @@ static const char *TEX_VS =
     "uniform float u_shift;\n"
     "uniform float u_xoff;   /* native-wide x translation (px); 0 canonical */\n"
     "uniform float u_xhalf;  /* x clip half-extent (px); 512 canonical */\n"
+    "uniform float u_xscale; /* native-wide 2D-backdrop x-stretch; 1 canonical */\n"
+    "uniform float u_xcenter;/* stretch centre in VRAM px; 0 canonical */\n"
     "noperspective out vec2 v_uv; noperspective out vec4 v_col;\n"
     "flat out ivec2 v_tpage; flat out ivec2 v_clut; flat out int v_depth;\n"
     "flat out int v_raw; flat out ivec4 v_limits;\n"
@@ -469,7 +501,8 @@ static const char *TEX_VS =
     "  v_limits = ivec4(floor(a_limits + 0.5));\n"
     "  /* u_shift: align GL's center-sample grid with the PS1 integer grid (see\n"
     "   * GEO_VS) so interpolated uv at a fragment equals the PS1 DDA value. */\n"
-    "  gl_Position = vec4((a_pos.x+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
+    "  float xb = (a_pos.x - u_xcenter)*u_xscale + u_xcenter;\n"
+    "  gl_Position = vec4((xb+u_shift+u_xoff)/u_xhalf - 1.0, (a_pos.y+u_shift)/256.0 - 1.0, 0.0, 1.0); }\n";
 static const char *TEX_FS =
     "#version 330\n"
     "noperspective in vec2 v_uv; noperspective in vec4 v_col; out vec4 frag;\n"
@@ -817,12 +850,39 @@ static void ensure_cpu(void) {
 
 static uint64_t s_scene_prims = 0;     /* frame_perf: scene primitives submitted (pre double-draw) */
 static uint64_t s_scene_prims_tex = 0; /* frame_perf: of which textured (vs flat geometry)         */
-static void mark_prim_dirty(const int *xs, const int *ys, int n) {
+static void flush_tex_batch(void);     /* fwd: drained at the backdrop-phase boundary below */
+static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
     s_scene_prims++;
     int x0 = xs[0], x1 = xs[0], y0 = ys[0], y1 = ys[0];
     for (int i = 1; i < n; i++) {
         if (xs[i] < x0) x0 = xs[i]; if (xs[i] > x1) x1 = xs[i];
         if (ys[i] < y0) y0 = ys[i]; if (ys[i] > y1) y1 = ys[i];
+    }
+    /* Native-wide backdrop phase: the far 2D backdrop draws first (far end of the
+     * ordering table). Once a prim reaches clearly into the 16:9 reveal -- a
+     * GTE-widened 3D prim -- the backdrop phase is over for this frame, so later
+     * (3D / HUD) prims are NOT x-stretched. Uses the unclamped prim x-extent. */
+    s_bdg_prims++;
+    if (g_wide_w > 0 && s_bd_phase) {
+        int base = g_wide_cur_base;
+        int native_w = g_wide_w - 2 * g_wide_off;
+        if (native_w > 0 && (textured || g_ws_bd_phase_mode == 0) &&
+            (x0 < base - g_ws_bd_phase_thresh || x1 > base + native_w + g_ws_bd_phase_thresh)) {
+            /* This (wide) prim ends the backdrop phase. Drain the pending textured
+             * batch NOW, while still phase-1, so the backdrop tiles queued in it
+             * get the stretch -- otherwise the batch (which may also hold this
+             * wide prim's neighbours) flushes later with phase 0 and is never
+             * scaled. Called before this prim is appended (mark_prim_dirty runs
+             * ahead of the batch append), so the flush drains only the backdrop. */
+            flush_tex_batch();
+            s_bd_phase = 0;
+            s_bdg_clearx = (x1 > base + native_w + g_ws_bd_phase_thresh) ? x1 : x0;
+        }
+    }
+    if (s_ptrace_n < PTRACE_CAP) {
+        PrimRec *p = &s_ptrace[s_ptrace_n++];
+        p->x0 = (short)x0; p->x1 = (short)x1; p->y0 = (short)y0; p->y1 = (short)y1;
+        p->tex = (unsigned char)textured;
     }
     if (x0 < s_area_x1) x0 = s_area_x1;
     if (y0 < s_area_y1) y0 = s_area_y1;
@@ -861,6 +921,28 @@ static void wide_target_end(GLint uXoff, GLint uXhalf) {
     p_glUniform1f(uXoff, 0.0f);
     p_glUniform1f(uXhalf, 512.0f);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
+}
+
+/* Set / clear the 2D-backdrop x-stretch for a wide-mirror draw. Stretches the
+ * far backdrop about screen centre while we're still in the backdrop phase and
+ * the feature is on; otherwise the no-op (1.0 / 0). */
+static void wide_set_bd_scale(GLint uScale, GLint uCenter) {
+    float scale = 1.0f, center = 0.0f;
+    if (s_bd_phase && g_ws_bd_stretch_on && g_wide_w > 0) {
+        int native_w = g_wide_w - 2 * g_wide_off;
+        if (native_w > 0) {
+            scale  = g_ws_bd_stretch_pct > 0 ? (float)g_ws_bd_stretch_pct / 100.0f
+                                             : (float)g_wide_w / (float)native_w;
+            center = (float)g_wide_cur_base + (float)native_w / 2.0f;
+        }
+    }
+    if (scale != 1.0f) s_bdg_applied++;
+    p_glUniform1f(uScale, scale);
+    p_glUniform1f(uCenter, center);
+}
+static void wide_clear_bd_scale(GLint uScale, GLint uCenter) {
+    p_glUniform1f(uScale, 1.0f);
+    p_glUniform1f(uCenter, 0.0f);
 }
 
 /* ---- textured-prim batching -------------------------------------------- *
@@ -909,6 +991,7 @@ static void flush_tex_batch(void) {
     if (g_wide_cur) {                       /* native-wide mirror (both STP passes) */
         int dx = wide_dx();
         wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
+        wide_set_bd_scale(s_tex_uXscale, s_tex_uXcenter);
         glDisable(GL_BLEND);
         mask_stencil(s_tb_mask);
         p_glUniform1i(s_uSemipass, 1);
@@ -917,6 +1000,7 @@ static void flush_tex_batch(void) {
         mask_stencil(1);
         p_glUniform1i(s_uSemipass, 2);
         glDrawArrays(GL_TRIANGLES, 0, nverts);
+        wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
         wide_target_end(s_tex_uXoff, s_tex_uXhalf);
     }
     hr_end();
@@ -928,7 +1012,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
                          const uint16_t *cs, int n, int semi) {
     flush_tex_batch();   /* flat prim: drain queued textured draws first (order + program) */
     flush_cpu_upload();
-    mark_prim_dirty(xs, ys, n);
+    mark_prim_dirty(xs, ys, n, 0 /* flat */);
     float verts[3 * 6];
     float mask_a = s_mask_set ? 1.0f : 0.0f;
     for (int i = 0; i < n; i++) {
@@ -957,7 +1041,9 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
     if (g_wide_cur && !s_wide_suppress) {
         int dx = wide_dx();
         wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
+        wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
         glDrawArrays(mode, 0, n);
+        wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
         wide_target_end(s_geo_uXoff, s_geo_uXhalf);
     }
     hr_end();
@@ -1023,7 +1109,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
 
     flush_cpu_upload();   /* if a CPU->VRAM upload is pending it flushes the batch first */
     flush_pack_if_sampling(base_x, base_y, depth, clut_x, clut_y);  /* flushes batch iff it must pack */
-    mark_prim_dirty(xs, ys, 3);
+    mark_prim_dirty(xs, ys, 3, 1 /* textured */);
 
     /* Append to the textured batch. Flush first if this prim's blend/mask/twin/
      * filter differ from the open batch, or the buffer is full. Per-prim texture
@@ -1459,6 +1545,16 @@ static int init_gpu_raster(void) {
     s_geo_uXhalf = p_glGetUniformLocation(s_geo_prog, "u_xhalf");
     s_tex_uXoff  = p_glGetUniformLocation(s_tex_prog, "u_xoff");
     s_tex_uXhalf = p_glGetUniformLocation(s_tex_prog, "u_xhalf");
+    s_geo_uXscale  = p_glGetUniformLocation(s_geo_prog, "u_xscale");
+    s_geo_uXcenter = p_glGetUniformLocation(s_geo_prog, "u_xcenter");
+    s_tex_uXscale  = p_glGetUniformLocation(s_tex_prog, "u_xscale");
+    s_tex_uXcenter = p_glGetUniformLocation(s_tex_prog, "u_xcenter");
+    /* Default the new uniforms to the no-op (1.0 scale, 0 centre) -- GLSL would
+     * otherwise zero them, collapsing all x to 0. */
+    p_glUseProgram(s_geo_prog);
+    p_glUniform1f(s_geo_uXscale, 1.0f); p_glUniform1f(s_geo_uXcenter, 0.0f);
+    p_glUseProgram(s_tex_prog);
+    p_glUniform1f(s_tex_uXscale, 1.0f); p_glUniform1f(s_tex_uXcenter, 0.0f);
 
     /* Sample-grid alignment shift: half an HR pixel, set once (S is fixed
      * for the lifetime of the pipeline). Backed off by 1/64 native px so
@@ -1928,6 +2024,15 @@ static void gl_perf_init(void) {
 
 /* Top of present (after flush_cpu_upload, before clear/blit). */
 static void gl_perf_present_enter(void) {
+    /* Per-frame boundary for the 2D-backdrop stretch — runs from BOTH present
+     * paths (4:3 present_vram AND native-wide present_wide_fbo), before the
+     * perf-on gate so native-wide frames reset too. Snapshot this frame's
+     * diagnostics, then reset the phase + counters for the next frame. The final
+     * scene batch was already flushed by the caller. */
+    g_bdg_applied = s_bdg_applied; g_bdg_prims = s_bdg_prims; g_bdg_clearx = s_bdg_clearx;
+    g_bdg_cur = (g_wide_cur != 0); g_bdg_base = g_wide_cur_base; g_bdg_w = g_wide_w; g_bdg_off = g_wide_off;
+    s_bdg_applied = 0; s_bdg_prims = 0; s_bdg_clearx = -999999;
+    s_bd_phase = 1;
     if (!s_pf_on) return;
     uint64_t now = SDL_GetPerformanceCounter();
     s_pf_enter = now;
@@ -2010,7 +2115,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     if (!s_ctx || !s_raster_ok) return;
     flush_tex_batch();
     flush_cpu_upload();
-    gl_perf_present_enter();
+    gl_perf_present_enter();   /* per-frame backdrop-phase reset + dbg snapshot live in here */
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     int lx, ly, lw, lh;
     if (force_4_3)

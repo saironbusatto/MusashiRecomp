@@ -246,15 +246,86 @@ int psx_ws_backdrop_x(int x) {
  * `orig` unchanged at 4:3 / squash / boot / FMV, so 4:3 stays byte-identical. */
 int psx_ws_backdrop_preload(void) { return ws_native_wide_active(); }
 
+/* Live-tunable widen amount (set via the `ws_backdrop_margin` debug command):
+ *   <0  => WHOLE-ROW preload: START->0, END->extent-1 (max generous)
+ *    0  => identity: no widening, native-wide still on (A/B the effect)
+ *   >0  => widen the camera-tracked window by N columns each side (bounded)
+ * Default is a safe-but-generous bounded value; dialed live while debugging so
+ * the widen strategy can be tuned without a rebuild. */
+int g_ws_bd_margin = 0;   /* column preload proven irrelevant to the void; default off */
+/* Set to 1 by the interpreter around its psx_ws_backdrop_value call so the value
+ * function does NOT also ring-note: the interp records a richer entry (live
+ * extent / camera / DL count). Native cache-DLL calls leave it 0, so the value
+ * function notes them itself -- that is how the ring sees native execution. */
+int g_ws_bd_from_interp = 0;
+
 uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols) {
-    if (!psx_ws_backdrop_preload()) return orig;
+    if (!psx_ws_backdrop_preload()) return orig;   /* 4:3 -> byte-identical */
     if (window_cols < 0) window_cols = -window_cols;
-    int dispw  = ws_disp_w();
-    /* +2 slack covers integer truncation and the generator's own pop-in margin;
-     * over-covering a couple columns is bounded by the window so it never
-     * approaches whole-row cost. */
-    int margin = (dispw > 0) ? (window_cols * ws_nw_offset()) / dispw + 2 : 2;
-    return is_end ? (orig + (uint32_t)margin) : (orig - (uint32_t)margin);
+    int      m   = g_ws_bd_margin;
+    int      from_interp = g_ws_bd_from_interp;
+    g_ws_bd_from_interp = 0;                        /* consume one-shot flag */
+    uint32_t finalv;
+    if (m < 0) {
+        /* Whole-row: the generator's shared clamps (START<0 -> 0; END>=extent ->
+         * extent-1) pin the loop to [0, extent-1]. Bounded because `extent` is a
+         * byte and the DL count is a byte (row <= 255 cols). */
+        enum { WS_BD_END_SENTINEL = 0x7FFF };
+        finalv = is_end ? (uint32_t)WS_BD_END_SENTINEL : 0u;
+    } else if (m == 0) {
+        finalv = orig;                              /* effect off (still recorded) */
+    } else {
+        finalv = is_end ? (orig + (uint32_t)m) : (orig - (uint32_t)m);
+    }
+    /* Single chokepoint for every path (interp hook, native cache-DLL via the
+     * overlay callback, sljit). The interp records its own richer entry, so skip
+     * here when it set the flag; native-DLL calls (flag 0) are recorded here with
+     * pc/extent/camera = 0 -- which is how the ring sees native execution. */
+    if (!from_interp)
+        psx_ws_backdrop_ring_note(0u, is_end ? 2 /*WS_BD_END*/ : 1 /*WS_BD_START*/,
+                                  window_cols, orig, finalv, 0, 0, 0, 0u, 0u);
+    return finalv;
+}
+
+/* ---- auto_backdrop diagnostic ring (always-on; see BACKDROP_PRELOAD.md) -----
+ * Every backdrop-window rewrite (interp or native) is recorded here so the live
+ * tile-row extent, the camera-tracked bounds, and exactly WHICH of a scene's
+ * windows fire can be read back via the `ws_backdrop_ring` debug command --
+ * query the ring for the window of interest, never pause/step. The recorder is
+ * fed by the interpreter (which has the live CPU state: s7=extent, the DL count,
+ * and the scratchpad camera-X) at the rewrite site. */
+typedef struct {
+    uint32_t frame, pc, orig, finalv, base, dl;
+    int      kind, wcols, extent, camx, count;
+} WsBdRingEnt;
+#define WS_BD_RING_CAP 512
+static WsBdRingEnt s_bd_ring[WS_BD_RING_CAP];
+static uint32_t    s_bd_ring_seq = 0;
+
+void psx_ws_backdrop_ring_note(uint32_t pc, int kind, int wcols, uint32_t orig,
+                               uint32_t finalv, int extent, int camx, int count,
+                               uint32_t base, uint32_t dl) {
+    WsBdRingEnt *e = &s_bd_ring[s_bd_ring_seq & (WS_BD_RING_CAP - 1)];
+    e->frame  = (uint32_t)s_frame_count; e->pc = pc; e->kind = kind; e->wcols = wcols;
+    e->orig   = orig; e->finalv = finalv; e->extent = extent; e->camx = camx; e->count = count;
+    e->base   = base; e->dl = dl;
+    s_bd_ring_seq++;
+}
+
+int psx_ws_backdrop_ring_json(char *buf, int cap) {
+    int n = (int)(s_bd_ring_seq < WS_BD_RING_CAP ? s_bd_ring_seq : WS_BD_RING_CAP);
+    uint32_t start = s_bd_ring_seq - (uint32_t)n;
+    int off = snprintf(buf, (size_t)cap, "\"seq\":%u,\"n\":%d,\"ents\":[", s_bd_ring_seq, n);
+    for (int i = 0; i < n && off < cap - 200; i++) {
+        WsBdRingEnt *e = &s_bd_ring[(start + (uint32_t)i) & (WS_BD_RING_CAP - 1)];
+        off += snprintf(buf + off, (size_t)(cap - off),
+            "%s{\"f\":%u,\"pc\":\"%08x\",\"k\":%d,\"wc\":%d,\"o\":%d,\"fin\":%d,\"ext\":%d,\"cam\":%d,\"cnt\":%d,\"base\":\"%08x\",\"dl\":\"%08x\"}",
+            i ? "," : "", e->frame, e->pc, e->kind, e->wcols,
+            (int)(int16_t)e->orig, (int)(int16_t)e->finalv, e->extent, e->camx, e->count,
+            e->base, e->dl);
+    }
+    off += snprintf(buf + off, (size_t)(cap - off), "]");
+    return off;
 }
 
 /* Backdrop store-site registry. The [widescreen.backdrop] x_sites are emitted
