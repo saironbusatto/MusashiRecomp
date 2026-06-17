@@ -25,6 +25,23 @@
 
 namespace PSXRecompV4 {
 
+// Pad input mode (per player). Replaces the old analog on/off boolean.
+//   hybrid  — auto-switch DualShock(analog)/digital per the most-recent input:
+//             nudge the stick -> report DualShock (0x73, variable sticks);
+//             press the D-pad -> report a digital pad (0x41) so the game runs
+//             its OWN d-pad path at true digital sensitivity. Mirrors a
+//             DualShock's analog LED toggling on/off (and Tomba Special
+//             Edition's auto-detect). Default.
+//   analog  — always present a DualShock/analog pad (id 0x73). The D-pad is
+//             folded onto the stick at full deflection so it still moves you.
+//   digital — always present a digital pad (id 0x41); sticks disabled.
+enum PadMode { PAD_MODE_HYBRID = 0, PAD_MODE_ANALOG = 1, PAD_MODE_DIGITAL = 2 };
+
+// Parse/format a pad mode. pad_mode_from_string accepts "hybrid"/"analog"/
+// "digital" (case-insensitive) and returns `fallback` for anything else.
+int         pad_mode_from_string(const std::string& s, int fallback);
+const char* pad_mode_to_string(int mode);
+
 // [runtime] block — consumed by runtime/src/main.cpp. All fields optional;
 // callers that need them check has_* flags or use the supplied defaults.
 struct RuntimeConfig {
@@ -138,15 +155,18 @@ struct RuntimeConfig {
     bool                  audio_spu_hq = false;
 
     // ---- [controller] block — game-declared input defaults ----
-    // default_analog: present a DualShock/analog pad (id 0x73) by default for
-    // this game, so a stick-capable title (e.g. Tomba, which gives variable run
-    // speed through the analog stick) feels right out of the box without the
-    // user toggling DualShock in the launcher. Per-install settings.toml
-    // [controller] p1_analog/p2_analog still override. Default off (digital 0x41).
-    // `default_analog = true` sets both ports; `p1_analog`/`p2_analog` set one.
-    bool                  has_default_analog = false;
-    bool                  default_p1_analog  = false;
-    bool                  default_p2_analog  = false;
+    // default_mode: the pad input mode this game ships with (see PadMode):
+    // "hybrid" (default) auto-switches DualShock/digital from the player's
+    // input, "analog" pins DualShock (0x73), "digital" pins a digital pad
+    // (0x41). A stick-capable title (e.g. Tomba) ships "hybrid" so the stick
+    // gives variable run speed yet the D-pad keeps its classic digital feel,
+    // with no launcher toggling. Per-install settings.toml [controller]
+    // p1_mode/p2_mode still override. `default_mode` sets both ports;
+    // `p1_mode`/`p2_mode` set one. Legacy `default_analog`/`p1_analog`/
+    // `p2_analog` booleans are still accepted (true->analog, false->digital).
+    bool                  has_default_mode = false;
+    int                   default_p1_mode  = PAD_MODE_HYBRID;
+    int                   default_p2_mode  = PAD_MODE_HYBRID;
 
     // deadzone: default analog-stick deadzone in raw SDL axis units (0..32767).
     // Applied both to the stick->d-pad press threshold and the analog-axis centre
@@ -361,12 +381,15 @@ struct UserSettings {
     //   "none"     — no pad in this port (port not connected)
     //   "keyboard" — driven by the keyboard map (input.ini)
     //   "<GUID>"   — an SDL game-controller GUID (SDL_JoystickGetGUIDString)
-    // analog selects the emulated pad type: false = digital (0x41), true =
-    // DualShock/analog (0x73). Defaults: P1 keyboard/digital, P2 none/digital.
+    // p1_mode/p2_mode select the emulated pad behaviour (see PadMode):
+    // hybrid (default) / analog / digital. Defaults: P1 keyboard, P2 none.
     bool has_p1_device = false; std::string p1_device = "keyboard";
     bool has_p2_device = false; std::string p2_device = "none";
-    bool has_p1_analog = false; bool p1_analog = false;
-    bool has_p2_analog = false; bool p2_analog = false;
+    // Pad input mode per player (see PadMode): hybrid (default) / analog /
+    // digital. Persisted as p1_mode/p2_mode strings. Legacy p1_analog/p2_analog
+    // booleans are still read for back-compat (true->analog, false->digital).
+    bool has_p1_mode = false; int p1_mode = PAD_MODE_HYBRID;
+    bool has_p2_mode = false; int p2_mode = PAD_MODE_HYBRID;
     // Analog-stick deadzone, raw SDL axis units (0..32767). The launcher edits
     // this as 0-100% (raw = pct*32767/100), mirroring snesrecomp's GamepadDeadzone.
     bool has_deadzone  = false; int  deadzone  = 12000;
