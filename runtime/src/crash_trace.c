@@ -410,9 +410,23 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
     }
 
     /* Native call-stack snapshot — the TRUE recursion cycle (recent_fn above is
-     * time-ordered and shows leaf churn, not the recursing frames). */
+     * time-ordered and shows leaf churn, not the recursing frames).
+     *
+     * SAFETY: append_native_stack walks raw host stack memory and, despite its
+     * VirtualQuery bounding, can still fault on a hostile crash state (e.g. the
+     * recursion's own exhausted fiber stack). Because it runs INSIDE the dump,
+     * such a fault would take the whole report with it (silent SIGSEGV, no
+     * psx_last_run_report.json). So flush a complete-but-native_stack-less report
+     * to disk FIRST; if the walk faults, the trigger context (reason, cpu,
+     * recent_fn) is already on disk. If it survives, the final fwrite at the end
+     * of this function overwrites this snapshot with the full report. */
 #ifdef _WIN32
     {
+        size_t safe_pos = pos;
+        append_str(buf, sizeof(buf), &safe_pos, "  \"native_stack\": null\n}\n");
+        FILE *pf = fopen(kReportPath, "wb");
+        if (pf) { fwrite(buf, 1, safe_pos, pf); fclose(pf); }
+
         uintptr_t sp = 0;
         if (seh_info)
             sp = (uintptr_t)((EXCEPTION_POINTERS *)seh_info)->ContextRecord->Rsp;
