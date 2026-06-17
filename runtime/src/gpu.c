@@ -500,6 +500,25 @@ void psx_ws_dbg_gate_frame_snapshot(void) {
     s_dbg_match_n = 0; s_dbg_match_tagged = 0;
 }
 
+/* Background-phase latch for the native-wide 2D-backdrop stretch. The far 2D
+ * backdrop (a sprite-tagged tile grid: sky gradient + flower-ball field) draws
+ * FIRST each frame, before the GTE 3D world. Once a shaded/gouraud prim (the 3D
+ * world's signature -- the backdrop is sprites/flat) is drawn, the backdrop phase
+ * is over: later TAGGED prims (HUD, characters) must NOT be stretched. Latched
+ * per-frame at GP0 decode (ws_bg_phase_note, sees every prim in draw order). */
+static uint32_t s_bg_phase_frame = 0xFFFFFFFFu;
+static int      s_bg_phase_over  = 0;
+void ws_bg_phase_note(uint32_t op) {
+    uint32_t f = (uint32_t)s_frame_count;
+    if (f != s_bg_phase_frame) { s_bg_phase_frame = f; s_bg_phase_over = 0; }
+    if (op >= 0x30u && op <= 0x3Fu) s_bg_phase_over = 1;   /* shaded = 3D world */
+}
+static int ws_bg_phase_over(void) {
+    uint32_t f = (uint32_t)s_frame_count;
+    if (f != s_bg_phase_frame) { s_bg_phase_frame = f; s_bg_phase_over = 0; }
+    return s_bg_phase_over;
+}
+
 int psx_ws_prim_in_backdrop(void) {
     if (gp0_cmd_source_addr != 0xFFFFFFFFu) {
         uint32_t f = (uint32_t)s_frame_count;
@@ -508,9 +527,12 @@ int psx_ws_prim_in_backdrop(void) {
         if (gp0_cmd_source_addr > g_bdg_src_hi) g_bdg_src_hi = gp0_cmd_source_addr;
     }
     if (g_dbg_mode != 0) return dbg_gate_match();   /* correlation override */
-    if (g_ws_backdrop_hi <= g_ws_backdrop_lo || gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
-    uint32_t a = gp0_cmd_source_addr & 0x1FFFFFFFu;
-    return a >= (g_ws_backdrop_lo & 0x1FFFFFFFu) && a <= (g_ws_backdrop_hi & 0x1FFFFFFFu);
+    /* Real gate: stretch the 2D backdrop = sprite-tagged prims drawn in the
+     * background phase (before the 3D world). Fills the native-wide void for both
+     * the flower grid and the sky band; HUD/characters (tagged but post-3D) and the
+     * GTE world (untagged) are excluded. */
+    if (ws_bg_phase_over()) return 0;
+    return psx_ws_prim_is_tagged();
 }
 
 int psx_ws_prim_is_tagged(void) {
@@ -2117,6 +2139,8 @@ static void gp0_execute_command(void) {
     uint8_t opcode = (gp0_cmd_buf[0] >> 24) & 0xFF;
     gp0_opcode_count[opcode]++;
     gp0_ring_record(gp0_cmd_buf, gp0_words_needed);
+    extern void ws_bg_phase_note(uint32_t op);
+    ws_bg_phase_note(opcode);   /* native-wide 2D-backdrop stretch: background-phase latch */
 
     /* Draw-census: capture every drawing primitive's first vertex + camera. */
     if (opcode >= 0x20 && opcode <= 0x7F) {
