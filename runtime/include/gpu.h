@@ -155,6 +155,18 @@ int  psx_ws_backdrop_ring_json(char *buf, int cap);
 extern int g_ws_bd_margin;
 extern int g_ws_bd_from_interp;
 
+/* Native-wide: nonzero if the GP0 prim currently being drawn is sprite-tagged
+ * (a character / Tomba / HUD element). The GL 2D-backdrop stretch uses this to
+ * EXCLUDE foreground sprites (only the untagged 2D backdrop is stretched). */
+int psx_ws_prim_is_tagged(void);
+
+/* Flower-field backdrop data-structure address range + a predicate matching the
+ * prim being drawn against it (gp0_cmd_source_addr ∈ [lo,hi]). The dirty-RAM
+ * interp sets lo/hi when the backdrop generator runs; the GL stretch gate uses
+ * psx_ws_prim_in_backdrop() to identify the flower-field tiles precisely. */
+extern uint32_t g_ws_backdrop_lo, g_ws_backdrop_hi;
+int psx_ws_prim_in_backdrop(void);
+
 /* Backdrop store-site registry: the runtime registers the [widescreen.backdrop]
  * x_sites here (from game.toml) so the dirty-RAM interpreter applies the same
  * psx_ws_backdrop_x() squash at those `sh` PCs that the recompiler emits into

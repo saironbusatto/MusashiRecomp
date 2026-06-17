@@ -310,14 +310,20 @@ static GLint s_tex_uXoff = -1, s_tex_uXhalf = -1;
 static GLint s_geo_uXscale = -1, s_geo_uXcenter = -1;
 static GLint s_tex_uXscale = -1, s_tex_uXcenter = -1;
 /* Runtime controls (ws_backdrop_stretch debug command). */
-int g_ws_bd_stretch_on   = 1;   /* feature on (gated by native-wide + phase) */
+int g_ws_bd_stretch_on   = 1;   /* feature on (gated by native-wide + per-prim gate) */
 int g_ws_bd_stretch_pct  = 0;   /* 0 = auto (g_wide_w/native_w); else pct/100 */
-int g_ws_bd_phase_thresh = 24;  /* px beyond 4:3 that ends the backdrop phase */
-int g_ws_bd_phase_mode   = 1;   /* 0 = any wide prim ends phase; 1 = only a wide
-                                 * TEXTURED prim does (the flat full-width sky
-                                 * draws first and must NOT end the backdrop phase;
-                                 * the 3D foreground is textured-and-wide). */
-static int s_bd_phase = 1;      /* 1 while still drawing the far 2D backdrop */
+int g_ws_bd_phase_thresh = 24;  /* "narrow" margin (px): a prim overhanging the 4:3
+                                 * region by more than this is treated as already-
+                                 * widened GTE geometry and NOT stretched */
+int g_ws_bd_phase_mode   = 1;   /* (retained for the debug command; unused since the
+                                 * gate is now per-prim !tagged && narrow) */
+/* Per-prim 2D-backdrop gate (replaces the old draw-order phase): a prim is
+ * stretched iff native-wide + feature on + NOT sprite-tagged (foreground chars/
+ * HUD are tagged) + NARROW (the GTE far-parallax/3D extend into the margins).
+ * s_bd_gate is what wide_set_bd_scale reads; s_tb_gate is the open textured
+ * batch's gate (batch flushes when a prim's gate differs, so a batch is uniform). */
+static int s_bd_gate = 0;
+static int s_tb_gate = 0;
 /* ws_backdrop_stretch diagnostics: per-frame snapshot reported by the command. */
 int g_bdg_applied = 0, g_bdg_prims = 0, g_bdg_clearx = -999999;
 int g_bdg_cur = 0, g_bdg_base = 0, g_bdg_w = 0, g_bdg_off = 0;
@@ -858,27 +864,7 @@ static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
         if (xs[i] < x0) x0 = xs[i]; if (xs[i] > x1) x1 = xs[i];
         if (ys[i] < y0) y0 = ys[i]; if (ys[i] > y1) y1 = ys[i];
     }
-    /* Native-wide backdrop phase: the far 2D backdrop draws first (far end of the
-     * ordering table). Once a prim reaches clearly into the 16:9 reveal -- a
-     * GTE-widened 3D prim -- the backdrop phase is over for this frame, so later
-     * (3D / HUD) prims are NOT x-stretched. Uses the unclamped prim x-extent. */
-    s_bdg_prims++;
-    if (g_wide_w > 0 && s_bd_phase) {
-        int base = g_wide_cur_base;
-        int native_w = g_wide_w - 2 * g_wide_off;
-        if (native_w > 0 && (textured || g_ws_bd_phase_mode == 0) &&
-            (x0 < base - g_ws_bd_phase_thresh || x1 > base + native_w + g_ws_bd_phase_thresh)) {
-            /* This (wide) prim ends the backdrop phase. Drain the pending textured
-             * batch NOW, while still phase-1, so the backdrop tiles queued in it
-             * get the stretch -- otherwise the batch (which may also hold this
-             * wide prim's neighbours) flushes later with phase 0 and is never
-             * scaled. Called before this prim is appended (mark_prim_dirty runs
-             * ahead of the batch append), so the flush drains only the backdrop. */
-            flush_tex_batch();
-            s_bd_phase = 0;
-            s_bdg_clearx = (x1 > base + native_w + g_ws_bd_phase_thresh) ? x1 : x0;
-        }
-    }
+    s_bdg_prims++;   /* dbg: prims seen this frame (gate is now per-prim, see bd_prim_gate) */
     if (s_ptrace_n < PTRACE_CAP) {
         PrimRec *p = &s_ptrace[s_ptrace_n++];
         p->x0 = (short)x0; p->x1 = (short)x1; p->y0 = (short)y0; p->y1 = (short)y1;
@@ -923,12 +909,33 @@ static void wide_target_end(GLint uXoff, GLint uXhalf) {
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
 }
 
-/* Set / clear the 2D-backdrop x-stretch for a wide-mirror draw. Stretches the
- * far backdrop about screen centre while we're still in the backdrop phase and
- * the feature is on; otherwise the no-op (1.0 / 0). */
+extern int psx_ws_prim_is_tagged(void);   /* gpu.c: is the current GP0 prim sprite-tagged? */
+extern int psx_ws_prim_in_backdrop(void); /* gpu.c: is its source addr in the flower-field struct? */
+
+/* Per-prim gate: stretch this prim iff native-wide + feature on AND the prim's
+ * source address is inside the flower-field backdrop data structure (precise —
+ * excludes the 3D rock/foreground, which is untagged AND has narrow prims so the
+ * earlier tag/narrow heuristic tore it). mode!=0 falls back to the old
+ * tag+narrow heuristic for A/B. */
+static int bd_prim_gate(const int *xs, int n) {
+    if (g_wide_w <= 0 || !g_ws_bd_stretch_on) return 0;
+    if (g_ws_bd_phase_mode != 0) return psx_ws_prim_in_backdrop();  /* default: precise address gate */
+    /* mode 0: legacy tag+narrow heuristic (kept for comparison) */
+    int native_w = g_wide_w - 2 * g_wide_off;
+    if (native_w <= 0) return 0;
+    if (psx_ws_prim_is_tagged()) return 0;
+    int base = g_wide_cur_base, lo = xs[0], hi = xs[0];
+    for (int i = 1; i < n; i++) { if (xs[i] < lo) lo = xs[i]; if (xs[i] > hi) hi = xs[i]; }
+    if (lo < base - g_ws_bd_phase_thresh) return 0;             /* into left margin -> GTE-wide */
+    if (hi > base + native_w + g_ws_bd_phase_thresh) return 0;  /* into right margin -> GTE-wide */
+    return 1;
+}
+
+/* Set / clear the 2D-backdrop x-stretch for a wide-mirror draw, per the current
+ * gate (s_bd_gate, set by the caller from bd_prim_gate / the batch gate). */
 static void wide_set_bd_scale(GLint uScale, GLint uCenter) {
     float scale = 1.0f, center = 0.0f;
-    if (s_bd_phase && g_ws_bd_stretch_on && g_wide_w > 0) {
+    if (s_bd_gate && g_ws_bd_stretch_on && g_wide_w > 0) {
         int native_w = g_wide_w - 2 * g_wide_off;
         if (native_w > 0) {
             scale  = g_ws_bd_stretch_pct > 0 ? (float)g_ws_bd_stretch_pct / 100.0f
@@ -990,6 +997,7 @@ static void flush_tex_batch(void) {
 
     if (g_wide_cur) {                       /* native-wide mirror (both STP passes) */
         int dx = wide_dx();
+        s_bd_gate = s_tb_gate;              /* this batch is uniform-gate (flushed on change) */
         wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
         wide_set_bd_scale(s_tex_uXscale, s_tex_uXcenter);
         glDisable(GL_BLEND);
@@ -1040,6 +1048,7 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
      * u_xhalf. Canonical pass above is untouched (u_xoff=0/u_xhalf=512). */
     if (g_wide_cur && !s_wide_suppress) {
         int dx = wide_dx();
+        s_bd_gate = bd_prim_gate(xs, n);   /* flat prims are immediate -> gate per prim */
         wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
         wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
         glDrawArrays(mode, 0, n);
@@ -1116,13 +1125,14 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
      * state goes in the vertex; only these keys force a new draw. */
     {
         int twx = s_tw_mask_x, twy = s_tw_mask_y, tox = s_tw_off_x, toy = s_tw_off_y;
+        int gate = bd_prim_gate(xs, 3);  /* backdrop-stretch gate is also a batch key */
         if (s_tb_n > 0 &&
-            (semi != s_tb_semi || s_mask_set != s_tb_mask || s_tex_filter != s_tb_filter ||
+            (semi != s_tb_semi || s_mask_set != s_tb_mask || s_tex_filter != s_tb_filter || gate != s_tb_gate ||
              twx != s_tb_twin[0] || twy != s_tb_twin[1] || tox != s_tb_twin[2] || toy != s_tb_twin[3]))
             flush_tex_batch();
         if (s_tb_n + 3 > TEXBATCH_MAXV) flush_tex_batch();
         if (s_tb_n == 0) {            /* opening a batch: capture its keyed state */
-            s_tb_semi = semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter;
+            s_tb_semi = semi; s_tb_mask = s_mask_set; s_tb_filter = s_tex_filter; s_tb_gate = gate;
             s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
         }
         float *vp = &s_tb[s_tb_n * TEXV];
@@ -2027,12 +2037,13 @@ static void gl_perf_present_enter(void) {
     /* Per-frame boundary for the 2D-backdrop stretch — runs from BOTH present
      * paths (4:3 present_vram AND native-wide present_wide_fbo), before the
      * perf-on gate so native-wide frames reset too. Snapshot this frame's
-     * diagnostics, then reset the phase + counters for the next frame. The final
-     * scene batch was already flushed by the caller. */
+     * backdrop-stretch diagnostics, then reset the per-frame counters. (The gate
+     * is per-prim now — no draw-order phase to reset.) Final batch already flushed
+     * by the caller. */
     g_bdg_applied = s_bdg_applied; g_bdg_prims = s_bdg_prims; g_bdg_clearx = s_bdg_clearx;
     g_bdg_cur = (g_wide_cur != 0); g_bdg_base = g_wide_cur_base; g_bdg_w = g_wide_w; g_bdg_off = g_wide_off;
     s_bdg_applied = 0; s_bdg_prims = 0; s_bdg_clearx = -999999;
-    s_bd_phase = 1;
+    { extern void psx_ws_dbg_gate_frame_snapshot(void); psx_ws_dbg_gate_frame_snapshot(); }
     if (!s_pf_on) return;
     uint64_t now = SDL_GetPerformanceCounter();
     s_pf_enter = now;

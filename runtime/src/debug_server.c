@@ -5443,6 +5443,7 @@ static void handle_ws_backdrop_stretch(int id, const char *json)
 {
     extern int g_ws_bd_stretch_on, g_ws_bd_stretch_pct, g_ws_bd_phase_thresh, g_ws_bd_phase_mode;
     extern int g_bdg_applied, g_bdg_prims, g_bdg_clearx, g_bdg_cur, g_bdg_base, g_bdg_w, g_bdg_off;
+    extern uint32_t g_ws_backdrop_lo, g_ws_backdrop_hi, g_bdg_src_lo, g_bdg_src_hi;
     int on  = json_get_int(json, "on", -1);
     int pct = json_get_int(json, "pct", -1);
     int th  = json_get_int(json, "thresh", -1);
@@ -5452,9 +5453,41 @@ static void handle_ws_backdrop_stretch(int id, const char *json)
     if (th  >= 0) g_ws_bd_phase_thresh = th;
     if (md  >= 0) g_ws_bd_phase_mode   = md;
     send_fmt("{\"id\":%d,\"ok\":true,\"on\":%d,\"pct\":%d,\"thresh\":%d,\"mode\":%d,"
-             "\"dbg\":{\"applied\":%d,\"prims\":%d,\"clearx\":%d,\"wide_cur\":%d,\"base\":%d,\"wide_w\":%d,\"off\":%d}}",
+             "\"dbg\":{\"applied\":%d,\"prims\":%d,\"wide_cur\":%d,\"base\":%d,\"wide_w\":%d,\"off\":%d,"
+             "\"bd_lo\":\"%08x\",\"bd_hi\":\"%08x\",\"src_lo\":\"%08x\",\"src_hi\":\"%08x\"}}",
              id, g_ws_bd_stretch_on, g_ws_bd_stretch_pct, g_ws_bd_phase_thresh, g_ws_bd_phase_mode,
-             g_bdg_applied, g_bdg_prims, g_bdg_clearx, g_bdg_cur, g_bdg_base, g_bdg_w, g_bdg_off);
+             g_bdg_applied, g_bdg_prims, g_bdg_cur, g_bdg_base, g_bdg_w, g_bdg_off,
+             g_ws_backdrop_lo, g_ws_backdrop_hi, g_bdg_src_lo, g_bdg_src_hi);
+}
+
+/* prim<->pixel correlation gate (ws_dbg_stretch). Forces g_ws_bd_stretch_on=1 and
+ * sets the selectable match mode used by the GL native-wide 2D-stretch gate so a
+ * probe can stretch an exact prim set and screenshot which one fills the void.
+ * Args: mode (0..6), lo, hi (OT addrs, hex via _hex fields or decimal), clut.
+ * Reports matched/tagged counts (last frame) + applied. */
+static void handle_ws_dbg_stretch(int id, const char *json)
+{
+    extern int g_ws_bd_stretch_on, g_ws_bd_stretch_pct, g_ws_bd_phase_mode;
+    extern int g_bdg_applied, g_dbg_mode, g_dbg_match_n, g_dbg_match_tagged;
+    extern uint32_t g_dbg_lo, g_dbg_hi;
+    extern unsigned short g_dbg_clut;
+    int mode = json_get_int(json, "mode", -1);
+    int pct  = json_get_int(json, "pct", -1);
+    char s[40];
+    if (mode >= 0) {
+        g_dbg_mode = mode;
+        g_ws_bd_stretch_on = 1;            /* ensure the stretch is enabled */
+        g_ws_bd_phase_mode = 1;            /* route bd_prim_gate -> psx_ws_prim_in_backdrop */
+    }
+    if (pct >= 0) g_ws_bd_stretch_pct = pct;
+    if (json_get_str(json, "lo", s, sizeof(s)))   g_dbg_lo   = hex_to_u32(s) & 0x1FFFFFFFu;
+    if (json_get_str(json, "hi", s, sizeof(s)))   g_dbg_hi   = hex_to_u32(s) & 0x1FFFFFFFu;
+    if (json_get_str(json, "clut", s, sizeof(s))) g_dbg_clut = (unsigned short)hex_to_u32(s);
+    send_fmt("{\"id\":%d,\"ok\":true,\"mode\":%d,\"on\":%d,\"pct\":%d,"
+             "\"lo\":\"%08x\",\"hi\":\"%08x\",\"clut\":\"%04x\","
+             "\"matched\":%d,\"matched_tagged\":%d,\"applied\":%d}",
+             id, g_dbg_mode, g_ws_bd_stretch_on, g_ws_bd_stretch_pct,
+             g_dbg_lo, g_dbg_hi, g_dbg_clut, g_dbg_match_n, g_dbg_match_tagged, g_bdg_applied);
 }
 
 /* 8C far-backdrop depth split. ws_far_threshold [t=<SZ>] sets the SZ cutoff
@@ -8881,6 +8914,7 @@ static const CmdEntry s_commands[] = {
     { "ws_backdrop_ring",  handle_ws_backdrop_ring },
     { "ws_backdrop_margin", handle_ws_backdrop_margin },
     { "ws_backdrop_stretch", handle_ws_backdrop_stretch },
+    { "ws_dbg_stretch",    handle_ws_dbg_stretch },
     { "ws_far_threshold",  handle_ws_far_threshold },
     { "ws_census",         handle_ws_census },
     { "mem_words",         handle_mem_words },

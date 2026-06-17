@@ -437,6 +437,96 @@ static int ws_tagged_anchor(int32_t *out_ax) {
     return 0;
 }
 
+/* Native-wide-compatible "is the current GP0 prim sprite-tagged?" — same ws_tags
+ * lookup as ws_tagged_anchor but gated on ws_engaged() (squash OR native-wide)
+ * instead of ws_active() (squash only). Used by the GL native-wide 2D-backdrop
+ * stretch to EXCLUDE foreground sprites: characters / Tomba / HUD are tagged by
+ * psx_ws_sprite_tag (their prim ptr -> ws_tags), the 2D backdrop tiles are not.
+ * Reads the live gp0_cmd_source_addr (the source addr of the prim being drawn). */
+/* Flower-field backdrop data-structure address range — set by the dirty-RAM
+ * interpreter when the backdrop generator (overlay 0x80116808) runs; its tile
+ * packets live in [lo, hi]. The GL native-wide 2D-stretch gate matches the prim
+ * being drawn (gp0_cmd_source_addr) against this to PRECISELY identify the
+ * flower-field tiles — the 3D rock/foreground is untagged AND has narrow prims,
+ * so tag/narrow heuristics alone mis-stretch and tear it. */
+uint32_t g_ws_backdrop_lo = 0, g_ws_backdrop_hi = 0;
+/* diag: per-frame min/max of the prim source addrs the GL gate sees */
+uint32_t g_bdg_src_lo = 0xFFFFFFFFu, g_bdg_src_hi = 0;
+static uint32_t bdg_src_frame = 0xFFFFFFFFu;
+
+/* ---- prim<->pixel correlation debug gate (ws_dbg_stretch command) ------------
+ * To identify WHICH drawn prims constitute the native-wide 2D-backdrop void layer
+ * (vs Tomba/HUD/3D), this lets a probe stretch an exact SELECTABLE prim set and
+ * screenshot the result. When g_dbg_mode != 0 the GL stretch gate uses this
+ * instead of the flower-struct range. Modes (buffer/frame-independent except 1):
+ *   1 OT-range   : gp0_cmd_source_addr in [g_dbg_lo,g_dbg_hi]
+ *   2 clut       : textured prim whose clut == g_dbg_clut
+ *   3 tpage      : textured prim whose tpage == (g_dbg_clut & 0x1FF)
+ *   4 tagged     : prim is sprite-tagged (psx_ws_prim_is_tagged)
+ *   5 untag-tex  : textured AND not sprite-tagged
+ *   6 all-tex    : every textured prim (sanity: should fill void + distort 3D)
+ * Counters (per-frame, snapshotted by the present hook) report how many prims
+ * matched and how many of those were sprite-tagged. */
+int      g_dbg_mode = 0;
+uint32_t g_dbg_lo = 0, g_dbg_hi = 0;
+uint16_t g_dbg_clut = 0;
+int      g_dbg_match_n = 0, g_dbg_match_tagged = 0;        /* snapshot (reported) */
+static int s_dbg_match_n = 0, s_dbg_match_tagged = 0;      /* accumulate per frame */
+int psx_ws_prim_is_tagged(void);   /* defined below */
+
+static int dbg_gate_match(void) {
+    uint32_t op   = (gp0_cmd_buf[0] >> 24) & 0xFFu;
+    uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
+    uint32_t a    = gp0_cmd_source_addr & 0x1FFFFFFFu;
+    int textured  = ((op >= 0x20 && op <= 0x3F) && (op & 0x04)) || (op >= 0x64 && op <= 0x67);
+    int tagged    = psx_ws_prim_is_tagged();
+    int m = 0;
+    switch (g_dbg_mode) {
+        case 1: m = (g_dbg_hi > g_dbg_lo && a >= g_dbg_lo && a <= g_dbg_hi); break;
+        case 2: m = (textured && clut == g_dbg_clut); break;
+        case 3: m = (textured && ((uint16_t)(gp0_cmd_buf[4] >> 16) & 0x1FF) == (g_dbg_clut & 0x1FF)); break;
+        case 4: m = tagged; break;
+        case 5: m = (textured && !tagged); break;
+        case 6: m = textured; break;
+        default: m = 0; break;
+    }
+    if (m) { s_dbg_match_n++; if (tagged) s_dbg_match_tagged++; }
+    return m;
+}
+
+/* Called by the present hook each frame to publish the dbg match counters. */
+void psx_ws_dbg_gate_frame_snapshot(void) {
+    g_dbg_match_n = s_dbg_match_n; g_dbg_match_tagged = s_dbg_match_tagged;
+    s_dbg_match_n = 0; s_dbg_match_tagged = 0;
+}
+
+int psx_ws_prim_in_backdrop(void) {
+    if (gp0_cmd_source_addr != 0xFFFFFFFFu) {
+        uint32_t f = (uint32_t)s_frame_count;
+        if (f != bdg_src_frame) { bdg_src_frame = f; g_bdg_src_lo = 0xFFFFFFFFu; g_bdg_src_hi = 0; }
+        if (gp0_cmd_source_addr < g_bdg_src_lo) g_bdg_src_lo = gp0_cmd_source_addr;
+        if (gp0_cmd_source_addr > g_bdg_src_hi) g_bdg_src_hi = gp0_cmd_source_addr;
+    }
+    if (g_dbg_mode != 0) return dbg_gate_match();   /* correlation override */
+    if (g_ws_backdrop_hi <= g_ws_backdrop_lo || gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
+    uint32_t a = gp0_cmd_source_addr & 0x1FFFFFFFu;
+    return a >= (g_ws_backdrop_lo & 0x1FFFFFFFu) && a <= (g_ws_backdrop_hi & 0x1FFFFFFFu);
+}
+
+int psx_ws_prim_is_tagged(void) {
+    if (!ws_engaged() || gp0_cmd_source_addr == 0xFFFFFFFFu) return 0;
+    uint32_t now = (uint32_t)s_frame_count;
+    for (int variant = 0; variant < 2; variant++) {
+        uint32_t key = (gp0_cmd_source_addr - (variant ? 0u : 4u)) & 0x1FFFFCu;
+        uint32_t idx = (key >> 2) & (WS_TAG_BUCKETS - 1);
+        for (int i = 0; i < WS_TAG_PROBES; i++) {
+            WsTag *t = &ws_tags[(idx + i) & (WS_TAG_BUCKETS - 1)];
+            if (t->key == key && now - t->stamp <= 2) return 1;
+        }
+    }
+    return 0;
+}
+
 /* Squash x around pivot ax by ws_xnum/ws_xden, round to nearest. */
 static int32_t ws_scale_about(int32_t x, int32_t ax) {
     int32_t d = x - ax;

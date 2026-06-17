@@ -294,3 +294,30 @@ flatten path (full_function_emitter.cpp). See TombaRecomp/ISSUES.md.
   per-frame dbg block (applied/prims/clearx/wide_cur/base/wide_w/off).
 - Keyboard ALWAYS drives player 1 (OR'd with any controller; main.cpp) — debug
   convenience, unconditional.
+
+# 2026-06-17 — CONTENT-MATCH DISPROVEN; writer chain mapped; SOURCE-SIDE chosen
+The "BREAKTHROUGH — draw-time classification" / content-match plan above is the
+THIRD dead end. Live RE (GP0-ring tools in TombaRecomp/tools/an_*.py):
+- The cmd-0x25 flower template (a1=0x801a603c, generator 0x80116808) is TRANSFORMED
+  before drawing: template clut 0x1c91/0x4bde, tpage 0x00a4 — NONE of those appear
+  in any drawn prim (drawn flat-prim cluts all 0x7xxx); ~110KB of active template
+  blobs collapse to a ~14KB drawn OT. No stable per-prim fingerprint exists.
+- Flower prims are REBUILT into the OT each frame (DMA src = OT 0x0b3xxx, disjoint
+  from struct 0x1a6xxx) → the committed address-range gate can never match (applied=0).
+- The early-drawn 0x65 sprite GRID (6 cols x7, X=-2..318 step-64, cluts 780f/784f/798f,
+  drawn before any 3D) is the leading void-layer suspect. Its XY is written via `sh`
+  (X=0x13e=318) by SHARED helper 0x8005dfd8 (caller ra=0x8004e188), from a main-EXE
+  builder at 0x8004e120-0x8004e188 that ALSO sprite-tags via 0x8005e08c → those
+  grid sprites are SPRITE-TAGGED. So the fix likely belongs in the sprite-tag /
+  native-wide path, NOT x_sites. (psx_ws_backdrop_x is squash-only; needs a
+  native-wide STRETCH branch regardless.)
+- TOOLING NOTE: wtrace `pc` is the STALE last-interp pc for native writes (codegen
+  emits no g_debug_last_store_pc; only the interp sets it → all native OT writes
+  read pc=0x80116f20). Trust the `ra` field (= jal+8). FUN_80027600 (GTE far-parallax
+  emitter, the 8C un-squash target) writes polygons into the same OT buffer, so
+  range-based wtrace is contaminated — use single-word traces (an_writer2.py).
+- OPEN/DO-FIRST: VERIFY which drawn prims actually constitute the void (build a
+  live prim<->pixel correlation: stretch/tint only a chosen {op,clut} or OT-range
+  set, iterate vs wide_shot) BEFORE picking the source site. Then scale that layer's
+  X at the source. Details + full reasoning in memory ws_backdrop_preload.md
+  (2026-06-17 section).
