@@ -982,8 +982,7 @@ static void refresh_player_devices(void) {
         PlayerInput& p = g_players[s];
         if (p.kind != 2) close_player(p);           /* keyboard/none: no handle */
         else open_player(p, g_players[s ^ 1]);
-        /* Slot 0 is always connected: the keyboard always drives player 1 (debug). */
-        sio_set_pad_connected(s, (s == 0 || p.kind != 0) ? 1 : 0);
+        sio_set_pad_connected(s, p.kind != 0 ? 1 : 0);
         sio_set_pad_analog(s, pad_mode_boot_analog(p.mode), 0x80, 0x80, 0x80, 0x80);
     }
 }
@@ -1229,24 +1228,13 @@ static void sdl_vblank_present(void) {
         sio_set_pad_state_slot(0, (uint16_t)override);
     } else {
         for (int s = 0; s < 2; s++) {
-            PlayerInput& p = g_players[s];   /* non-const: HYBRID mutates p.hybrid_analog */
-            /* Player 1 (slot 0): the keyboard ALWAYS drives the pad, OR'd with
-             * any assigned controller (debug convenience) -- so port 1 stays
-             * keyboard-controllable regardless of the configured device. Other
-             * ports use only their assigned device. */
-            const bool kb_always = (s == 0);
-            if (p.kind == 0 && !kb_always) continue;  /* no device in this port */
-
-            /* Button word: 0 bit = pressed, so AND of the release-masks unions
-             * the presses from both sources (device + keyboard for slot 0). */
-            uint16_t buttons = (p.kind != 0) ? pad_buttons_for(p) : 0xFFFF;
-            if (kb_always) buttons &= pad_from_keyboard();
-            sio_set_pad_state_slot(s, buttons);
+            PlayerInput& p = g_players[s];
+            if (p.kind == 0) continue;  /* no device in this port */
+            sio_set_pad_state_slot(s, pad_buttons_for(p));
 
             /* Resolve the pad type this frame from the player's mode. HYBRID
              * auto-switches DualShock<->digital from the most-recent input
-             * (stick -> analog, D-pad -> digital), mirroring the Special
-             * Edition's analog-LED auto-detect, so the game runs its own analog
+             * (stick -> analog, D-pad -> digital) so the game runs its own analog
              * or digital input path exactly as on hardware. */
             int eff_analog;
             uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
@@ -1260,16 +1248,6 @@ static void sdl_vblank_present(void) {
                 else if (hybrid_dpad_active(p, false)) p.hybrid_analog = false;
                 eff_analog = p.hybrid_analog ? 1 : 0;
                 if (eff_analog) pad_sticks_for(p, st, /*fold_dpad=*/false);
-            }
-            /* Fold the keyboard arrows onto the left stick (full deflection) when
-             * slot 0 resolves to analog, so P1 can be steered from the keyboard
-             * too. kind==1 (keyboard) already does this in pad_sticks_for. */
-            if (eff_analog && kb_always && p.kind != 1) {
-                const Uint8* keys = SDL_GetKeyboardState(NULL);
-                if (keys[SDL_SCANCODE_LEFT])  st[0] = 0x00;
-                if (keys[SDL_SCANCODE_RIGHT]) st[0] = 0xFF;
-                if (keys[SDL_SCANCODE_UP])    st[1] = 0x00;
-                if (keys[SDL_SCANCODE_DOWN])  st[1] = 0xFF;
             }
             sio_set_pad_analog(s, eff_analog, st[0], st[1], st[2], st[3]);
         }
@@ -2015,8 +1993,7 @@ int main(int argc, char** argv) {
     set_player_device(g_players[0], p1_device, p1_mode);
     set_player_device(g_players[1], p2_device, p2_mode);
     for (int s = 0; s < 2; s++) {
-        /* Slot 0 is always connected: the keyboard always drives player 1 (debug). */
-        sio_set_pad_connected(s, (s == 0 || g_players[s].kind != 0) ? 1 : 0);
+        sio_set_pad_connected(s, g_players[s].kind != 0 ? 1 : 0);
         sio_set_pad_analog(s, pad_mode_boot_analog(g_players[s].mode), 0x80, 0x80, 0x80, 0x80);
     }
     /* SPU float-shadow gate must be set before spu_init() (which runs
