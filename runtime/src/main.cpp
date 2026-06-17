@@ -105,7 +105,12 @@ static SDL_Texture*  sdl_texture;
 struct PlayerInput {
     int   kind = 0;            /* 0=none, 1=keyboard, 2=controller */
     char  guid[40] = {0};      /* SDL joystick GUID string when kind==controller */
-    bool  analog = false;      /* DualShock (analog) vs digital pad */
+    /* Pad input mode (PSXRecompV4::PadMode): 0=hybrid (default), 1=analog,
+     * 2=digital. hybrid_analog is the per-frame auto-switch latch used only in
+     * hybrid mode: true => currently presenting DualShock (stick was the last
+     * input), false => currently presenting a digital pad (D-pad was last). */
+    int   mode = PSXRecompV4::PAD_MODE_HYBRID;
+    bool  hybrid_analog = false;
     SDL_GameController* handle = nullptr;
     SDL_JoystickID      instance = -1;
 };
@@ -963,6 +968,13 @@ static void open_player(PlayerInput& p, const PlayerInput& other) {
     }
 }
 
+/* The pad type a mode reports before any input has been sampled (boot /
+ * hotplug). analog pins DualShock; digital and hybrid both start as a digital
+ * pad (hybrid only flips to DualShock once the player nudges the stick). */
+static int pad_mode_boot_analog(int mode) {
+    return mode == PSXRecompV4::PAD_MODE_ANALOG ? 1 : 0;
+}
+
 /* Open/close SDL handles so they match g_players, and (re)assert each slot's
  * PSX connection + pad type. Safe to call repeatedly (hotplug, boot). */
 static void refresh_player_devices(void) {
@@ -971,14 +983,15 @@ static void refresh_player_devices(void) {
         if (p.kind != 2) close_player(p);           /* keyboard/none: no handle */
         else open_player(p, g_players[s ^ 1]);
         sio_set_pad_connected(s, p.kind != 0 ? 1 : 0);
-        sio_set_pad_analog(s, p.analog ? 1 : 0, 0x80, 0x80, 0x80, 0x80);
+        sio_set_pad_analog(s, pad_mode_boot_analog(p.mode), 0x80, 0x80, 0x80, 0x80);
     }
 }
 
 /* Parse a [controller] device string into a player slot:
  *   "none" -> no pad; "keyboard" -> keyboard map; otherwise an SDL GUID. */
-static void set_player_device(PlayerInput& p, const std::string& dev, bool analog) {
-    p.analog = analog;
+static void set_player_device(PlayerInput& p, const std::string& dev, int mode) {
+    p.mode = mode;
+    p.hybrid_analog = false;   /* hybrid starts digital until the stick moves */
     p.guid[0] = '\0';
     std::string d = lower_copy(trim_copy(dev));
     if (d.empty() || d == "none") { p.kind = 0; }
@@ -1078,15 +1091,18 @@ static uint16_t pad_buttons_for(const PlayerInput& p) {
 
 /* Analog stick bytes (lx,ly,rx,ry) for a player; centred if no live source.
  *
- * The host left stick maps to the LEFT analog axes (variable). The physical
- * D-pad (and, for a keyboard player, the arrow keys) is ALSO folded onto the
- * left axes at full deflection, so an analog-mode game whose movement reads only
- * the stick magnitude (e.g. Tomba) still responds to the D-pad/keyboard. This is
- * the faithful "seamless" behaviour the Special Edition exposes: the stick gives
- * variable speed, the D-pad gives full speed, and both work at once. Only the
- * PHYSICAL D-pad is folded in (not the stick->d-pad button mapping), so the
- * stick keeps its true variable magnitude rather than snapping to full. */
-static void pad_sticks_for(const PlayerInput& p, uint8_t out[4]) {
+ * The host left stick maps to the LEFT analog axes (variable). When fold_dpad
+ * is set, the physical D-pad (and, for a keyboard player, the arrow keys) is
+ * ALSO folded onto the left axes at full deflection, so an analog-mode game
+ * whose movement reads only the stick magnitude (e.g. Tomba) still responds to
+ * the D-pad/keyboard — the faithful "seamless" behaviour: the stick gives
+ * variable speed, the D-pad gives full speed, both at once. Only the PHYSICAL
+ * D-pad is folded in (not the stick->d-pad button mapping), so the stick keeps
+ * its true variable magnitude. fold_dpad is false in HYBRID mode (there the
+ * D-pad instead flips the pad to digital, so the game runs its own d-pad path)
+ * and true in pinned-ANALOG mode. The keyboard branch always folds the arrows
+ * — they are that player's only stick source. */
+static void pad_sticks_for(const PlayerInput& p, uint8_t out[4], bool fold_dpad) {
     out[0] = out[1] = out[2] = out[3] = 0x80;
     if (p.kind == 1) {
         const Uint8* keys = SDL_GetKeyboardState(NULL);
@@ -1101,11 +1117,42 @@ static void pad_sticks_for(const PlayerInput& p, uint8_t out[4]) {
         out[1] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTY));
         out[2] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTX));
         out[3] = axis_to_pad_byte(SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_RIGHTY));
-        if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  out[0] = 0x00;
-        if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) out[0] = 0xFF;
-        if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_UP))    out[1] = 0x00;
-        if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  out[1] = 0xFF;
+        if (fold_dpad) {
+            if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_LEFT))  out[0] = 0x00;
+            if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) out[0] = 0xFF;
+            if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_UP))    out[1] = 0x00;
+            if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_DOWN))  out[1] = 0xFF;
+        }
     }
+}
+
+/* HYBRID-mode auto-switch detectors (mirror the DualShock analog LED toggling).
+ * hybrid_stick_active: the LEFT stick is deflected past the deadzone — the
+ * player has reached for analog. hybrid_dpad_active: any D-pad direction (or,
+ * for the keyboard, an arrow key) is held — the player wants classic digital.
+ * The keyboard has no analog stick, so a keyboard player stays digital. */
+static bool hybrid_stick_active(const PlayerInput& p) {
+    if (p.kind != 2 || !p.handle) return false;
+    const int dz = controller_deadzone;
+    int lx = SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTX);
+    int ly = SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTY);
+    return lx > dz || lx < -dz || ly > dz || ly < -dz;
+}
+static bool hybrid_dpad_active(const PlayerInput& p, bool kb_always) {
+    if (p.kind == 2 && p.handle) {
+        if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_LEFT)  ||
+            SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) ||
+            SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_UP)    ||
+            SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_DOWN))
+            return true;
+    }
+    if (p.kind == 1 || kb_always) {
+        const Uint8* keys = SDL_GetKeyboardState(NULL);
+        if (keys[SDL_SCANCODE_LEFT] || keys[SDL_SCANCODE_RIGHT] ||
+            keys[SDL_SCANCODE_UP]   || keys[SDL_SCANCODE_DOWN])
+            return true;
+    }
+    return false;
 }
 
 /* PSX native vblank cadence: NTSC ≈ 59.94 Hz. Wall-clock target keeps
@@ -1181,14 +1228,29 @@ static void sdl_vblank_present(void) {
         sio_set_pad_state_slot(0, (uint16_t)override);
     } else {
         for (int s = 0; s < 2; s++) {
-            const PlayerInput& p = g_players[s];
+            PlayerInput& p = g_players[s];
             if (p.kind == 0) continue;  /* no device in this port */
             sio_set_pad_state_slot(s, pad_buttons_for(p));
-            if (p.analog) {
-                uint8_t st[4];
-                pad_sticks_for(p, st);
-                sio_set_pad_analog(s, 1, st[0], st[1], st[2], st[3]);
+
+            /* Resolve the pad type this frame from the player's mode. HYBRID
+             * auto-switches DualShock<->digital from the most-recent input
+             * (stick -> analog, D-pad -> digital), mirroring the Special
+             * Edition's analog-LED auto-detect, so the game runs its own analog
+             * or digital input path exactly as on hardware. */
+            int eff_analog;
+            uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
+            if (p.mode == PSXRecompV4::PAD_MODE_DIGITAL) {
+                eff_analog = 0;
+            } else if (p.mode == PSXRecompV4::PAD_MODE_ANALOG) {
+                eff_analog = 1;
+                pad_sticks_for(p, st, /*fold_dpad=*/true);
+            } else { /* HYBRID */
+                if (hybrid_stick_active(p))            p.hybrid_analog = true;
+                else if (hybrid_dpad_active(p, false)) p.hybrid_analog = false;
+                eff_analog = p.hybrid_analog ? 1 : 0;
+                if (eff_analog) pad_sticks_for(p, st, /*fold_dpad=*/false);
             }
+            sio_set_pad_analog(s, eff_analog, st[0], st[1], st[2], st[3]);
         }
     }
 
@@ -1550,8 +1612,8 @@ int main(int argc, char** argv) {
     /* [controller] device routing (defaults: P1 keyboard/digital, P2 none). */
     std::string p1_device = "keyboard";
     std::string p2_device = "none";
-    bool p1_analog = false;
-    bool p2_analog = false;
+    int  p1_mode = PSXRecompV4::PAD_MODE_HYBRID;
+    int  p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     std::filesystem::path resolved_disc;
     std::string window_title = PSX_WINDOW_TITLE;
@@ -1603,9 +1665,9 @@ int main(int argc, char** argv) {
             g_auto_skip_fmv    = gc.runtime.video_auto_skip_fmv ? 1 : 0;
             /* [controller] game-declared input defaults (settings.toml/launcher
              * still override below). */
-            if (gc.runtime.has_default_analog) {
-                p1_analog = gc.runtime.default_p1_analog;
-                p2_analog = gc.runtime.default_p2_analog;
+            if (gc.runtime.has_default_mode) {
+                p1_mode = gc.runtime.default_p1_mode;
+                p2_mode = gc.runtime.default_p2_mode;
             }
             if (gc.runtime.has_deadzone) resolved_deadzone = gc.runtime.deadzone;
             { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
@@ -1699,8 +1761,8 @@ int main(int argc, char** argv) {
         if (us.has_memcard2_enabled) memcard2_enabled = us.memcard2_enabled;
         if (us.has_p1_device) p1_device = us.p1_device;
         if (us.has_p2_device) p2_device = us.p2_device;
-        if (us.has_p1_analog) p1_analog = us.p1_analog;
-        if (us.has_p2_analog) p2_analog = us.p2_analog;
+        if (us.has_p1_mode) p1_mode = us.p1_mode;
+        if (us.has_p2_mode) p2_mode = us.p2_mode;
         if (us.has_deadzone)  resolved_deadzone = us.deadzone;
     }
 
@@ -1777,8 +1839,8 @@ int main(int argc, char** argv) {
             if (!memcard2_path.empty()) { seed.memcard2_path = memcard2_path; seed.has_memcard2_path = true; }
             seed.p1_device = p1_device; seed.has_p1_device = true;
             seed.p2_device = p2_device; seed.has_p2_device = true;
-            seed.p1_analog = p1_analog; seed.has_p1_analog = true;
-            seed.p2_analog = p2_analog; seed.has_p2_analog = true;
+            seed.p1_mode = p1_mode; seed.has_p1_mode = true;
+            seed.p2_mode = p2_mode; seed.has_p2_mode = true;
             seed.deadzone = resolved_deadzone >= 0 ? resolved_deadzone : 12000;
             seed.has_deadzone = true;
             seed.window_width = g_video_win_w; seed.has_window_width = true;
@@ -1845,7 +1907,7 @@ int main(int argc, char** argv) {
                 if (seed.has_memcard1_path) memcard1_path = seed.memcard1_path;
                 if (seed.has_memcard2_path) memcard2_path = seed.memcard2_path;
                 p1_device = seed.p1_device; p2_device = seed.p2_device;
-                p1_analog = seed.p1_analog; p2_analog = seed.p2_analog;
+                p1_mode = seed.p1_mode; p2_mode = seed.p2_mode;
                 if (seed.has_deadzone) resolved_deadzone = seed.deadzone;
                 g_video_win_w = seed.window_width;
                 /* Persist the user's choices next to the exe. */
@@ -1929,11 +1991,11 @@ int main(int argc, char** argv) {
      * SDL controller handles are opened later (after SDL_Init); here we only
      * set the PSX-visible connection + pad type so the BIOS sees the right
      * ports during early boot. */
-    set_player_device(g_players[0], p1_device, p1_analog);
-    set_player_device(g_players[1], p2_device, p2_analog);
+    set_player_device(g_players[0], p1_device, p1_mode);
+    set_player_device(g_players[1], p2_device, p2_mode);
     for (int s = 0; s < 2; s++) {
         sio_set_pad_connected(s, g_players[s].kind != 0 ? 1 : 0);
-        sio_set_pad_analog(s, g_players[s].analog ? 1 : 0, 0x80, 0x80, 0x80, 0x80);
+        sio_set_pad_analog(s, pad_mode_boot_analog(g_players[s].mode), 0x80, 0x80, 0x80, 0x80);
     }
     /* SPU float-shadow gate must be set before spu_init() (which runs
      * spu_shadow_reset()). Default OFF; PSX_AUDIO_SHADOW env overrides. */
