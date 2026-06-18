@@ -38,6 +38,7 @@ void vk_renderer_present_cpu(const uint32_t*p,int w,int h,int l,int f){(void)p;(
 void vk_renderer_present_blank(void){}
 void vk_renderer_sync_cpu(void){}
 void vk_renderer_set_present_mode(int m){(void)m;}
+int  vk_perf_json(char *out,int cap,int count){(void)count; return cap>2?snprintf(out,cap,"[]"):0;}
 const GpuRenderBackend *vk_backend_get(void) { return 0; }
 
 #else  /* PSX_HAVE_VULKAN */
@@ -255,6 +256,30 @@ static VkDescriptorSet s_ds_pack;
 static VkDescriptorSet s_ds_blit_ring[BLIT_DESC_RING];
 static int s_ds_blit_idx;
 
+/* ---- always-on per-frame perf ring (transition-stall diagnosis) ----------
+ * Per-op counters accumulate into s_perf_cur; each present() snapshots them into
+ * the ring keyed by present index, then resets. Query via the debug-server
+ * "vk_perf" command (vk_perf_json). Op COUNTS alone reveal the dominant
+ * per-frame cost (e.g. make_staging vkAllocateMemory churn during transitions:
+ * a frame that jumps from ~10 to ~2000 allocs is the smoking gun). Always on. */
+typedef struct {
+    uint32_t present_idx;
+    uint32_t allocs, alloc_kb, oneshots, submits, syncs, pack_flushes,
+             blits, upload_blocks, copy_rects, geo_flushes, tex_flushes;
+} VkPerf;
+#define VK_PERF_RING 256
+static VkPerf s_perf_ring[VK_PERF_RING];
+static uint32_t s_perf_head;          /* number of frames recorded (monotonic) */
+static VkPerf s_perf_cur;             /* current (in-progress) frame */
+static uint32_t s_present_idx;
+
+static void perf_snapshot_present(void) {
+    s_perf_cur.present_idx = s_present_idx++;
+    s_perf_ring[s_perf_head % VK_PERF_RING] = s_perf_cur;
+    s_perf_head++;
+    memset(&s_perf_cur, 0, sizeof s_perf_cur);
+}
+
 /* Pipeline layouts (one per program family). */
 static VkPipelineLayout s_pl_geo;
 static VkPipelineLayout s_pl_tex;
@@ -349,6 +374,7 @@ static void vk_gpu_sync_internal(void);   /* drain queue + reclaim work pool/sta
 /* Begin a one-shot work command buffer (allocated from s_work_pool, which is
  * bulk-reset at gpu_sync). */
 static VkCommandBuffer begin_oneshot(void) {
+    s_perf_cur.oneshots++;
     VkCommandBufferAllocateInfo ai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     ai.commandPool = s_work_pool;
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -371,6 +397,7 @@ static void end_oneshot(VkCommandBuffer cb) {
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cb;
     p_vkQueueSubmit(s_queue, 1, &si, VK_NULL_HANDLE);
+    s_perf_cur.submits++;
     s_work_pending = 1;
 }
 
@@ -385,6 +412,7 @@ static void defer_staging(VkBuffer buf, VkDeviceMemory mem) {
 /* Drain all submitted work, then reclaim the work-CB pool and deferred staging.
  * The single sync point for the deferred-submit model. */
 static void vk_gpu_sync_internal(void) {
+    s_perf_cur.syncs++;
     if (s_work_pending) {
         p_vkQueueWaitIdle(s_queue);
         /* RELEASE_RESOURCES so the per-op command buffers allocated since the
@@ -1279,6 +1307,7 @@ int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
                 VK_ACCESS_TRANSFER_WRITE_BIT, 0,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     submit_present(cb, idx, fr);
+    perf_snapshot_present();
     return 1;
 }
 
@@ -1297,6 +1326,7 @@ void vk_renderer_present_blank(void) {
                 VK_ACCESS_TRANSFER_WRITE_BIT, 0,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     submit_present(cb, idx, fr);
+    perf_snapshot_present();
 }
 
 /* Present an ARGB8888 image (24-bit FMV / display-disabled clear) letterboxed.
@@ -1357,6 +1387,7 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
     p_vkQueueWaitIdle(s_queue);   /* transient resources: keep alive until done */
     p_vkDestroyImage(s_dev, img, NULL); p_vkFreeMemory(s_dev, imem, NULL);
     free_staging(buf, mem);
+    perf_snapshot_present();
 }
 
 int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
@@ -1367,6 +1398,31 @@ int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
 void vk_renderer_sync_cpu(void) {
     if (!s_ctx_ok) return;
     ensure_cpu();   /* drain batches, pack hr->raw, copy raw->CPU mirror */
+}
+
+/* Dump the last `count` per-frame perf records as a JSON array (oldest..newest).
+ * Always-on; the debug-server "vk_perf" command reads this to find which op
+ * explodes during a transition stall (e.g. allocs jumping 10 -> thousands). */
+int vk_perf_json(char *out, int cap, int count) {
+    uint32_t total = s_perf_head;
+    uint32_t n = ((uint32_t)count < total) ? (uint32_t)count : total;
+    if (n > VK_PERF_RING) n = VK_PERF_RING;
+    int o = snprintf(out, cap, "[");
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t k = total - n + i;          /* frame index, oldest..newest */
+        VkPerf *p = &s_perf_ring[k % VK_PERF_RING];
+        o += snprintf(out + o, cap - o,
+            "%s{\"f\":%u,\"alloc\":%u,\"alloc_kb\":%u,\"oneshot\":%u,\"submit\":%u,"
+            "\"sync\":%u,\"pack\":%u,\"blit\":%u,\"upload\":%u,\"copy\":%u,"
+            "\"geo\":%u,\"tex\":%u}",
+            i ? "," : "",
+            p->present_idx, p->allocs, p->alloc_kb, p->oneshots, p->submits,
+            p->syncs, p->pack_flushes, p->blits, p->upload_blocks, p->copy_rects,
+            p->geo_flushes, p->tex_flushes);
+        if (o >= cap - 256) break;
+    }
+    o += snprintf(out + o, cap - o, "]");
+    return o;
 }
 
 /* ---- render-pass + coherency helpers ----------------------------------- */
@@ -1418,6 +1474,8 @@ static int make_staging(VkDeviceSize bytes, VkBuffer *buf, VkDeviceMemory *mem, 
     }
     p_vkBindBufferMemory(s_dev, *buf, *mem, 0);
     p_vkMapMemory(s_dev, *mem, 0, bytes, 0, map);
+    s_perf_cur.allocs++;
+    s_perf_cur.alloc_kb += (uint32_t)(bytes / 1024);
     return 1;
 }
 static void free_staging(VkBuffer buf, VkDeviceMemory mem) {
@@ -1428,6 +1486,7 @@ static void free_staging(VkBuffer buf, VkDeviceMemory mem) {
  * each SxS block). Caller has already drained the batches that dirtied it. */
 static void pack_flush(void) {
     if (!s_ready || !s_pack_dirty.set) return;
+    s_perf_cur.pack_flushes++;
     int x = s_pack_dirty.x0, y = s_pack_dirty.y0;
     int w = s_pack_dirty.x1 - s_pack_dirty.x0 + 1;
     int h = s_pack_dirty.y1 - s_pack_dirty.y0 + 1;
@@ -1469,6 +1528,7 @@ static void blit_region(int x, int y, int w, int h, VkImageView src_view,
                         VkImage src_img, VkImageLayout *src_layout,
                         int src_div, int sox, int soy, int plain, int mark_pack) {
     if (w <= 0 || h <= 0) return;
+    s_perf_cur.blits++;
     if (s_ds_blit_idx >= BLIT_DESC_RING) gpu_sync();   /* ring exhausted: drain, reset idx */
     VkDescriptorSet ds = s_ds_blit_ring[s_ds_blit_idx++];
     VkDescriptorImageInfo ii = { s_samp, src_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -1511,6 +1571,7 @@ static void blit_region(int x, int y, int w, int h, VkImageView src_view,
  * updated via a blit so the stencil bit15 mirror stays exact. */
 static void vram_upload_block(int x, int y, int w, int h, const uint16_t *data) {
     if (w <= 0 || h <= 0 || !s_ready) return;
+    s_perf_cur.upload_blocks++;
     flush_tex_batch(); flush_geometry();
 
     /* 1) raw mirror: native 1555, exact. */
@@ -1681,6 +1742,7 @@ static DirtyRect s_geo_bbox;
  * (blend/mask per the batch keys), then the image returns to TRANSFER_SRC. */
 static void flush_geometry(void) {
     if (s_vcount == 0 || !s_ready) return;
+    s_perf_cur.geo_flushes++;
     uint32_t n = s_vcount; s_vcount = 0;
     int semi = s_geo_semi, blend = (semi < 0) ? 0 : (semi + 1);
     VkCommandBuffer cb = begin_oneshot();
@@ -1807,6 +1869,7 @@ static void vkb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_
  * pipeline. The raw mirror was made coherent at append time (flush_pack_if_sampling). */
 static void flush_tex_batch(void) {
     if (s_tcount == 0 || !s_ready) return;
+    s_perf_cur.tex_flushes++;
     uint32_t n = s_tcount; s_tcount = 0;
     int semi = s_tb_semi, blend = (semi < 0) ? 0 : (semi + 1);
     VkCommandBuffer cb = begin_oneshot();
@@ -1963,6 +2026,7 @@ static void vkb_copy_rect(int sx,int sy,int dx,int dy,int w,int h){
     if (sy + h > VRAM_H) h = VRAM_H - sy;
     if (dy + h > VRAM_H) h = VRAM_H - dy;
     if (w <= 0 || h <= 0) return;
+    s_perf_cur.copy_rects++;
     int S = s_scale;
 
     /* stage 1: copy source hr region into scratch at the same coords */
