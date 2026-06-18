@@ -2393,11 +2393,11 @@ static void handle_fntrace_dump(int id, const char *json)
                         "%s{\"seq\":%llu,\"target\":\"0x%08X\","
                         "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
                         "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
-                        "\"s3\":\"0x%08X\",\"frame\":%u}",
+                        "\"s3\":\"0x%08X\",\"sp\":\"0x%08X\",\"frame\":%u}",
                         emitted == 0 ? "" : ",",
                         (unsigned long long)seq,
                         e->target, e->ra, e->a0, e->a1, e->a2, e->a3,
-                        e->s3, e->frame);
+                        e->s3, e->sp, e->frame);
         emitted++;
     }
     pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%d}\n", emitted);

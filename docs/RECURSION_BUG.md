@@ -931,3 +931,153 @@ contained interp/dispatch fix), or does it genuinely never return (→ §11 rede
 prior surface attempts (block-loop §20, JAL/JALR §22) are proven dead ends; stop
 surfacing single crossings. The §19 `ce_profile` flat-vs-climb remains the objective
 check; the self-driven screenshot-validated soak remains the harness.
+
+---
+
+## 23. ORACLE DISAMBIGUATION DONE — VERDICT: contained return-contract fix, NOT §11 (2026-06-18)
+
+Ran the oracle disambiguation (only). Both sides traced **in the identical idle state**
+(Tomba New Game, starting village, "Hey, you with the pink hair!" dialogue; object
+`*(0x1F8001D4)=0x801FD950`, `state/scene/jumptable` all 0). Artifacts in
+`_freeze_specimens/oracle/` (`oracle_chain_filtered.json`, `oracle_state.txt`,
+`recomp_allfn_frame.json`, `recomp_ce_profile.json`).
+
+**Tooling built (CLAUDE.md §15 — the oracle had a real gap).** psxref has **no**
+instruction/PC trace (`emu_step`/`emu_trace_addr` never existed — the handoff/§10 assumed
+them). The right oracle is **`psx-beetle.exe`** (shares the wire protocol; Beetle PSX core
+INTERPRETS, so its always-on `g_psxrecomp_fntrace_cb` records **every J/JAL/JR/JALR**
+with caller/target/ra/a0/a1/kind). Loads Tomba via `--disc tomba.cue <bios>`. Added **SP
+capture** to the fntrace ring on BOTH backends (read `GPR[29]` live) — `beetle_libretro.cpp`
++ `beetle_debug_server.c` and recomp `fntrace.c`/`fntrace.h`/`debug_server.c`; runtime-only,
+no regen. Also moved psx-beetle's default debug port **4380 → 4382** (`--port N` override):
+4380 collided with psxref AND `cdirecomp/CdiRuntime.exe`, and two LISTENers on one port
+silently route connections to the wrong process — that dual-listener was the whole
+"oracle keeps dying / unknown cmd" confusion early in the session, NOT a real crash.
+
+**ORACLE (real HW), one `func_8001A954` invocation — perfectly balanced, once/frame:**
+```
+JAL 0x8001A630 -> 0x8001A954  ra=0x8001A5DC  sp=0x801FE3E0   main_loop calls A954 (ret=0x8001A638)
+JAL 0x8001A9B8 -> 0x8001AC00  ra=0x8001A638  sp=0x801FE3C8  ┐
+JAL 0x8001AC4C -> 0x8001B2B4  ra=0x8001A9C0  sp=0x801FE3A8  │ nested chain,
+JAL 0x8001B3E4 -> 0x8001B5A8  ra=0x8001AC54  sp=0x801FE390  │ SP descends
+JAL 0x8001B750 -> 0x80046264  ra=0x8001B73C  sp=0x801FE378  │
+JAL 0x80046274 -> 0x80063864  ra=0x8001B758  sp=0x801FE360  ┘ (the dirty hop)
+JR  0x8001A9E8 -> 0x8001A638                 sp=0x801FE3E0   A954 RETURNS, SP fully restored
+```
+- `func_8001A954` is entered **exactly once/frame** (`JAL` from `0x8001A630`) and **returns
+  exactly once/frame** (`jr ra` at `0x8001A9E8` → `0x8001A638`), with **SP back to its entry
+  value `0x801FE3E0`** ⇒ the whole subtree unwinds every frame.
+- **NO re-entry of `func_8001A954` before its exit** (armed on `0x8001A954`; the only hit per
+  frame is the `0x8001A630` JAL). **The overlay `0x80063864` NEVER calls back into
+  `func_8001A954`** — §21's "interp overlay does `jalr func_8001A954`" is **REFUTED on real
+  HW**. There is **no guest call-cycle**: main_loop is a per-frame VSync callback that calls
+  A954 and A954 returns; §22's "`jal back to main_loop`" was a misread of the recomp's
+  forward-dispatched returns (below).
+
+**RECOMP (`build-recursion`, `PSX_MIXED_OWNER=0`), same idle — IDENTICAL guest flow, but
+every boundary-crossing RETURN is a forward `psx_dispatch`:**
+```
+... render leaf 0x8004DEE0 (ra=0x8004DEE8) ×5 ...
+psx_dispatch 0x800462C4  sp=0x801FE360   (80046264 subtree returns)
+psx_dispatch 0x8001B758  sp=0x801FE378   (80046264 -> B5A8 return)
+psx_dispatch 0x8001B3EC  sp=0x801FE390   (B5A8 -> B2B4 return)
+psx_dispatch 0x8001AC54  sp=0x801FE3A8   (B2B4 -> AC00 return)
+psx_dispatch 0x8001A9C0  sp=0x801FE3C8   (AC00 -> A954 return)
+psx_dispatch 0x8001A638  sp=0x801FE3E0   (A954 -> main_loop return; SP restored)
+```
+- The **guest** stack unwinds **identically** to the oracle (SP climbs back to `0x801FE3E0`,
+  same addresses, same RA). The down-chain calls (A954→AC00→…→80046264) are compiled DIRECT
+  calls; the render leaves are interpreted overlays (`0x8011xxxx`/`0x8012xxxx`/`0x8006Bxxx`,
+  ra `0x8001E0D8`). When those interpreted/dirty frames **return** to a compiled main-EXE
+  address, the dirty-RAM dispatch realizes the `jr ra` as a **forward `psx_dispatch(ret)`**
+  that NESTS `psx_dispatch_game_compiled` instead of surfacing to the trampoline owner.
+- **Live leak confirmed** (`ce_profile`): `max_kb` 20099→22215 over 1807 frames =
+  **+1.17 KB/frame**, `entries/frame` constant ~1300, deepest func the render cluster
+  (`0x8004DEE0`/`0x8005FF60`/`0x8005FA60`). Identical to §20.
+
+**VERDICT (decisive):**
+1. **No guest control-flow divergence.** Targets, RA, delay-slot results and SP are
+   bit-identical on both sides. ⇒ Hypothesis **C-as-interp-fabrication is RULED OUT** (the
+   interp does NOT mishandle a JAL/JALR/delay-slot/RA; it does not fabricate the re-entry).
+2. **Beetle UNWINDS each invocation; the recomp leaves the chain SUSPENDED** (ChatGPT
+   determination **#1**), because the recomp **maps the guest's nonlocal-but-balanced returns
+   onto accumulating host calls** (determination **#2**). The guest **genuinely returns every
+   frame** (proven by SP on BOTH sides) → this is a **CONTAINED return/unwind-contract bug**,
+   **NOT** the §11 continuation-passing redesign.
+3. **The leaking edge is the RETURN path, not the call path.** The boundary crossings that
+   leak are the up-chain `jr ra` returns from interpreted/dirty code into compiled main-EXE
+   functions: `0x800462C4 / 0x8001B758 / 0x8001B3EC / 0x8001AC54 / 0x8001A9C0 / 0x8001A638`.
+   This is **why §20 (block-loop tail-transfer) and §22 (interp JAL/JALR down-calls) failed**
+   — they surfaced the CALL path; the leak is the dirty→compiled RETURN dispatch nesting.
+
+**Next (the fix, contained — runtime-only, no regen):** at the dirty-RAM↔compiled boundary,
+a guest **return** (`jr ra`, and any dirty-dispatch whose target is a compiled-game address
+reached as a RETURN) must **surface `cpu->pc=ret` to the `psx_dispatch_impl` trampoline owner
+and UNWIND**, not nest `psx_dispatch_game_compiled`. Single-owner model is §11's *boundary*
+piece (NOT the full resumable-frame codegen). Regression-guard with: (a) §19 `ce_profile`
+per-frame `max_kb` must go **FLAT** (currently +1.17 KB/frame); (b) the oracle trace above is
+the gold reference — recomp `psx_dispatch` returns must vanish into host unwinds while the
+guest JAL/JR/SP sequence stays bit-identical; (c) full dwarf→overworld playtest (the
+overlay-native `pc==0` return contract is the regression risk — the surface must fire for
+compiled-GAME return targets, not overlay-native DLL returns).
+
+---
+
+## 24. native_stack capture CORRECTS §23's fix scope — it is the §11 boundary work, NOT a one-liner (2026-06-18)
+
+Before implementing the §23 fix I captured a clean early-trip `native_stack`
+(`PSX_STACK_GUARD_KB=6144`, frame 7592, 6 MB; report decoded with `decode_report.py`).
+**This revised the fix scope — §23's oracle VERDICT stands, but its "quick contained
+runtime patch" framing was wrong.** Recorded honestly:
+
+**The leaking host cycle (native_stack histogram, ~5239× each, ≈1 chain/frame):**
+```
+func_8001A954 → func_8001AC00 → func_8001B2B4 → func_8001B5A8 → func_80046264
+  → psx_dispatch_impl → dirty_ram_dispatch → exec_one
+  → interp_enter_compiled → psx_dispatch_game_compiled → func_8001A954  (repeats)
+```
+So the per-frame chain (the §8 chain, emitted as DIRECT compiled `func_X(cpu)` calls)
+**re-enters itself**: `func_80046264`'s dirty hop (`psx_dispatch_impl` → `dirty_ram_dispatch`
+→ interp) loops back up to `func_8001A954`, and the direct-call chain never unwinds. This is
+exactly the native-stack-guard comment's "in-range guest transfer emitted as a DIRECT
+`func_X(cpu)` call grows the native stack WITHOUT going through `psx_dispatch_impl`."
+
+**Instrument cross-check (the instruments DISAGREE — do not over-trust native_stack):**
+- `ce_profile` (the ONE trustworthy gauge, §20): **+1.17 KB/frame, real, live-reconfirmed.**
+- `xprobe` per-frame summary: `a954`≈1/frame, `cr`≈1844 crossings/frame, **`dmax` (mixed_depth)
+  BOUNDED at 6** (reset per frame); the xprobe *detail* ring shows the chain UNWINDING cleanly
+  at frame end (mixed_depth d=1, surfaced returns to 0x8001A638/0x8001A9C0/0x8001AC54/…).
+- `dirty_insn_log` (65536 insns) and `dirty_block_log`: **NO transfer/dispatch targets
+  `0x8001A954`.** So the re-entry is NOT a dirty-interp instruction with a literal
+  `func_8001A954` target, and `dirty_ram_dispatch(0x8001A954)` is never called (matches §16).
+- ⇒ The `interp_enter_compiled → psx_dispatch_game_compiled → func_8001A954` frames in the
+  native_stack are partly **the compiled chain's own direct calls** (and possibly some stale
+  return addresses the walker over-collects). The accumulating unit is the COMPILED per-frame
+  chain not unwinding — the interp boundary is the *enabler* (CD-DMA dirtiness routes the
+  chain through `dirty_ram_dispatch`, §12), not a simple nesting site.
+
+**Corrected fix scope.** §23's oracle proof (real HW's `func_8001A954` is balanced and returns
+once/frame, guest SP bit-identical) RULES OUT a simple one-instruction return-contract bug —
+but that means the fix is NOT the quick "surface the return" patch §23 sketched. The recomp's
+**whole per-frame chain is emitted as direct nested C calls that re-enter via the CD-DMA-dirty
+boundary and never unwind**; making them unwind is the **§11 single-mixed-dispatch-owner /
+resumable-boundary** work, which spans the interp boundary (`dirty_ram_interp.c`, runtime) AND
+the `psx_dispatch_impl` trampoline (`full_function_emitter.cpp`, **codegen → REGEN**). It is
+delicate (the Bug A/C/D contract area) and regression-prone — the §14 watermark band-aid of
+this already made the wedge "(Not Responding)". This is precisely the change ChatGPT's gate
+flagged to undertake only deliberately. Two real, substantial options (NOT one-liners):
+- **(§11) Boundary resumability / single owner** — the per-frame compiled chain entered from
+  the interp must surface tail-transfers/returns to ONE owner trampoline and re-dispatch flat.
+  Spans runtime + codegen (regen). Highest fidelity; highest risk.
+- **(§12) CD-DMA dirty-marking precision** — `func_8001A954`'s page is only on the dirty/interp
+  path because CD-DMA marks its whole page dirty (textures/audio sharing the page). Make
+  dirtiness byte-range/content-precise so the compiled chain dispatches via the FLAT static
+  table (normal C returns) and the boundary cycle never forms. Removes the enabler at the
+  source; lower codegen risk but touches `dma.c` + `dirty_ram` granularity.
+
+**Validation gate for EITHER fix (unchanged):** §19 `ce_profile` per-frame `max_kb` FLAT
+(not +1.17 KB/frame) + the §23 oracle JAL/JR/SP sequence stays identical + 15-min+ idle soak
+with no freeze + dwarf→overworld playtest (regression). Artifacts this session in
+`_freeze_specimens/`: `oracle/oracle_chain_filtered.json`, `oracle/recomp_allfn_frame.json`,
+the early-trip `psx_last_run_report.json` (native_stack), `_xprobe.json`, `_dirty_insn.json`.
+
