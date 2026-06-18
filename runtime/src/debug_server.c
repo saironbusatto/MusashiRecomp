@@ -16,6 +16,7 @@
 #endif
 #include <time.h>
 #include "debug_server.h"
+#include "latency_ring.h"
 #include "overlay_loader.h"
 #include "overlay_capture.h"
 #include "code_provider.h"
@@ -9035,8 +9036,42 @@ static void handle_xprobe_arm(int id, const char *json)
              id, ft, sk, wu);
 }
 
+/* "latency": input->photon latency summary from the always-on latency ring.
+ * Optional args: window=N (frames to summarize, default 240), raw=1 (also
+ * include the last `count` raw per-frame records, count default 120). */
+static void handle_latency(int id, const char *json)
+{
+    int window = json_get_int(json, "window", 240);
+    int raw    = json_get_int(json, "raw", 0);
+    int count  = json_get_int(json, "count", 120);
+    static char sum[2048];
+    latency_ring_summary_json(sum, sizeof(sum), window);
+    if (raw) {
+        static char rawbuf[16384];
+        latency_ring_dump_json(rawbuf, sizeof(rawbuf), count);
+        send_fmt("{\"id\":%d,\"ok\":true,\"summary\":%s,\"frames\":%s}",
+                 id, sum, rawbuf);
+    } else {
+        send_fmt("{\"id\":%d,\"ok\":true,\"summary\":%s}", id, sum);
+    }
+}
+
+/* "vk_perf": last N Vulkan per-frame op counters (allocs/submits/pack/blit/...).
+ * Always-on ring in gpu_vk_renderer.c; used to find which op explodes during a
+ * transition stall. arg count=N (default 60). */
+static void handle_vk_perf(int id, const char *json)
+{
+    extern int vk_perf_json(char *out, int cap, int count);
+    int count = json_get_int(json, "count", 60);
+    static char buf[49152];
+    vk_perf_json(buf, (int)sizeof(buf), count);
+    send_fmt("{\"id\":%d,\"ok\":true,\"vk_perf\":%s}", id, buf);
+}
+
 static const CmdEntry s_commands[] = {
     { "ping",              handle_ping },
+    { "latency",           handle_latency },
+    { "vk_perf",           handle_vk_perf },
     { "game_options",      handle_game_options },
     { "stack_profile",     handle_stack_profile },
     { "xprobe",            handle_xprobe },

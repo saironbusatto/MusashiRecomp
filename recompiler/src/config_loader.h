@@ -124,6 +124,14 @@ struct RuntimeConfig {
     // software rasterizer remains the fallback. Stored as 0=software, 1=opengl.
     int                   video_renderer = 0;
 
+    // low_latency_input: re-sample the pad after the wall-clock pacer (just
+    // before present) so the next CPU frame reads near-fresh input instead of
+    // input ~one frame stale. Default on. vsync: present/swap mode —
+    // 1=on (tear-free, default), 0=immediate (lowest display latency, may
+    // tear), -1=adaptive. The wall-clock pacer holds 59.94Hz regardless.
+    bool                  video_low_latency_input = true;
+    int                   video_vsync             = 1;
+
     // crt_filter: present-time screen-colour model (verified-enhancement LUT).
     // "raw" (default, byte-identical 5->8 passthrough) | "crt" | "composite" |
     // "trinitron". Stored 0..3 to match ScreenKind in runtime/color_lut.h. The
@@ -358,6 +366,13 @@ struct UserSettings {
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
     bool has_screen_kind    = false; int  screen_kind    = 0; // 0..3 (ScreenKind)
     bool has_auto_skip_fmv  = false; bool auto_skip_fmv  = false; // skip FMVs
+    // Low-latency present knobs. low_latency_input re-samples the pad after the
+    // wall-clock pacer (just before present) so the next CPU frame reads fresh
+    // input instead of input ~one frame stale (the dominant input->photon cost
+    // on a vsync-light box). vsync: 1=on (tear-free), 0=immediate (lowest
+    // display latency, may tear), -1=adaptive.
+    bool has_low_latency_input = false; bool low_latency_input = true;
+    bool has_vsync             = false; int  vsync             = 1;
     // [launcher] — when true, boot straight into the game and skip the GUI
     // launcher window (mirrors snesrecomp's SkipLauncher). Overridable per-run:
     // `--launcher` forces the GUI back on; `PSX_NO_LAUNCHER=1` forces it off.

@@ -158,8 +158,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             const auto mode = toml::find<std::string>(video, "renderer");
             if (mode == "software")     rt.video_renderer = 0;
             else if (mode == "opengl")  rt.video_renderer = 1;
+            else if (mode == "vulkan")  rt.video_renderer = 2;
             else throw std::runtime_error(fmt::format(
-                "[video] renderer must be \"software\" or \"opengl\": {}", mode));
+                "[video] renderer must be \"software\", \"opengl\" or \"vulkan\": {}", mode));
         }
         if (video.contains("crt_filter")) {
             const auto mode = toml::find<std::string>(video, "crt_filter");
@@ -173,6 +174,17 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         }
         if (video.contains("auto_skip_fmv")) {
             rt.video_auto_skip_fmv = toml::find<bool>(video, "auto_skip_fmv");
+        }
+        if (video.contains("low_latency_input")) {
+            rt.video_low_latency_input = toml::find<bool>(video, "low_latency_input");
+        }
+        if (video.contains("vsync")) {
+            const auto mode = toml::find<std::string>(video, "vsync");
+            if      (mode == "on"  || mode == "vsync")     rt.video_vsync = 1;
+            else if (mode == "off" || mode == "immediate") rt.video_vsync = 0;
+            else if (mode == "adaptive")                   rt.video_vsync = -1;
+            else throw std::runtime_error(fmt::format(
+                "[video] vsync must be \"on\"|\"off\"|\"immediate\"|\"adaptive\": {}", mode));
         }
         if (video.contains("aspect_ratio")) {
             const auto mode = toml::find<std::string>(video, "aspect_ratio");
@@ -695,6 +707,7 @@ UserSettings load_user_settings(const fs::path& path) {
             const auto m = toml::find<std::string>(v, "renderer");
             if (m == "software") { s.renderer = 0; s.has_renderer = true; }
             else if (m == "opengl") { s.renderer = 1; s.has_renderer = true; }
+            else if (m == "vulkan") { s.renderer = 2; s.has_renderer = true; }
         });
         if (v.contains("supersampling")) try_get([&]{
             const auto n = toml::find<int64_t>(v, "supersampling");
@@ -721,6 +734,16 @@ UserSettings load_user_settings(const fs::path& path) {
         });
         if (v.contains("auto_skip_fmv")) try_get([&]{
             s.auto_skip_fmv = toml::find<bool>(v, "auto_skip_fmv"); s.has_auto_skip_fmv = true;
+        });
+        if (v.contains("low_latency_input")) try_get([&]{
+            s.low_latency_input = toml::find<bool>(v, "low_latency_input");
+            s.has_low_latency_input = true;
+        });
+        if (v.contains("vsync")) try_get([&]{
+            const auto m = toml::find<std::string>(v, "vsync");
+            if      (m == "on"  || m == "vsync")    { s.vsync = 1;  s.has_vsync = true; }
+            else if (m == "off" || m == "immediate"){ s.vsync = 0;  s.has_vsync = true; }
+            else if (m == "adaptive")               { s.vsync = -1; s.has_vsync = true; }
         });
         if (v.contains("aspect_ratio")) try_get([&]{
             const auto m = toml::find<std::string>(v, "aspect_ratio");
@@ -836,7 +859,9 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
 
     f << "[video]\n";
     if (s.has_renderer)
-        f << "renderer          = \"" << (s.renderer ? "opengl" : "software") << "\"\n";
+        f << "renderer          = \""
+          << (s.renderer == 2 ? "vulkan" : s.renderer == 1 ? "opengl" : "software")
+          << "\"\n";
     if (s.has_supersampling)
         f << "supersampling     = " << s.supersampling << "\n";
     if (s.has_window_width)
@@ -853,6 +878,10 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
     }
     if (s.has_auto_skip_fmv)
         f << "auto_skip_fmv     = " << (s.auto_skip_fmv ? "true" : "false") << "\n";
+    if (s.has_low_latency_input)
+        f << "low_latency_input = " << (s.low_latency_input ? "true" : "false") << "\n";
+    if (s.has_vsync)
+        f << "vsync             = \"" << (s.vsync == 0 ? "immediate" : s.vsync < 0 ? "adaptive" : "on") << "\"\n";
     if (s.has_aspect_ratio)
         f << "aspect_ratio      = \"" << s.aspect_num << ":" << s.aspect_den << "\"\n";
     f << "\n[audio]\n";

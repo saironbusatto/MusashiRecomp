@@ -66,6 +66,7 @@
 #include "gpu_render.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_gl_renderer.h"
+#include "latency_ring.h"
 
 #include <SDL.h>
 #include <SDL_opengl.h>
@@ -262,6 +263,7 @@ static int load_modern_gl(void) {
 static SDL_Window   *s_win = NULL;
 static SDL_GLContext s_ctx = NULL;
 static uint16_t     *s_vram = NULL;       /* CPU VRAM array (gpu.c's storage) */
+static int           s_swap_interval = 1; /* SDL_GL swap interval (vsync mode) */
 
 static int           s_scale = 1;          /* internal-res scale (hr FBO) */
 static int           s_req_scale = 1;      /* requested before context init */
@@ -1663,7 +1665,13 @@ int gl_renderer_init_context(SDL_Window *win) {
     s_ctx = SDL_GL_CreateContext(win);
     if (!s_ctx) { fprintf(stdout, "psxrecomp: GL context creation failed (%s)\n", SDL_GetError()); return 0; }
     if (SDL_GL_MakeCurrent(win, s_ctx) != 0) { fprintf(stdout, "psxrecomp: MakeCurrent failed (%s)\n", SDL_GetError()); SDL_GL_DeleteContext(s_ctx); s_ctx=NULL; return 0; }
-    SDL_GL_SetSwapInterval(1);
+    /* Swap interval: 1=vsync (tear-free, default), 0=immediate (lowest display
+     * latency, may tear; our wall-clock pacer still holds 59.94Hz), -1=adaptive.
+     * Adaptive falls back to vsync if the driver rejects it. */
+    if (SDL_GL_SetSwapInterval(s_swap_interval) != 0 && s_swap_interval < 0) {
+        SDL_GL_SetSwapInterval(1);
+        s_swap_interval = 1;
+    }
     glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
     const char *ver = (const char *)glGetString(GL_VERSION);
     fprintf(stdout, "psxrecomp: OpenGL context created (%s)\n", ver ? ver : "?");
@@ -1692,6 +1700,19 @@ int gl_renderer_init_context(SDL_Window *win) {
         return 0;
     }
     return 1;
+}
+
+/* Set the GL swap interval (vsync mode): 1=vsync, 0=immediate, -1=adaptive.
+ * Safe to call before or after context creation; applies live when a context
+ * exists. Adaptive falls back to vsync if unsupported. */
+void gl_renderer_set_swap_interval(int interval) {
+    s_swap_interval = interval;
+    if (s_ctx) {
+        if (SDL_GL_SetSwapInterval(interval) != 0 && interval < 0) {
+            SDL_GL_SetSwapInterval(1);
+            s_swap_interval = 1;
+        }
+    }
 }
 
 void gl_renderer_shutdown(void) {
@@ -1726,7 +1747,9 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     p_glUseProgram(s_present_prog); p_glUniform1i(s_present_uTex, 0);
     p_glBindVertexArray(s_present_vao); glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0); p_glUseProgram(0);
+    latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
+    latency_ring_mark(LAT_SWAP_END);
 }
 
 void gl_renderer_present_blank(void) {
@@ -1734,7 +1757,9 @@ void gl_renderer_present_blank(void) {
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh); glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
+    latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
+    latency_ring_mark(LAT_SWAP_END);
 }
 
 /* Sync the authoritative FBO down into CPU VRAM (no-op when current).
@@ -2146,7 +2171,9 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                         lx, ly + lh, lx + lw, ly,
                         GL_COLOR_BUFFER_BIT, linear ? GL_LINEAR : GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
+    latency_ring_mark(LAT_SWAP_END);
     gl_perf_present_exit(0);
     coh_record(GL_COH_PRESENT, disp_x, disp_y, disp_x + w - 1, disp_y + h - 1);
 }
@@ -2182,7 +2209,9 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
                         lx, ly + lh, lx + lw, ly,
                         GL_COLOR_BUFFER_BIT, linear ? GL_LINEAR : GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
+    latency_ring_mark(LAT_SWAP_END);
     gl_perf_present_exit(1);
     coh_record(GL_COH_PRESENT, 0, disp_y, g_wide_w - 1, disp_y + disp_h - 1);
     return 1;

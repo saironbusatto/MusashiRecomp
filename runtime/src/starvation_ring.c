@@ -50,8 +50,22 @@ static int             s_dump_done = 0;
 /* Watchdog threshold: 4 seconds of wall-clock without a heartbeat is
  * "TCP died, BIOS still running" territory. Real BIOS pad polling
  * fires VBlank ~60Hz so debug_server_poll runs at ~60Hz. 4 seconds
- * is well past any normal stall. */
-#define STARVATION_TIMEOUT_US (4 * 1000000ULL)
+ * is well past any normal stall.
+ *
+ * Override with env PSX_STARVATION_TIMEOUT_US (microseconds; 0 disables the
+ * watchdog) — needed while bringing up a renderer whose per-op submit model is
+ * deliberately slow (a single heavy frame can legitimately exceed 4 s). */
+#define STARVATION_TIMEOUT_US_DEFAULT (4 * 1000000ULL)
+static uint64_t starvation_timeout_us(void) {
+    static int resolved = 0;
+    static uint64_t timeout = STARVATION_TIMEOUT_US_DEFAULT;
+    if (!resolved) {
+        const char *e = getenv("PSX_STARVATION_TIMEOUT_US");
+        if (e && *e) timeout = strtoull(e, NULL, 10);
+        resolved = 1;
+    }
+    return timeout;
+}
 
 void starvation_watchdog_heartbeat(void) {
     s_last_heartbeat_us = host_us_now();
@@ -204,8 +218,10 @@ void starvation_ring_dump(const char *path) {
 void starvation_watchdog_check(void) {
     if (s_dump_done) return;
     if (s_last_heartbeat_us == 0) return;  /* not initialized yet */
+    uint64_t timeout = starvation_timeout_us();
+    if (timeout == 0) return;              /* watchdog disabled (renderer bring-up) */
     uint64_t now = host_us_now();
-    if (now - s_last_heartbeat_us > STARVATION_TIMEOUT_US) {
+    if (now - s_last_heartbeat_us > timeout) {
         starvation_ring_dump(NULL);
         /* Abort cleanly so the dump file is preserved and the user knows
          * the runtime starved. */
