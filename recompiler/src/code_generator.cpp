@@ -52,7 +52,8 @@ CodeGenerator::CodeGenerator(const PS1Executable& exe, const CodeGenConfig& conf
     : exe_(exe), config_(config) {
     // RECURSION_BUG.md §25 — continuation-passing call/return. Gen-time opt-in
     // via PSX_CPS so legacy codegen stays byte-identical when unset.
-    cps_enabled_ = (std::getenv("PSX_CPS") != nullptr);
+    // CPS is the DEFAULT (RECURSION_BUG.md §25). Opt out (legacy) with PSX_CPS=0.
+    { const char* e = std::getenv("PSX_CPS"); cps_enabled_ = (e == nullptr || e[0] != '0'); }
 }
 
 std::string CodeGenerator::reg_name(int reg_num) {

@@ -23,7 +23,11 @@ namespace PSXRecompV4 {
 // `if (psx_syscall(...)) return;`. psx_syscall returns 0 for those void
 // syscalls and 1 when control transfers (cpu->pc set). Gated so legacy codegen
 // stays byte-identical.
-static const bool g_strict_cps = (std::getenv("PSX_CPS") != nullptr);
+// CPS is the DEFAULT (RECURSION_BUG.md §25). Opt out (legacy) with PSX_CPS=0.
+static const bool g_strict_cps = []() {
+    const char* e = std::getenv("PSX_CPS");
+    return e == nullptr || e[0] != '0';
+}();
 
 namespace {
 

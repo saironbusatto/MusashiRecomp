@@ -1299,3 +1299,20 @@ through → `overlay_captures.json` grows → re-run `compile_overlays.py --cps`
 playtest (the regression check). Then consider CPS default + removing inert
 `psx_call_contract`/`g_psx_call_bail`. Commit Stage 3 when the user is satisfied.
 
+
+### 25.6 CPS IS NOW THE DEFAULT (2026-06-18) — landing on master
+
+The PSX_CPS gate is flipped to DEFAULT-ON in all three emitter sites
+(full_function_emitter.cpp ×2, code_generator.cpp, strict_translator.cpp):
+`cps = (getenv("PSX_CPS") == nullptr) || (PSX_CPS[0] != '0')`. So a normal regen
+emits continuation-passing; `PSX_CPS=0` is the legacy opt-out (escape hatch, no
+recompiler rebuild needed). Verified: default regen → CPS markers present; PSX_CPS=0
+→ 0 markers; default-CPS Tomba boots, no frame-0 exit, ce_profile flat (4 KB).
+
+Merged to master + pushed (both repos). The shared-framework caveat: ApeEscape/MMX6
+pin old psxrecomp commits, so they're unaffected until they bump their pin + regen —
+at which point they build CPS (validate then, or PSX_CPS=0 to stay legacy). Overlay
+cache codegen_ver=4 (CPS) means production overlay caches rebuild CPS on next compile;
+the production game.toml overlay_autocompile_cmd no longer needs --cps (default-on
+makes the recompiler emit CPS regardless). The inert psx_call_contract /
+g_psx_call_bail machinery is left in place (a future cleanup once CPS has soaked).
