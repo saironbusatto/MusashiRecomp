@@ -9056,9 +9056,22 @@ static void handle_latency(int id, const char *json)
     }
 }
 
+/* "vk_perf": last N Vulkan per-frame op counters (allocs/submits/pack/blit/...).
+ * Always-on ring in gpu_vk_renderer.c; used to find which op explodes during a
+ * transition stall. arg count=N (default 60). */
+static void handle_vk_perf(int id, const char *json)
+{
+    extern int vk_perf_json(char *out, int cap, int count);
+    int count = json_get_int(json, "count", 60);
+    static char buf[49152];
+    vk_perf_json(buf, (int)sizeof(buf), count);
+    send_fmt("{\"id\":%d,\"ok\":true,\"vk_perf\":%s}", id, buf);
+}
+
 static const CmdEntry s_commands[] = {
     { "ping",              handle_ping },
     { "latency",           handle_latency },
+    { "vk_perf",           handle_vk_perf },
     { "game_options",      handle_game_options },
     { "stack_profile",     handle_stack_profile },
     { "xprobe",            handle_xprobe },
