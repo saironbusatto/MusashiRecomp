@@ -62,9 +62,16 @@ int main(int argc, char** argv) {
 
     const char* bios_path = "bios/SCPH1001.BIN";
     const char* disc_path = NULL;
+    /* Default debug port 4382: 4380 collides with psxref and other recomp
+     * projects' oracles (e.g. cdirecomp's CdiRuntime), and two LISTENers on
+     * the same port silently route connections to the wrong process. Give
+     * psx-beetle its own port; override with --port N. */
+    int dbg_port = 4382;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--disc") && i + 1 < argc) {
             disc_path = argv[++i];
+        } else if (!std::strcmp(argv[i], "--port") && i + 1 < argc) {
+            dbg_port = std::atoi(argv[++i]);
         } else if (argv[i][0] != '-') {
             bios_path = argv[i];
         }
@@ -113,11 +120,8 @@ int main(int argc, char** argv) {
     }
 
 #ifndef PSX_NO_DEBUG_TOOLS
-#ifdef DEFAULT_DEBUG_PORT
-    beetle_debug_server_init(DEFAULT_DEBUG_PORT);
-#else
-    beetle_debug_server_init(4380);
-#endif
+    beetle_debug_server_init(dbg_port);
+    std::fprintf(stdout, "psx-beetle: debug server on port %d\n", dbg_port);
 #endif
 
     static uint32_t pixels[640 * 512];

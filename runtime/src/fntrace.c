@@ -68,6 +68,7 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
     e->a2     = cpu->gpr[6];
     e->a3     = cpu->gpr[7];
     e->s3     = cpu->gpr[19];
+    e->sp     = cpu->gpr[29];
 }
 
 void fntrace_arm(uint32_t target) {

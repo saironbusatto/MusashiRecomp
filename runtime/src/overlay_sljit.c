@@ -27,6 +27,13 @@
 
 /* ---- counters ---------------------------------------------------------- */
 static OverlayBackend s_active   = OVERLAY_BACKEND_AUTO;
+/* RECURSION_BUG.md §25 — 1 when the build is continuation-passing (set by a
+ * constructor in the generated CPS dispatch). Under CPS this JIT must emit the
+ * tail-transfer contract: jr $ra publishes cpu->pc, and call-containing
+ * fragments decline to the (CPS-safe, depth-1) interpreter instead of the legacy
+ * nested psx_sljit_call. Defined in overlay_loader.c. */
+extern int g_psx_cps_mode;
+
 static int            s_resolved = 0;
 static int            s_selftest_ok = -1; /* -1 = not run */
 static uint64_t       s_compiles = 0;
@@ -980,6 +987,15 @@ void overlay_sljit_try_compile(uint32_t entry,
             if (emit_one(C, insn, s_bd_kind[i], s_bd_cols[i]) != EMIT_OK) { aborted = 1; break; }
             gpr_flush(C);
             if (pending == PEND_RET) {
+                if (g_psx_cps_mode) {
+                    /* CPS: publish $ra (jr $ra) so the flat trampoline dispatches
+                     * the caller's continuation. gpr[] already flushed to memory
+                     * by gpr_flush() above. */
+                    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R0, 0, SLJIT_MEM1(R_CPU),
+                                   (sljit_sw)(offsetof(CPUState, gpr) + 31 * sizeof(uint32_t)));
+                    sljit_emit_op1(C, SLJIT_MOV32, SLJIT_MEM1(R_CPU),
+                                   (sljit_sw)offsetof(CPUState, pc), SLJIT_R0, 0);
+                }
                 sljit_emit_return_void(C);
                 gpr_reset();
             } else if (pending == PEND_TAIL) {
@@ -1000,6 +1016,15 @@ void overlay_sljit_try_compile(uint32_t entry,
                  * the following code is dead or label-guarded — reset. */
                 if (!pend_cond) gpr_reset();
             } else { /* PEND_CALL: psx_sljit_call(cpu, target, return_pc, check) */
+                if (g_psx_cps_mode) {
+                    /* CPS: a call's continuation (return_pc, inside this fragment)
+                     * would need a re-entry entry-switch this JIT doesn't emit;
+                     * and psx_sljit_call uses the legacy nested contract. Decline
+                     * the whole fragment — it falls to the interpreter, which
+                     * handles the call CPS-safely (depth-1). Leaf fragments (no
+                     * calls) still JIT. */
+                    aborted = 1; break;
+                }
                 sljit_emit_op1(C, SLJIT_MOV, SLJIT_R0, 0, R_CPU, 0);           /* cpu */
                 if (pend_call_dynamic)
                     sljit_emit_op1(C, SLJIT_MOV32, SLJIT_R1, 0, R_CTRL, 0);    /* jalr target */

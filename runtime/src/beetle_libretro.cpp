@@ -185,7 +185,7 @@ static void wtrace_callback(uint32_t addr, uint32_t value,
 #define BEETLE_FNTRACE_MAX_ARMS   64
 struct BeetleFnTraceEntry {
     uint64_t seq;
-    uint32_t caller_pc, target_pc, parent_ra, a0, a1, frame;
+    uint32_t caller_pc, target_pc, parent_ra, a0, a1, frame, sp;
     uint8_t  kind, pad[3];
 };
 static BeetleFnTraceEntry s_fntrace[BEETLE_FNTRACE_CAP];
@@ -216,6 +216,12 @@ static void fntrace_callback(uint32_t caller_pc, uint32_t target_pc,
     e->a1        = a1;
     e->frame     = s_frame_count;
     e->kind      = kind;
+    /* SP at retire — needed for the func_8001A954 SP/RA-lifecycle oracle
+     * (does the invocation's stack balance / return). GPR[29] read live. */
+    {
+        char dummy[8] = {0};
+        e->sp = PSX_CPU ? PSX_CPU->GetRegister(PS_CPU::GSREG_GPR + 29, dummy, sizeof(dummy)) : 0;
+    }
     s_fntrace_idx = (s_fntrace_idx + 1) % BEETLE_FNTRACE_CAP;
 }
 
@@ -815,7 +821,8 @@ extern "C" uint32_t beetle_fntrace_get(uint64_t *out_seq,
                                        uint32_t *out_caller, uint32_t *out_target,
                                        uint32_t *out_ra, uint32_t *out_a0,
                                        uint32_t *out_a1, uint32_t *out_frame,
-                                       uint8_t *out_kind, int max_count)
+                                       uint8_t *out_kind, uint32_t *out_sp,
+                                       int max_count)
 {
     int avail = (int)(s_fntrace_seq < (uint64_t)BEETLE_FNTRACE_CAP
                       ? s_fntrace_seq : BEETLE_FNTRACE_CAP);
@@ -832,6 +839,7 @@ extern "C" uint32_t beetle_fntrace_get(uint64_t *out_seq,
         out_a1[i]     = e->a1;
         out_frame[i]  = e->frame;
         out_kind[i]   = e->kind;
+        out_sp[i]     = e->sp;
     }
     return (uint32_t)count;
 }

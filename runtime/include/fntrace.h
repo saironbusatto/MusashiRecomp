@@ -41,6 +41,7 @@ typedef struct {
     uint32_t a2;        /* cpu->gpr[6]  */
     uint32_t a3;        /* cpu->gpr[7]  */
     uint32_t s3;        /* cpu->gpr[19] — callee-saved, useful for arg-passing chains */
+    uint32_t sp;        /* cpu->gpr[29] — for func_8001A954 SP/RA-lifecycle oracle */
 } FntraceEntry;
 
 extern FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];

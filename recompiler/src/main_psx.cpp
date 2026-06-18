@@ -812,13 +812,41 @@ int main(int argc, char** argv) {
         ds << "/* Maps PS1 address to compiled game code. Returns 1 if dispatched, 0 if unknown. */\n";
         ds << "int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr) {\n";
         ds << "    switch (addr) {\n";
-        for (uint32_t addr : dispatch_addrs) {
-            ds << fmt::format("        case 0x{:08X}u: func_{:08X}(cpu); return 1;\n",
-                              addr, addr);
+        if (codegen.cps_enabled()) {
+            // CPS (§25): entries clear cpu->pc so the function's entry-switch is
+            // skipped (runs from the top); continuations set cpu->pc so the
+            // entry-switch routes into the owning block. The unified flat
+            // trampoline (psx_dispatch_impl) then drives every tail-transfer.
+            for (uint32_t addr : dispatch_addrs) {
+                ds << fmt::format("        case 0x{:08X}u: cpu->pc = 0; func_{:08X}(cpu); return 1;\n",
+                                  addr, addr);
+            }
+            const auto& conts = codegen.cps_continuations();
+            ds << fmt::format("        /* {} continuation return-points (CPS) */\n", conts.size());
+            for (const auto& [cont, owner] : conts) {
+                if (dispatch_addrs.count(cont)) continue;  /* already a function entry */
+                ds << fmt::format("        case 0x{:08X}u: cpu->pc = 0x{:08X}u; func_{:08X}(cpu); return 1;\n",
+                                  cont, cont, owner);
+            }
+        } else {
+            for (uint32_t addr : dispatch_addrs) {
+                ds << fmt::format("        case 0x{:08X}u: func_{:08X}(cpu); return 1;\n",
+                                  addr, addr);
+            }
         }
         ds << "        default: return 0;\n";
         ds << "    }\n";
         ds << "}\n";
+
+        if (codegen.cps_enabled()) {
+            // RECURSION_BUG.md §25 — mark CPS mode at startup so the overlay sljit
+            // JIT (overlay_sljit.c) emits the CPS contract. Static ctor: no clash
+            // with the BIOS dispatch's marker.
+            ds << "\n/* CPS runtime-mode marker (overlay sljit JIT reads g_psx_cps_mode). */\n";
+            ds << "__attribute__((constructor)) static void psx_cps_mark_game(void) {\n";
+            ds << "    extern int g_psx_cps_mode; g_psx_cps_mode = 1;\n";
+            ds << "}\n";
+        }
 
         std::ofstream dispatch_file(dispatch_filename);
         if (dispatch_file.is_open()) {

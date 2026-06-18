@@ -80,6 +80,12 @@ typedef struct {
 static Candidate s_cand[CAND_CAP];
 static int       s_cand_n = 0;
 
+/* RECURSION_BUG.md §25 — 1 when the build is continuation-passing (set by a
+ * constructor in the generated CPS dispatch). The overlay dispatch + sljit JIT
+ * read it to emit/route the CPS tail-transfer contract. Defined here (before
+ * overlay_loader_dispatch) so both can see it. 0 = legacy unit-model. */
+int g_psx_cps_mode = 0;
+
 /* Open-addressed index: phys entry addr -> head candidate index (-1 sentinel
  * stored as chain terminator on each Candidate). addr 0 = empty slot. */
 #define IDX_CAP  32768u
@@ -666,7 +672,7 @@ int overlay_loader_has_cached_crc(uint32_t region_start, uint32_t crc) {
 extern void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra);
 extern void psx_check_interrupts(CPUState *cpu);
 extern void gte_execute(CPUState *cpu, uint32_t cmd);
-extern void psx_syscall(CPUState *cpu, uint32_t code);
+extern int psx_syscall(CPUState *cpu, uint32_t code);
 extern void psx_unknown_dispatch(CPUState *cpu, uint32_t addr, uint32_t phys);
 extern void debug_server_log_call_entry(uint32_t func_addr);
 
@@ -876,6 +882,13 @@ void overlay_loader_apply_live_policy(void) {
      * stay on the interpreter, so default-on cannot reintroduce the save-load
      * wedge. The PSX_OVERLAY_SLJIT_LIVE env var still overrides (0 forces off). */
     int live = (code_provider_sljit() != NULL) ? 1 : 0;
+    /* Mutually exclusive (user preference, RECURSION_BUG.md §25): if gcc is the
+     * active backend, do NOT run sljit live. The gcc autocompile produces
+     * full-coverage CPS DLLs in the background; the gap before they land is the
+     * interpreter (relatively fast), not sljit leaf shards. So gcc boxes are
+     * gcc>interp; toolchain-less boxes are sljit>interp. PSX_OVERLAY_SLJIT_LIVE
+     * still overrides for testing. */
+    if (overlay_backend_active() == OVERLAY_BACKEND_GCC) live = 0;
     const char *e = getenv("PSX_OVERLAY_SLJIT_LIVE");
     if (e && *e) live = (*e != '0') ? 1 : 0;
     s_sljit_live = live;
@@ -990,6 +1003,25 @@ static void try_load_region(uint32_t phys) {
 
 /* ---- Dispatch ---------------------------------------------------------- */
 
+/* CPS (§25): find a non-blacklisted candidate whose code range CONTAINS phys —
+ * i.e. phys is a continuation / return point INSIDE an overlay function, not its
+ * registered entry. Under continuation-passing, an overlay function tail-
+ * transfers after each block, so a callee returns to a mid-function address that
+ * idx_head() (entry-keyed) misses; we re-enter the owning function with
+ * cpu->pc = that address so its entry-switch routes to the right block. Returns
+ * the candidate index, or -1. */
+static int overlay_find_by_range(uint32_t phys) {
+    for (int i = 0; i < s_cand_n; i++) {
+        const Candidate *c = &s_cand[i];
+        if (c->state == ENTRY_BLACKLIST) continue;
+        for (int r = 0; r < c->nranges; r++) {
+            uint32_t lo = c->range_lo[r];
+            if (phys >= lo && phys < lo + c->range_len[r]) return i;
+        }
+    }
+    return -1;
+}
+
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
     int head = idx_head(phys);
@@ -1010,6 +1042,47 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
              * gcc run complementarily. */
             try_sljit_region(addr);   /* virtual entry (carries KSEG bits) */
             head = idx_head(phys);
+        }
+    }
+
+    /* CPS (§25) continuation re-entry: phys is not an overlay ENTRY, but it may
+     * be a return point inside an already-registered overlay function (the
+     * caller's continuation after a tail-transferred call). Re-enter that
+     * function natively with cpu->pc = addr so its entry-switch routes to the
+     * continuation block — without this the continuation falls to the interp and
+     * native coverage stops at the first call. gcc-DLL candidates are the trusted
+     * tier (diff-validated at their entry; the continuation is the same DLL code),
+     * so they run native directly here; device-touch funcs still go to interp. */
+    if (head < 0 && g_psx_cps_mode) {
+        int ci = overlay_find_by_range(phys);
+        if (ci >= 0) {
+            Candidate *c = &s_cand[ci];
+            uint32_t live = cand_crc(c);
+            s_rehashes++;
+            s_last_crc = live;
+            if (live == c->crc_code) {
+                if (c->state != ENTRY_VALID) { c->state = ENTRY_VALID; s_valid_count++; }
+                if (c->device_touch)   { s_disp_interp++; return 0; }
+                if (!s_native_exec)    { s_would_run_native++; s_disp_interp++; return 0; }
+                uint32_t slot = s_nring_pos++ & (NRING_CAP - 1u);
+                s_nring[slot].addr = addr;
+                s_nring[slot].crc  = c->crc_code;
+                s_nring[slot].seq  = ++s_nring_seq;
+                s_nring[slot].returned = 0;
+                uint32_t prev_inprogress = s_native_inprogress;
+                s_native_inprogress = c->addr;
+                s_native_calls_total++;
+                if (s_active_depth < (int)(sizeof(s_active_stack) / sizeof(s_active_stack[0])))
+                    s_active_stack[s_active_depth++] = ci;
+                s_disp_native++;
+                cpu->pc = addr;          /* route the func's entry-switch to the block */
+                c->fn(cpu);
+                if (s_active_depth > 0) s_active_depth--;
+                s_nring[slot].returned = 1;
+                s_native_inprogress = prev_inprogress;
+                return 1;
+            }
+            /* stale code bytes: fall through to the interpreter */
         }
     }
 

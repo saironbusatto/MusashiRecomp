@@ -58,7 +58,13 @@ typedef struct CPUState {
 } CPUState;
 
 /* Trap trampolines — defined in runtime/src/traps.c */
-extern void psx_syscall(CPUState* cpu, uint32_t code);
+/* psx_syscall returns 1 if control transfers (cpu->pc set to a dispatch target;
+ * the caller must return to the trampoline), 0 for a directly-handled "void"
+ * syscall (Enter/ExitCriticalSection). Under CPS the generated code emits
+ * `if (psx_syscall(...)) return;` so a void syscall falls through to the inline
+ * post-syscall code (the guest's own jr $ra); legacy callers ignore the return
+ * value and rely on cpu->pc (0 = handled, resume at caller). */
+extern int psx_syscall(CPUState* cpu, uint32_t code);
 extern void psx_arith_overflow(CPUState* cpu);
 extern void psx_unaligned_access(CPUState* cpu, uint32_t addr, uint32_t pc);
 extern void psx_break(CPUState* cpu, uint32_t code, uint32_t pc);

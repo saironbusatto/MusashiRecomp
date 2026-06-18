@@ -176,6 +176,32 @@ private:
     std::set<uint32_t> extra_labels_;    // Mid-block addresses that need inline labels (jump table targets)
     const AnnotationTable* annotations_ = nullptr;
 
+    // RECURSION_BUG.md §25 — continuation-passing call/return (the universal fix
+    // for the idle-freeze host-stack leak). When set (gen-time env PSX_CPS),
+    // guest calls (jal/jalr/jr-table/external) are emitted as TAIL-TRANSFERS
+    // (set $ra, cpu->pc = target, return) and each call's return point is
+    // registered as a dispatchable continuation; jr $ra publishes cpu->pc.
+    // The unified flat trampoline (psx_dispatch_impl) drives the whole
+    // call/return via the guest's own $ra/$sp — so the host stack can never
+    // mirror unbounded guest re-entrancy. The §8 leaking chain (func_8001A954
+    // ...) lives in GAME code, so the game emitter MUST honor CPS too.
+    bool cps_enabled_ = false;
+    // Continuations (return points) collected during the CURRENT function's
+    // block translation; consumed by generate_function to emit the entry-switch.
+    std::vector<uint32_t> cps_cur_continuations_;
+    // Global map: continuation address -> owning function entry, for the game
+    // dispatch table (psx_dispatch_game_compiled) to route a returned-to
+    // continuation into its function's entry-switch.
+    std::map<uint32_t, uint32_t> cps_continuation_owner_;
+
+public:
+    bool cps_enabled() const { return cps_enabled_; }
+    // continuation_addr -> owning function entry (CPS dispatch routing).
+    const std::map<uint32_t, uint32_t>& cps_continuations() const {
+        return cps_continuation_owner_;
+    }
+private:
+
     // Set per-function by generate_function when config_.ws_auto_screen_x_cull is
     // on AND the function carries the GTE screen-extent reject signature; read by
     // translate_instruction to widen that function's width compares. See

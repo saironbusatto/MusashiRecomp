@@ -130,7 +130,8 @@ extern uint32_t beetle_fntrace_get(uint64_t *out_seq,
                                     uint32_t *out_caller, uint32_t *out_target,
                                     uint32_t *out_ra, uint32_t *out_a0,
                                     uint32_t *out_a1, uint32_t *out_frame,
-                                    uint8_t *out_kind, int max_count);
+                                    uint8_t *out_kind, uint32_t *out_sp,
+                                    int max_count);
 
 /* ---- Server state ---- */
 static sock_t s_listen = SOCK_INVALID;
@@ -663,13 +664,14 @@ static void h_fntrace_dump(int id, const char *json) {
     uint32_t *a1s     = (uint32_t*)malloc(count * sizeof(uint32_t));
     uint32_t *frames  = (uint32_t*)malloc(count * sizeof(uint32_t));
     uint8_t  *kinds   = (uint8_t*) malloc(count);
-    if (!seqs || !callers || !targets || !ras || !a0s || !a1s || !frames || !kinds) {
+    uint32_t *sps     = (uint32_t*)malloc(count * sizeof(uint32_t));
+    if (!seqs || !callers || !targets || !ras || !a0s || !a1s || !frames || !kinds || !sps) {
         free(seqs); free(callers); free(targets); free(ras);
-        free(a0s); free(a1s); free(frames); free(kinds);
+        free(a0s); free(a1s); free(frames); free(kinds); free(sps);
         send_err(id, "alloc"); return;
     }
     uint32_t got = beetle_fntrace_get(seqs, callers, targets, ras,
-                                       a0s, a1s, frames, kinds, count);
+                                       a0s, a1s, frames, kinds, sps, count);
     uint64_t total = beetle_fntrace_total();
 
     send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"entries\":[",
@@ -678,14 +680,14 @@ static void h_fntrace_dump(int id, const char *json) {
         if (i > 0) send_fmt(",");
         send_fmt("{\"seq\":%llu,\"caller\":\"0x%08X\",\"target\":\"0x%08X\","
                  "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
-                 "\"frame\":%u,\"kind\":\"%s\"}",
+                 "\"frame\":%u,\"kind\":\"%s\",\"sp\":\"0x%08X\"}",
                  (unsigned long long)seqs[i], callers[i], targets[i],
-                 ras[i], a0s[i], a1s[i], frames[i], fn_kind_str(kinds[i]));
+                 ras[i], a0s[i], a1s[i], frames[i], fn_kind_str(kinds[i]), sps[i]);
     }
     send_fmt("]}\n");
 
     free(seqs); free(callers); free(targets); free(ras);
-    free(a0s); free(a1s); free(frames); free(kinds);
+    free(a0s); free(a1s); free(frames); free(kinds); free(sps);
 }
 
 /* ---- spu_voices: Beetle oracle ground truth via PS_SPU::GetRegister ----

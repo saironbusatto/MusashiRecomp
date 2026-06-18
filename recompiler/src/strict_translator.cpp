@@ -9,11 +9,25 @@
 #include "strict_translator.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 
 #include "fmt/format.h"
 
 namespace PSXRecompV4 {
+
+// RECURSION_BUG.md §25 — continuation-passing call/return. Under CPS, a
+// directly-handled "void" syscall (Enter/ExitCriticalSection) must fall
+// through to the inline post-syscall code (the guest's own jr $ra) instead of
+// returning to a nested dispatcher, so the syscall is emitted as
+// `if (psx_syscall(...)) return;`. psx_syscall returns 0 for those void
+// syscalls and 1 when control transfers (cpu->pc set). Gated so legacy codegen
+// stays byte-identical.
+// CPS is the DEFAULT (RECURSION_BUG.md §25). Opt out (legacy) with PSX_CPS=0.
+static const bool g_strict_cps = []() {
+    const char* e = std::getenv("PSX_CPS");
+    return e == nullptr || e[0] != '0';
+}();
 
 namespace {
 
@@ -202,9 +216,19 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
 
             case 0x0C: { // SYSCALL
                 r.supported = true;
-                r.c_code = fmt::format(
-                    "cpu->pc = 0x{:08X}u; psx_syscall(cpu, cpu->gpr[2]); return;",
-                    d.address);
+                if (g_strict_cps) {
+                    // CPS: void syscalls (psx_syscall returns 0) fall through to
+                    // the inline post-syscall code (the guest's jr $ra), which
+                    // returns to the caller via the flat trampoline. Transfers
+                    // (return 1) set cpu->pc and return to the trampoline.
+                    r.c_code = fmt::format(
+                        "cpu->pc = 0x{:08X}u; if (psx_syscall(cpu, cpu->gpr[2])) return;",
+                        d.address);
+                } else {
+                    r.c_code = fmt::format(
+                        "cpu->pc = 0x{:08X}u; psx_syscall(cpu, cpu->gpr[2]); return;",
+                        d.address);
+                }
                 r.comment = "syscall";
                 return r;
             }

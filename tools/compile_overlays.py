@@ -815,8 +815,8 @@ void psx_check_interrupts(CPUState *cpu) {
 void gte_execute(CPUState *cpu, uint32_t cmd) {
     g_cbs.gte_execute(cpu, cmd);
 }
-void psx_syscall(CPUState *cpu, uint32_t code) {
-    g_cbs.psx_syscall(cpu, code);
+int psx_syscall(CPUState *cpu, uint32_t code) {
+    return g_cbs.psx_syscall(cpu, code);
 }
 void psx_unknown_dispatch(CPUState *cpu, uint32_t addr, uint32_t phys) {
     g_cbs.psx_unknown_dispatch(cpu, addr, phys);
@@ -1129,6 +1129,10 @@ def main():
                     help='codegen flavor id baked into overlay_abi() (0=base/master; '
                          'widescreen build passes 1). The loader rejects DLLs whose '
                          'flavor != the runtime flavor, keeping caches separate.')
+    ap.add_argument('--cps',             action='store_true',
+                    help='continuation-passing (RECURSION_BUG.md §25): set PSX_CPS '
+                         'when invoking the recompiler so overlay funcs tail-transfer '
+                         '+ carry an entry-switch. Must match the runtime build.')
     args = ap.parse_args()
 
     # Read game ID from game.toml (strip BOM if present)
@@ -1259,10 +1263,13 @@ def main():
                    # sites that resolve into overlay code) are applied. --ws-config
                    # only adopts the widescreen lists, not the game's exe/paths.
                    '--ws-config', os.path.abspath(args.game_toml)]
-            print(f'  recompile: {args.recompiler} ...')
+            print(f'  recompile: {args.recompiler} ...{" [CPS]" if args.cps else ""}')
             toml_dir = os.path.dirname(os.path.abspath(args.game_toml))
+            sub_env = dict(os.environ)
+            if args.cps:
+                sub_env['PSX_CPS'] = '1'   # §25: emit continuation-passing overlay C
             r = subprocess.run(cmd, capture_output=True, text=True,
-                               cwd=toml_dir)
+                               cwd=toml_dir, env=sub_env)
             if r.returncode != 0:
                 print(f'  RECOMPILER ERROR:\n{r.stderr or r.stdout}')
                 continue

@@ -29,7 +29,9 @@
  *     window START/END finalize, and the callback struct grows a
  *     ws_backdrop_value pointer (appended last). Bumping rejects pre-preload
  *     DLLs (which lack both the emit and a host that supplies the callback). */
-#define PSX_OVERLAY_ABI_VERSION 4
+/*   v5: psx_syscall callback return type void->int (CPS, RECURSION_BUG.md §25);
+ *       overlays compiled under CPS emit `if (psx_syscall(...)) return;`. */
+#define PSX_OVERLAY_ABI_VERSION 5
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -66,8 +68,11 @@
  *   1: baseline + auto_screen_x render-funnel cull via psx_ws_cull_sltiu.
  *   2: + auto_backdrop far-backdrop column preload via psx_ws_backdrop_value.
  *   3: auto_backdrop switched to camera-tracked window WIDENING
- *      (psx_ws_backdrop_value gains a window_cols arg). */
-#define PSX_OVERLAY_CODEGEN_VER 3
+ *      (psx_ws_backdrop_value gains a window_cols arg).
+ *   4: continuation-passing (PSX_CPS, RECURSION_BUG.md §25) — overlay funcs
+ *      tail-transfer + carry an entry-switch; the loader routes continuations.
+ *      Fresh namespace so CPS DLLs never reuse a legacy (unit-model) cg3 DLL. */
+#define PSX_OVERLAY_CODEGEN_VER 4
 
 typedef struct {
     /* Core dispatch: routes call_by_address() and out-of-overlay jal */
@@ -76,8 +81,11 @@ typedef struct {
     void (*check_interrupts)(CPUState *cpu);
     /* GTE coprocessor 2 execution */
     void (*gte_execute)(CPUState *cpu, uint32_t cmd);
-    /* MIPS syscall (break/syscall instructions) */
-    void (*psx_syscall)(CPUState *cpu, uint32_t code);
+    /* MIPS syscall (break/syscall instructions). Returns 1 if control
+     * transfers (cpu->pc set), 0 for a directly-handled void syscall. See
+     * cpu_state.h. The signature changed with CPS (RECURSION_BUG.md §25), so
+     * PSX_OVERLAY_ABI_VERSION was bumped to reject stale overlay caches. */
+    int  (*psx_syscall)(CPUState *cpu, uint32_t code);
     /* Unresolved dispatch target */
     void (*psx_unknown_dispatch)(CPUState *cpu, uint32_t addr, uint32_t phys);
     /* Debug instrumentation: called at every function entry (may be NULL) */
