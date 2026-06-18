@@ -413,6 +413,47 @@ static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
     return 0;
 }
 
+/* ── Mixed interp<->compiled dispatch owner (host-stack recursion fix) ──────
+ * The dirty interpreter nests psx_dispatch_game_compiled when an interpreted
+ * block transfers into compiled code. A guest tail-dispatch loop that crosses the
+ * boundary (an interpreted overlay <-> the main-EXE per-frame loop func_8001A954)
+ * grows the HOST stack unboundedly while the GUEST stack stays flat — the long-run
+ * freeze (docs/RECURSION_BUG.md). The compiled side already keeps tail-call loops
+ * flat via the psx_dispatch_impl trampoline + g_psx_call_bail unwind; the
+ * interpreter bypassed it by nesting directly.
+ *
+ * Fix: only the FIRST (outermost) interp->compiled crossing on a native call chain
+ * nests; a NESTED crossing publishes the target as a wild-flow bail. The existing
+ * contract (compiled frames honor `if (g_psx_call_bail) return;`) unwinds it to the
+ * OUTERMOST psx_dispatch_impl, whose flatten path clears the bail and re-dispatches
+ * cpu->pc in its loop — so the mutual tail-recursion iterates with bounded native
+ * depth. Runtime-only (reuses the existing bail + flatten; no regen). The nesting
+ * counter need not be exact: an over-count only causes extra (correct) iteration; an
+ * under-count degrades to the pre-fix nesting. Toggle off with PSX_MIXED_OWNER=0. */
+static int g_psx_mixed_nest = 0;
+
+static int psx_mixed_owner_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("PSX_MIXED_OWNER"); v = (e && e[0] == '0') ? 0 : 1; }
+    return v;
+}
+
+/* Enter compiled code from the interpreter for a guest control transfer. Returns
+ * like psx_dispatch_game_compiled (1 = handled, OR a nested-crossing bail was
+ * surfaced; 0 = not a compiled target — caller falls through to overlay/dirty/
+ * nonlocal paths). On surface: cpu->pc = target and g_psx_call_bail set. */
+static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
+    if (g_psx_mixed_nest > 0 && psx_mixed_owner_enabled()) {
+        cpu->pc = target;
+        g_psx_call_bail = 1;
+        return 1;
+    }
+    g_psx_mixed_nest++;
+    int handled = psx_dispatch_game_compiled(cpu, target);
+    g_psx_mixed_nest--;
+    return handled;
+}
+
 /* Execute ONE instruction at *pc on the given CPU state.  Returns:
  *   0 = continue (advance pc by 4)
  *   1 = control transferred OR unsupported opcode (caller checks
@@ -562,7 +603,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
 #ifdef PSX_HAS_GAME_DISPATCH
             cpu->pc = 0;
-            if (psx_dispatch_game_compiled(cpu, target)) {
+            if (interp_enter_compiled(cpu, target)) {
                 if (g_psx_call_bail) return 1;  /* wild unwind: cpu->pc = true target */
                 if (cpu->pc != 0) return 1;
                 if (rd == 0 || rd == 31) {
@@ -708,7 +749,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
 #ifdef PSX_HAS_GAME_DISPATCH
         cpu->pc = 0;
-        if (psx_dispatch_game_compiled(cpu, target)) {
+        if (interp_enter_compiled(cpu, target)) {
             if (g_psx_call_bail) return 1;  /* wild unwind: cpu->pc = true target */
             if (cpu->pc != 0) return 1;
             if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
@@ -1176,7 +1217,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                  * stale target in pc (which would re-dispatch — and re-run —
                  * the same function). */
                 cpu->pc = 0;
-                if (psx_dispatch_game_compiled(cpu, target)) {
+                if (interp_enter_compiled(cpu, target)) {
                     g_dirty_ram_blocks_run++;
                     if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
                     OV_FPLOG_RET1();
