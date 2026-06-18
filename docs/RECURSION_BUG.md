@@ -434,6 +434,65 @@ Earlier parked read of `0x800638C4` showed a clean GTE-loader leaf
 
 ---
 
+## 15. Strategy reset — control-flow flight recorder (session 2 end; ChatGPT-assisted)
+
+The oracle RAM-diff of two **separately-navigated** idle emulators was a dead end
+(alignment noise; §14). New plan (external review): **stop diffing RAM; build a
+triggered control-flow flight recorder on OUR side, find the edge that flips at
+~frame 50k, then walk a backward causal slice.** Use the oracle only at the END,
+for a small causal address set (not whole-RAM).
+
+**My analytical narrowing (reason first, then confirm with the recorder):**
+- The 23k laps are **WITHIN ONE FRAME**, not accumulated across frames: the host
+  call stack resets to the SDL frame loop every frame (the per-frame dispatch
+  returns, then present, then next frame), so host depth CANNOT accumulate across
+  frames. So a single frame's per-frame-update spirals to 23k and never returns.
+- The trip cycle advances `psx_advance_cycles(1)` + `psx_check_interrupts` **per
+  lap**, so 23k laps ≈ **23k guest cycles ≪ ~565k cycles/frame** → **no VBlank
+  can fire before overflow** (~40µs guest time). So it is NOT "stuck waiting for a
+  late interrupt" (scheduler-starvation-wait); it is a **control-flow cycle** — the
+  per-frame update re-enters itself. => we are in ChatGPT's "branch/target changes
+  abruptly → state/interp control-flow divergence" or "interpreter semantic bug" row.
+
+**Decision tree (which problem do we have):**
+| Observation | Diagnosis |
+|---|---|
+| depth grows gradually across frames; CF + scheduler stable | pure mixed-boundary stack leak |
+| 23k laps in ONE frame; cycles/events don't advance | mixed dispatch starves scheduler |
+| scheduler advances but a branch/target changes abruptly | state / interp CF divergence |
+| branch operands identical but recomp picks a different target | interpreter semantic bug |
+| recomp value differs, last-writer = a HW-produced write | hardware emulation bug |
+| watermark unwind stops the outer pump (normal exec didn't) | bailout impl incomplete |
+
+**Execution order (focused, NOT another broad diff):**
+1. **Per-frame frequency + first-occurrence of the re-entry edge** (interp →
+   `0x8001A954`) and the jumptable edge (`0x8004630C` → its `jr` target). Is the
+   re-entry **ordinary bounded per-frame behavior that stops TERMINATING at ~50k**,
+   or a brand-new edge? (ChatGPT expects at least one is normal rendering behavior.)
+2. **Last-writer map** on the values controlling those edges (selector `0x8009BCDD`,
+   the jump-table entry, `state[0x4a]`, the loop's termination variable): record
+   `{pc, frame, cycle, old, new}` per RAM write; when a load feeds the controlling
+   branch, emit a backward slice "edge taken because reg==V loaded from Y last
+   written at PC Z." That answers *what changed and why*, vs 900 differing bytes.
+3. **Indirect-site state** per branch: `{last_target, first_seen_frame,
+   last_change_frame, counts_by_target}` — makes "did `func_80046264` start taking a
+   new target at ~50k?" instantly answerable.
+4. **Oracle, narrowly:** only after #1–3 name a small address set, ask Beetle
+   (write-trace `trace_arm`/`ram_diff`, or a tiny **5-address PC hook** added
+   locally inside the Beetle core — much smaller than lockstep) whether real HW
+   takes the same edge, how often, and whether it ever transitions the controlling
+   value the way we do. Anchor epochs on a once-per-update write (OT-cursor reset /
+   game frame counter), local-align (allow ins/del), filter framebuffer/OT/stack/
+   audio/RNG, compress repeated identical writes.
+
+**Hooks available (runtime, no regen):** `s_frame_count` (main.cpp:1189),
+`psx_cycle_count` (psx_cycles.c), the `interp_enter_compiled` boundary
+(dirty_ram_interp.c — the re-entry edge `target==0x8001A954` passes through here),
+`g_dirty_ram_flow_log` ring, `crash_trace.c` report dump. First instrument = a
+re-entry-edge per-frame count ring dumped on the guard trip.
+
+---
+
 ## 14. Fix attempt + CORRECTED understanding (session 2, 2026-06-17 PM)
 
 Implemented + live-tested the single-mixed-dispatch-owner fix (§11) at the interp↔

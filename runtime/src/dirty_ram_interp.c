@@ -462,11 +462,60 @@ static size_t psx_mixed_stack_watermark(void) {
     return (size_t)v * 1024u;
 }
 
+/* ── Flight recorder: per-frame count of the re-entry edge interp->0x8001A954 ──
+ * (RECURSION_BUG.md §15). The long-run freeze is a per-frame update that, at
+ * ~frame 50k, re-enters func_8001A954 (the per-frame loop head) unboundedly via
+ * an interpreted overlay. Record, per emulated frame, how many times that edge
+ * fires + the cycle counter, in a ring the crash report dumps. Answers: is the
+ * re-entry ORDINARY bounded per-frame behavior that stops TERMINATING at ~50k
+ * (count goes unbounded), or a brand-new edge — and whether cycles advance.
+ * Only the INTERP->compiled re-entry passes through here; the normal compiled
+ * per-frame entry to func_8001A954 does not, so this isolates the suspect edge. */
+extern uint64_t psx_cycle_count;
+typedef struct { uint32_t frame; uint32_t count; uint64_t cycle; } Re954Entry;
+#define RE954_CAP 256u
+static Re954Entry g_re954_ring[RE954_CAP];
+static uint64_t   g_re954_seq = 0;
+static uint32_t   g_re954_this = 0;
+static uint32_t   g_re954_last_frame = 0xFFFFFFFFu;
+static uint32_t   g_re954_max_per_frame = 0;
+
+static void re954_note(void) {
+    uint32_t f = (uint32_t)s_frame_count;
+    if (f != g_re954_last_frame) {
+        if (g_re954_last_frame != 0xFFFFFFFFu) {
+            Re954Entry *e = &g_re954_ring[g_re954_seq++ & (RE954_CAP - 1u)];
+            e->frame = g_re954_last_frame; e->count = g_re954_this; e->cycle = psx_cycle_count;
+            if (g_re954_this > g_re954_max_per_frame) g_re954_max_per_frame = g_re954_this;
+        }
+        g_re954_this = 0; g_re954_last_frame = f;
+    }
+    g_re954_this++;
+}
+
+/* Emit the re-entry flight recorder as a JSON fragment (called by crash_trace). */
+int dirty_ram_re954_json(char *out, int cap) {
+    int n = snprintf(out, cap,
+        "  \"reentry_8001A954\": {\"max_per_frame\":%u,\"cur_frame\":%u,\"cur_count\":%u,\"history\":[",
+        g_re954_max_per_frame, g_re954_last_frame, g_re954_this);
+    uint64_t total = g_re954_seq;
+    int avail = (total < RE954_CAP) ? (int)total : (int)RE954_CAP;
+    uint64_t start = total - (uint64_t)avail;
+    for (int i = 0; i < avail && n < cap - 96; i++) {
+        Re954Entry *e = &g_re954_ring[(start + (uint64_t)i) & (RE954_CAP - 1u)];
+        n += snprintf(out + n, cap - n, "%s{\"f\":%u,\"n\":%u,\"cyc\":%llu}",
+                      i ? "," : "", e->frame, e->count, (unsigned long long)e->cycle);
+    }
+    n += snprintf(out + n, cap - n, "]},\n");
+    return n;
+}
+
 /* Enter compiled code from the interpreter for a guest control transfer. Returns
  * like psx_dispatch_game_compiled (1 = handled, OR a stack-watermark bail was
  * surfaced; 0 = not a compiled target — caller falls through to overlay/dirty/
  * nonlocal paths). On surface: cpu->pc = target and g_psx_call_bail set. */
 static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
+    if (target == 0x8001A954u) re954_note();
     if (psx_mixed_owner_enabled()
         && interp_host_stack_used() > psx_mixed_stack_watermark()) {
         cpu->pc = target;
