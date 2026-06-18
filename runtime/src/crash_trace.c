@@ -409,6 +409,16 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         append_str(buf, sizeof(buf), &pos, "]\n  },\n");
     }
 
+    /* Re-entry flight recorder (RECURSION_BUG.md §15): per-frame count of the
+     * interp->0x8001A954 edge + cycle counter, leading up to the trip — answers
+     * "ordinary bounded per-frame behavior that stopped terminating, or new edge?" */
+    {
+        extern int dirty_ram_re954_json(char *out, int cap);
+        static char re954[8192];
+        int k = dirty_ram_re954_json(re954, (int)sizeof(re954));
+        if (k > 0) append_str(buf, sizeof(buf), &pos, re954);
+    }
+
     /* Native call-stack snapshot — the TRUE recursion cycle (recent_fn above is
      * time-ordered and shows leaf churn, not the recursing frames).
      *
