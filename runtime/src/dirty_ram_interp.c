@@ -418,40 +418,62 @@ static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
  * block transfers into compiled code. A guest tail-dispatch loop that crosses the
  * boundary (an interpreted overlay <-> the main-EXE per-frame loop func_8001A954)
  * grows the HOST stack unboundedly while the GUEST stack stays flat — the long-run
- * freeze (docs/RECURSION_BUG.md). The compiled side already keeps tail-call loops
- * flat via the psx_dispatch_impl trampoline + g_psx_call_bail unwind; the
- * interpreter bypassed it by nesting directly.
+ * freeze (docs/RECURSION_BUG.md). The compiled side keeps tail-call loops flat via
+ * the psx_dispatch_impl trampoline + g_psx_call_bail unwind; the interpreter
+ * bypassed it by nesting directly.
  *
- * Fix: only the FIRST (outermost) interp->compiled crossing on a native call chain
- * nests; a NESTED crossing publishes the target as a wild-flow bail. The existing
- * contract (compiled frames honor `if (g_psx_call_bail) return;`) unwinds it to the
- * OUTERMOST psx_dispatch_impl, whose flatten path clears the bail and re-dispatches
- * cpu->pc in its loop — so the mutual tail-recursion iterates with bounded native
- * depth. Runtime-only (reuses the existing bail + flatten; no regen). The nesting
- * counter need not be exact: an over-count only causes extra (correct) iteration; an
- * under-count degrades to the pre-fix nesting. Toggle off with PSX_MIXED_OWNER=0. */
-static int g_psx_mixed_nest = 0;
-
+ * Fix: when an interp->compiled crossing would push the HOST stack past a safe
+ * watermark, publish the target as a wild-flow bail instead of nesting. The
+ * existing contract (compiled frames honor `if (g_psx_call_bail) return;`) unwinds
+ * it to the OUTERMOST psx_dispatch_impl, whose flatten path clears the bail and
+ * re-dispatches cpu->pc in its loop — so the mutual tail-recursion iterates with
+ * bounded native depth. Runtime-only (reuses the existing bail + flatten; no regen).
+ *
+ * The trigger is the ACTUAL host-stack usage (TEB StackBase - rsp), NOT a nesting
+ * counter. A counter LEAKS across the fiber exception path (psx_exception_longjmp
+ * never returns, so interp_enter_compiled's post-call decrement is skipped) and
+ * creeps up until it falsely trips on a benign call — observed as the FIRST dialogue
+ * freezing. Stack usage can't leak and is the real resource we protect: legitimate
+ * code (boot, dialogue, deep-but-bounded recursion) stays far below the watermark;
+ * only the runaway approaches it. Toggle off with PSX_MIXED_OWNER=0; watermark via
+ * PSX_MIXED_STACK_KB (default 700; fiber ~1MB, native-stack guard ~768KB used). */
 static int psx_mixed_owner_enabled(void) {
     static int v = -1;
     if (v < 0) { const char *e = getenv("PSX_MIXED_OWNER"); v = (e && e[0] == '0') ? 0 : 1; }
     return v;
 }
 
+#ifdef _WIN32
+#include <intrin.h>   /* __readgsqword — fiber TEB StackBase */
+static size_t interp_host_stack_used(void) {
+    char probe;
+    uintptr_t base = (uintptr_t)__readgsqword(0x08);   /* TEB StackBase (high end) */
+    uintptr_t sp   = (uintptr_t)&probe;
+    return (base > sp) ? (size_t)(base - sp) : 0;
+}
+#else
+static size_t interp_host_stack_used(void) { return 0; }
+#endif
+
+static size_t psx_mixed_stack_watermark(void) {
+    static long v = -1;
+    if (v < 0) { const char *e = getenv("PSX_MIXED_STACK_KB");
+                 v = (e && *e) ? atol(e) : 700; if (v < 64) v = 64; }
+    return (size_t)v * 1024u;
+}
+
 /* Enter compiled code from the interpreter for a guest control transfer. Returns
- * like psx_dispatch_game_compiled (1 = handled, OR a nested-crossing bail was
+ * like psx_dispatch_game_compiled (1 = handled, OR a stack-watermark bail was
  * surfaced; 0 = not a compiled target — caller falls through to overlay/dirty/
  * nonlocal paths). On surface: cpu->pc = target and g_psx_call_bail set. */
 static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
-    if (g_psx_mixed_nest > 0 && psx_mixed_owner_enabled()) {
+    if (psx_mixed_owner_enabled()
+        && interp_host_stack_used() > psx_mixed_stack_watermark()) {
         cpu->pc = target;
         g_psx_call_bail = 1;
         return 1;
     }
-    g_psx_mixed_nest++;
-    int handled = psx_dispatch_game_compiled(cpu, target);
-    g_psx_mixed_nest--;
-    return handled;
+    return psx_dispatch_game_compiled(cpu, target);
 }
 
 /* Execute ONE instruction at *pc on the given CPU state.  Returns:
