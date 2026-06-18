@@ -91,6 +91,16 @@ bool FullFunctionEmitter::emit_function(
 {
     const uint32_t norm = func.normalized_addr;
 
+    // RECURSION_BUG.md §25 — continuation-passing call/return (the universal fix
+    // for the idle-freeze host-stack leak). When PSX_CPS is set at gen time,
+    // guest calls (jal/jalr) are emitted as TAIL-TRANSFERS (set $ra, cpu->pc =
+    // target, return) with the return address registered as a dispatchable
+    // continuation, instead of a nested psx_dispatch(). The trampoline drives
+    // the whole call/return FLAT via the guest's own $ra/$sp — like hardware —
+    // so the host stack can never mirror unbounded guest re-entrancy. Perf cost:
+    // every call becomes a dispatch (accepted: "right before fast").
+    static const bool cps = (std::getenv("PSX_CPS") != nullptr);
+
     // Build sorted instruction list and a set for O(1) membership test.
     // sfr.instructions is already sorted by address.
     std::map<uint32_t, uint32_t> addr_to_raw;
@@ -413,6 +423,8 @@ bool FullFunctionEmitter::emit_function(
                         if (rs == 31) {
                             if (ra_loaded_from_non_sp)
                                 out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
+                            else if (cps)
+                                out += "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra */\n";
                             else
                                 out += "    return;\n";
                         } else {
@@ -450,6 +462,8 @@ bool FullFunctionEmitter::emit_function(
                     if (rs == 31) {
                         if (ra_loaded_from_non_sp)
                             out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
+                        else if (cps)
+                            out += "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra */\n";
                         else
                             out += "    return;\n";
                     } else {
@@ -521,12 +535,24 @@ bool FullFunctionEmitter::emit_function(
                     }
                     uint32_t target = relocate_j_target(addr, tr.terminator_target);
                     uint32_t return_addr = relocate_ra(addr + 8);
-                    out += "    { uint32_t _csp = cpu->gpr[29];\n";
-                    out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
-                    out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
-                    out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
-                                       return_addr);
-                    out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", return_addr);
+                    if (cps) {
+                        if (addr_to_raw.count(addr + 8)) {
+                            uint32_t cn = normalize_address(addr + 8);
+                            if (!all_function_entries_norm.count(cn))
+                                local_continuations.push_back({addr + 8, cn, norm});
+                        } else {
+                            register_cross_function_target(addr + 8);
+                        }
+                        out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
+                        out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", target);
+                    } else {
+                        out += "    { uint32_t _csp = cpu->gpr[29];\n";
+                        out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
+                        out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
+                        out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
+                                           return_addr);
+                        out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", return_addr);
+                    }
                 } else if (kind == "jalr") {
                     uint32_t ds_addr = addr + 4;
                     uint32_t base_phys = base_addr & 0x1FFFFFFFu;
@@ -545,21 +571,38 @@ bool FullFunctionEmitter::emit_function(
                     uint8_t rs = (raw >> 21) & 0x1F;
                     uint8_t rd = (raw >> 11) & 0x1F;
                     uint32_t return_addr = relocate_ra(addr + 8);
-                    out += "    { uint32_t _csp = cpu->gpr[29];\n";
-                    if (rd != 0) {
-                        out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
-                                           static_cast<int>(rd), return_addr);
-                    }
-                    out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
-                                       static_cast<int>(rs));
-                    if (rd == 31) {
-                        out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
-                                           return_addr);
+                    if (cps) {
+                        if (addr_to_raw.count(addr + 8)) {
+                            uint32_t cn = normalize_address(addr + 8);
+                            if (!all_function_entries_norm.count(cn))
+                                local_continuations.push_back({addr + 8, cn, norm});
+                        } else {
+                            register_cross_function_target(addr + 8);
+                        }
+                        out += fmt::format("    {{ uint32_t _t = cpu->gpr[{}];\n",
+                                           static_cast<int>(rs));
+                        if (rd != 0) {
+                            out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
+                                               static_cast<int>(rd), return_addr);
+                        }
+                        out += "    cpu->pc = _t; return; }\n";
                     } else {
-                        /* Return register isn't $ra: only propagate an active bail. */
-                        out += "    if (g_psx_call_bail) return; (void)_csp; }\n";
+                        out += "    { uint32_t _csp = cpu->gpr[29];\n";
+                        if (rd != 0) {
+                            out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
+                                               static_cast<int>(rd), return_addr);
+                        }
+                        out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
+                                           static_cast<int>(rs));
+                        if (rd == 31) {
+                            out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
+                                               return_addr);
+                        } else {
+                            /* Return register isn't $ra: only propagate an active bail. */
+                            out += "    if (g_psx_call_bail) return; (void)_csp; }\n";
+                        }
+                        out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", return_addr);
                     }
-                    out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", return_addr);
                 }
             }
             continue;
@@ -663,64 +706,92 @@ bool FullFunctionEmitter::emit_function(
             } else if (kind == "jal") {
                 uint32_t target = pb.target;
                 uint32_t return_addr = relocate_ra(pb.terminator_addr + 8);
-                out += "    { uint32_t _csp = cpu->gpr[29];\n";
-                out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
-                // Regular call: always go through psx_dispatch (handles tail-call loop).
-                if (target == 0x00006380u) {
-                    out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
-                                       pb.terminator_addr);
-                }
-                out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
-                if (target == 0x00006380u) {
-                    out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
-                                       pb.terminator_addr + 1);
-                }
-                out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
-                                   return_addr);
-                // Safety net: if continuation falls outside this function, tail-call to it.
-                if (!addr_to_raw.count(pb.terminator_addr + 8)) {
-                    out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jal cont: outside func */\n", return_addr);
-                }
-                // Register continuation label if the return point is inside
-                // this function and the callee is a separate dispatch entry.
-                // The callee's jr $ra will set cpu->pc = return_addr, and the
-                // dispatch loop needs a table entry to route back here.
-                if (addr_to_raw.count(pb.terminator_addr + 8)) {
+                bool cont_in_func = addr_to_raw.count(pb.terminator_addr + 8) != 0;
+                // Register the continuation (return point) as dispatchable: a
+                // local continuation if it lands in this function, else a
+                // cross-function target re-injected into its owner (§25/CPS) —
+                // legacy also needs the in-func label for the callee's jr $ra.
+                if (cont_in_func) {
                     uint32_t cont_rom = pb.terminator_addr + 8;
                     uint32_t cont_norm = normalize_address(cont_rom);
-                    // Only needed if the continuation isn't already a function entry.
                     if (!all_function_entries_norm.count(cont_norm)) {
                         local_continuations.push_back({cont_rom, cont_norm, norm});
+                    }
+                } else if (cps) {
+                    register_cross_function_target(pb.terminator_addr + 8);
+                }
+                if (cps) {
+                    // Continuation-passing: tail-transfer to the callee. Its
+                    // jr $ra sets cpu->pc = return_addr; the trampoline then
+                    // dispatches the registered continuation. No host nesting.
+                    if (target == 0x00006380u) {
+                        out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
+                                           pb.terminator_addr);
+                    }
+                    out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
+                    out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", target);
+                } else {
+                    out += "    { uint32_t _csp = cpu->gpr[29];\n";
+                    out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
+                    // Regular call: always go through psx_dispatch (handles tail-call loop).
+                    if (target == 0x00006380u) {
+                        out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
+                                           pb.terminator_addr);
+                    }
+                    out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
+                    if (target == 0x00006380u) {
+                        out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
+                                           pb.terminator_addr + 1);
+                    }
+                    out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
+                                       return_addr);
+                    // Safety net: if continuation falls outside this function, tail-call to it.
+                    if (!cont_in_func) {
+                        out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jal cont: outside func */\n", return_addr);
                     }
                 }
             } else if (kind == "jalr") {
                 uint8_t rs = (pb.raw >> 21) & 0x1F;
                 uint8_t rd = (pb.raw >> 11) & 0x1F;
                 uint32_t return_addr = relocate_ra(pb.terminator_addr + 8);
-                out += "    { uint32_t _csp = cpu->gpr[29];\n";
-                if (rd != 0) {
-                    out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
-                                       static_cast<int>(rd), return_addr);
-                }
-                out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
-                                   static_cast<int>(rs));
-                if (rd == 31) {
-                    out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
-                                       return_addr);
-                } else {
-                    /* Return register isn't $ra: only propagate an active bail. */
-                    out += "    if (g_psx_call_bail) return; (void)_csp; }\n";
-                }
-                // Safety net: if continuation falls outside this function, tail-call to it.
-                if (!addr_to_raw.count(pb.terminator_addr + 8)) {
-                    out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jalr cont: outside func */\n", return_addr);
-                }
-                // Register continuation for jalr too (same logic as jal).
-                if (addr_to_raw.count(pb.terminator_addr + 8)) {
+                bool cont_in_func = addr_to_raw.count(pb.terminator_addr + 8) != 0;
+                if (cont_in_func) {
                     uint32_t cont_rom = pb.terminator_addr + 8;
                     uint32_t cont_norm = normalize_address(cont_rom);
                     if (!all_function_entries_norm.count(cont_norm)) {
                         local_continuations.push_back({cont_rom, cont_norm, norm});
+                    }
+                } else if (cps) {
+                    register_cross_function_target(pb.terminator_addr + 8);
+                }
+                if (cps) {
+                    // CPS jalr: capture the target register BEFORE writing the
+                    // link reg (rd==rs alias-safe), then tail-transfer.
+                    out += fmt::format("    {{ uint32_t _t = cpu->gpr[{}];\n",
+                                       static_cast<int>(rs));
+                    if (rd != 0) {
+                        out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
+                                           static_cast<int>(rd), return_addr);
+                    }
+                    out += "    cpu->pc = _t; return; }\n";
+                } else {
+                    out += "    { uint32_t _csp = cpu->gpr[29];\n";
+                    if (rd != 0) {
+                        out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
+                                           static_cast<int>(rd), return_addr);
+                    }
+                    out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
+                                       static_cast<int>(rs));
+                    if (rd == 31) {
+                        out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
+                                           return_addr);
+                    } else {
+                        /* Return register isn't $ra: only propagate an active bail. */
+                        out += "    if (g_psx_call_bail) return; (void)_csp; }\n";
+                    }
+                    // Safety net: if continuation falls outside this function, tail-call to it.
+                    if (!cont_in_func) {
+                        out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);  /* jalr cont: outside func */\n", return_addr);
                     }
                 }
             } else if (kind == "jr") {
@@ -728,6 +799,8 @@ bool FullFunctionEmitter::emit_function(
                 if (rs == 31) {
                     if (ra_loaded_from_non_sp)
                         out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
+                    else if (cps)
+                        out += "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra for trampoline dispatch */\n";
                     else
                         out += "    return;\n";
                 } else {

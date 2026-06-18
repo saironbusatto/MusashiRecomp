@@ -1081,3 +1081,108 @@ with no freeze + dwarf→overworld playtest (regression). Artifacts this session
 `_freeze_specimens/`: `oracle/oracle_chain_filtered.json`, `oracle/recomp_allfn_frame.json`,
 the early-trip `psx_last_run_report.json` (native_stack), `_xprobe.json`, `_dirty_insn.json`.
 
+---
+
+## 25. UNIVERSAL FIX = continuation-passing call/return (user-chosen 2026-06-18; perf-loss OK)
+
+User direction: build the **universal** fix (matures the ecosystem; nothing but Tomba is
+load-bearing; "right before fast"). That is **§11 done fully = continuation-passing**, not a
+§12 mitigation.
+
+**Current call contract (the host-mirroring root), `full_function_emitter.cpp`.** A guest
+`jal target` is emitted as a **nested dispatch**:
+```c
+{ uint32_t _csp = cpu->gpr[29];
+  cpu->gpr[31] = return_addr;
+  psx_dispatch(cpu, target);                       // NESTS a psx_dispatch_impl frame
+  if (psx_call_contract(cpu, return_addr, _csp)) return; }
+// continuation runs INLINE here
+```
+One nested `psx_dispatch_impl` per guest call frame ⇒ the guest call graph mirrors onto the
+host stack. Bounded guest depth → bounded host; **unbounded guest re-entry (the §8 per-frame
+cycle) → unbounded host nesting → 48 MB → freeze.** `psx_call_contract`/`g_psx_call_bail`
+(Bug A/C/D) exist *only* to paper over the mismatch between host C-nesting and guest ra-based
+returns — they are a symptom of the mirroring.
+
+**Continuation-passing emission (the fix).** Emit every guest call as a TAIL-TRANSFER, with
+the return address registered as a dispatchable continuation:
+```c
+// jal target:
+cpu->gpr[31] = return_addr;     cpu->pc = target; return;
+// jalr rd, rs:
+{ uint32_t _t = cpu->gpr[rs];   /* capture BEFORE link → rd==rs alias-safe */
+  cpu->gpr[rd] = return_addr;   /* if rd != 0 */
+  cpu->pc = _t; return; }
+```
+The trampoline (`psx_dispatch_impl`, already a `for(;;)` tail-dispatch loop) dispatches the
+callee; the callee's `jr ra` sets `cpu->pc = return_addr`; the loop dispatches the registered
+continuation block. The **whole call/return runs FLAT in one loop**, driven by the guest's own
+`ra`/`sp` — exactly like hardware. Each basic block becomes a separate dispatch (the perf cost
+the user accepted). `psx_call_contract`/the bail machinery become unnecessary (no host nesting
+to mismatch; a wild `jr` just dispatches the wild PC, as HW would jump there).
+
+**Why this is universal.** It makes the recompiler *architecturally* incapable of host-stack
+overflow from guest control flow — any game, any re-entrancy depth, real or divergent. §12
+(CD-DMA precision) and fixing the specific `func_80046264→func_8001A954` divergence are
+per-symptom shortcuts; this is the complete fix.
+
+**Scope (multi-component — staged, validated rollout, NOT a big-bang):**
+1. **C emitter** (`full_function_emitter.cpp`) — the 4 call sites (jal/jalr × orphaned-delay +
+   pending-delay paths). Tail-transfer + ensure EVERY `return_addr` (addr+8) is a block leader
+   AND a `local_continuation` (so interior dispatch routes back in). This is where the leaking
+   §8 chain lives → fixes the main-EXE mirroring. **Needs REGEN.**
+2. **Dirty interp** (`dirty_ram_interp.c`) — `interp_enter_compiled` must SURFACE a
+   compiled-GAME call target (set `gpr[31]=return_pc`, `cpu->pc=target`, return) instead of
+   nesting `psx_dispatch_game_compiled` (this is §22's change — which was only PARTIAL because
+   the compiled side still nested; with #1 it completes). Gate to game-text targets so
+   overlay-native DLLs (which C-return `pc==0`) keep their contract → no dwarf→overworld
+   regression. Runtime-only.
+3. **sljit backend + overlay compiler** (`compile_overlays.py`) — mirror the contract so
+   sljit/overlay-compiled code tail-transfers too (else mixed contracts). Follow-on stage.
+4. **Regen** BIOS + game(s); the `psx_call_contract` / bail code can be left inert first, then
+   removed once #1–#3 are proven.
+
+**Regression-prone cases** (test): JALR `rd==rs` alias (handled by capture-before-link);
+delay-slot side effects committed before the transfer (already emitted inline before the
+terminator); `jr $ra` longjmp-returns for exception handlers (`psx_restore_state_escape`) —
+keep as-is; install-slot hooks (Rule 18); jump tables; continuation that lands outside the
+caller's function (dispatch routes by table — must be a registered entry/continuation
+somewhere); guest regs cached in C locals across a call (must be flushed at block boundary —
+calls are block terminators, so block-local temps don't span; verify the emitter never caches
+across a terminator).
+
+**Validation (the gate):** §19 `ce_profile` per-frame `max_kb` FLAT + BIOS boots to shell +
+Tomba boots to gameplay + the §23 oracle JAL/JR/SP sequence stays bit-identical + 15-min idle
+soak no-freeze + dwarf→overworld playtest. Safe point to revert to: commit `ae47e69`.
+
+### 25.1 Implementation status (2026-06-18) — Stage 1 emitter done + GATED; boot regression open
+
+DONE (`full_function_emitter.cpp`, gated behind gen-time env `PSX_CPS`):
+- All 4 call sites (jal/jalr × orphaned-delay + pending-delay) emit `cpu->pc=target; return;`
+  (tail-transfer) under CPS instead of nested `psx_dispatch` + `psx_call_contract`. JALR
+  captures the target reg BEFORE the link (rd==rs alias-safe).
+- All 3 `jr $ra` return sites publish `cpu->pc = cpu->gpr[31]; return;` under CPS (legacy just
+  `return;` and relied on the nested-dispatch C-return). **This was required** — without it the
+  BIOS "completed" instantly (returns left `cpu->pc=0` → outermost trampoline exit).
+- Every call's return address registered as a dispatchable continuation (local_continuation in
+  the caller's function, else `register_cross_function_target`).
+
+**GATING PROVEN SAFE:** regen+build WITHOUT `PSX_CPS` (legacy) boots Tomba normally — the
+default codegen is byte-unaffected; CPS is fully opt-in. So this WIP is safe to land.
+
+OPEN (the boot regression, CPS path only): with `PSX_CPS=1`, BIOS regen+build boots `main()`
+then exits at frame 0 (`execution completed, PC=0x00000000`). Root cause (high confidence):
+in CPS the trampoline must **dispatch** mid-function continuation addresses (a `jr $ra` returns
+to a caller's `return_addr`, which the trampoline then dispatches), but the **dispatch table
+contains only function ENTRIES** — a return to a mid-function continuation misses the table →
+`psx_unknown_dispatch` → `pc=0` → outermost exit. Legacy never needed continuations in the
+table (they were reached by C-return from the nested `psx_dispatch`). 
+
+**NEXT (the fix to make CPS boot):** add every registered continuation (local_continuations +
+out_cross_targets) to the **dispatch table** (mapping `continuation_addr → containing func`),
+so the trampoline routes a returned-to continuation into its function's entry-switch. Find the
+dispatch-table emitter (writes `*_dispatch.c`), and include continuations alongside function
+entries. Then re-regen `PSX_CPS=1`, boot-test, and run the §25 validation gate (ce_profile flat
++ oracle-identical + 15-min soak + dwarf→overworld). Stages 2 (interp `interp_enter_compiled`
+surface) and 3 (sljit/overlay parity) follow once the C-emitter path boots+flattens.
+
