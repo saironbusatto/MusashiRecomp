@@ -472,7 +472,7 @@ static size_t psx_mixed_stack_watermark(void) {
  * Only the INTERP->compiled re-entry passes through here; the normal compiled
  * per-frame entry to func_8001A954 does not, so this isolates the suspect edge. */
 extern uint64_t psx_cycle_count;
-#define SITE_CAP 256u
+#define SITE_CAP 32u   /* 3 sites x 256 overflowed crash_trace's 8KB sub-buffer; 32 frames of lead-up is plenty */
 typedef struct { uint32_t frame; uint32_t count; uint64_t cycle; } SiteEntry;
 typedef struct { SiteEntry ring[SITE_CAP]; uint64_t seq; uint32_t cur;
                  uint32_t last_frame; uint32_t maxf; } SiteRec;
