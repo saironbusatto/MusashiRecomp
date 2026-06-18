@@ -56,6 +56,37 @@ data as executable/dirty. Same family as the "wild call contract" recursion bugs
 
 ---
 
+## 1a. Confirmed organic capture — frame 50241 (`build-recursion`, 2026-06-17)
+
+Second specimen, captured live by the 4-soak harness + harvest watcher
+(`_freeze_specimens/soak_report_20260617_171145.json`). The native_stack tool
+worked end-to-end (walked 300000 frames, decoded the cycle); the early-flush was
+not even needed. Confirms §1 and adds the guest-level mechanism:
+
+- `reason`: native-stack guard tripped — runaway guest recursion.
+- `recursion_func = 0x8004DEE0`. At halt: **`v0 = 0x8004DEE0`, `ra = 0x8004DEE8`**
+  (`= v0 + 8`) -> the guest ran a `jalr v0` whose target slot points back into the
+  recursing chain. **Indirect call through a jump-table / function-pointer slot**
+  — the wild-call family (cf. seesaw `func_8001DFD4`, bogus `v0=0x8001DFF8`), NOT a
+  benign loop. `pc = 0x00000000` = the dispatch `pc==0` unwind sentinel.
+- Steady-state lap (~23074x, ~13 host frames each):
+  `exec_one -> dirty_ram_dispatch -> psx_check_interrupts -> psx_dispatch_impl ->
+   func_80046264 -> func_8001B5A8 -> func_8001B2B4 -> func_8001AC00 -> func_8001A954
+   -> exec_delay_slot -> psx_dispatch_game_compiled -> exec_one`.
+- Dirty pages on the interpreted path: **`0x80063xxx` and `0x8011xxxx` (overlay
+  region)**; `last_store_pc = 0x80116A24`; `dirty_block_tail` tail shows
+  self-referential dispatch (`target == ra == 0x80116204`).
+
+**Mechanism, restated with evidence:** a guest indirect transfer (jalr through a
+jumptable/fp slot) crosses the compiled<->dirty-interp boundary, and the recompiler
+implements each crossing as a **nested host call** (`psx_dispatch_game_compiled` /
+`dirty_ram_dispatch` / `exec_one`) that never returns. The guest transfer is
+jump/tail-style (guest stack does not grow proportionally) but the HOST stack grows
+~13 frames/lap -> fiber overflow. CD-DMA dirty-marking (`dma.c:695`) is what forces
+those overlay/0x80063xxx pages onto the interpreted path in the first place.
+
+---
+
 ## 2. The reproduction harness ("soaks") — and the regression blocking it
 
 **Workflow.** Run **4 instances** in parallel ("Soak A/B/C/D"). Claude launches
@@ -66,11 +97,12 @@ ports 4393-4396 (`tomba_soak_{a,b,c,d}.toml`). Stay off heavy host work while
 soaking (a wall-clock starvation watchdog, 4s no-heartbeat -> exit(2), false-trips
 under host load).
 
-**The regression (currently blocking everything).** On the current
-uncommitted/debug build, **Soaks A-D crash the instant anything loads to the
-overworld** — before idle, before any chance to reproduce the freeze. SIGSEGV,
-**no `psx_last_run_report.json`**. This did not happen on the build that used to
-soak faithfully for ~15m.
+**The regression — RESOLVED.** It was a **stale build artifact** (`build-soak`),
+NOT the tooling and NOT master. `build-soak`'s generated `.obj` were byte-identical
+to the good build, but its *runtime* objects predated the session and the link was
+incoherent; a clean from-scratch rebuild (`build-recursion` = master + native_stack
+tooling + early-flush) does **not** crash on overworld-load (user-confirmed). The
+"crash the instant anything loads" symptom is gone. See §4 / §5.
 
 ---
 
@@ -106,38 +138,58 @@ psxrecomp reflog shows HEAD parked at master `3ba40b0` since 09:34 that day, so 
 and B were regen'd off the **same** master tip — **not** a flavor trap, **not**
 stale generated code. (Those were the handoff's two hypotheses; both refuted.)
 
-**Open logical tension.** `crash_trace.c`'s only new code runs inside the dump
-path, and **every dump caller terminates**. So if a dump fired on overworld-load,
-build B (no tooling) would stop too — contradicting "B gets into game." Two ways
-out, to be settled empirically (§5):
-1. B was never actually driven through the exact "New Game -> overworld" path the
-   soaks use; OR
-2. **the overworld-load regression is in `master` itself** (this morning's merges:
-   ws-backdrop-coverage @09:27, controller change @09:34), not the tooling. The A-vs-B
-   diff can't see a master regression because both A and B are post-09:34 master.
+**Open logical tension — RESOLVED.** The tension (`crash_trace.c`'s only new code
+runs in the terminating dump path, yet B "got into game") dissolved when a clean
+rebuild WITH the tooling did not crash. The crashing `build-soak` was a stale/
+incoherent incremental build; neither the tooling nor a master regression was at
+fault. The session pivoted from "explain the overworld-load crash" to "capture and
+fix the actual freeze" — which we then did (§1a, §7, §8).
 
 ---
 
-## 5. Plan
+## 5. Status & plan (updated 2026-06-17, end of session)
 
-1. **(done)** Branch `bug/recursion`, write this down.
-2. **Unravel the overworld-load regression — decisive A/B from source.** Build two
-   clean builds from current master: **X = master + native_stack tooling +
-   "flush report before the walk" hardening**; **Y = pure master, no tooling**
-   (the existing `build-soak-e` already IS Y). Run 2 soaks on X + 2 on Y, navigate
-   all to overworld:
-   - Y also crashes -> it's a **master regression**; bisect master against the
-     last-known-good faithful-soak commit.
-   - Only X crashes -> it's the **tooling**; X's report (now flushed before the
-     walk) shows the real trigger — recursion-fired-immediately vs a separate fault.
-   - X crashes with **no** report even after the early flush -> the fault is
-     **outside** `psx_crash_trace_dump` -> not `append_native_stack`; look elsewhere.
-3. **Return to the soak workflow** on whichever build survives overworld-load,
-   reproduce the freeze, and capture it with native_stack (the early-flush makes the
-   report survive the overflow walk).
-4. **Fix the recompiler** (interp<->compiled unwind contract and/or `dma.c:695`
-   over-marking). Regen, rebuild, re-soak to confirm. No stubs, no HLE, never edit
-   generated C.
+**Done this session:**
+- Branch `bug/recursion` created; native_stack tooling committed (`d9b6ae5`).
+- native_stack tool **hardened** with an early-flush (commit `e63fdee`): the report
+  is written to disk BEFORE the risky host-stack walk, so a walk fault can no longer
+  destroy it. (Turned out not to be needed for the captures — the walk completed —
+  but it's the right robustness fix and unblocks future overflow captures.)
+- Overworld-load regression (§2) **resolved** — stale build artifact; clean
+  `build-recursion` is healthy.
+- Freeze **captured organically** (3 specimens: A frame 50241, C frame 50088, B
+  Dwarf Forest) via the 4-soak harness + `harvest_soak.py`. Deterministic: all three
+  halt with identical `v0=0x8004DEE0, ra=0x8004DEE8, pc=0`. Both New-Game and
+  Dwarf-Forest areas reproduce → universal per-frame code path.
+- Root-caused to the interpreter↔compiled boundary (§7) + Ghidra-mapped the guest
+  state machine (§8). External review (§9) rates this Hypothesis A; flags a distinct
+  Hypothesis C to rule out with an oracle trace (§10).
+
+**Builds in tree (do NOT delete):** `build-recursion` (X = master+tooling+early-flush,
+the good build), `build-soak`/`build-soak-e` (the A/B subjects). Soak configs
+`tomba_soak_{a,b,c,d}.toml` (ports 4393-6, software, per-instance `saves_a..d`
+seeded from the real card). `harvest_soak.py` watches the shared
+`psx_last_run_report.json` and decodes with `allsyms.txt`.
+
+**Next (in order):**
+1. **A-vs-C static check:** disassemble the dynamic routine around `0x80063864`
+   (the dirty page `func_80046264` first calls into), specifically the instructions
+   before/after its transfer to `0x8001A954` and its stack-restoration / intended
+   return path (§13). Is the re-entry a legit guest tail-transfer (A) or an interp
+   artifact (C)? `0x80063xxx` is runtime-loaded — read from a PARKED instance via the
+   debug server `read`, not the static EXE.
+2. **Oracle disambiguation (§10):** trace control flow at `0x8001A954` / `0x80046264`
+   / `0x80063864` / the interpreted `jal 0x8001A954` vs psxref @ 4380. Strongest
+   metric: `main_loop_entries_per_vblank`. Cheap pre-check: on the oracle, sample
+   `state[0x4a]` + `0x8009BCDD` over minutes of play — if they sit unchanged for
+   thousands of frames, Hypothesis B is falsified outright.
+3. **Implement the single mixed-dispatch-owner fix (§11)** — RUNTIME-only
+   (`dirty_ram_interp.c` + `cpu_state.h`), so **rebuild, no regen**. Re-soak all 4
+   (New-Game area ≈ 14-min repro) to validate the freeze is gone.
+4. **Separately:** tighten CD-DMA dirty-marking (§12) — not the root cause but it
+   makes the broken boundary common.
+
+No stubs, no HLE, never edit generated C; the fix is in the recompiler/runtime.
 
 ---
 
@@ -167,3 +219,215 @@ debug server + always-on rings; read `psx_last_run_report.json` for fatals);
 per-instance memcard dir per concurrent instance (sharing corrupts the card ->
 fake "regression"); software renderer for soaks; `taskkill //F //IM psx-runtime.exe`
 before any launch.
+
+---
+
+## 7. The runtime contract — why the host stack leaks (the mechanism)
+
+The codebase ALREADY solves tail-calls for **compiled** code, via two pieces:
+
+- **`psx_dispatch_impl`** (generated; emitted in `recompiler/src/full_function_emitter.cpp:1103`)
+  is a **tail-call trampoline**:
+  ```c
+  for (;;) {
+      cpu->pc = 0;
+      dispatch(addr);                 // run one compiled func, or interp a dirty block
+      if (g_psx_call_bail) { ...resolve/propagate/flatten... }
+      if (cpu->pc == 0) { ...contract check; return... }   // genuine return
+      addr = cpu->pc;                 // TAIL call: re-dispatch in-place, NO host nesting
+  }
+  ```
+  A compiled function signals a tail-call by setting `cpu->pc` and returning; the
+  loop re-dispatches without growing the host stack. Compiled tail-call loops stay flat.
+
+- **`psx_call_contract`** (`runtime/include/cpu_state.h:132`, static inline) is the
+  wild-return unwind. After a direct call returns, if guest `$sp`/`$ra` don't match
+  the call site, it raises `g_psx_call_bail = 1`, sets `cpu->pc = $ra` (the true
+  target), and unwinds frame-by-frame until the frame whose `(ra,sp)` matches
+  resolves it (clears bail, resumes).
+
+**The dirty-RAM interpreter BYPASSES both.** In `runtime/src/dirty_ram_interp.c`,
+`exec_one`:
+- guest `JR`/`J` (case 0x08 ~L550, 0x02 ~L697): correctly unwind — `cpu->pc=target; return 1`.
+- guest `JAL`/`JALR` (case 0x03 ~L703, 0x09 ~L556): **NEST** — call
+  `psx_dispatch_game_compiled(cpu, target)` directly. The post-call
+  `psx_call_contract(...)` is only reached if that nested call RETURNS.
+- `dirty_ram_dispatch_inner` (~L1170-1186) does the same for a surfaced compiled
+  target: nests `psx_dispatch_game_compiled` instead of returning `cpu->pc=target`
+  to the trampoline.
+
+So when interpreted overlay code does `jal func_8001A954` (tail-transfer back into
+the per-frame loop), the interpreter nests a host frame. The previous lap's compiled
+chain (`func_8001A954 → … → func_80046264`) is still suspended (it called *into* the
+interpreter and is waiting for a return that never comes). Every lap leaks the chain;
+the `psx_call_contract` that would unwind it is **unreachable** because the nested
+`psx_dispatch_game_compiled` never returns (it descends forever).
+
+**Proof it's host-only, not real guest recursion:** at the halt the guest
+`sp = 0x801FE338` — only ~7 KB below the stack base `0x801FFFF0` — and it does **not
+grow** across all ~23,074 laps. The guest is *iterating* (tail dispatch); the host
+is *recursing* (~13 frames/lap).
+
+---
+
+## 8. The guest state machine (Ghidra: `SCUS_942.36_no_header`, base `0x80010000`)
+
+Two nested selectors, both pinned at the freeze:
+
+**Selector 1 — `func_8001A954` (per-frame state dispatcher).** Reads
+`state[0x4a]` (halfword) from the object pointer `*(0x1F8001D4)` and switches:
+`0 → func_8001A9F0`, `1 → func_8001AC00`, `2 → func_8001D2F0`, `3 → func_8001D480`,
+else return. Stuck at **`state[0x4a] == 1`** → calls `func_8001AC00` every frame.
+It only *reads* the selector; it never writes it. (Adjacent fields
+`[+0x4a]/[+0x4c]/[+0x4e]` read `1/1/1` and never advance.)
+
+**Chain:** `func_8001AC00 → func_8001B2B4 → func_8001B5A8 → func_80046264`.
+
+**Selector 2 — `func_80046264`.** Runs a per-frame call sequence (incl. the dirty
+hop `jal 0x80063864` first), then jump-table dispatches on a **byte at `0x8009BCDD`**
+(16 cases, table at `0x80013C60`, computed `jr v0`). Stuck case →
+`0x8004DEE0` stub (`jal 0x8004DFA0; move a0,s0; j 0x8004DF68`). Also at `0x80046340`
+it reads a word at `0x8009BCC8` (scene id, reads 0) and one branch calls overlay
+`0x8011AF78`. A third byte selector sits at `0x800A539A` inside the `0x8004DEx` stubs.
+
+**`func_8004DFA0` (the stuck case's handler):** a per-object GPU/GTE render routine
+— GTE transforms, appends primitives to the ordering table at `*0x1F800164`, loops
+over vertices, `jr ra`. Returns normally; advances **no** selector.
+
+So nothing in the hot loop (`func_8001A954`, `func_80046264`, `func_8004DFA0`)
+advances either selector. Whatever flips them (an event/input/animation/CD-script
+step) lives elsewhere.
+
+---
+
+## 9. External review verdict (fresh-context second opinion)
+
+- **Hypothesis A (interp↔compiled boundary nesting) — overwhelmingly likely.**
+  Mechanically exact: flat guest `sp` + host `+~13/lap` + the unreachable contract
+  check fully explain "thousands of successful iterations, then overflow."
+- **Hypothesis B (HW/event state wedge) — no positive evidence.** `state[0x4a]==1`
+  plausibly just means "active gameplay" and can stay 1 the entire session.
+  `0x8009BCDD` indexes a **render handler** (`func_8004DFA0`) → looks like an
+  object/render-TYPE selector, not a temporal counter; an object using the same
+  renderer every frame for its whole lifetime is normal. Adjacent `1/1/1` may be
+  flags, not counters. Normal gameplay continuing right up to the guard trip favors
+  A (a real wedge would show visible guest-level nonprogress *before* the host stack
+  happened to exhaust).
+- **Hypothesis C (NEW, must be ruled out) — interp control-transfer bug.** The
+  interpreter could mishandle a JAL delay slot / return-PC / a subsequent JR and
+  **fabricate** the re-entry of `0x8001A954`. The flat guest stack does NOT rule
+  this out. A short oracle PC-trace distinguishes C from A.
+
+Conclusion: fix/neutralize the boundary stack leak (A) before any broad IRQ/event
+hunt (B); run the oracle trace to exclude C first.
+
+---
+
+## 10. Oracle disambiguation plan (psxref @ 4380)
+
+**Cheap pre-check (falsifies B without reproducing the freeze):** on the oracle,
+sample `state[0x4a]` (via `*(0x1F8001D4)+0x4A`) and the byte at `0x8009BCDD` over
+several minutes of ordinary gameplay. If they commonly sit unchanged for thousands
+of frames, the "stuck selector" premise is dead.
+
+**Decisive control-flow trace.** At each entry to `0x8001A954`, `0x80046264`,
+`0x80063864`, and the interpreted `jal 0x8001A954`, record: `emulated_cycle`,
+`vblank_serial`, `pc`, `ra`, `sp`, `*(0x1F8001D4)`, `state[0x4a]`,
+`*(uint8*)0x8009BCDD`, `I_STAT`, `I_MASK`. Plus control-transfers only:
+`source_pc`, opcode kind (J/JAL/JR/JALR), `target`, `new_ra`, `sp`. Compare a few
+hundred laps recomp vs oracle:
+
+| Result | Verdict |
+|---|---|
+| Same PC/target/RA/SP sequence (incl. repeated `0x8001A954` entries) | **A** — guest valid, only host representation leaks |
+| First divergence at JAL/JR target, RA, delay-slot result, or return PC | **C** — interp control-transfer semantics wrong |
+| Flow agrees, then a memory/IRQ value differs and only recomp stays in the loop | **B** — HW/event state divergence |
+
+Strongest single metric: **`main_loop_entries_per_vblank`** (same count + flat guest
+sp on both ⇒ selectors are irrelevant to the stack bug). Trace the **pointer** at
+`0x1F8001D4` too, not just `[ptr+0x4A]` — the object may be replaced and each
+replacement may start in state 1.
+
+---
+
+## 11. Fix design (single mixed-dispatch OWNER) — RUNTIME-only, no regen
+
+Core rule: **exactly one owner of mixed-mode dispatch per native call chain.**
+`exec_one` must never blindly call `psx_dispatch_game_compiled` in a way that can
+establish another interp→compiled→interp chain.
+
+Make the bail **typed** and **per-`CPUState`** (not a global bool):
+```c
+typedef enum { PSX_BAIL_NONE=0, PSX_BAIL_WILD_RETURN, PSX_BAIL_MIXED_TRANSFER,
+               PSX_BAIL_EXCEPTION, PSX_BAIL_STOP } PsxBailKind;
+// in CPUState: PsxBailKind bail_kind;  bool mixed_dispatch_active;
+```
+The first `dirty_ram_dispatch` becomes the owner (`mixed_dispatch_active=true`). A
+nested boundary crossing does NOT start a new loop — it publishes the target and
+unwinds to the owner:
+```c
+if (cpu->mixed_dispatch_active) { cpu->pc = target;
+    cpu->bail_kind = PSX_BAIL_MIXED_TRANSFER; return 1; }
+```
+The owner re-dispatches in a `for(;;)` loop (compiled or interp), consuming
+`PSX_BAIL_MIXED_TRANSFER` to continue and other bail kinds to unwind. Real returns
+to the original compiled caller still return normally; native depth stays bounded.
+
+Supporting changes:
+- **Externalize interpreter continuation** into an `InterpState` (pc, pending-load
+  reg/value/valid, cycles); yield only AFTER fully committing the control-transfer
+  instruction + its delay slot.
+- **Replace the overloaded `cpu->pc==0` sentinel** with an explicit
+  `DispatchResult{kind,target}` where practical — far easier to reason about than
+  `pc` + return value + a global bool.
+
+**Regression-prone cases to test** (this is the Bug A/C/D contract area):
+JAL/JALR delay-slot exec before yield; JR/JALR target captured before delay-slot
+mutates the source reg; JALR with `rd`==`rs` aliasing; MIPS load-delay commitment;
+exceptions in a branch delay slot (EPC/BD bit); cycle/event accounting exactly once
+across a yield; interrupts arriving while a mixed-dispatch owner is active; guest
+returns through KSEG aliases; **wild returns must pass THROUGH the owner, not be
+consumed by it**; generated code caching guest regs in native locals across calls;
+the `pc==0` overload.
+
+**Long-term (bigger codegen change, not now):** continuation-passing / resumable
+compiled frames — a compiled block returns the next guest PC/result and a central
+dispatcher chooses compiled vs interp — eliminates host guest-call mirroring
+entirely. The single-owner boundary is the lower-risk bridge for the current design.
+
+---
+
+## 12. CD-DMA "dirty/executable" marking (`dma.c:695`) — contributor, not root cause
+
+The CD-ROM DMA loop marks **every** word it writes executable/dirty
+(`dirty_ram_mark_executable_range(addr, 4)`). It conflates three properties:
+*written* vs *modified-relative-to-compiled-bytes* vs *executed*. CD DMA carries
+textures/audio/compressed data, not just code. This is NOT the stack-leak root
+cause, but it makes the broken boundary common (page-wide dirtiness forces static
+code onto the interpreter when unrelated data shares a page).
+
+Better model (aligns with the overlay-cache work): per-region **write
+generation/version** + compiled-code **byte-range + expected hash** + **ever-executed**
+flag + dynamic translation cache. On ANY write (CPU/CD-DMA/other DMA/decompressor/
+BIOS copy), invalidate only the OVERLAPPING compiled ranges. On dispatch: if a
+compiled version exists and bytes/generation match → run compiled; else
+interpret/compile-cache this byte-version. "Executable" becomes true on instruction
+**fetch**, not on write. Natural end state: `address + content-hash → compiled
+specialization`, with CD DMA merely one way a new byte-version arrives.
+
+---
+
+## 13. Immediate next disassembly target
+
+The complete **dynamic routine around `0x80063864`** — the dirty page that
+`func_80046264` first calls into — especially the instructions **before and after
+its transfer to `0x8001A954`**, plus its stack restoration and intended return path.
+This is the static-side A-vs-C discriminator: is the re-entry of `0x8001A954` a
+legitimate guest tail-transfer (A), or does the interpreter fabricate it via a
+mishandled delay-slot / RA / JR (C)?
+
+`0x80063xxx` is runtime-loaded/dirty, so it may NOT match the static EXE — read it
+from a **parked instance** (`python tools/debug_client.py --port 4393 read 0x80063864 <len>`,
+length in DECIMAL) after re-soaking to a freeze, or from a captured overlay dump.
+Earlier parked read of `0x800638C4` showed a clean GTE-loader leaf
+(`lw t0..t2; mtc2 ×3; jr ra`), so at least part of `0x80063xxx` is well-formed code.
