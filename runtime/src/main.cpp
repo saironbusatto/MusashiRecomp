@@ -2410,7 +2410,45 @@ int main(int argc, char** argv) {
     psx_dispatch(&cpu, cpu.pc);
 #endif
 
-    /* If we reach here, all execution completed without MMIO abort. */
+    /* If we reach here, all execution completed without MMIO abort.
+     * During normal operation the guest runs an infinite main loop and the
+     * top-level psx_dispatch NEVER returns. Reaching this point means the
+     * outermost trampoline loop saw cpu->pc == 0 (some jr/tail-transfer
+     * published a null PC) — an abnormal boot exit. Dump the always-on
+     * fntrace ring tail (last dispatch chain) to a JSON artifact so we can
+     * see exactly which targets led to the null PC. (CLAUDE.md ring-buffer
+     * model: consume the always-on ring after the fact, not arm-and-time.) */
+    {
+        FILE* tf = std::fopen("psx_cps_exit_trace.json", "wb");
+        if (tf) {
+            std::fprintf(tf, "{\n  \"final_pc\": \"0x%08X\",\n  \"final_ra\": \"0x%08X\",\n"
+                            "  \"final_sp\": \"0x%08X\",\n  \"fntrace_seq\": %llu,\n  \"tail\": [\n",
+                         cpu.pc, cpu.gpr[31], cpu.gpr[29],
+                         (unsigned long long)g_fntrace_seq);
+            uint64_t seq = g_fntrace_seq;
+            uint32_t n = seq < 128u ? (uint32_t)seq : 128u;
+            for (uint32_t i = 0; i < n; i++) {
+                uint64_t idx = seq - n + i;
+                const FntraceEntry* e = &g_fntrace_ring[idx % FNTRACE_RING_CAP];
+                std::fprintf(tf,
+                    "    {\"seq\":%llu,\"frame\":%u,\"target\":\"0x%08X\",\"ra\":\"0x%08X\","
+                    "\"sp\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\"}%s\n",
+                    (unsigned long long)idx, e->frame, e->target, e->ra, e->sp,
+                    e->a0, e->a1, (i + 1 < n) ? "," : "");
+            }
+            std::fprintf(tf, "  ],\n  \"stack\": [\n");
+            uint32_t sbase = (cpu.gpr[29] - 0x40u) & ~3u;
+            for (int w = 0; w < 40; w++) {
+                uint32_t a = sbase + (uint32_t)w * 4u;
+                uint32_t v = cpu.read_word(a);
+                std::fprintf(tf, "    {\"addr\":\"0x%08X\",\"val\":\"0x%08X\"}%s\n",
+                             a, v, (w < 39) ? "," : "");
+            }
+            std::fprintf(tf, "  ]\n}\n");
+            std::fclose(tf);
+        }
+    }
+
     std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
 
     shutdown_runtime();

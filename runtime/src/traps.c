@@ -354,7 +354,7 @@ static int psx_change_thread(CPUState* cpu, uint32_t target_tcb)
     return psx_change_thread_fiber(cpu, target_tcb);
 }
 
-void psx_syscall(CPUState* cpu, uint32_t code) {
+int psx_syscall(CPUState* cpu, uint32_t code) {
     /*
      * PS1 BIOS SYSCALL convention:
      *   $a0 = 1: EnterCriticalSection — disable interrupts, return old SR
@@ -377,18 +377,29 @@ void psx_syscall(CPUState* cpu, uint32_t code) {
             cpu->cop0[12] = sr & ~1u; /* clear IEc (bit 0) */
             cpu->gpr[2] = sr & 1u; /* return old IEc */
             cpu->pc = 0;
-            return;
+            /* Directly handled "void" syscall. Return 0: under CPS the caller
+             * (`if (psx_syscall(...)) return;`) falls through to the inline
+             * post-syscall code (the guest's own jr $ra), which returns to the
+             * caller via the flat trampoline — matching real-HW resume at
+             * EPC+4. Legacy callers ignore this and rely on cpu->pc==0. */
+            return 0;
 
         case 2: /* ExitCriticalSection: enable interrupts */
             cpu->cop0[12] = sr | 0x0401u; /* set IEc (bit 0) + IM[2] (bit 10) */
             cpu->gpr[2] = 0;
             cpu->pc = 0;
-            return;
+            return 0;
 
         case 3: { /* ChangeThread / ReturnFromException */
             uint32_t target_tcb = cpu->gpr[5];
             if (!psx_get_in_exception() && psx_change_thread(cpu, target_tcb)) {
-                return;
+                /* Thread switched (and this thread has since been resumed): the
+                 * fiber scheduler leaves cpu->pc == 0. Under CPS that must NOT
+                 * be a transfer — return 0 so the syscall wrapper falls through
+                 * to its own jr $ra and this thread resumes at its caller via
+                 * the flat trampoline. Legacy ignores the return value (it uses
+                 * cpu->pc == 0 + the nested-dispatch C-return to resume). */
+                return 0;
             }
 
             uint32_t tcb_ptr_addr = cpu->read_word(0x00000108u);
@@ -412,13 +423,13 @@ void psx_syscall(CPUState* cpu, uint32_t code) {
                     if (psx_get_in_exception()) {
                         psx_exception_longjmp(); /* unwind handler */
                     }
-                    return;
+                    return 1;
                 }
             }
             /* Fallback: simple RFE on current SR. */
             cpu->cop0[12] = (sr & ~0x0Fu) | ((sr >> 2) & 0x0Fu);
             cpu->pc = cpu->cop0[14];
-            return;
+            return 1;
         }
 
         default:
@@ -434,14 +445,14 @@ void psx_syscall(CPUState* cpu, uint32_t code) {
         cpu->cop0[12] = (sr & ~0x3Fu) | ((sr & 0x0Fu) << 2); /* SR push */
         uint32_t vector = (sr & 0x00400000u) ? 0xBFC00180u : 0x80000080u;
         psx_dispatch(cpu, vector);
-        return;
+        return 1;
     }
 
     /* Early boot fallback for syscall 3. */
     if (func == 3) {
         cpu->cop0[12] = (sr & ~0x0Fu) | ((sr >> 2) & 0x0Fu);
         cpu->pc = cpu->cop0[14];
-        return;
+        return 1;
     }
 
     /* Unknown syscall number and no handler — fatal. */
@@ -453,6 +464,7 @@ void psx_syscall(CPUState* cpu, uint32_t code) {
         fprintf(stderr, "%s\n", buf); fflush(stderr);
         exit(1);
     }
+    return 1;
 }
 
 void psx_break(CPUState* cpu, uint32_t code, uint32_t pc) {

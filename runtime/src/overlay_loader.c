@@ -666,7 +666,7 @@ int overlay_loader_has_cached_crc(uint32_t region_start, uint32_t crc) {
 extern void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra);
 extern void psx_check_interrupts(CPUState *cpu);
 extern void gte_execute(CPUState *cpu, uint32_t cmd);
-extern void psx_syscall(CPUState *cpu, uint32_t code);
+extern int psx_syscall(CPUState *cpu, uint32_t code);
 extern void psx_unknown_dispatch(CPUState *cpu, uint32_t addr, uint32_t phys);
 extern void debug_server_log_call_entry(uint32_t func_addr);
 

@@ -7,6 +7,7 @@
 #include "../../runtime/include/ws_backdrop_detect.h"
 #include <fmt/format.h>
 #include <algorithm>
+#include <cstdlib>
 #include <set>
 #include <vector>
 
@@ -48,7 +49,11 @@ static uint32_t ram_to_rom(uint32_t addr, const PS1Executable& exe) {
 }
 
 CodeGenerator::CodeGenerator(const PS1Executable& exe, const CodeGenConfig& config)
-    : exe_(exe), config_(config) {}
+    : exe_(exe), config_(config) {
+    // RECURSION_BUG.md §25 — continuation-passing call/return. Gen-time opt-in
+    // via PSX_CPS so legacy codegen stays byte-identical when unset.
+    cps_enabled_ = (std::getenv("PSX_CPS") != nullptr);
+}
 
 std::string CodeGenerator::reg_name(int reg_num) {
     if (reg_num >= 0 && reg_num < 32) {
@@ -1159,6 +1164,9 @@ std::string CodeGenerator::translate_basic_block(
                         if (target_in) {
                             ss << config_.indent << config_.indent
                                << fmt::format("goto block_{:08X};  /* taken */\n", branch_target);
+                        } else if (cps_enabled_) {
+                            ss << config_.indent << config_.indent
+                               << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS taken: split */\n", branch_target);
                         } else if (known_functions_.count(branch_target)) {
                             ss << config_.indent << config_.indent
                                << fmt::format("func_{:08X}(cpu); return;  /* taken: split piece */\n", branch_target);
@@ -1170,6 +1178,9 @@ std::string CodeGenerator::translate_basic_block(
                         if (fallthru_in) {
                             ss << config_.indent << config_.indent
                                << fmt::format("goto block_{:08X};  /* not taken */\n", fall_through_addr);
+                        } else if (cps_enabled_) {
+                            ss << config_.indent << config_.indent
+                               << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS not taken: split */\n", fall_through_addr);
                         } else if (known_functions_.count(fall_through_addr)) {
                             ss << config_.indent << config_.indent
                                << fmt::format("func_{:08X}(cpu); return;  /* not taken: split piece */\n", fall_through_addr);
@@ -1184,6 +1195,12 @@ std::string CodeGenerator::translate_basic_block(
                     if (!block.successors.empty()) {
                         ss << config_.indent
                            << fmt::format("goto block_{:08X};  /* j */\n", block.successors[0]);
+                    } else if (cps_enabled_ && block.exit_instr.target != 0) {
+                        // CPS: out-of-function jump target — tail-transfer (the
+                        // flat trampoline dispatches the split piece / mid-func).
+                        ss << config_.indent
+                           << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS j: split */\n",
+                                          block.exit_instr.target);
                     } else if (block.exit_instr.target != 0 && known_functions_.count(block.exit_instr.target)) {
                         // Jump target is out-of-function and is a known function start
                         ss << config_.indent
@@ -1230,6 +1247,11 @@ std::string CodeGenerator::translate_basic_block(
                         ss << config_.indent
                            << "cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;"
                            << "  /* jr $ra — longjmp-return (ra loaded from non-sp) */\n";
+                    } else if (cps_enabled_) {
+                        // CPS: publish $ra so the flat trampoline dispatches the
+                        // caller's continuation (no host C-return to nest).
+                        ss << config_.indent
+                           << "cpu->pc = cpu->gpr[31]; return;  /* CPS: jr $ra */\n";
                     } else {
                         ss << config_.indent << "return;  /* jr $ra */\n";
                     }
@@ -1353,24 +1375,52 @@ std::string CodeGenerator::translate_basic_block(
                             for (auto& [rt, rom] : targets) {
                                 ss << config_.indent << fmt::format("    case 0x{:08X}u: goto block_{:08X};\n", rt, rom);
                             }
-                            ss << config_.indent << "    default: call_by_address(cpu, " << reg_name(jr_rs) << "); return;\n";
+                            if (cps_enabled_) {
+                                ss << config_.indent << "    default: cpu->pc = " << reg_name(jr_rs)
+                                   << "; return;  /* CPS: jr table miss — tail-transfer */\n";
+                            } else {
+                                ss << config_.indent << "    default: call_by_address(cpu, " << reg_name(jr_rs) << "); return;\n";
+                            }
                             ss << config_.indent << "}\n";
                             emitted_switch = true;
                         }
                     }
                     if (!emitted_switch) {
-                        // BIOS call or unrecognised indirect jump
-                        ss << config_.indent << fmt::format("call_by_address(cpu, {});  /* jr {} */\n",
-                                                            reg_name(jr_rs), reg_name(jr_rs));
-                        ss << config_.indent << "return;\n";
+                        if (cps_enabled_) {
+                            // CPS: indirect jump / BIOS-call gate — tail-transfer
+                            // to the target (the flat trampoline dispatches it).
+                            ss << config_.indent << fmt::format("cpu->pc = {}; return;  /* CPS: jr {} */\n",
+                                                                reg_name(jr_rs), reg_name(jr_rs));
+                        } else {
+                            // BIOS call or unrecognised indirect jump
+                            ss << config_.indent << fmt::format("call_by_address(cpu, {});  /* jr {} */\n",
+                                                                reg_name(jr_rs), reg_name(jr_rs));
+                            ss << config_.indent << "return;\n";
+                        }
                     }
                 } else if (block.exit_instr.type == ControlFlowType::JumpLink) {
+                    uint32_t target   = block.exit_instr.target;
+                    uint32_t cont_addr = block.exit_instr.address + 8;
+                    if (cps_enabled_) {
+                        // CPS: tail-transfer to the callee. Set $ra to the
+                        // return point and register it as a dispatchable
+                        // continuation; the callee's jr $ra publishes cpu->pc =
+                        // $ra and the flat trampoline dispatches back into this
+                        // function's entry-switch. No host nesting.
+                        if (!block.successors.empty()) {
+                            cps_cur_continuations_.push_back(cont_addr);
+                        }
+                        ss << config_.indent
+                           << fmt::format("cpu->gpr[31] = 0x{:08X}u;  /* CPS jal return addr */\n", cont_addr);
+                        ss << config_.indent
+                           << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS jal -> 0x{:08X} */\n",
+                                          target, target);
+                    } else {
                     // Function call (jal).  The call contract (Bug D family)
                     // guards the continuation: it may only run if the guest
                     // actually returned here with the caller's $sp.
                     ss << config_.indent << "{ uint32_t _csp = cpu->gpr[29];\n";
                     ss << config_.indent << "cpu->gpr[31] = " << fmt::format("0x{:08X};  /* return address */\n", addr + 8);
-                    uint32_t target = block.exit_instr.target;
                     if (known_functions_.count(target) > 0) {
                         ss << config_.indent << fmt::format("func_{:08X}(cpu);  /* jal */\n", target);
                         ss << config_.indent << fmt::format("if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n", addr + 8);
@@ -1386,7 +1436,6 @@ std::string CodeGenerator::translate_basic_block(
                     } else {
                         // Split-function: JAL continuation is outside this function piece.
                         // Tail-call to the continuation piece (at exit_addr + 8, past delay slot).
-                        uint32_t cont_addr = block.exit_instr.address + 8;
                         if (known_functions_.count(cont_addr)) {
                             ss << config_.indent
                                << fmt::format("func_{:08X}(cpu); return;  /* jal cont: split piece */\n", cont_addr);
@@ -1395,11 +1444,28 @@ std::string CodeGenerator::translate_basic_block(
                                << fmt::format("call_by_address(cpu, 0x{:08X}u); return;  /* jal cont: split */\n", cont_addr);
                         }
                     }
+                    }
                 } else if (block.exit_instr.type == ControlFlowType::JumpLinkReg) {
                     // Register indirect call (jalr $rs, $rd) — call function at rs, return to rd
                     uint32_t rs = get_rs(block.exit_instr.instruction);
                     uint32_t rd = get_rd(block.exit_instr.instruction);
+                    uint32_t cont_addr = block.exit_instr.address + 8;
 
+                    if (cps_enabled_) {
+                        // CPS: capture the target reg BEFORE writing the link
+                        // (rd==rs alias-safe), set $rd to the return point and
+                        // register it as a dispatchable continuation, then
+                        // tail-transfer. The flat trampoline drives the rest.
+                        if (!block.successors.empty()) {
+                            cps_cur_continuations_.push_back(cont_addr);
+                        }
+                        ss << config_.indent << fmt::format("{{ uint32_t _t = {};\n", reg_name(rs));
+                        if (rd != 0) {
+                            ss << config_.indent << fmt::format("    {} = 0x{:08X};  /* CPS jalr return addr */\n",
+                                                                reg_name(rd), cont_addr);
+                        }
+                        ss << config_.indent << "cpu->pc = _t; return; }  /* CPS jalr */\n";
+                    } else {
                     // Set link register to return address (PC + 8, past delay slot)
                     ss << config_.indent << fmt::format("{} = 0x{:08X};  /* jalr return addr */\n",
                                                         reg_name(rd), addr + 8);
@@ -1418,7 +1484,6 @@ std::string CodeGenerator::translate_basic_block(
                                           block.successors[0]);
                     } else {
                         // Split-function: JALR continuation is outside this function piece.
-                        uint32_t cont_addr = block.exit_instr.address + 8;
                         if (known_functions_.count(cont_addr)) {
                             ss << config_.indent
                                << fmt::format("func_{:08X}(cpu); return;  /* jalr cont: split piece */\n", cont_addr);
@@ -1426,6 +1491,7 @@ std::string CodeGenerator::translate_basic_block(
                             ss << config_.indent
                                << fmt::format("call_by_address(cpu, 0x{:08X}u); return;  /* jalr cont: split */\n", cont_addr);
                         }
+                    }
                     }
                 }
             }
@@ -1526,8 +1592,50 @@ GeneratedFunction CodeGenerator::generate_function(
                        bd_windows, func.name, func.start_addr);
     }
 
+    // Pre-scan: find jump table targets that land mid-block (not a block boundary).
+    // These need inline labels so goto statements in the switch can reach them.
+    // Must run BEFORE translating blocks (translate_basic_block reads extra_labels_).
+    extra_labels_.clear();
+    std::map<uint32_t, std::vector<uint32_t>> jr_table_edges;
+    scan_jr_tables(cfg, jr_table_edges);
+
+    // CPS (§25): collect this function's continuations (call return points) as
+    // blocks are translated, so the entry-switch below can route a dispatched
+    // continuation address into the right block.
+    cps_cur_continuations_.clear();
+
+    // Translate blocks into a temp buffer first: the CPS entry-switch is emitted
+    // at the top (before the entry hooks) and must know every continuation.
+    std::stringstream blocks_ss;
+    for (uint32_t block_addr : cfg.block_order) {
+        const BasicBlock& block = cfg.blocks.at(block_addr);
+        blocks_ss << "\n" << translate_basic_block(block, cfg);
+    }
+
     std::stringstream body_ss;
     body_ss << "{\n";
+
+    // CPS entry-switch: when the unified flat trampoline dispatches a
+    // continuation address (a callee published cpu->pc = $ra back to us), route
+    // into the owning block. Emitted BEFORE the entry hooks so a continuation
+    // re-entry bypasses debug_server_log_call_entry / widescreen entry hooks
+    // (those must run only on a true function entry, cpu->pc == 0).
+    if (cps_enabled_ && !cps_cur_continuations_.empty()) {
+        std::set<uint32_t> seen;
+        body_ss << config_.indent << "if (cpu->pc != 0u) {\n";
+        body_ss << config_.indent << "    uint32_t _cont = cpu->pc; cpu->pc = 0;\n";
+        body_ss << config_.indent << "    switch (_cont) {\n";
+        for (uint32_t c : cps_cur_continuations_) {
+            if (!seen.insert(c).second) continue;
+            body_ss << config_.indent
+                    << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n", c, c);
+            cps_continuation_owner_[c] = func.start_addr;
+        }
+        body_ss << config_.indent << "        default: break;\n";
+        body_ss << config_.indent << "    }\n";
+        body_ss << config_.indent << "}\n";
+    }
+
     body_ss << config_.indent
             << fmt::format("debug_server_log_call_entry(0x{:08X}u);\n",
                           func.start_addr);
@@ -1547,17 +1655,7 @@ GeneratedFunction CodeGenerator::generate_function(
                               func.start_addr, func.size, cfg.blocks.size());
     }
 
-    // Pre-scan: find jump table targets that land mid-block (not a block boundary).
-    // These need inline labels so goto statements in the switch can reach them.
-    extra_labels_.clear();
-    std::map<uint32_t, std::vector<uint32_t>> jr_table_edges;
-    scan_jr_tables(cfg, jr_table_edges);
-
-    // Generate code for each basic block
-    for (uint32_t block_addr : cfg.block_order) {
-        const BasicBlock& block = cfg.blocks.at(block_addr);
-        body_ss << "\n" << translate_basic_block(block, cfg);
-    }
+    body_ss << blocks_ss.str();
 
     // Emit fallthrough call if the function ends without explicit control flow.
     // A MIPS function truly falls through when:
@@ -1688,6 +1786,11 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     std::map<uint32_t, std::vector<uint32_t>> jr_table_edges;
     scan_jr_tables(cfg, jr_table_edges);
 
+    // CPS (§25): collect this alias group's continuations during block
+    // translation (also prevents a stale list from leaking into the next
+    // generate_function call).
+    cps_cur_continuations_.clear();
+
     // Union of blocks reachable from any alias entry. Edges are
     // BasicBlock::successors plus jump-table targets (mapped to their
     // containing block — table targets may be mid-block labels).
@@ -1721,12 +1824,41 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
         }
     }
 
+    // Translate live blocks first (populates cps_cur_continuations_ for the CPS
+    // continuation switch below).
+    std::stringstream blocks_buf;
+    for (uint32_t block_addr : cfg.block_order) {
+        if (!live_blocks.count(block_addr)) continue;
+        const BasicBlock& block = cfg.blocks.at(block_addr);
+        blocks_buf << "\n" << translate_basic_block(block, cfg);
+    }
+
     // Shared body: host-range blocks (live subset) behind an entry switch.
     std::stringstream body;
     body << fmt::format("/* Overlapping-alias body for host func_{:08X}: {} entries */\n",
                         host, aliases.size());
     body << fmt::format("static void psx_alias_body_{:08X}(CPUState* cpu, uint32_t entry)\n{{\n",
                         host);
+    // CPS (§25): a dispatched continuation (callee published cpu->pc = $ra) is
+    // routed into its block here, BEFORE the entry switch — cpu->pc overrides
+    // the `entry` arg. The dispatch routes a continuation by calling the first
+    // alias wrapper with cpu->pc set (entry is then ignored). Owner =
+    // aliases[0]->start_addr.
+    if (cps_enabled_ && !cps_cur_continuations_.empty()) {
+        std::set<uint32_t> seen;
+        body << config_.indent << "if (cpu->pc != 0u) {\n";
+        body << config_.indent << "    uint32_t _cont = cpu->pc; cpu->pc = 0;\n";
+        body << config_.indent << "    switch (_cont) {\n";
+        for (uint32_t c : cps_cur_continuations_) {
+            if (!seen.insert(c).second) continue;
+            body << config_.indent
+                 << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n", c, c);
+            cps_continuation_owner_[c] = aliases[0]->start_addr;
+        }
+        body << config_.indent << "        default: break;\n";
+        body << config_.indent << "    }\n";
+        body << config_.indent << "}\n";
+    }
     body << config_.indent << "switch (entry) {\n";
     for (const Function* a : aliases) {
         body << config_.indent
@@ -1736,11 +1868,7 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
     body << config_.indent << "    default: return;\n";
     body << config_.indent << "}\n";
 
-    for (uint32_t block_addr : cfg.block_order) {
-        if (!live_blocks.count(block_addr)) continue;
-        const BasicBlock& block = cfg.blocks.at(block_addr);
-        body << "\n" << translate_basic_block(block, cfg);
-    }
+    body << blocks_buf.str();
 
     // Host-end fallthrough (mirrors generate_function): only relevant when the
     // host's final block is live and ends without explicit control flow.
@@ -1786,6 +1914,11 @@ std::vector<GeneratedFunction> CodeGenerator::generate_all_functions(
 
     std::vector<GeneratedFunction> results;
     results.reserve(functions.size());
+
+    // CPS (§25): rebuild the continuation->owner map for this full pass so the
+    // game dispatch table (psx_dispatch_game_compiled) reflects exactly the
+    // functions emitted here (the final generate_file pass is authoritative).
+    cps_continuation_owner_.clear();
 
     fmt::print("\n=== C Code Generation ===\n\n");
     fmt::print("Generating C code for {} functions...\n", functions.size());

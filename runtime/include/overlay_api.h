@@ -29,7 +29,9 @@
  *     window START/END finalize, and the callback struct grows a
  *     ws_backdrop_value pointer (appended last). Bumping rejects pre-preload
  *     DLLs (which lack both the emit and a host that supplies the callback). */
-#define PSX_OVERLAY_ABI_VERSION 4
+/*   v5: psx_syscall callback return type void->int (CPS, RECURSION_BUG.md §25);
+ *       overlays compiled under CPS emit `if (psx_syscall(...)) return;`. */
+#define PSX_OVERLAY_ABI_VERSION 5
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -76,8 +78,11 @@ typedef struct {
     void (*check_interrupts)(CPUState *cpu);
     /* GTE coprocessor 2 execution */
     void (*gte_execute)(CPUState *cpu, uint32_t cmd);
-    /* MIPS syscall (break/syscall instructions) */
-    void (*psx_syscall)(CPUState *cpu, uint32_t code);
+    /* MIPS syscall (break/syscall instructions). Returns 1 if control
+     * transfers (cpu->pc set), 0 for a directly-handled void syscall. See
+     * cpu_state.h. The signature changed with CPS (RECURSION_BUG.md §25), so
+     * PSX_OVERLAY_ABI_VERSION was bumped to reject stale overlay caches. */
+    int  (*psx_syscall)(CPUState *cpu, uint32_t code);
     /* Unresolved dispatch target */
     void (*psx_unknown_dispatch)(CPUState *cpu, uint32_t addr, uint32_t phys);
     /* Debug instrumentation: called at every function entry (may be NULL) */

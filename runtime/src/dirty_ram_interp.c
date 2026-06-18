@@ -721,7 +721,12 @@ int dirty_ram_xprobe_json(char *out, int cap) {
 /* Enter compiled code from the interpreter for a guest control transfer. Returns
  * like psx_dispatch_game_compiled (1 = handled, OR a stack-watermark bail was
  * surfaced; 0 = not a compiled target — caller falls through to overlay/dirty/
- * nonlocal paths). On surface: cpu->pc = target and g_psx_call_bail set. */
+ * nonlocal paths). On surface: cpu->pc = target and g_psx_call_bail set.
+ *
+ * Only present when a game dispatch table is linked (PSX_HAS_GAME_DISPATCH).
+ * In the BIOS-only build psx_dispatch_game_compiled does not exist, and the
+ * two callers below are themselves gated behind the same macro. */
+#ifdef PSX_HAS_GAME_DISPATCH
 static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
     if (target == 0x8001A954u) site_note(&g_site_interp);
     if (psx_mixed_owner_enabled()
@@ -735,6 +740,7 @@ static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
     g_mixed_depth--;
     return r;
 }
+#endif /* PSX_HAS_GAME_DISPATCH */
 
 /* Execute ONE instruction at *pc on the given CPU state.  Returns:
  *   0 = continue (advance pc by 4)
