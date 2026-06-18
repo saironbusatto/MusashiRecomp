@@ -1,8 +1,34 @@
 # Async background overlay compilation — implementation plan
 
-Status: PLANNED (2026-06-18). The CPS leak fix + full overlay-CPS parity are DONE & committed
-(bug/recursion: psxrecomp 94a1966 core, 2d468ee stage3). This doc is the build plan for the
-NEXT focused session. Nothing here is implemented yet.
+Status: **LARGELY ALREADY BUILT + VALIDATED under CPS (2026-06-18).** The "planned" feature below
+turned out to mostly exist: `overlay_capture.c` (`overlay_autocapture_tick` — autocapture on
+interp pressure, ON whenever the cache is on) + `autocompile.c` (background compile: probes for a
+C compiler on PATH, spawns `cmd.exe /C <configured cmd>` on a watcher thread, applies on the emu
+thread) + the `code_provider` abstraction (gcc vs sljit). It is FILE-BASED exactly as planned —
+the worker writes DLLs; the dispatch thread loads them. Config-driven via `[runtime]
+overlay_autocompile_cmd`.
+
+What this session ADDED to make it work under CPS + match the user's gcc-only preference:
+1. `compile_overlays.py --cps` (committed, §25.5) — the autocompile cmd passes `--cps`.
+2. `overlay_loader.c overlay_loader_apply_live_policy` — when the active backend is gcc, sljit-live
+   is forced OFF (gcc>interp; toolchain-less stays sljit>interp) — "mutually exclusive" per user.
+3. The dev/soak config (`tomba_soak_a.toml`, untracked): `overlay_cache=true` +
+   `overlay_autocompile_cmd = python ../psxrecomp/tools/compile_overlays.py … --cps`. The PRODUCTION
+   `game.toml` overlay_autocompile_cmd needs `--cps` appended when CPS ships to master.
+
+VALIDATED: autocapture fired (triggers≥1) → background `compile_overlays --cps` produced CPS
+overlay DLLs (new CRCs, post-cache-clear) → loader loaded them (`loads`>0) → `dispatch_native`
+rises, gcc box shows 0 sljit shards. ce_profile stays flat. As you PLAY, the cache auto-builds and
+each scene goes native after its autocapture cycle (~60s cooldown) + compile.
+
+REMAINING / FUTURE: broader capture coverage is just play-time (each scene's overlays auto-compile
+on first sustained visit); optionally raise the autocapture cadence / cap; the in-process sljit
+tier (toolchain-less users) is still leaf-only under CPS (call-fragments interp) until the
+per-fragment entry-switch codegen lands. The DETAILED design below is retained as reference.
+
+---
+
+## (original plan — retained for reference; most is already implemented as above)
 
 ## 1. Goal (user's words)
 

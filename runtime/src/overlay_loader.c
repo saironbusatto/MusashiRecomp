@@ -882,6 +882,13 @@ void overlay_loader_apply_live_policy(void) {
      * stay on the interpreter, so default-on cannot reintroduce the save-load
      * wedge. The PSX_OVERLAY_SLJIT_LIVE env var still overrides (0 forces off). */
     int live = (code_provider_sljit() != NULL) ? 1 : 0;
+    /* Mutually exclusive (user preference, RECURSION_BUG.md §25): if gcc is the
+     * active backend, do NOT run sljit live. The gcc autocompile produces
+     * full-coverage CPS DLLs in the background; the gap before they land is the
+     * interpreter (relatively fast), not sljit leaf shards. So gcc boxes are
+     * gcc>interp; toolchain-less boxes are sljit>interp. PSX_OVERLAY_SLJIT_LIVE
+     * still overrides for testing. */
+    if (overlay_backend_active() == OVERLAY_BACKEND_GCC) live = 0;
     const char *e = getenv("PSX_OVERLAY_SLJIT_LIVE");
     if (e && *e) live = (*e != '0') ? 1 : 0;
     s_sljit_live = live;
