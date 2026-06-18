@@ -838,6 +838,16 @@ int main(int argc, char** argv) {
         ds << "    }\n";
         ds << "}\n";
 
+        if (codegen.cps_enabled()) {
+            // RECURSION_BUG.md §25 — mark CPS mode at startup so the overlay sljit
+            // JIT (overlay_sljit.c) emits the CPS contract. Static ctor: no clash
+            // with the BIOS dispatch's marker.
+            ds << "\n/* CPS runtime-mode marker (overlay sljit JIT reads g_psx_cps_mode). */\n";
+            ds << "__attribute__((constructor)) static void psx_cps_mark_game(void) {\n";
+            ds << "    extern int g_psx_cps_mode; g_psx_cps_mode = 1;\n";
+            ds << "}\n";
+        }
+
         std::ofstream dispatch_file(dispatch_filename);
         if (dispatch_file.is_open()) {
             dispatch_file << ds.str();

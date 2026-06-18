@@ -1266,8 +1266,36 @@ it decelerates and is unrelated to the (now-fixed) host-stack leak. Run gameplay
 `PSX_FNTRACE_ARM` for a normal footprint.
 
 **Validation gate status:** ce_profile FLAT ✅ · 56.9k-frame soak no-freeze ✅ · boots+plays ✅.
-REMAINING: dwarf→overworld playtest (overlay-native `pc==0` return contract = the regression
-risk) · Stage 3 = sljit + overlay CPS parity (overlays must be recompiled under CPS; overlay ABI
-already bumped 4→5) · then consider making CPS the default and removing the now-inert
-`psx_call_contract`/`g_psx_call_bail` machinery. Commit the branch when the user is satisfied.
+
+### 25.5 Stage 3 — overlay (sljit + gcc-DLL) CPS parity (2026-06-18)
+
+**sljit JIT (overlay_sljit.c), scoped:** `jr $ra` publishes `cpu->pc`; call-containing
+fragments **decline to the interp** (CPS-safe, depth-1); `jr rX` already tail-transferred.
+So only leaf shards JIT — `jr` covered, calls interp. Validated: boots, leak flat, shards
+persist. A runtime CPS flag `g_psx_cps_mode` (defined in overlay_loader.c, set by a
+`__attribute__((constructor))` emitted in the BIOS + game CPS dispatch) gates the sljit/overlay
+CPS behavior.
+
+**gcc-DLL path — FULL native overlay coverage under CPS (the production path), DONE + proven:**
+- `compile_overlays.py --cps` sets `PSX_CPS` for the recompiler → CPS overlay C (tail-transfer
+  + per-function entry-switch; `code_generator` `--overlay` mode only affects widescreen, not
+  CPS). The DISPATCH_PREAMBLE's `psx_syscall` decl was fixed void→int. `PSX_OVERLAY_CODEGEN_VER`
+  bumped 3→4 (fresh `cg4/` cache namespace; legacy unit-model DLLs in cg3 ignored).
+- **Loader continuation routing** (`overlay_loader_dispatch`, gated `g_psx_cps_mode`): under CPS
+  an overlay function is flat-dispatched (one block then tail-transfer), so a callee returns to
+  a mid-function continuation that idx_head() (entry-keyed) misses. New `overlay_find_by_range()`
+  finds the owning candidate by code range and re-enters it with `cpu->pc = addr` → its
+  entry-switch routes to the block. gcc DLLs are the trusted tier (diff-validated at entry), run
+  native directly. This is the CPS equivalent of the old unit-model that fixed the dwarf→overworld
+  blue screen — overlay funcs no longer run as units; continuations re-dispatch flat.
+- **Result:** CPS overlay DLLs compile + load + `dispatch_native > 0`; with continuation routing
+  **`dispatch_interp_fallback` → 0** (full native overlay coverage), ce_profile FLAT (6 KB),
+  boots clean. Addresses are KSEG0-consistent (overlay C sets `gpr[31]=0x800E…` continuations =
+  the entry-switch cases).
+
+REMAINING: capture breadth — only the 2 overlays my short run captured are gcc-compiled; other
+scenes' overlays gcc-miss → sljit-leaf/interp (still CPS-safe) until captured+compiled (play
+through → `overlay_captures.json` grows → re-run `compile_overlays.py --cps`). dwarf→overworld
+playtest (the regression check). Then consider CPS default + removing inert
+`psx_call_contract`/`g_psx_call_bail`. Commit Stage 3 when the user is satisfied.
 

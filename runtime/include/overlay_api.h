@@ -68,8 +68,11 @@
  *   1: baseline + auto_screen_x render-funnel cull via psx_ws_cull_sltiu.
  *   2: + auto_backdrop far-backdrop column preload via psx_ws_backdrop_value.
  *   3: auto_backdrop switched to camera-tracked window WIDENING
- *      (psx_ws_backdrop_value gains a window_cols arg). */
-#define PSX_OVERLAY_CODEGEN_VER 3
+ *      (psx_ws_backdrop_value gains a window_cols arg).
+ *   4: continuation-passing (PSX_CPS, RECURSION_BUG.md §25) — overlay funcs
+ *      tail-transfer + carry an entry-switch; the loader routes continuations.
+ *      Fresh namespace so CPS DLLs never reuse a legacy (unit-model) cg3 DLL. */
+#define PSX_OVERLAY_CODEGEN_VER 4
 
 typedef struct {
     /* Core dispatch: routes call_by_address() and out-of-overlay jal */
