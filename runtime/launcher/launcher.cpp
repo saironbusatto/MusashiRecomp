@@ -511,9 +511,56 @@ std::string win_pick_save_file(SDL_Window* parent, const char* title,
     return std::string();
 }
 #else
-std::string win_pick_file(SDL_Window*, const char*, const char*) { return std::string(); }
-std::string win_pick_save_file(SDL_Window*, const char*, const char*, const char*,
-                               const std::string&) { return std::string(); }
+// POSIX native dialogs via popen-based choosers (zenity / kdialog / qarma /
+// osascript), each gated on `command -v` so an absent tool falls through.
+// Returns "" on cancel or when no chooser is installed. The Win32 double-null
+// `filter` string isn't portable, so the POSIX path uses a generic chooser
+// (the title is honored); BIOS / disc / memory-card browsing works on Linux.
+#include <cstdio>
+namespace {
+std::string sh_squote(const std::string& s) {
+    std::string q = "'";
+    for (char c : s) { if (c == '\'') q += "'\\''"; else q += c; }
+    return q + "'";
+}
+std::string run_chooser(const std::string& cmd) {
+    std::string out;
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p) return out;
+    char buf[2048];
+    if (fgets(buf, sizeof(buf), p)) out = buf;
+    int rc = pclose(p);
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    if (rc != 0) out.clear();
+    return out;
+}
+} // namespace
+
+std::string win_pick_file(SDL_Window*, const char* title, const char*) {
+    std::string t = sh_squote(title ? title : "Select file");
+    std::string r;
+    if (!(r = run_chooser("command -v zenity >/dev/null 2>&1 && "
+            "zenity --file-selection --title=" + t + " 2>/dev/null")).empty()) return r;
+    if (!(r = run_chooser("command -v kdialog >/dev/null 2>&1 && "
+            "kdialog --getopenfilename \"${HOME:-/}\" 2>/dev/null")).empty()) return r;
+    if (!(r = run_chooser("command -v qarma >/dev/null 2>&1 && "
+            "qarma --file-selection --title=" + t + " 2>/dev/null")).empty()) return r;
+    return run_chooser("command -v osascript >/dev/null 2>&1 && "
+            "osascript -e 'POSIX path of (choose file)' 2>/dev/null");
+}
+
+std::string win_pick_save_file(SDL_Window*, const char* title, const char*,
+                               const char*, const std::string& initial) {
+    std::string t = sh_squote(title ? title : "Save file");
+    std::string r;
+    std::string z = "command -v zenity >/dev/null 2>&1 && "
+                    "zenity --file-selection --save --confirm-overwrite --title=" + t;
+    if (!initial.empty()) z += " --filename=" + sh_squote(initial);
+    if (!(r = run_chooser(z + " 2>/dev/null")).empty()) return r;
+    std::string k = "command -v kdialog >/dev/null 2>&1 && kdialog --getsavefilename ";
+    k += initial.empty() ? std::string("\"${HOME:-/}\"") : sh_squote(initial);
+    return run_chooser(k + " 2>/dev/null");
+}
 #endif
 
 // Load at least one font face so RmlUi can render text. Tries bundled fonts in
