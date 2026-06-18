@@ -472,41 +472,54 @@ static size_t psx_mixed_stack_watermark(void) {
  * Only the INTERP->compiled re-entry passes through here; the normal compiled
  * per-frame entry to func_8001A954 does not, so this isolates the suspect edge. */
 extern uint64_t psx_cycle_count;
-typedef struct { uint32_t frame; uint32_t count; uint64_t cycle; } Re954Entry;
-#define RE954_CAP 256u
-static Re954Entry g_re954_ring[RE954_CAP];
-static uint64_t   g_re954_seq = 0;
-static uint32_t   g_re954_this = 0;
-static uint32_t   g_re954_last_frame = 0xFFFFFFFFu;
-static uint32_t   g_re954_max_per_frame = 0;
+#define SITE_CAP 256u
+typedef struct { uint32_t frame; uint32_t count; uint64_t cycle; } SiteEntry;
+typedef struct { SiteEntry ring[SITE_CAP]; uint64_t seq; uint32_t cur;
+                 uint32_t last_frame; uint32_t maxf; } SiteRec;
+/* Per-frame dispatch-count recorders for the suspect loop sites (RECURSION_BUG.md
+ * §15). g_site_interp (interp->0x8001A954) was found ORDINARY (1/frame); the
+ * recursion re-dispatches the compiled loop via dirty_ram_dispatch's entry because
+ * the CD-DMA dirty bitmap is saturated. So record dirty_ram_dispatch(0x8001A954)
+ * = loop head and dirty_ram_dispatch(0x80046264) = loop tail. Bounded normally,
+ * spike at the freeze => "the per-frame loop stopped terminating." */
+static SiteRec g_site_interp = { .last_frame = 0xFFFFFFFFu };  /* interp -> 0x8001A954 */
+static SiteRec g_site_dd954  = { .last_frame = 0xFFFFFFFFu };  /* dirty_ram_dispatch(0x8001A954) */
+static SiteRec g_site_dd264  = { .last_frame = 0xFFFFFFFFu };  /* dirty_ram_dispatch(0x80046264) */
 
-static void re954_note(void) {
+static void site_note(SiteRec *s) {
     uint32_t f = (uint32_t)s_frame_count;
-    if (f != g_re954_last_frame) {
-        if (g_re954_last_frame != 0xFFFFFFFFu) {
-            Re954Entry *e = &g_re954_ring[g_re954_seq++ & (RE954_CAP - 1u)];
-            e->frame = g_re954_last_frame; e->count = g_re954_this; e->cycle = psx_cycle_count;
-            if (g_re954_this > g_re954_max_per_frame) g_re954_max_per_frame = g_re954_this;
+    if (f != s->last_frame) {
+        if (s->last_frame != 0xFFFFFFFFu) {
+            SiteEntry *e = &s->ring[s->seq++ & (SITE_CAP - 1u)];
+            e->frame = s->last_frame; e->count = s->cur; e->cycle = psx_cycle_count;
+            if (s->cur > s->maxf) s->maxf = s->cur;
         }
-        g_re954_this = 0; g_re954_last_frame = f;
+        s->cur = 0; s->last_frame = f;
     }
-    g_re954_this++;
+    s->cur++;
 }
 
-/* Emit the re-entry flight recorder as a JSON fragment (called by crash_trace). */
-int dirty_ram_re954_json(char *out, int cap) {
-    int n = snprintf(out, cap,
-        "  \"reentry_8001A954\": {\"max_per_frame\":%u,\"cur_frame\":%u,\"cur_count\":%u,\"history\":[",
-        g_re954_max_per_frame, g_re954_last_frame, g_re954_this);
-    uint64_t total = g_re954_seq;
-    int avail = (total < RE954_CAP) ? (int)total : (int)RE954_CAP;
+static int site_json(char *out, int cap, const char *name, const SiteRec *s) {
+    int n = snprintf(out, cap, "  \"%s\": {\"max_per_frame\":%u,\"cur_frame\":%u,\"cur_count\":%u,\"history\":[",
+                     name, s->maxf, s->last_frame, s->cur);
+    uint64_t total = s->seq;
+    int avail = (total < SITE_CAP) ? (int)total : (int)SITE_CAP;
     uint64_t start = total - (uint64_t)avail;
     for (int i = 0; i < avail && n < cap - 96; i++) {
-        Re954Entry *e = &g_re954_ring[(start + (uint64_t)i) & (RE954_CAP - 1u)];
+        const SiteEntry *e = &s->ring[(start + (uint64_t)i) & (SITE_CAP - 1u)];
         n += snprintf(out + n, cap - n, "%s{\"f\":%u,\"n\":%u,\"cyc\":%llu}",
                       i ? "," : "", e->frame, e->count, (unsigned long long)e->cycle);
     }
     n += snprintf(out + n, cap - n, "]},\n");
+    return n;
+}
+
+/* Emit all three loop-site recorders as JSON (called by crash_trace). */
+int dirty_ram_re954_json(char *out, int cap) {
+    int n = 0;
+    n += site_json(out + n, cap - n, "reentry_interp_8001A954", &g_site_interp);
+    n += site_json(out + n, cap - n, "dispatch_8001A954",       &g_site_dd954);
+    n += site_json(out + n, cap - n, "dispatch_80046264",       &g_site_dd264);
     return n;
 }
 
@@ -515,7 +528,7 @@ int dirty_ram_re954_json(char *out, int cap) {
  * surfaced; 0 = not a compiled target — caller falls through to overlay/dirty/
  * nonlocal paths). On surface: cpu->pc = target and g_psx_call_bail set. */
 static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
-    if (target == 0x8001A954u) re954_note();
+    if (target == 0x8001A954u) site_note(&g_site_interp);
     if (psx_mixed_owner_enabled()
         && interp_host_stack_used() > psx_mixed_stack_watermark()) {
         cpu->pc = target;
@@ -1107,6 +1120,8 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
         psx_fatal_halt("dispatch recursion guard tripped — runaway self-call "
                        "(see dispatch_depth + dirty_block cycle for the recursing PC)");
     }
+    if (addr == 0x8001A954u)      site_note(&g_site_dd954);   /* loop head re-dispatch */
+    else if (addr == 0x80046264u) site_note(&g_site_dd264);   /* loop tail re-dispatch */
     int prev = g_dirty_interp_active;
     g_dirty_interp_active = 1;
     int r = dirty_ram_dispatch_inner(cpu, addr, stop_addr);
