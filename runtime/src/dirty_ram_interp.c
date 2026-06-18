@@ -523,6 +523,201 @@ int dirty_ram_re954_json(char *out, int cap) {
     return n;
 }
 
+/* ── Boundary control-flow flight recorder (RECURSION_BUG.md §18) ──────────────
+ * The long-run freeze is a runaway interp↔compiled re-entry. To choose among the
+ * four shapes (gradual boundary leak / sudden same-frame spin / interpreter
+ * fabrication / real guest wait-loop) WITHOUT assuming any of them, record every
+ * interp→compiled crossing at BOTH nesting sites (interp_enter_compiled for guest
+ * JAL/JALR, and dirty_ram_dispatch_inner's psx_dispatch_game_compiled) plus the
+ * watched-set tail-transfers (J/JR to the loop addresses). Two always-on rings:
+ *   - per-FRAME summary  -> the time-series (does depth/crossings grow across
+ *                            frames, or explode in one?). Answers Q1/Q2/Q3.
+ *   - per-CROSSING detail -> src_pc, decoded op, target, delay-slot insn, sp/ra,
+ *                            mixed depth, host-stack KB, I_STAT/I_MASK. Answers Q4.
+ * Trips EARLY (per-frame crossings or host-stack KB over a low threshold) so the
+ * detail ring still holds the ONSET (the transition frame's first crossings), not
+ * the 23k steady state that the terminal native-stack guard would capture. The
+ * dump routes through the normal crash report (xprobe_json), reusing the proven
+ * flush+halt+serve path. Watched set is flagged, but ALL crossings are recorded
+ * so the real driver address is not pre-assumed. NB: there is no due-cycle event
+ * scheduler in this build (psx_cycles.c), so "next scheduled event cycle" is N/A;
+ * cycles-advanced-per-frame + I_STAT/I_MASK cover event progress instead. */
+extern uint32_t i_stat;   /* owned by memory.c */
+extern uint32_t i_mask;
+
+enum { XOP_JAL = 0, XOP_JALR = 1, XOP_JR = 2, XOP_J = 3, XOP_DD = 4, XOP_BR = 5 };
+enum { XSITE_INTERP = 0, XSITE_DD = 1 };
+
+int g_mixed_depth = 0;   /* best-effort interp→compiled nesting depth; reset per frame */
+
+typedef struct {
+    uint32_t frame; uint64_t cycle; uint32_t src_pc; uint32_t target;
+    uint32_t ds_insn; uint32_t sp; uint32_t ra; uint32_t stk_kb;
+    uint32_t istat; uint32_t imask; uint16_t depth; uint8_t op; uint8_t site;
+} XDetail;
+typedef struct {
+    uint32_t frame; uint32_t crossings; uint32_t a954; int32_t depth_max;
+    uint32_t stk_max_kb; uint64_t cyc_advanced;
+} XSum;
+
+#define XDET_CAP 16384u
+#define XSUM_CAP 512u
+static XDetail g_xdet[XDET_CAP];
+static XSum    g_xsum[XSUM_CAP];
+static uint64_t g_xdet_seq = 0, g_xsum_seq = 0;
+
+/* per-frame accumulators */
+static uint32_t s_xf_frame = 0xFFFFFFFFu;
+static uint32_t s_xf_crossings = 0, s_xf_a954 = 0;
+static int32_t  s_xf_depth_max = 0;
+static uint32_t s_xf_stk_max_kb = 0;
+static uint64_t s_xf_cyc_start = 0;
+
+/* first crossing where mixed depth became > 0 this run (Q1) */
+static uint32_t s_xf_first_depth_frame = 0xFFFFFFFFu;
+static uint64_t s_xf_first_depth_cycle = 0;
+static int      s_xprobe_tripped = 0;
+
+/* Trip thresholds — DISABLED by default (0). Deep but LEGITIMATE boot stacks
+ * reach ~300KB host at crossing points (mixed-depth small) and would spuriously
+ * trip an absolute threshold. So arm at RUNTIME via the `xprobe_arm` TCP command
+ * once the game is idling and the normal per-frame baseline is known (idle stack
+ * is a flat ~5KB, so a threshold ~3x the idle crossing baseline / a stack KB well
+ * above 5KB then fires only on the runaway, with the onset still in the ring).
+ * warmup suppresses any trip before that frame regardless. Env overrides allow
+ * arming at launch (PSX_XPROBE_FRAME_TRIP / _STK_KB / _WARMUP). */
+int g_xprobe_frame_trip = 0;   /* per-frame crossings; 0 = disabled */
+int g_xprobe_stk_kb     = 0;   /* host-stack KB; 0 = disabled */
+int g_xprobe_warmup     = 0;   /* no trip before this frame */
+static int g_xprobe_env_done = 0;
+static void xprobe_env_init(void) {
+    if (g_xprobe_env_done) return;
+    g_xprobe_env_done = 1;
+    const char *a = getenv("PSX_XPROBE_FRAME_TRIP"); if (a && *a) g_xprobe_frame_trip = atoi(a);
+    const char *b = getenv("PSX_XPROBE_STK_KB");     if (b && *b) g_xprobe_stk_kb     = atoi(b);
+    const char *c = getenv("PSX_XPROBE_WARMUP");     if (c && *c) g_xprobe_warmup     = atoi(c);
+}
+void dirty_ram_xprobe_arm(int frame_trip, int stk_kb, int warmup) {
+    g_xprobe_frame_trip = frame_trip; g_xprobe_stk_kb = stk_kb; g_xprobe_warmup = warmup;
+    s_xprobe_tripped = 0;   /* (re-)arm */
+}
+
+static void xprobe_flush_frame(void) {
+    if (s_xf_frame == 0xFFFFFFFFu) return;
+    XSum *s = &g_xsum[g_xsum_seq++ & (XSUM_CAP - 1u)];
+    s->frame = s_xf_frame; s->crossings = s_xf_crossings; s->a954 = s_xf_a954;
+    s->depth_max = s_xf_depth_max; s->stk_max_kb = s_xf_stk_max_kb;
+    s->cyc_advanced = psx_cycle_count - s_xf_cyc_start;
+}
+
+/* Record one boundary crossing. want_detail=1 for interp-site guest transfers
+ * (rich context), 0 for the dd-site (count + depth only). Runs the per-frame
+ * flush on frame change (leak-proof reset of g_mixed_depth) and the early trip. */
+static int g_xprobe_watch(uint32_t t) {
+    return t == 0x8001A954u || t == 0x80046264u || t == 0x8004630Cu || t == 0x8004DFA0u;
+}
+static void xprobe_event(uint32_t src_pc, uint8_t op, uint8_t site, uint32_t target,
+                         uint32_t ds_insn, uint32_t sp, uint32_t ra, int want_detail) {
+    uint32_t f = (uint32_t)s_frame_count;
+    if (f != s_xf_frame) {
+        xprobe_flush_frame();
+        s_xf_frame = f; s_xf_crossings = 0; s_xf_a954 = 0; s_xf_depth_max = 0;
+        s_xf_stk_max_kb = 0; s_xf_cyc_start = psx_cycle_count;
+        g_mixed_depth = 0;   /* shallow at frame top (proven ~5KB) — leak-proof reset */
+    }
+    s_xf_crossings++;
+    if (target == 0x8001A954u) s_xf_a954++;
+    if (g_mixed_depth > s_xf_depth_max) s_xf_depth_max = g_mixed_depth;
+    if (g_mixed_depth > 0 && s_xf_first_depth_frame == 0xFFFFFFFFu) {
+        s_xf_first_depth_frame = f; s_xf_first_depth_cycle = psx_cycle_count;
+    }
+    uint32_t stk = (uint32_t)(interp_host_stack_used() >> 10);
+    if (stk > s_xf_stk_max_kb) s_xf_stk_max_kb = stk;
+
+    if (want_detail || g_xprobe_watch(target)) {
+        XDetail *e = &g_xdet[g_xdet_seq++ & (XDET_CAP - 1u)];
+        e->frame = f; e->cycle = psx_cycle_count; e->src_pc = src_pc; e->target = target;
+        e->ds_insn = ds_insn; e->sp = sp; e->ra = ra; e->stk_kb = stk;
+        e->istat = i_stat; e->imask = i_mask;
+        e->depth = (uint16_t)(g_mixed_depth > 0xFFFF ? 0xFFFF : g_mixed_depth);
+        e->op = op; e->site = site;
+    }
+
+    xprobe_env_init();
+    if (!s_xprobe_tripped && f >= (uint32_t)g_xprobe_warmup &&
+        ((g_xprobe_frame_trip > 0 && (int)s_xf_crossings > g_xprobe_frame_trip) ||
+         (g_xprobe_stk_kb     > 0 && (int)stk            > g_xprobe_stk_kb))) {
+        s_xprobe_tripped = 1;
+        extern void psx_fatal_halt(const char *reason);
+        psx_fatal_halt("xprobe: interp<->compiled boundary onset trip "
+                       "(per-frame crossings/host-stack over armed threshold — see xprobe rings)");
+    }
+}
+
+/* Emit the flight-recorder rings as JSON (called by crash_trace). The detail dump
+ * is OLDEST-first so the transition (last normal frame -> first runaway crossings)
+ * is visible; the trip fires early enough that the onset is still in the ring. */
+int dirty_ram_xprobe_json(char *out, int cap) {
+    xprobe_flush_frame();   /* fold the in-progress frame into the summary */
+    int n = snprintf(out, cap,
+        "{\n"
+        "    \"tripped\": %d, \"trip_frame\": %u, \"mixed_depth_now\": %d,\n"
+        "    \"first_depth_frame\": %u, \"first_depth_cycle\": %llu,\n"
+        "    \"frame_trip\": %d, \"stk_kb_trip\": %d, \"warmup\": %d,\n",
+        s_xprobe_tripped, s_xf_frame, g_mixed_depth,
+        s_xf_first_depth_frame, (unsigned long long)s_xf_first_depth_cycle,
+        g_xprobe_frame_trip, g_xprobe_stk_kb, g_xprobe_warmup);
+
+    /* per-frame summary (whole window in the ring) */
+    n += snprintf(out + n, cap - n, "    \"summary\": [");
+    {
+        uint64_t total = g_xsum_seq;
+        uint32_t avail = total < XSUM_CAP ? (uint32_t)total : XSUM_CAP;
+        uint64_t start = total - avail;
+        for (uint32_t i = 0; i < avail && n < cap - 160; i++) {
+            const XSum *s = &g_xsum[(start + i) & (XSUM_CAP - 1u)];
+            n += snprintf(out + n, cap - n,
+                "%s{\"f\":%u,\"cr\":%u,\"a954\":%u,\"dmax\":%d,\"stk\":%u,\"cyc\":%llu}",
+                i ? "," : "", s->frame, s->crossings, s->a954, s->depth_max,
+                s->stk_max_kb, (unsigned long long)s->cyc_advanced);
+        }
+    }
+    n += snprintf(out + n, cap - n, "],\n");
+
+    /* per-crossing detail, CENTERED on the focus frame (trip frame, or the current
+     * frame when live): dump from ~24 crossings before the focus frame's first
+     * crossing forward, so the transition (last normal frame -> runaway onset) is
+     * always captured regardless of ring fill. */
+    n += snprintf(out + n, cap - n, "    \"detail\": [");
+    {
+        static const char *opn[] = {"JAL","JALR","JR","J","DD","BR"};
+        uint64_t total = g_xdet_seq;
+        uint32_t avail = total < XDET_CAP ? (uint32_t)total : XDET_CAP;
+        uint64_t base  = total - avail;             /* oldest live entry */
+        uint32_t focus = s_xf_frame;
+        uint32_t first = avail;                     /* first index of the focus frame */
+        for (uint32_t i = 0; i < avail; i++) {
+            if (g_xdet[(base + i) & (XDET_CAP - 1u)].frame == focus) { first = i; break; }
+        }
+        uint32_t starto = (first == avail) ? (avail > 24u ? avail - 24u : 0u)
+                                           : (first > 24u ? first - 24u : 0u);
+        int firstdump = 1;
+        for (uint32_t i = starto; i < avail && n < cap - 240; i++) {
+            const XDetail *e = &g_xdet[(base + i) & (XDET_CAP - 1u)];
+            n += snprintf(out + n, cap - n,
+                "%s{\"f\":%u,\"cyc\":%llu,\"op\":\"%s\",\"site\":%u,\"src\":\"0x%08X\","
+                "\"tgt\":\"0x%08X\",\"ds\":\"0x%08X\",\"sp\":\"0x%08X\",\"ra\":\"0x%08X\","
+                "\"d\":%u,\"stk\":%u,\"ist\":\"0x%X\",\"imk\":\"0x%X\"}",
+                firstdump ? "" : ",", e->frame, (unsigned long long)e->cycle,
+                e->op < 6 ? opn[e->op] : "?", e->site, e->src_pc, e->target, e->ds_insn,
+                e->sp, e->ra, e->depth, e->stk_kb, e->istat, e->imask);
+            firstdump = 0;
+        }
+    }
+    n += snprintf(out + n, cap - n, "]\n  }");
+    return n;
+}
+
 /* Enter compiled code from the interpreter for a guest control transfer. Returns
  * like psx_dispatch_game_compiled (1 = handled, OR a stack-watermark bail was
  * surfaced; 0 = not a compiled target — caller falls through to overlay/dirty/
@@ -535,7 +730,10 @@ static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
         g_psx_call_bail = 1;
         return 1;
     }
-    return psx_dispatch_game_compiled(cpu, target);
+    g_mixed_depth++;
+    int r = psx_dispatch_game_compiled(cpu, target);
+    g_mixed_depth--;
+    return r;
 }
 
 /* Execute ONE instruction at *pc on the given CPU state.  Returns:
@@ -675,6 +873,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         case 0x08: { /* JR rs */
             uint32_t target = cpu->gpr[rs];
             exec_delay_slot(cpu, pc + 4);
+            /* crossing (if target is compiled) is counted at the block-loop
+             * tail-transfer site (interp_enter_compiled, §18) — not here, to
+             * avoid double-counting J/JR-to-compiled. */
             cpu->pc = target;
             return 1;
         }
@@ -685,6 +886,8 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             cpu->gpr[0] = 0;
             exec_delay_slot(cpu, pc + 4);
             uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
+            xprobe_event(pc, XOP_JALR, XSITE_INTERP, target,
+                         fetch_word((pc + 4) & 0x1FFFFFFFu), site_sp, cpu->gpr[31], 1);
 #ifdef PSX_HAS_GAME_DISPATCH
             cpu->pc = 0;
             if (interp_enter_compiled(cpu, target)) {
@@ -822,6 +1025,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     case 0x02: { /* J target */
         uint32_t target = ((pc + 4) & 0xF0000000u) | (target26(insn) << 2);
         exec_delay_slot(cpu, pc + 4);
+        /* crossing counted at the block-loop tail-transfer site (§18). */
         cpu->pc = target;
         return 1;
     }
@@ -831,6 +1035,8 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         cpu->gpr[31] = return_pc;
         exec_delay_slot(cpu, pc + 4);
         uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
+        xprobe_event(pc, XOP_JAL, XSITE_INTERP, target,
+                     fetch_word((pc + 4) & 0x1FFFFFFFu), site_sp, cpu->gpr[31], 1);
 #ifdef PSX_HAS_GAME_DISPATCH
         cpu->pc = 0;
         if (interp_enter_compiled(cpu, target)) {
@@ -1141,7 +1347,9 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     }
 
 #ifdef PSX_HAS_GAME_DISPATCH
-    if (psx_dispatch_game_compiled(cpu, addr)) return 1;
+    xprobe_event(cpu->gpr[31], XOP_DD, XSITE_DD, addr, 0u, cpu->gpr[29], cpu->gpr[31], 0);
+    g_mixed_depth++;
+    { int _gc = psx_dispatch_game_compiled(cpu, addr); g_mixed_depth--; if (_gc) return 1; }
 #endif
 
     /* B-2: statically-compiled overlay functions (generated/overlays_static.c).
@@ -1297,18 +1505,29 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             uint32_t target = cpu->pc;
 #ifdef PSX_HAS_GAME_DISPATCH
             if (target != 0) {
-                /* Tail transfer into compiled code: run with pc cleared so a
-                 * plain C return surfaces as a genuine return (pc==0) to the
-                 * dispatch loop's contract checks, instead of leaving the
-                 * stale target in pc (which would re-dispatch — and re-run —
-                 * the same function). */
-                cpu->pc = 0;
-                if (interp_enter_compiled(cpu, target)) {
-                    g_dirty_ram_blocks_run++;
-                    if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
-                    OV_FPLOG_RET1();
-                }
-                cpu->pc = target;  /* not compiled: restore surfaced target */
+                /* §20 FIX — the long-run idle freeze. A guest TAIL-transfer (j/jr/
+                 * branch) from an interpreted overlay into compiled code used to NEST
+                 * a fresh psx_dispatch_game_compiled trampoline here. That nest never
+                 * unwound for the per-frame render chain, leaking ~one host call chain
+                 * (~1.17 KB) PER FRAME -> the 64 MB guest stack overflowed after ~40k
+                 * idle frames -> the native-stack guard tripped (RECURSION_BUG.md
+                 * §19/§20; confirmed by the ce_profile linear climb).
+                 *
+                 * A tail-transfer carries NO return obligation, so the correct action
+                 * is to SURFACE the target (leave it in cpu->pc) and return; the OUTER
+                 * psx_dispatch_impl trampoline re-dispatches cpu->pc FLAT
+                 * (full_function_emitter.cpp:1230), keeping the host stack bounded
+                 * across frames. Dirty-overlay targets still take the local-dirty-flow
+                 * just below (kept flat in-interpreter); compiled / static / unknown
+                 * targets fall through to the surface return (case 3). Real guest
+                 * CALLS (jal/jalr) are unaffected — they nest inline in exec_one and
+                 * return normally. (The §14 watermark surfaced via g_psx_call_bail,
+                 * which is wild-return semantics and wedged; a plain tail surface does
+                 * not touch the bail.) */
+                xprobe_event(g_debug_last_store_pc, XOP_BR, XSITE_INTERP, target,
+                             fetch_word(g_debug_last_store_pc & 0x1FFFFFFFu),
+                             cpu->gpr[29], cpu->gpr[31], 1);
+                cpu->pc = target;  /* surfaced; trampoline re-dispatches flat */
             }
 #endif
             uint32_t target_phys = target & 0x1FFFFFFFu;
