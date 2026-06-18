@@ -54,6 +54,9 @@ static const GpuRenderBackend SW_BACKEND = {
 
 /* Supplied by gpu_gl_renderer.c; returns NULL until the GL backend is ready. */
 extern const GpuRenderBackend *gl_backend_get(void);
+/* Supplied by gpu_vk_renderer.c; returns NULL until the Vulkan backend is
+ * ready (init succeeded). When Vulkan isn't compiled in it returns NULL. */
+extern const GpuRenderBackend *vk_backend_get(void);
 
 static const GpuRenderBackend *g_b         = &SW_BACKEND;
 static GrBackend               g_effective = GR_BACKEND_SOFTWARE;
@@ -68,6 +71,16 @@ void gr_set_backend(GrBackend backend) {
             return;
         }
         fprintf(stdout, "psxrecomp: renderer = opengl requested but unavailable "
+                        "— falling back to software\n");
+    } else if (backend == GR_BACKEND_VULKAN) {
+        const GpuRenderBackend *vk = vk_backend_get();
+        if (vk) {
+            g_b = vk;
+            g_effective = GR_BACKEND_VULKAN;
+            fprintf(stdout, "psxrecomp: renderer = vulkan (%s)\n", vk->name);
+            return;
+        }
+        fprintf(stdout, "psxrecomp: renderer = vulkan requested but unavailable "
                         "— falling back to software\n");
     }
     g_b = &SW_BACKEND;
