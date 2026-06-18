@@ -352,6 +352,13 @@ function(psxrecomp_add_runtime_target target)
     # (the backend reports init failure and the runtime falls back to software).
     # We need only the Vulkan HEADERS at compile time, plus glslc to build SPIR-V.
     # Both ship with the Vulkan SDK ($VULKAN_SDK) or a Vulkan-Headers package.
+    #
+    # Build-EXCLUDED by default (silent WIP): the real Vulkan path compiles only
+    # with -DPSX_ENABLE_VULKAN=ON. When OFF, gpu_vk_renderer.c builds as the inert
+    # stub and the exe behaves exactly as the GL/software build — no SDK/glslc
+    # dependency, regardless of whether $VULKAN_SDK is present on the machine.
+    option(PSX_ENABLE_VULKAN "Build the experimental Vulkan renderer backend (WIP)" OFF)
+    if(PSX_ENABLE_VULKAN)
     set(_vk_inc "")
     if(DEFINED ENV{VULKAN_SDK})
         if(EXISTS "$ENV{VULKAN_SDK}/Include/vulkan/vulkan.h")
@@ -395,8 +402,12 @@ function(psxrecomp_add_runtime_target target)
         add_dependencies(${target} ${target}_vk_shaders)
         target_include_directories(${target} PRIVATE "${_vk_gen_dir}")
     else()
-        message(STATUS "Vulkan backend: SDK headers/glslc not found - "
-                       "gpu_vk_renderer.c builds as a software-fallback stub")
+        message(STATUS "Vulkan backend: PSX_ENABLE_VULKAN=ON but SDK headers/glslc "
+                       "not found - gpu_vk_renderer.c builds as a software stub")
+    endif()
+    else()
+        message(STATUS "Vulkan backend: disabled (PSX_ENABLE_VULKAN=OFF) - "
+                       "gpu_vk_renderer.c builds as an inert stub")
     endif()
 
     if(MINGW)
