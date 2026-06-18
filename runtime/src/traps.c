@@ -258,7 +258,17 @@ static HostThreadFiber* psx_get_or_create_host_thread(CPUState* cpu, uint32_t tc
     slot->return_tcb = 0;
     slot->owned = 1;
     slot->closed = 0;
-    slot->fiber = psx_fiber_create(1024 * 1024, psx_thread_fiber_entry, slot);
+    /* Guest-thread fiber stack. Default 1 MB; PSX_FIBER_STACK_KB overrides it so
+     * the long-run-freeze repro can be run at 0.5x/2x stack (RECURSION_BUG.md §17
+     * orthogonal test): if the overflow frame scales ~linearly with stack size,
+     * the freeze is gradual host-stack accumulation, not a frame-50k trigger. */
+    static long s_fiber_kb = -1;
+    if (s_fiber_kb < 0) {
+        const char *e = getenv("PSX_FIBER_STACK_KB");
+        s_fiber_kb = (e && *e) ? atol(e) : 1024;
+        if (s_fiber_kb < 256) s_fiber_kb = 256;
+    }
+    slot->fiber = psx_fiber_create((size_t)s_fiber_kb * 1024u, psx_thread_fiber_entry, slot);
     if (!slot->fiber) {
         trap_crash("psx_fiber_create failed for BIOS thread");
         exit(1);

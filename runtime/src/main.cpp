@@ -230,7 +230,16 @@ static std::filesystem::path exe_dir_from_argv(const char* argv0) {
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::path exe_dir;
-    if (argv0 && argv0[0]) {
+    // Inside an AppImage the binary lives in a read-only mount and argv[0] can
+    // be a bare name or symlink (launched via PATH / a .desktop file). $APPIMAGE
+    // is the .AppImage's own path, so settings.toml anchors next to it. Prefer
+    // it; fall back to argv[0], then cwd. (settings.toml is read/written ONLY
+    // here — one location next to the exe, no directory walk-up.)
+    if (const char* appimg = std::getenv("APPIMAGE"); appimg && appimg[0]) {
+        exe_dir = fs::absolute(appimg, ec).parent_path();
+        if (ec) exe_dir.clear();
+    }
+    if (exe_dir.empty() && argv0 && argv0[0]) {
         exe_dir = fs::absolute(argv0, ec).parent_path();
         if (ec) exe_dir.clear();
     }
@@ -1162,6 +1171,75 @@ static bool hybrid_dpad_active(const PlayerInput& p, bool kb_always) {
  * speed it can — typically several × realtime — and audio glitches. */
 static constexpr double PSX_FRAME_PERIOD_MS = 1000.0 / 59.94;
 
+/* ── Host-stack-usage profile (RECURSION_BUG.md §17) ──────────────────────────
+ * The decisive instrument for the long-run freeze. The guest call graph mirrors
+ * onto the 1MB guest fiber stack (traps.c), and the native-stack guard trips at
+ * ~768KB used. The open question is the SHAPE of host-stack usage over frames:
+ *   - LINEAR climb from gameplay start  => a per-frame interp<->compiled boundary
+ *     leak: every game tick leaks one un-unwound host call chain (~13 frames),
+ *     overflowing the fiber after ~50k frames. 50k is a CAPACITY limit, not a
+ *     trigger. (Model A — predicted.)
+ *   - FLAT, then a cliff at one frame   => a within-one-frame runaway re-entry at
+ *     a real ~frame-50k trigger. (Model W — the old §15 premise.)
+ * (TEB StackBase - rsp), sampled on the guest fiber each vblank, IS the leaked
+ * depth. Sampled in sdl_vblank_present — a gpu_vblank_tick callback off
+ * psx_check_interrupts, i.e. ON the guest fiber, every vblank, in both builds.
+ * Decimated 1-per-STRIDE frames so the ring spans the whole run; "now" carries
+ * the exact latest sample. ALWAYS-ON: read live via the `stack_profile` TCP
+ * command while the game is still responsive (no need to reach the overflow),
+ * and dumped in the crash report. Query the ring; never arm-and-capture. */
+#if defined(_WIN32)
+#include <intrin.h>   /* __readgsqword — fiber TEB StackBase */
+static size_t host_stack_used(void) {
+    char probe;
+    uintptr_t base = (uintptr_t)__readgsqword(0x08);   /* TEB StackBase (high) */
+    uintptr_t sp   = (uintptr_t)&probe;
+    return (base > sp) ? (size_t)(base - sp) : 0;
+}
+#else
+static size_t host_stack_used(void) { return 0; }
+#endif
+
+#define STACK_PROFILE_CAP    512u
+#define STACK_PROFILE_STRIDE 128u   /* 512 * 128 = 65536 frames of coverage */
+typedef struct { uint32_t frame; uint32_t used_kb; } StackSample;
+static StackSample g_stack_prof[STACK_PROFILE_CAP];
+static uint32_t    g_stack_prof_seq    = 0;
+static uint32_t    g_stack_used_now_kb = 0;
+static uint32_t    g_stack_frame_now   = 0;
+static uint32_t    g_stack_used_max_kb = 0;
+
+static void stack_profile_sample(void) {
+    extern uint64_t s_frame_count;
+    uint32_t f  = (uint32_t)s_frame_count;
+    uint32_t kb = (uint32_t)(host_stack_used() >> 10);
+    g_stack_frame_now   = f;
+    g_stack_used_now_kb = kb;
+    if (kb > g_stack_used_max_kb) g_stack_used_max_kb = kb;
+    if ((f % STACK_PROFILE_STRIDE) == 0) {
+        StackSample *e = &g_stack_prof[g_stack_prof_seq++ & (STACK_PROFILE_CAP - 1u)];
+        e->frame = f; e->used_kb = kb;
+    }
+}
+
+/* JSON dump of the profile (callable from C: crash report + TCP command). */
+extern "C" int stack_profile_json(char *out, int cap) {
+    uint32_t total = g_stack_prof_seq;
+    uint32_t avail = total < STACK_PROFILE_CAP ? total : STACK_PROFILE_CAP;
+    uint32_t start = total - avail;
+    int n = snprintf(out, cap,
+        "{\"now\":{\"f\":%u,\"kb\":%u},\"max_kb\":%u,\"stride\":%u,\"count\":%u,\"samples\":[",
+        g_stack_frame_now, g_stack_used_now_kb, g_stack_used_max_kb,
+        STACK_PROFILE_STRIDE, avail);
+    for (uint32_t i = 0; i < avail && n < cap - 48; i++) {
+        StackSample *e = &g_stack_prof[(start + i) & (STACK_PROFILE_CAP - 1u)];
+        n += snprintf(out + n, cap - n, "%s{\"f\":%u,\"kb\":%u}",
+                      i ? "," : "", e->frame, e->used_kb);
+    }
+    n += snprintf(out + n, cap - n, "]}");
+    return n;
+}
+
 /* Called from gpu_vblank_tick() at each simulated vblank. */
 static void sdl_vblank_present(void) {
 #ifndef PSX_NO_DEBUG_TOOLS
@@ -1180,6 +1258,11 @@ static void sdl_vblank_present(void) {
     s_frame_count++;
     int override = -1;
 #endif
+
+    /* Host-stack-usage profile sample — frame counter is now current, and we are
+     * on the guest fiber (see §17 block above). BEFORE the turbo/fast-boot early
+     * returns so the curve is captured even when presents are skipped. */
+    stack_profile_sample();
 
     /* Step 2.8 automation ticks — BEFORE the turbo/fast-boot early returns
      * below, so capture detection and compile pickup keep running while the

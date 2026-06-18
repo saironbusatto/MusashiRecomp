@@ -1667,17 +1667,101 @@ uint32_t g_psx_recent_fn[PSX_RECENT_FN_CAP];
 uint32_t g_psx_recent_fn_i   = 0;
 uint32_t g_psx_recursion_func = 0;
 
+/* ── §19 compiled-entry stack-depth profile ───────────────────────────────────
+ * Sampled at EVERY compiled function entry (the deepest hot path), so the
+ * per-frame MAX host-stack-used here is the TRUE intra-frame depth — the §17
+ * vblank sample is shallow and the §18 boundary recorder proved the boundary is
+ * flat. Resolves the open contradiction (native_stack walker says 23k-deep vs
+ * live counters say flat): if the FROZEN frame's max_kb climbs to ~the guard
+ * threshold while normal frames stay low => real compiled recursion; if it stays
+ * low => the native-guard tripped on a BAD TEB read (raw base/dealloc/sp at the
+ * trip are dumped to verify the math). Defined always; fed only under the guard. */
+typedef struct { uint32_t frame; uint32_t entries; uint32_t max_kb; uint32_t max_func; } CeSum;
+#define CE_CAP 512u
+static CeSum    s_ce[CE_CAP];
+static uint64_t s_ce_seq = 0;
+static uint32_t s_ce_frame = 0xFFFFFFFFu, s_ce_entries = 0, s_ce_max_kb = 0, s_ce_max_func = 0;
+/* raw TEB values captured AT the guard trip (sanity-check garbage-read hypothesis) */
+static uint64_t g_ce_trip_base = 0, g_ce_trip_dealloc = 0, g_ce_trip_sp = 0;
+static uint32_t g_ce_trip_kb = 0, g_ce_trip_frame = 0;
+
+static void ce_sample(uint32_t func_addr, uintptr_t base, uintptr_t sp) {
+    extern uint64_t s_frame_count;
+    uint32_t f = (uint32_t)s_frame_count;
+    if (f != s_ce_frame) {
+        if (s_ce_frame != 0xFFFFFFFFu) {
+            CeSum *e = &s_ce[s_ce_seq++ & (CE_CAP - 1u)];
+            e->frame = s_ce_frame; e->entries = s_ce_entries;
+            e->max_kb = s_ce_max_kb; e->max_func = s_ce_max_func;
+        }
+        s_ce_frame = f; s_ce_entries = 0; s_ce_max_kb = 0; s_ce_max_func = 0;
+    }
+    s_ce_entries++;
+    uint32_t kb = (base > sp) ? (uint32_t)((base - sp) >> 10) : 0;
+    if (kb > s_ce_max_kb) { s_ce_max_kb = kb; s_ce_max_func = func_addr; }
+}
+
+/* Dump the compiled-entry profile (called by crash_trace + the ce_profile cmd). */
+int ce_profile_json(char *out, int cap) {
+    /* fold the in-progress frame into the ring */
+    if (s_ce_frame != 0xFFFFFFFFu) {
+        CeSum *e = &s_ce[s_ce_seq & (CE_CAP - 1u)];   /* peek slot (do not advance) */
+        e->frame = s_ce_frame; e->entries = s_ce_entries;
+        e->max_kb = s_ce_max_kb; e->max_func = s_ce_max_func;
+    }
+    int n = snprintf(out, cap,
+        "{\"cur_frame\":%u,\"cur_entries\":%u,\"cur_max_kb\":%u,"
+        "\"trip\":{\"frame\":%u,\"kb\":%u,\"base\":\"0x%llX\",\"dealloc\":\"0x%llX\",\"sp\":\"0x%llX\"},"
+        "\"frames\":[",
+        s_ce_frame, s_ce_entries, s_ce_max_kb,
+        g_ce_trip_frame, g_ce_trip_kb, (unsigned long long)g_ce_trip_base,
+        (unsigned long long)g_ce_trip_dealloc, (unsigned long long)g_ce_trip_sp);
+    uint64_t total = s_ce_seq + (s_ce_frame != 0xFFFFFFFFu ? 1 : 0);
+    uint32_t avail = total < CE_CAP ? (uint32_t)total : CE_CAP;
+    uint64_t start = total - avail;
+    for (uint32_t i = 0; i < avail && n < cap - 96; i++) {
+        const CeSum *e = &s_ce[(start + i) & (CE_CAP - 1u)];
+        n += snprintf(out + n, cap - n, "%s{\"f\":%u,\"e\":%u,\"mkb\":%u,\"mf\":\"0x%08X\"}",
+                      i ? "," : "", e->frame, e->entries, e->max_kb, e->max_func);
+    }
+    n += snprintf(out + n, cap - n, "]}");
+    return n;
+}
+
 #ifdef PSX_STACK_GUARD
 static void psx_native_stack_guard(uint32_t func_addr) {
     char probe;
     uintptr_t sp      = (uintptr_t)&probe;
     uintptr_t base    = (uintptr_t)__readgsqword(0x08);    /* TEB StackBase (high) */
     uintptr_t dealloc = (uintptr_t)__readgsqword(0x1478);  /* TEB DeallocationStack (reserve low) */
+    ce_sample(func_addr, base, sp);                        /* §19: true intra-frame depth */
+    /* §20 diag: optional EARLY trip at a custom used-KB so the leak structure can
+     * be captured after only a few thousand leak-frames instead of waiting for the
+     * full 48 MB overflow. PSX_STACK_GUARD_KB=N trips when (base-sp) > N KB. */
+    {
+        static long s_guard_kb = -2;
+        if (s_guard_kb == -2) { const char *e = getenv("PSX_STACK_GUARD_KB");
+                                s_guard_kb = (e && *e) ? atol(e) : -1; }
+        if (s_guard_kb > 0 && base > sp && (base - sp) > (uintptr_t)s_guard_kb * 1024u) {
+            g_psx_recursion_func = func_addr;
+            extern uint64_t s_frame_count;
+            g_ce_trip_base = base; g_ce_trip_dealloc = dealloc; g_ce_trip_sp = sp;
+            g_ce_trip_kb = (uint32_t)((base - sp) >> 10);
+            g_ce_trip_frame = (uint32_t)s_frame_count;
+            extern void psx_fatal_halt(const char *reason);
+            psx_fatal_halt("PSX_STACK_GUARD_KB early trip — capture the leak structure "
+                           "(see native_stack run-length cycle + ce_profile + xprobe)");
+        }
+    }
     if (base <= dealloc) return;                            /* implausible TEB read — skip */
     uintptr_t headroom = (base - dealloc) / 4;             /* ¼ stack (256 KB on a 1 MB fiber) */
     if (headroom < (128u << 10)) headroom = 128u << 10;
     if (sp > dealloc && (sp - dealloc) < headroom) {
         g_psx_recursion_func = func_addr;                  /* the func recursing at the trip */
+        extern uint64_t s_frame_count;
+        g_ce_trip_base = base; g_ce_trip_dealloc = dealloc; g_ce_trip_sp = sp;
+        g_ce_trip_kb = (base > sp) ? (uint32_t)((base - sp) >> 10) : 0;
+        g_ce_trip_frame = (uint32_t)s_frame_count;
         extern void psx_fatal_halt(const char *reason);
         psx_fatal_halt("native stack guard tripped — runaway guest recursion "
                        "(direct func_X dispatch; g_psx_dispatch_depth is blind to it "
@@ -8899,9 +8983,65 @@ static void handle_game_options(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"go\":%s}", id, buf);
 }
 
+/* Live host-stack-usage profile (RECURSION_BUG.md §17): read the always-on ring
+ * while the game is still responsive to distinguish a gradual cross-frame leak
+ * (used_kb climbs linearly with frame) from a within-one-frame runaway. */
+static void handle_stack_profile(int id, const char *json)
+{
+    (void)json;
+    extern int stack_profile_json(char *out, int cap);
+    static char buf[24576];
+    stack_profile_json(buf, (int)sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,\"sp\":%s}", id, buf);
+}
+
+/* Live boundary control-flow flight recorder (RECURSION_BUG.md §18): per-frame
+ * crossing/depth summary + per-crossing onset detail. Read while responsive to
+ * see whether the interp<->compiled recursion accumulates across frames or
+ * explodes within one. */
+static void handle_xprobe(int id, const char *json)
+{
+    (void)json;
+    extern int dirty_ram_xprobe_json(char *out, int cap);
+    static char buf[1048576];
+    /* send_fmt's formatting buffer is 64KB — cap the live dump (summary + a
+     * detail window) under that. The full rings go to the crash report file. */
+    dirty_ram_xprobe_json(buf, 56000);
+    send_fmt("{\"id\":%d,\"ok\":true,\"xprobe\":%s}", id, buf);
+}
+
+/* §19 compiled-entry depth profile: per-frame max host-stack-used sampled at
+ * EVERY compiled function entry. Read live to see whether the frozen frame's
+ * stack actually climbs (real recursion) or stays flat (garbage guard trip). */
+static void handle_ce_profile(int id, const char *json)
+{
+    (void)json;
+    extern int ce_profile_json(char *out, int cap);
+    static char buf[49152];
+    ce_profile_json(buf, (int)sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,\"ce\":%s}", id, buf);
+}
+
+/* Arm the §18 boundary trip at runtime once the idle baseline is known:
+ * xprobe_arm {"frame_trip":N,"stk_kb":K,"warmup":F}. Any 0 disables that arm. */
+static void handle_xprobe_arm(int id, const char *json)
+{
+    extern void dirty_ram_xprobe_arm(int frame_trip, int stk_kb, int warmup);
+    int ft = json_get_int(json, "frame_trip", 0);
+    int sk = json_get_int(json, "stk_kb", 0);
+    int wu = json_get_int(json, "warmup", 0);
+    dirty_ram_xprobe_arm(ft, sk, wu);
+    send_fmt("{\"id\":%d,\"ok\":true,\"frame_trip\":%d,\"stk_kb\":%d,\"warmup\":%d}",
+             id, ft, sk, wu);
+}
+
 static const CmdEntry s_commands[] = {
     { "ping",              handle_ping },
     { "game_options",      handle_game_options },
+    { "stack_profile",     handle_stack_profile },
+    { "xprobe",            handle_xprobe },
+    { "xprobe_arm",        handle_xprobe_arm },
+    { "ce_profile",        handle_ce_profile },
     { "frame",             handle_frame },
     { "get_registers",     handle_get_registers },
     { "read_ram",          handle_read_ram },

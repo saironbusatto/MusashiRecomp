@@ -419,6 +419,48 @@ void psx_crash_trace_dump(const char *reason, void *seh_info) {
         if (k > 0) append_str(buf, sizeof(buf), &pos, re954);
     }
 
+    /* Host-stack-usage profile (RECURSION_BUG.md §17): the climb curve —
+     * flat-then-cliff vs linear-across-frames — that discriminates the freeze's
+     * two models. Emitted BEFORE the early-flush below so it survives even if the
+     * native_stack walk faults on the exhausted fiber stack. */
+    {
+        extern int stack_profile_json(char *out, int cap);
+        static char sp[24576];
+        int k = stack_profile_json(sp, (int)sizeof(sp));
+        if (k > 0) {
+            append_str(buf, sizeof(buf), &pos, "  \"stack_profile\": ");
+            append_str(buf, sizeof(buf), &pos, sp);
+            append_str(buf, sizeof(buf), &pos, ",\n");
+        }
+    }
+
+    /* Boundary control-flow flight recorder (RECURSION_BUG.md §18): the per-frame
+     * summary (shape over frames) + per-crossing detail (onset transfer). Emitted
+     * before the early-flush so it survives a native_stack-walk fault. */
+    {
+        extern int dirty_ram_xprobe_json(char *out, int cap);
+        static char xp[1048576];
+        int k = dirty_ram_xprobe_json(xp, (int)sizeof(xp));
+        if (k > 0) {
+            append_str(buf, sizeof(buf), &pos, "  \"xprobe\": ");
+            append_str(buf, sizeof(buf), &pos, xp);
+            append_str(buf, sizeof(buf), &pos, ",\n");
+        }
+    }
+
+    /* §19 compiled-entry depth profile: true intra-frame stack depth + raw TEB
+     * values at the trip (real recursion vs garbage guard-read). */
+    {
+        extern int ce_profile_json(char *out, int cap);
+        static char ce[49152];
+        int k = ce_profile_json(ce, (int)sizeof(ce));
+        if (k > 0) {
+            append_str(buf, sizeof(buf), &pos, "  \"ce_profile\": ");
+            append_str(buf, sizeof(buf), &pos, ce);
+            append_str(buf, sizeof(buf), &pos, ",\n");
+        }
+    }
+
     /* Native call-stack snapshot — the TRUE recursion cycle (recent_fn above is
      * time-ordered and shows leaf churn, not the recursing frames).
      *

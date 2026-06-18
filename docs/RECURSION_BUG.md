@@ -447,6 +447,10 @@ for a small causal address set (not whole-RAM).
   call stack resets to the SDL frame loop every frame (the per-frame dispatch
   returns, then present, then next frame), so host depth CANNOT accumulate across
   frames. So a single frame's per-frame-update spirals to 23k and never returns.
+  > **❌ FALSE — superseded by §17.** There is NO per-frame return to a shallow loop:
+  > present/`s_frame_count++` is a `gpu_vblank_tick`→`sdl_vblank_present` callback
+  > fired *from within* the guest stack, so host depth CAN accumulate across frames.
+  > This premise was load-bearing for the whole "frame-50k trigger" framing; see §17.
 - The trip cycle advances `psx_advance_cycles(1)` + `psx_check_interrupts` **per
   lap**, so 23k laps ≈ **23k guest cycles ≪ ~565k cycles/frame** → **no VBlank
   can fire before overflow** (~40µs guest time). So it is NOT "stuck waiting for a
@@ -585,3 +589,309 @@ emu_trace_addr, emu_step): the guest frame/timer counters, the state object
 `*(0x1F8001D4)+0x4A`, the dirty-bitmap growth, IRQ `I_STAT`/`I_MASK`, root-counter
 state. Whatever first differs from real HW is the lead. The host-stack fix is a dead
 end for *fixing* it (kept only as a robustness/observability aid).
+
+---
+
+## 17. REFRAME — gradual host-stack accumulation, not a "frame-50k trigger" (session 3, 2026-06-17, ChatGPT-assisted via user)
+
+**The §15 premise is architecturally false, and it was load-bearing.** §15 asserts
+the 23k laps happen *within one frame* "because the host call stack resets to the
+SDL frame loop every frame (the per-frame dispatch returns, then present, then next
+frame)." **There is no per-frame return to a shallow main loop.** Verified in the
+runtime:
+
+- The guest runs continuously on a **1 MB guest fiber** (`traps.c` —
+  `psx_fiber_create(1024*1024, …)`; the BIOS runs each TCB thread on its own fiber).
+- `s_frame_count++` / present happen inside `sdl_vblank_present()`, which is a
+  **callback** fired by `gpu_vblank_tick()` ← `psx_check_interrupts()`
+  (`gpu.c:743`, `interrupts.c:288`) — i.e. *from within* the guest's call stack as a
+  side effect of cycle advancement, NOT by unwinding the guest stack back to a loop.
+- `psx_check_interrupts` appears **×23,084 inside the recursion histogram itself**
+  (§1a / the 205330 capture) — vblanks fire *throughout* the accumulation, not after.
+
+So the frame counter advances 1/frame **while the host fiber stack grows monotonically
+and never unwinds.** That is exactly the condition for a **gradual cross-frame leak**:
+
+> **Model A (predicted).** Every game-logic tick (30 Hz), the per-frame message/render
+> overlay walk crosses the interp↔compiled boundary, and (per §7) the boundary **nests
+> one host call chain that never unwinds**. ~1 leaked chain/tick accumulates on the
+> fiber; after ~23k ticks the 1 MB fiber is exhausted and the native-stack guard trips.
+> **Frame ~50k is a CAPACITY limit, not a trigger.** Real HW never does this because it
+> doesn't mirror the guest call graph onto a host stack.
+
+**Why Model A fits the evidence better than Model W ("a state flips at ~50k"):**
+
+| Evidence | Model A (gradual leak) | Model W (50k trigger) |
+|---|---|---|
+| frame counter advances 1/frame to the very end | ✅ vblank is a mid-stack callback | ⚠️ needs the whole 23k spiral inside one inter-vblank gap |
+| `psx_check_interrupts` ×23,084 *in* the cycle | ✅ vblanks fire all through accumulation | ⚠️ then frames would advance — contradicts "one frame" |
+| `recursion_func` **varies** run-to-run (0x8004DEE0 / 0x8004DFA0 / 0x8005FF60 / 0x8001A954) | ✅ steady leak, arbitrary leaf at trip | ❌ a fixed self-recursive fn would be constant |
+| wall clock 23,074 × 30 Hz ≈ 12.8 min + boot ≈ 14 min | ✅ exact | — |
+| `50,241 − 2×23,074 = 4,093` (≈ leak starts at gameplay) | ✅ ~2 display-fields / leaked chain = 1/tick @ 30 Hz | — |
+
+The `native_stack` block in the reports is a **snapshot at the trip** — both models
+yield "23,074 copies on the stack at capture," so it never discriminated them. The
+missing measurement was always **host-stack depth as a function of frame.**
+
+**The decisive instrument (built this session, RUNTIME-only — rebuild, no regen):**
+an always-on per-vblank sample of `(frame, host_stack_used = TEB StackBase − rsp)` on
+the guest fiber, decimated 1-per-128-frames into a 512-entry ring. Read **live** via
+the `stack_profile` TCP command (while the game is still responsive — no need to reach
+the overflow) and dumped in the crash report (before the early-flush, so it survives a
+native_stack-walk fault). Files: `main.cpp` (ring + sampler + `stack_profile_json`,
+sampled in `sdl_vblank_present`), `debug_server.c` (`handle_stack_profile`),
+`crash_trace.c` (report block). Also added `PSX_FIBER_STACK_KB` (`traps.c`) for the
+orthogonal **stack-size sweep**: if the overflow frame scales ~linearly with stack
+size (0.5×→~27k, 2×→~96k), accumulation is confirmed by a second independent method.
+
+- **Verdict reading:** `used` climbs ~linearly with frame from ~gameplay-start →
+  **Model A**; the slope = leak rate, the x-intercept = leak-start frame. `used` stays
+  flat then cliffs at one frame → **Model W**.
+- **Boot baseline (validated live):** frames 128–2576 sit flat at 1–6 KB (no gameplay
+  loop yet → no leak), confirming the instrument reads the right quantity.
+
+**If Model A holds, the fix is §11 (single mixed-dispatch owner / resumable boundary)**
+— but framed correctly: *stop leaking one host chain per frame at the interp↔compiled
+boundary*, NOT "find what flips at 50k." The §14 "NEXT = oracle idle-diff to find the
+first divergence at ~50k" plan is then **misdirected** — there is no 50k divergence to
+find; the divergence is at every boundary crossing from gameplay start. (Oracle still
+useful later to confirm real HW takes the same guest edges — Hypothesis C — but it is
+not the path to the root.)
+
+**VERDICT (2026-06-17, decisive — Model W, NOT Model A).** Turbo'd idle soak, port
+4393, `PSX_MIXED_OWNER=0`. The `stack_profile` curve is **DEAD FLAT**: `used` = 5 KB,
+`max_kb` = 7 KB, for **every sample from boot through frame 48,504** (continuous
+decimated samples 128,256,…,47488,47616,…,48384 and the per-frame `now`=48504, ALL at
+5 KB). Then the frame counter **froze at 48,504** and the native-stack guard tripped
+with a **deep recursion present** (`native_stack` ~23,073 laps; `recursion_func`
+0x8004DFA0). CPU went to 0 (parked, halt-and-serve).
+
+- **Model A (gradual host-stack leak from ~frame 4093) is REFUTED.** The host stack
+  did not grow *at all* over 48,503 frames — zero accumulation. The
+  `50241−2×23074=4093` arithmetic was a coincidence.
+- **Model W (within-one-frame runaway re-entry) is CONFIRMED.** The per-frame loop
+  terminates normally to a ~5 KB depth every frame, until **one** frame (48,504) where
+  it re-enters itself ~23,073 deep and overflows the 1 MB fiber *within that single
+  frame* — which is why no vblank fires during the spiral (frame counter frozen) and
+  the per-vblank sampler can't see the climb (the crash report's `native_stack` walker
+  does; the two instruments are complementary, not contradictory). §15's *conclusion*
+  ("within one frame") was right; its *premise* (return-based loop) was wrong — the
+  loop stays shallow because it genuinely TERMINATES each normal frame, not because of
+  a per-frame return to a main loop.
+- **Trigger is event/state-driven, not a fixed frame counter:** trip frame varies run
+  to run (48,504 / 49,599 / 50,241 / 63,826).
+- **Selectors at the freeze are the NORMAL idle steady-state** (read live from the
+  parked process): `*(0x1F8001D4)`=0x801FD800, `state[0x4a/4c/4e]`=1/1/1,
+  `word@0x8009BCC8`(scene)=0, `byte@0x8009BCDD`(jumptable)=0. So the runaway is **NOT a
+  flipped top-level selector** (Hypothesis B weakened, as §9 predicted) — it is the
+  canonical §8 cycle `func_8001A954→AC00→B2B4→B5A8→func_80046264→(interp overlay
+  crossing)→…→func_8001A954` failing to terminate on one frame.
+
+**Corrected next step (re-points to §9 Hypothesis C / oracle, NOT a leak hunt):** the
+loop re-enters via interpreted overlay blocks (`dirty_block_tail`: dirty_ram_dispatch
+to 0x800E9120 / 0x8012608C / 0x80124318 / 0x801168F4 … called from main-EXE ra
+0x8002–0x8005). The question is whether that re-entry is a **real guest tail-transfer**
+(then real HW must escape it via an event we don't deliver — Hyp A/B) or an **interp
+control-transfer artifact** (Hyp C — interp mishandles a JAL/JALR/delay-slot/RA in an
+overlay crossing and fabricates the re-entry). Decide with (1) an **onset-capture**
+instrument that trips EARLY (≈a few thousand laps, before overflow) and dumps the
+dirty_ram_dispatch sequence at the *first* bad lap — capturing what STARTS the runaway,
+not the 23k-deep steady state that overwrites the ring; and (2) a **narrow oracle
+check** (psxref @4380): does real HW execute the same overlay crossing without the
+unbounded re-entry? The §11 boundary-resumability fix remains SYMPTOM-only (bounds the
+stack; guest still wedges → "(Not Responding)", per §14) — the root is whatever makes
+the loop stop terminating on the trigger frame.
+
+The `PSX_FIBER_STACK_KB` sweep is now redundant confirmation only: under Model W a
+bigger stack just lets the single-frame spiral go deeper before tripping at the SAME
+trigger frame (it would NOT push the freeze to ~96k as a leak would).
+
+---
+
+## 18. REFRAME #2 — it is DIRECT compiled recursion, NOT the interp↔compiled boundary (session 3 cont., 2026-06-17)
+
+Built an always-on boundary control-flow flight recorder (`dirty_ram_interp.c`:
+`xprobe_event` at every interp→compiled crossing — JAL/JALR at 888/1042, the
+block-loop tail-transfer at 1514, and the dd-site at 1352; per-frame summary ring +
+per-crossing detail ring; runtime-armable trip via `xprobe_arm`; `xprobe` TCP cmd;
+dumped in the crash report). Reproduced the freeze **3 more times** (frames 44145,
+~48504-class, 87176) — deterministic, `recursion_func` 0x8004DEE0/0x8004DFA0.
+
+**The decisive negative result.** Through the overflow, the boundary recorder stayed
+**FLAT**: per-frame crossings ~1846 (normal) on the frozen frame, `mixed_depth` ≤ 7,
+the detail ring's last activity a tight d=1 overlay loop with flat guest `sp`. My
+trip never fired (the native-stack guard did). Yet the native_stack shows the §8
+chain `func_8001A954→AC00→B2B4→B5A8→func_80046264` **×23,073** plus the render
+cluster. Reconciliation:
+
+> **The recursion is the §8 per-frame chain re-entering ITSELF via the recompiler's
+> in-range `jal`→`func_X(cpu)` DIRECT C calls — exactly what the native-stack-guard
+> comment describes ("an in-range guest jal emits a DIRECT func_X(cpu) call … grows
+> the native stack WITHOUT going through psx_dispatch_impl"). The `interp_enter_compiled`
+> / `dirty_ram_dispatch` frames in the native_stack are per-lap hops that RETURN
+> (g_mixed_depth balanced ≤7) and/or stale stack values the walker collected — NOT
+> the accumulating mechanism. §7's "boundary nesting" was the WRONG layer.**
+
+Proof it's direct compiled recursion: (1) `mixed_depth` (inc/dec around the only two
+interp→compiled nesting calls) never grows; (2) guest `sp` flat (0x801FE338) ⇒ the
+guest uses TAIL-transfers, not calls; (3) the native-stack guard (a compiled-entry
+chokepoint, `debug_server_log_call_entry`) is what trips; (4) `recent_fn` (compiled
+func-entry ring) shows the recursing cycle, the boundary recorder does not.
+
+**The recursing functions (recent_fn cycle, leaf→):**
+`0x8004DEE0 → 0x8004DFA0 → 0x8005FA60 → 0x8005FF60 → 0x80060194 → 0x8005DFD8
+ → [0x8005E1A4 → 0x8005E08C] → …`  `recursion_func` 0x8004DEE0.
+- `0x8004DEE0` is a **jump-table case inside `FUN_8004dd14`** (a per-frame RENDER
+  LOOP: count at scratchpad `0x1F800240`/`0x1F80025A`, object list at `0x1F800270`/
+  `0x1F80022C`, dispatch each object by type byte `lbu 0xA(obj)` through table
+  `0x80013F00`/`0x80013F18`; case → `jal 0x8004DFA0` = the GPU/GTE render routine).
+  `func_8004DEE0` recompiled = `{ jal 0x8004DFA0; j 0x8004DF68 (loop tail) }`.
+- `FUN_8004dd14`'s own loop is a backward `j` (flat). So the recursion is NOT its
+  iteration — it is `func_80046264`'s subtree transferring back up to `func_8001A954`
+  unboundedly (the §8 chain re-entering), with the render cluster as the leaf where
+  the guard happens to trip.
+
+**The 5 answers (capture frame 87176):**
+1. first mixed-depth>0 = frame 565 (boot) — but mixed-depth is the wrong layer; it
+   never grows. The recursion is compiled direct calls.
+2. accumulate vs explode → **EXPLODE within one frame** (per-frame crossings flat
+   ~1846 every frame incl. the trip frame; 23k laps inside the single frozen frame).
+3. cycles/events during → cycles DO advance (`psx_advance_cycles`/lap → 139,703 in
+   the frozen frame ≈ ¼ frame) but **no VBlank** (frame frozen) and `psx_check_interrupts`
+   not per-lap → no scheduler progress. A control-flow cycle, NOT scheduler-wait.
+4. first anomalous transfer → boundary recorder can't see it (wrong layer); the
+   compiled cycle is `0x8004DEE0/DFA0 ↔ 0x8005DFD8/E08C/E1A4/FA60/FF60/60194`.
+5. **Diagnosis: a real guest control-flow cycle in the per-frame render path,
+   compiled into direct host recursion (guest tail-transfer emitted as a host call;
+   guest sp flat, host stack grows).** NOT a gradual boundary leak, NOT scheduler
+   starvation, NOT interp fabrication at the boundary.
+
+**Next (no soak needed):** Ghidra `func_80046264` + `func_8001A954` to find the edge
+that re-enters `func_8001A954` from `func_80046264`'s subtree, and decide: (a) the
+recompiler emits an in-range TAIL-transfer (`j`/`jr`) as a direct `func_X(cpu)` call
+(→ recompiler emission fix: tail-transfers must set `cpu->pc` + return to the
+trampoline, not nest), vs (b) a genuine guest non-termination (the loop's exit
+condition diverges from real HW → narrow oracle check). The right onset instrument
+is now at the COMPILED-entry chokepoint (`debug_server_log_call_entry`: per-frame
+compiled-entry count + func-entry sequence + early trip), NOT the interp boundary.
+The boundary recorder (§18) stays as a proven-negative (rules out the boundary).
+
+---
+
+## 20. FINAL DIAGNOSIS — gradual per-frame host-stack leak (Model A), CONFIRMED (session 3 end, 2026-06-17)
+
+Built the §19 compiled-entry depth profile (`debug_server.c` `ce_sample` in
+`psx_native_stack_guard` — sampled at EVERY compiled function entry, the deepest hot
+path; per-frame MAX host-stack-used + entry count + deepest func; raw TEB at the trip;
+`ce_profile` TCP cmd + crash-report block). It samples the GUEST (main-thread) stack
+with NO per-frame reset. It settled everything:
+
+**Captured freeze (frame 44732), TEB SANE (not garbage):**
+`base=0x9528000000 dealloc=0x9524000000 sp=0x9524FFFFD0` → 64 MB stack reserve, **48 MB
+used at trip**, 16 MB headroom, base>sp>dealloc. The guest runs on the **64 MB
+main-thread stack** (NOT a 1 MB fiber); the guard correctly trips at ¼ headroom = 48 MB.
+
+**The trajectory is dead-linear: +1.17 KB/frame from gameplay start** (frame 4453 ≈
+1948 KB → frame 44732 ≈ 49152 KB), with **`entries/frame` CONSTANT (~1347)** and the
+deepest frame always the render cluster (`0x8004DEE0`/`DFA0`/`0x8005FA60`/`FF60`).
+Constant entries + climbing depth ⇒ a **fixed per-frame LEAK** (~one ~13-frame call
+chain, ~1.17 KB), not a growing recursion.
+
+> **ROOT: ~1.17 KB of host stack (≈ one §8 per-frame chain, entered through the
+> interp→compiled boundary) LEAKS every frame and never unwinds. It accumulates on the
+> 64 MB main-thread stack until 48 MB → native-stack guard → freeze (~40k frames ≈
+> 14 min). The native_stack's "§8 chain ×23,073" is ~41,000 LEAKED chains (one/frame;
+> the walker capped at 300k slots), NOT a within-one-frame spiral.**
+
+This is **ChatGPT's Model A, fully confirmed**, and **§7 was right about the leak site**
+(the interp↔compiled boundary). The two mid-session reversals were INSTRUMENT
+ARTIFACTS, both now understood:
+- **§15/§17 "flat → Model W"** was wrong: `stack_profile` sampled `sdl_vblank_present`,
+  which runs on the **scheduler fiber** (flat ~5 KB), not the guest stack.
+- **§18 "boundary ruled out"** was wrong: `xprobe` **reset `mixed_depth` per frame**,
+  masking the cross-FRAME accumulation (the leak is 1 chain/frame — a per-frame reset
+  zeroes exactly the accumulating quantity). The boundary IS the leak; it leaks 1
+  chain/frame, not within-one-frame.
+
+Lesson (matches the global ring-buffer rule): sample the RIGHT context, at ABSOLUTE
+scale, with NO reset that can hide accumulation. §19 (guest stack, absolute, no reset)
+is the trustworthy instrument; §17 (wrong fiber) and §18 (per-frame reset) misled.
+
+**The 5 answers, corrected:** (1) the leak starts at gameplay (~frame 4453), depth>0
+immediately; (2) **ACCUMULATE across frames** (linear +1.17 KB/frame), NOT explode;
+(3) cycles/events/scheduler all advance normally every frame (frame counter advances —
+a slow resource leak, not a control-flow stall); (4) the leaked unit is the §8 chain
+`func_8001A954→AC00→B2B4→B5A8→func_80046264` entered via
+`interp_enter_compiled`→`psx_dispatch_game_compiled` once/frame and left un-unwound;
+(5) **diagnosis: gradual interp↔compiled boundary host-stack leak (~1 chain/frame).**
+
+**FIX (the real one, not the watermark):** the §11 single mixed-dispatch-owner /
+resumable-boundary design — when the per-frame compiled chain entered from the
+interpreter "returns" by tail-transfer (cpu->pc set / pc==0), the
+`interp_enter_compiled`/`psx_dispatch_game_compiled`/`dirty_ram_dispatch` frames MUST
+unwind back to the outer `psx_dispatch_impl` trampoline instead of being left on the
+stack. The §14 watermark fix was a band-aid (bounds the stack, doesn't stop the leak →
+game still wedges). The proper fix makes every interp→compiled crossing resumable so
+the host stack stays flat across frames. RUNTIME-only (dirty_ram_interp.c + cpu_state.h);
+rebuild, no regen. Validate by re-running the §19 ce_profile soak: the per-frame max_kb
+must stay FLAT instead of climbing 1.17 KB/frame.
+
+**NEXT:** pin the exact non-unwinding crossing (one per frame, entering `func_8001A954`)
+across `interp_enter_compiled` / the block-loop tail-transfer (line ~1514) /
+`dirty_ram_dispatch_inner`, then implement the §11 resumable-owner fix and re-soak under
+§19 to confirm the climb is gone.
+
+---
+
+## 21. EXACT crossing pinned + fix attempts (session 3 end, 2026-06-18)
+
+Added an env early-trip (`PSX_STACK_GUARD_KB=N` in `psx_native_stack_guard`) to capture
+the leak structure after a few thousand frames instead of the full 48 MB. Self-driven
+repro (inject `START`=0xFFF7/release=0xFFFF presses through FMV→New Game→idle;
+screenshot-validated — see [[self-drive-tomba-soak]]).
+
+**EXACT leaking crossing (early-trip capture, frame 14461, 6 MB):** the per-frame
+re-entry chain is
+```
+func_80046264 → jal 0x80063864 (the dirty "hop", func_80046264's first call)
+  → psx_dispatch_impl → dirty_ram_dispatch → exec_one (interp the 0x80063xxx overlay)
+  → jalr func_8001A954 → interp_enter_compiled → psx_dispatch_game_compiled
+  → func_8001A954 → AC00 → B2B4 → B5A8 → func_80046264 → jal 0x80063864 → …
+```
+`psx_dispatch_game_compiled` is a SINGLE-dispatch switch (`func_X(cpu); return 1`), not
+a trampoline. So the leak is: **once per frame an interpreted overlay (reached via
+`func_80046264`'s dirty hop `jal 0x80063864`) does `jalr func_8001A954`, nesting a host
+call that never unwinds** (the per-frame loop never returns). ~1 nest/frame = the
+1.17 KB/frame climb. Contributor: `func_8001A954`'s page is CD-DMA-dirty (§12), so it is
+routed through `dirty_ram_dispatch`/the interp instead of the flat static table.
+
+**Fix attempt #1 — block-loop tail-transfer surface (line ~1514): RULED OUT.** Changed
+the block-loop to SURFACE compiled tail-transfer targets to the trampoline instead of
+nesting. Correct for tail-transfers (no return obligation) and kept, but the §19 climb
+was UNCHANGED (still +1.17 KB/frame) — the leak is the **call** path (jalr/jal), not the
+tail-transfer path. (Empirically confirmed: post-fix early-trip leak unit still
+`exec_one → interp_enter_compiled ×5238`.)
+
+**The real fix is delicate (NOT a runtime 2-liner — §11 was optimistic):**
+- (A) **Surface compiled CALLS to the owner trampoline.** The interp `jalr/jal` to a
+  compiled-game target should set `gpr[31]=return_pc`, `cpu->pc=target`, and return
+  (surface) instead of nesting `psx_dispatch_game_compiled`. The owner runs the callee
+  flat and re-dispatches `return_pc` on its `jr ra` (the overlay resumes at return_pc —
+  functionally identical, flat). **RISK:** doing this for *overlay-native* targets
+  (precompiled DLLs that C-return with `pc==0`) reintroduces the dwarf→overworld
+  lost-continuation bug (comment `dirty_ram_interp.c` ~903-907). So it must fire ONLY
+  for compiled-game targets — which needs a **non-nesting membership test**
+  (`psx_dispatch_game_compiled` is a `switch`; add a generated `psx_dispatch_game_has()`
+  bsearch → REGEN, or a runtime-maintained set). Validate with §19 (flat) + a full
+  playtest incl. dwarf→overworld (the regression this risks).
+- (B) **§12 CD-DMA dirty-marking precision.** If `func_8001A954`'s page weren't
+  spuriously CD-DMA-dirty, it would dispatch via the flat static table and never hit the
+  interp boundary. Stop `dma.c:695` marking non-code CD-DMA words executable/dirty
+  (per-range invalidation + content hash). Bigger, but removes the boundary pressure
+  generally.
+
+**Recommendation:** implement (A) with the generated membership test, gated to
+compiled-game targets only, and validate with §19 + a dwarf→overworld playtest before
+trusting it. Do NOT ship a naive all-targets surface (regression). The §19 `ce_profile`
+(per-frame max_kb must stay FLAT) is the objective regression check; the self-driven
+repro + screenshot validation is the harness.
