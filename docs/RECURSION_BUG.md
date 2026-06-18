@@ -493,6 +493,55 @@ re-entry-edge per-frame count ring dumped on the guard trip.
 
 ---
 
+## 16. Flight-recorder runs #1/#2 — the recursion is VARIABLE; use the data-driven rings
+
+Two turbo'd soaks with the per-frame site recorders (commits `2475ee0` → `8cbea2a`,
+branch `bug/recursion`). **Turbo works and is organic-safe** (TCP `turbo enabled=1`
+→ ~2.4× block-dispatch rate; the freeze is identical, just reached faster).
+
+- **Run #1** (frame 63826, `recursion_func 0x8004DEE0`): the edge I instrumented,
+  **interp→`0x8001A954`, is ORDINARY** — exactly **1/frame, every frame, even on the
+  crash frame** (`max_per_frame=1`). The cycle counter advances normally per frame.
+  So the 23k-deep recursion is NOT that edge.
+- **Run #2** (frame 49599, `recursion_func 0x8005FF60`): `dispatch_8001A954` =
+  **`max_per_frame=0`, `last_frame=0xFFFFFFFF`** → `dirty_ram_dispatch` was **NEVER
+  called with `0x8001A954`**. So `func_8001A954` isn't re-dispatched via
+  `dirty_ram_dispatch` either. And **`recursion_func` VARIES** (0x8004DEE0 /
+  0x8004DFA0 / 0x8005FF60). => **address-specific counters are the WRONG instrument**;
+  the recursing functions change run to run.
+
+**The data-driven cycle (from `dirty_block_tail`, run #2, frame 49599) is the real
+picture:** `dirty_ram_dispatch` targets are **overlay blocks `0x8011xxxx`–`0x8013xxxx`
+(+`0x800E9xxx`)**, called (the `ra` field) from **main-EXE `0x8002xxxx`–`0x8005xxxx`**
+(the `0x8005FF60` cluster). Repeating targets (`0x8012608C`×4, `0x800E9120`×4). So the
+runaway is the **per-frame MESSAGE/RENDER overlay system** (main-EXE message handlers
+`0x8004–0x8005` ↔ interpreted overlays `0x8011–0x8013`), and *which* functions recurse
+depends on which message/state is rendering when it trips. The `func_8001A954` chain
+from the minidump (§1) was just one instance of this family.
+
+**BUG fixed:** the 3 site recorders (256 entries × 3) overflowed `crash_trace.c`'s 8KB
+`re954[]` sub-buffer → truncated the whole report JSON. `SITE_CAP` 256→32 (committed)
+so reports parse. **But the recorders are at the wrong sites anyway.**
+
+**PIVOT for next session — stop guessing addresses:**
+1. Re-soak with the fixed buffer (turbo'd) and read the **existing data-driven rings
+   from a clean report**: `native_stack` (the host cycle), `dirty_block_tail` (the
+   `dirty_ram_dispatch` `target`+`ra` cycle — the `ra` names the re-dispatch caller),
+   `dispatch_tail`. These show the ACTUAL cycle without guessing.
+2. From the `ra` callers (main-EXE `0x8002–0x8005`), Ghidra those functions to find
+   the per-frame loop and its **termination condition**.
+3. Add the **last-writer map** (hook `psx_write_word/byte/half` in memory.c — generated
+   code writes via `cpu->write_word`→these; writer-PC via... NOTE `g_debug_last_store_pc`
+   is NOT set per-store in generated code, count was 0 — need another writer-PC source,
+   e.g. a global cpu via `debug_cpu_ptr` (memory.c:252) + its pc) on the controlling
+   value → the causal slice "loop didn't terminate because reg==V from addr Y written
+   by PC Z." `psx_read_word/half/byte` (memory.c 586/671/727) are free funcs usable in
+   the write hook to read state.
+4. Determinism check worth doing: does the freeze frame VARY run-to-run (63826 vs 49599)
+   or is it input/navigation-dependent? Both runs idled on a dialogue; frames differ.
+
+---
+
 ## 14. Fix attempt + CORRECTED understanding (session 2, 2026-06-17 PM)
 
 Implemented + live-tested the single-mixed-dispatch-owner fix (§11) at the interp↔
