@@ -895,3 +895,39 @@ compiled-game targets only, and validate with §19 + a dwarf→overworld playtes
 trusting it. Do NOT ship a naive all-targets surface (regression). The §19 `ce_profile`
 (per-frame max_kb must stay FLAT) is the objective regression check; the self-driven
 repro + screenshot validation is the harness.
+
+---
+
+## 22. Fix (A) IMPLEMENTED + VALIDATED INSUFFICIENT — it's a guest CALL-CYCLE (session 3 end, 2026-06-18)
+
+Pinned the exact crossing from the xprobe detail: the leaking entry to `func_8001A954`
+is a single **`JAL`, src `0x8001A630`** (the main loop's call site — `func_8001A954`'s
+only caller) — once per frame. Implemented (A): surface interp `JAL`/`JALR` to a
+game-text target (`psx_game_address_in_text` gate, so overlay-native keeps the nesting
+contract → no dwarf→overworld risk) to the owner trampoline instead of nesting
+`psx_dispatch_game_compiled`.
+
+**Result (§19, self-driven idle soak): STILL CLIMBS (~0.875 KB/frame, down from 1.17).**
+So (A) reduced but did NOT eliminate the leak. **REVERTED** (uncommitted, partial, risky
+semantics change). The mechanism is a guest **CALL-CYCLE**: `main_loop(0x8001A51C) →
+jal func_8001A954 → … → jal back to main_loop → …`. Surfacing the *interp* side just
+relocates the nest to the *compiled* side (the chain's `jal 0x8001A51C` is emitted as a
+nesting `psx_dispatch_call`). You cannot fix a call-cycle by surfacing ONE crossing —
+the host stack mirrors the guest call graph and the cycle nests at whatever edge isn't
+surfaced. Whack-a-mole.
+
+**Crucial nuance:** the leak is ~1 host frame PER FRAME (565k cycles between leaks), NOT
+per cycle-iteration — so the per-frame loop MOSTLY returns (flat); exactly ONE call per
+frame fails to unwind. Real HW idles forever (flat), so on real HW that loop is balanced
+(returns each frame). So either (C) our recomp mishandles ONE specific return per frame
+(fixable, contained), or it is the fundamental host-stack-mirrors-guest-calls limitation
+that only the §11 continuation-passing redesign (compiled funcs return to a single owner
+instead of calling each other) resolves.
+
+**DECISIVE NEXT STEP — the oracle (not more surfacing).** Compare the per-frame return
+structure of `main_loop`/`func_8001A954` against psxref @4380: does real HW RETURN from
+`func_8001A954` to `0x8001A634` each frame (→ we mishandle a specific return = Hyp C,
+contained interp/dispatch fix), or does it genuinely never return (→ §11 redesign)? Both
+prior surface attempts (block-loop §20, JAL/JALR §22) are proven dead ends; stop
+surfacing single crossings. The §19 `ce_profile` flat-vs-climb remains the objective
+check; the self-driven screenshot-validated soak remains the harness.
