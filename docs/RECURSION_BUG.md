@@ -431,3 +431,49 @@ from a **parked instance** (`python tools/debug_client.py --port 4393 read 0x800
 length in DECIMAL) after re-soaking to a freeze, or from a captured overlay dump.
 Earlier parked read of `0x800638C4` showed a clean GTE-loader leaf
 (`lw t0..t2; mtc2 ×3; jr ra`), so at least part of `0x80063xxx` is well-formed code.
+
+---
+
+## 14. Fix attempt + CORRECTED understanding (session 2, 2026-06-17 PM)
+
+Implemented + live-tested the single-mixed-dispatch-owner fix (§11) at the interp↔
+compiled boundary (commits `f488dc5` → `e59043b`, branch `bug/recursion`). Two
+iterations: a nesting-counter trigger that **LEAKED** across the fiber exception
+longjmp (`psx_exception_longjmp` never returns → the post-call decrement is skipped
+→ the counter crept up → false-tripped on a benign call → froze a render) was
+replaced by a host-stack-**USAGE** watermark (`PSX_MIXED_STACK_KB`, default 700; can't
+leak). Gated by `PSX_MIXED_OWNER` (default on).
+
+**RESULT — the fix is a SYMPTOM-fix and does NOT make the game playable.** Live 2×2
+soak (A/B fix-on, C/D fix-off, `overlay_cache` OFF): **ALL FOUR froze at ~14 min
+(~frame 50k), fix on or off.** C/D overflowed (recursion crash, harvest report); A/B
+hung "(Not Responding)" (the watermark surfaced into the still-wedged guest state and
+the main thread spun). The fix bounds the host stack (no overflow crash) but the guest
+still wedges → hang — arguably *worse* for debugging than the crash-with-report.
+Keep it gated; default it OFF in a future pass.
+
+**CORRECTION — strike a wrong mid-session assessment.** The freeze is **NOT
+dialogue-triggered.** It is the **~14-minute IDLE freeze**, time/frame-based
+(~frame 50k), **location-independent** (New Game area, Dwarf Forest, or idling on a
+dialogue — all identical; same conclusion we reached for Dwarf Forest earlier). The
+screenshots of a frozen dialogue were just *where the game sat idle*. The
+`e59043b` commit message claiming it "fires at the first dialogue" is **WRONG**:
+`overlay_cache` OFF does not move the trigger earlier — the ~14-min timing is the SAME
+with cache on or off, so the trigger is NOT interp-coverage; it is a time/frame-
+correlated divergence. (USER correction, authoritative.)
+
+**Root, restated:** at ~frame 50k of idle, our sim diverges from real hardware — which
+idles indefinitely, **USER-CONFIRMED** — and tips the per-frame loop
+(`func_8001A954` → `func_80046264`) into the boundary recursion. The recursion is the
+SYMPTOM; the time-based divergence is the ROOT. Every soak so far was **us-vs-us**; we
+have never diffed against real hardware over the idle window.
+
+**NEXT = the oracle.** psxref (`F:\Projects\psxref`, Beetle PSX, TCP **4380**, shares
+`card1.mcd`; see [[psxref_oracle]] / `memory/psxref_oracle.md`). Run BOTH our recomp
+and psxref idle (**turbo** if possible, to reach ~frame 50k in well under 14 min wall
+clock) and find the **FIRST** state / control-flow divergence around frame ~50k — that
+divergence is the bug. Candidate signals to diff (find_first_divergence, emu_read_ram,
+emu_trace_addr, emu_step): the guest frame/timer counters, the state object
+`*(0x1F8001D4)+0x4A`, the dirty-bitmap growth, IRQ `I_STAT`/`I_MASK`, root-counter
+state. Whatever first differs from real HW is the lead. The host-stack fix is a dead
+end for *fixing* it (kept only as a robustness/observability aid).
