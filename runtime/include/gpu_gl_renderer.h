@@ -19,6 +19,10 @@ extern "C" {
  * Returns 1 on success, 0 to fall back to the SDL_Renderer present path. */
 int  gl_renderer_init_context(struct SDL_Window *win);
 
+/* Set the GL swap interval / vsync mode (1=vsync, 0=immediate, -1=adaptive).
+ * Safe before or after context creation; applies live when a context exists. */
+void gl_renderer_set_swap_interval(int interval);
+
 /* Present an ARGB8888 image (BGRA byte order) as a letterboxed quad + swap.
  * Used for 24-bit (FMV) frames and the PSX_GL_FORCE_CPU_PRESENT diagnostic.
  * force_4_3 = pillarbox at native 4:3 even on a wide display aspect (FMVs

@@ -19,7 +19,9 @@
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
 #include "gpu_gl_renderer.h"
+#include "gpu_vk_renderer.h"
 #include "frame_pacing.h"
+#include "latency_ring.h"
 #include "sio.h"
 #include "spu.h"
 #include "spu_shadow.h"
@@ -130,6 +132,16 @@ static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitr
 static int           g_video_win_w    = 1280; /* window width (height follows aspect) */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
 static int           g_auto_skip_fmv  = 0;   /* fast-forward FMVs invisibly to EOF */
+/* Low-latency present options (see [video] in config_loader). Measured on a
+ * 60Hz box the dominant input->photon cost is NOT vsync at the swap (that
+ * blocks ~tens of us) but that input is sampled ~one pacer-wait (~13.6ms)
+ * before the frame the CPU then renders from it. g_low_latency_input re-samples
+ * the pad AFTER the wall-clock pacer (just before present) so the next CPU frame
+ * reads near-fresh input. g_video_vsync controls the GL swap interval
+ * (1=vsync/tear-free, 0=immediate/lowest display latency+tearing, -1=adaptive);
+ * it trims the display-side scanout latency the CPU-side ring can't see. */
+static int           g_low_latency_input = 1;
+static int           g_video_vsync        = 1;
 
 /* FMV auto-skip detection hooks (cdrom.c / mdec.c). */
 extern "C" int      cdrom_xa_stream_active(void);
@@ -187,6 +199,7 @@ extern "C" void psx_ws_set_native_wide(int on) {
 extern "C" int psx_ws_get_native_wide(void) { return g_ws_native_wide; }
 
 static bool          g_gl_active = false;    /* GL context live -> GL present path */
+static bool          g_vk_active = false;    /* Vulkan context live -> VK present path */
 /* Present straight from the FBO (fast, no readback). Set PSX_GL_FORCE_CPU_PRESENT=1
  * to force the software readout path instead — a diagnostic/fallback that also
  * keeps CPU VRAM current every frame (so screenshots reflect the screen). */
@@ -1164,6 +1177,44 @@ static bool hybrid_dpad_active(const PlayerInput& p, bool kb_always) {
     return false;
 }
 
+/* Sample each player's live device state into the matching SIO pad slot.
+ * override >= 0 forces port-1 buttons (debug-server input injection). Called
+ * once at cycle start (covers the turbo/FMV-skip paths that present nothing)
+ * and, when g_low_latency_input is set, AGAIN after the pacer wait so the next
+ * CPU frame reads near-fresh input instead of input ~one frame stale.
+ *
+ * HYBRID mode auto-switches DualShock<->digital from the most-recent input
+ * (stick -> analog, D-pad -> digital) so the game runs its own analog or
+ * digital input path exactly as on hardware (mirrors the inline block this
+ * helper was extracted from for the low-latency re-sample). */
+static void sample_pad_into_sio(int override) {
+    if (override >= 0) {
+        sio_set_pad_state_slot(0, (uint16_t)override);
+        return;
+    }
+    for (int s = 0; s < 2; s++) {
+        PlayerInput& p = g_players[s];
+        if (p.kind == 0) continue;  /* no device in this port */
+        sio_set_pad_state_slot(s, pad_buttons_for(p));
+
+        /* Resolve the pad type this frame from the player's mode. */
+        int eff_analog;
+        uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
+        if (p.mode == PSXRecompV4::PAD_MODE_DIGITAL) {
+            eff_analog = 0;
+        } else if (p.mode == PSXRecompV4::PAD_MODE_ANALOG) {
+            eff_analog = 1;
+            pad_sticks_for(p, st, /*fold_dpad=*/true);
+        } else { /* HYBRID */
+            if (hybrid_stick_active(p))            p.hybrid_analog = true;
+            else if (hybrid_dpad_active(p, false)) p.hybrid_analog = false;
+            eff_analog = p.hybrid_analog ? 1 : 0;
+            if (eff_analog) pad_sticks_for(p, st, /*fold_dpad=*/false);
+        }
+        sio_set_pad_analog(s, eff_analog, st[0], st[1], st[2], st[3]);
+    }
+}
+
 /* PSX native vblank cadence: NTSC ≈ 59.94 Hz. Wall-clock target keeps
  * audio sample generation (735 samples/vblank * 60 = 44100/sec) matched
  * to the SDL audio device drain rate, eliminating queue overflow drops
@@ -1306,35 +1357,15 @@ static void sdl_vblank_present(void) {
     }
 
     /* Sample each player's device and feed the matching SIO pad slot.
-     * Debug server input override (when active) drives port 1 only. */
-    if (override >= 0) {
-        sio_set_pad_state_slot(0, (uint16_t)override);
-    } else {
-        for (int s = 0; s < 2; s++) {
-            PlayerInput& p = g_players[s];
-            if (p.kind == 0) continue;  /* no device in this port */
-            sio_set_pad_state_slot(s, pad_buttons_for(p));
+     * Debug server input override (when active) drives port 1 only. With
+     * g_low_latency_input this early sample is re-done after the pacer wait
+     * (below) for the interactive present path; it still covers the turbo /
+     * FMV-skip paths that early-return before pacing. */
+    sample_pad_into_sio(override);
 
-            /* Resolve the pad type this frame from the player's mode. HYBRID
-             * auto-switches DualShock<->digital from the most-recent input
-             * (stick -> analog, D-pad -> digital) so the game runs its own analog
-             * or digital input path exactly as on hardware. */
-            int eff_analog;
-            uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
-            if (p.mode == PSXRecompV4::PAD_MODE_DIGITAL) {
-                eff_analog = 0;
-            } else if (p.mode == PSXRecompV4::PAD_MODE_ANALOG) {
-                eff_analog = 1;
-                pad_sticks_for(p, st, /*fold_dpad=*/true);
-            } else { /* HYBRID */
-                if (hybrid_stick_active(p))            p.hybrid_analog = true;
-                else if (hybrid_dpad_active(p, false)) p.hybrid_analog = false;
-                eff_analog = p.hybrid_analog ? 1 : 0;
-                if (eff_analog) pad_sticks_for(p, st, /*fold_dpad=*/false);
-            }
-            sio_set_pad_analog(s, eff_analog, st[0], st[1], st[2], st[3]);
-        }
-    }
+    /* Latency ring: open this present cycle's slot, stamping when input was
+     * sampled into SIO.  Always-on; queried via the debug server "latency". */
+    latency_ring_frame_begin();
 
     /* Turbo-active test, shared by the audio gate here and the pacing/
      * present gate below. sdl_audio_update owns the mute + fade-in/out +
@@ -1447,6 +1478,18 @@ static void sdl_vblank_present(void) {
         static FramePacer pacer = { 0 };
         frame_pacer_wait(&pacer, PSX_FRAME_PERIOD_MS);
     }
+    latency_ring_mark(LAT_PACED);
+
+    /* Low-latency input: the early sample above is now ~one pacer-wait old.
+     * Refresh the device state and re-sample right before present so the next
+     * CPU frame reads near-fresh input (the dominant input->photon cost on a
+     * vsync-light box). Re-stamp the ring's input mark to measure from here. */
+    if (g_low_latency_input) {
+        SDL_GameControllerUpdate();  /* refresh pad state after the wait */
+        SDL_PumpEvents();            /* refresh keyboard state */
+        sample_pad_into_sio(override);
+        latency_ring_restamp_input();
+    }
 
     /* Engage widescreen at game entry: BIOS boot stays authentic 4:3. */
     if (!g_ws_engaged) {
@@ -1478,6 +1521,8 @@ static void sdl_vblank_present(void) {
                 disabled_frame_presented = true;
                 if (g_gl_active) {
                     gl_renderer_present_blank();
+                } else if (g_vk_active) {
+                    vk_renderer_present_blank();
                 } else {
                     SDL_SetRenderDrawColor(sdl_renderer, 0, 0, 0, 255);
                     SDL_RenderClear(sdl_renderer);
@@ -1534,6 +1579,25 @@ static void sdl_vblank_present(void) {
             }
         }
         if (g_gl_active) gl_renderer_sync_cpu();
+        /* Vulkan owns every frame: 15-bit frames present straight from the GPU
+         * VRAM image (deterministic blit, no readback), mirroring the GL path;
+         * 24-bit (FMV) frames go through the CPU present (Phase 3). The Vulkan
+         * window has no SDL_Renderer, so we must never fall through below. */
+        if (g_vk_active) {
+            if (di.depth24) {
+                vk_renderer_present_cpu(NULL, (int)present_w, (int)h,
+                                        g_video_aa ? 1 : 0, fmv_frame ? 1 : 0);
+            } else if (wide_present &&
+                       vk_renderer_present_wide((int)di.display_x, (int)di.display_y,
+                                                (int)h, g_video_aa ? 1 : 0)) {
+                /* presented wide */
+            } else {
+                vk_renderer_present_vram((int)di.display_x, (int)di.display_y,
+                                         (int)present_w, (int)h, g_video_aa ? 1 : 0,
+                                         fmv_frame ? 1 : 0);
+            }
+            return;
+        }
 #endif
 
         /* The hi-res mirror is a 15-bit copy of VRAM; 24-bit display (FMV)
@@ -1612,9 +1676,11 @@ static void sdl_vblank_present(void) {
      * block pathologically several times in a row, drop driver vsync
      * for the rest of the session; our own pacing keeps the rate. */
     {
+        latency_ring_mark(LAT_SWAP_BEGIN);
         const Uint64 t0 = SDL_GetPerformanceCounter();
         SDL_RenderPresent(sdl_renderer);
         const Uint64 t1 = SDL_GetPerformanceCounter();
+        latency_ring_mark(LAT_SWAP_END);
         const Uint64 freq = SDL_GetPerformanceFrequency();
         const Uint64 present_ms = (t1 >= t0 && freq) ? ((t1 - t0) * 1000u) / freq : 0;
         if (!g_present_vsync_disabled && present_ms > 250) {
@@ -1649,11 +1715,20 @@ int main(int argc, char** argv) {
      * PSX_NO_LAUNCHER env) forces it off. --launcher wins if both are given. */
     bool        force_launcher    = false;
     bool        force_no_launcher = false;
+    /* CLI overrides for running several instances side by side (soak fleet).
+     * These win over any game-config value and, crucially, work for the BIOS
+     * (which has no [game]-block config schema, so debug_port/renderer can't be
+     * supplied via --game). -1 = "not set on the CLI". */
+    int         cli_debug_port = -1;
+    int         cli_renderer   = -1;   /* 0=software 1=opengl 2=vulkan */
+    const char* cli_window_title = nullptr;  /* label windows in a fleet */
     /* Parse args.
      *   --bios <path>       override the compile-time BIOS path
      *   --game <toml>       load a game config (single source of truth for
      *                       disc / memcard / window title / debug port)
      *   --disc <path>       override the game config disc path
+     *   --debug-port <n>    override the TCP debug-server port (multi-instance)
+     *   --renderer <name>   override the renderer: software|opengl|vulkan
      *   --launcher          force the GUI launcher (overrides skip_launcher)
      *   --no-launcher       skip the GUI launcher (boot straight in)
      *   <positional>        deprecated alias for --bios
@@ -1666,6 +1741,15 @@ int main(int argc, char** argv) {
             game_config_path = argv[++i];
         } else if (std::strcmp(argv[i], "--disc") == 0 && i + 1 < argc) {
             disc_override_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--debug-port") == 0 && i + 1 < argc) {
+            cli_debug_port = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--renderer") == 0 && i + 1 < argc) {
+            const char* r = argv[++i];
+            if      (std::strcmp(r, "software") == 0) cli_renderer = 0;
+            else if (std::strcmp(r, "opengl")   == 0) cli_renderer = 1;
+            else if (std::strcmp(r, "vulkan")   == 0) cli_renderer = 2;
+        } else if (std::strcmp(argv[i], "--window-title") == 0 && i + 1 < argc) {
+            cli_window_title = argv[++i];
         } else if (std::strcmp(argv[i], "--launcher") == 0) {
             force_launcher = true;
         } else if (std::strcmp(argv[i], "--no-launcher") == 0) {
@@ -1734,6 +1818,8 @@ int main(int argc, char** argv) {
             g_video_screen     = gc.runtime.video_screen_kind;
             g_video_aspect_num = gc.runtime.video_aspect_num;
             g_video_aspect_den = gc.runtime.video_aspect_den;
+            g_low_latency_input = gc.runtime.video_low_latency_input ? 1 : 0;
+            g_video_vsync       = gc.runtime.video_vsync;
             g_ws_anchor_addr   = gc.ws_sprite_anchor_addr;
             g_ws_hud_sprt      = gc.ws_hud_sprt_squash;
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
@@ -1846,7 +1932,14 @@ int main(int argc, char** argv) {
         if (us.has_p1_mode) p1_mode = us.p1_mode;
         if (us.has_p2_mode) p2_mode = us.p2_mode;
         if (us.has_deadzone)  resolved_deadzone = us.deadzone;
+        if (us.has_low_latency_input) g_low_latency_input = us.low_latency_input ? 1 : 0;
+        if (us.has_vsync)             g_video_vsync       = us.vsync;
     }
+
+    /* Latency knobs: env overrides win over config (for A/B measurement).
+     * PSX_LOW_LATENCY_INPUT=0/1 ; PSX_VSYNC=1(vsync)/0(immediate)/-1(adaptive). */
+    if (const char *e = std::getenv("PSX_LOW_LATENCY_INPUT")) g_low_latency_input = atoi(e) ? 1 : 0;
+    if (const char *e = std::getenv("PSX_VSYNC"))             g_video_vsync       = atoi(e);
 
     /* Resolve the effective memory-card directory now (before the launcher) so
      * the launcher can introspect the real card files. The same default is used
@@ -2000,6 +2093,13 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    /* CLI overrides win over config — applied last, before backend/port init.
+     * Enables a soak fleet: several instances on distinct ports + renderers,
+     * including BIOS instances that have no [game]-block config. */
+    if (cli_debug_port >= 0) debug_port      = (uint16_t)cli_debug_port;
+    if (cli_renderer   >= 0) g_video_renderer = cli_renderer;
+    if (cli_window_title)    window_title     = cli_window_title;
+
     std::filesystem::path resolved_bios = resolve_bios_for_runtime(bios_path, argv[0]);
     if (resolved_bios.empty()) {
         std::fprintf(stderr, "psxrecomp: no BIOS selected; exiting.\n");
@@ -2024,8 +2124,10 @@ int main(int argc, char** argv) {
     /* Select the renderer backend BEFORE gpu_init() (which runs gr_init ->
      * the backend's init on the VRAM buffer). Software is the default and the
      * fallback; an unavailable OpenGL backend reverts to software. */
-    gr_set_backend(g_video_renderer == 1 ? GR_BACKEND_OPENGL : GR_BACKEND_SOFTWARE);
+    gr_set_backend(g_video_renderer == 2 ? GR_BACKEND_VULKAN :
+                   g_video_renderer == 1 ? GR_BACKEND_OPENGL : GR_BACKEND_SOFTWARE);
     std::fprintf(stdout, "psxrecomp: renderer backend requested: %s\n",
+                 g_video_renderer == 2 ? "vulkan" :
                  g_video_renderer == 1 ? "opengl" : "software");
     gpu_init();
     /* Internal-resolution supersampling (SSAA). Must follow gpu_init (which
@@ -2166,6 +2268,7 @@ int main(int argc, char** argv) {
 
     Uint32 win_flags = SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE;
     if (g_video_renderer == 1) win_flags |= SDL_WINDOW_OPENGL;
+    if (g_video_renderer == 2) win_flags |= SDL_WINDOW_VULKAN;
     /* Open at the user-chosen window size (default 1280 wide) instead of the
      * old hardcoded 640x480, so the game doesn't boot into a tiny window. The
      * height follows the configured display aspect (4:3 native, wider for the
@@ -2188,6 +2291,7 @@ int main(int argc, char** argv) {
      * facade back to software (rasterization already runs through software in
      * this phase) and fall through to the SDL_Renderer present path below. */
     if (g_video_renderer == 1) {
+        gl_renderer_set_swap_interval(g_video_vsync);   /* applied at context init */
         g_gl_active = (gl_renderer_init_context(sdl_window) != 0);
         if (!g_gl_active) gr_set_backend(GR_BACKEND_SOFTWARE);
         /* The GL backend establishes its real internal scale HERE (raster init),
@@ -2198,6 +2302,17 @@ int main(int argc, char** argv) {
          * undersized and the wide readback overflows it. */
         g_video_scale = gr_scale();
     }
+    /* Vulkan backend: create the instance/device/swapchain on the
+     * SDL_WINDOW_VULKAN window. On failure, fall back to software (vkb_init
+     * already initialized the software renderer on the shared VRAM array). */
+    if (g_video_renderer == 2) {
+        vk_renderer_set_present_mode(g_video_vsync);
+        g_vk_active = (vk_renderer_init_context(sdl_window) != 0);
+        if (!g_vk_active) gr_set_backend(GR_BACKEND_SOFTWARE);
+        g_video_scale = gr_scale();
+    }
+    latency_ring_set_backend(g_vk_active ? "vulkan" : g_gl_active ? "opengl" : "software");
+    latency_ring_set_present_mode(g_video_vsync);
     /* Title bar shows the clean game title (set at window creation); the active
      * renderer is reported via the debug server / config, not appended here. */
 
@@ -2228,12 +2343,15 @@ int main(int argc, char** argv) {
      * presentation hang; macOS/Linux have no GDI path, so let SDL choose its
      * native backend (Metal on Apple Silicon). PRESENTVSYNC removes tearing;
      * fall back progressively if a driver can't provide vsync/accel. */
-  if (!g_gl_active) {
+  if (!g_gl_active && !g_vk_active) {
 #ifdef _WIN32
     SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
 #endif
-    sdl_renderer = SDL_CreateRenderer(sdl_window, -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    /* Vsync off (g_video_vsync==0) drops PRESENTVSYNC for lowest display
+     * latency; the wall-clock pacer still holds 59.94Hz (may tear). */
+    Uint32 rflags = SDL_RENDERER_ACCELERATED |
+                    (g_video_vsync != 0 ? SDL_RENDERER_PRESENTVSYNC : 0u);
+    sdl_renderer = SDL_CreateRenderer(sdl_window, -1, rflags);
     if (!sdl_renderer)
         sdl_renderer = SDL_CreateRenderer(sdl_window, -1, SDL_RENDERER_ACCELERATED);
     if (!sdl_renderer) {
@@ -2260,7 +2378,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-  if (!g_gl_active) {
+  if (!g_gl_active && !g_vk_active) {
     sdl_texture = SDL_CreateTexture(
         sdl_renderer,
         SDL_PIXELFORMAT_ARGB8888,

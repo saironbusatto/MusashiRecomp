@@ -120,6 +120,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/gpu_sw_renderer.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_render.c
     ${PSXRECOMP_ROOT}/runtime/src/gpu_gl_renderer.c
+    ${PSXRECOMP_ROOT}/runtime/src/gpu_vk_renderer.c
     ${PSXRECOMP_ROOT}/runtime/src/dma.c
     ${PSXRECOMP_ROOT}/runtime/src/mdec.c
     ${PSXRECOMP_ROOT}/runtime/src/timers.c
@@ -147,6 +148,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/iso_reader_c.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_cycles.c
     ${PSXRECOMP_ROOT}/runtime/src/starvation_ring.c
+    ${PSXRECOMP_ROOT}/runtime/src/latency_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/card_read_summary.c
     ${PSXRECOMP_ROOT}/runtime/src/card_data_writes.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_capture.c
@@ -340,6 +342,61 @@ function(psxrecomp_add_runtime_target target)
         if(OpenGL_FOUND)
             target_link_libraries(${target} PRIVATE OpenGL::GL)
         endif()
+    endif()
+
+    # ---- Vulkan backend (gpu_vk_renderer.c) --------------------------------
+    # Vulkan is loaded ENTIRELY dynamically via SDL_Vulkan_LoadLibrary +
+    # vkGetInstanceProcAddr (mirroring how the GL backend loads modern GL through
+    # SDL), so there is NO link-time dependency on vulkan-1: the self-contained
+    # static exe is preserved and a machine without a Vulkan ICD still launches
+    # (the backend reports init failure and the runtime falls back to software).
+    # We need only the Vulkan HEADERS at compile time, plus glslc to build SPIR-V.
+    # Both ship with the Vulkan SDK ($VULKAN_SDK) or a Vulkan-Headers package.
+    set(_vk_inc "")
+    if(DEFINED ENV{VULKAN_SDK})
+        if(EXISTS "$ENV{VULKAN_SDK}/Include/vulkan/vulkan.h")
+            set(_vk_inc "$ENV{VULKAN_SDK}/Include")
+        elseif(EXISTS "$ENV{VULKAN_SDK}/include/vulkan/vulkan.h")
+            set(_vk_inc "$ENV{VULKAN_SDK}/include")
+        endif()
+    endif()
+    if(NOT _vk_inc)
+        find_path(_vk_inc vulkan/vulkan.h)
+    endif()
+    find_program(GLSLC_EXE NAMES glslc
+        HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+    if(_vk_inc AND GLSLC_EXE)
+        message(STATUS "Vulkan backend: headers ${_vk_inc}, glslc ${GLSLC_EXE}")
+        target_include_directories(${target} PRIVATE "${_vk_inc}")
+        target_compile_definitions(${target} PRIVATE PSX_HAVE_VULKAN=1)
+        # Compile every shader under runtime/shaders/ to SPIR-V (glslc) and embed
+        # them into one generated header (vk_shaders_spv.h) of uint32_t arrays, so
+        # gpu_vk_renderer.c creates shader modules with no runtime file deps.
+        find_program(PSX_PYTHON NAMES python python3)
+        set(_vk_shader_dir "${PSXRECOMP_ROOT}/runtime/shaders")
+        file(GLOB _vk_shaders
+            "${_vk_shader_dir}/*.vert" "${_vk_shader_dir}/*.frag"
+            "${_vk_shader_dir}/*.comp")
+        set(_vk_gen_dir "${CMAKE_CURRENT_BINARY_DIR}/${target}_vkgen")
+        set(_vk_spv_hdr "${_vk_gen_dir}/vk_shaders_spv.h")
+        add_custom_command(
+            OUTPUT  "${_vk_spv_hdr}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_vk_gen_dir}"
+            COMMAND "${PSX_PYTHON}"
+                    "${PSXRECOMP_ROOT}/tools/embed_spirv.py"
+                    --glslc "${GLSLC_EXE}"
+                    --out   "${_vk_spv_hdr}"
+                    ${_vk_shaders}
+            DEPENDS ${_vk_shaders}
+                    "${PSXRECOMP_ROOT}/tools/embed_spirv.py"
+            COMMENT "Compiling + embedding Vulkan SPIR-V shaders"
+            VERBATIM)
+        add_custom_target(${target}_vk_shaders DEPENDS "${_vk_spv_hdr}")
+        add_dependencies(${target} ${target}_vk_shaders)
+        target_include_directories(${target} PRIVATE "${_vk_gen_dir}")
+    else()
+        message(STATUS "Vulkan backend: SDK headers/glslc not found - "
+                       "gpu_vk_renderer.c builds as a software-fallback stub")
     endif()
 
     if(MINGW)
