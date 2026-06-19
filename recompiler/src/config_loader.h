@@ -139,12 +139,27 @@ struct RuntimeConfig {
     int                   video_screen_kind = 0;
 
     // auto_skip_fmv: when true, full-motion videos (streaming XA audio + MDEC
-    // video) are fast-forwarded invisibly to their end — the disc stream is
-    // delivered instantly, presentation + pacing are suppressed, and audio is
-    // muted for the duration, so an FMV plays out in a fraction of a second with
-    // nothing shown. The game's own player loop still runs to end-of-stream, so
-    // all side effects (scene transition, save flags) happen exactly as normal.
+    // video) are skipped the instant they're detected — presentation + pacing are
+    // suppressed and audio muted for the duration, so an FMV ends in a fraction of
+    // a second with nothing shown, landing on the next screen with side effects
+    // intact. The skip is driven the GAME's own way (see fmv_skip_* below); with
+    // no per-game config it falls back to holding the skip button.
     bool                  video_auto_skip_fmv = false;
+
+    // fmv_skip_*: per-game FMV instant-skip via the game's own end-of-movie path.
+    // Some players (Tomba) end a movie when the streamed frame number reaches that
+    // movie's per-movie frame total minus a small offset. When auto_skip_fmv is on
+    // and fmv_skip_total_table is set, the runtime writes the CURRENT movie's total
+    // (at fmv_skip_total_table + movie_id*2, a u16 table indexed by the movie-id
+    // byte at fmv_skip_movie_id) down to fmv_skip_end_total, so the player tears the
+    // movie down on its next frame — a natural end that reaches EVERY movie (incl.
+    // ones whose caller never polls the skip button). Only the active movie's entry
+    // is touched. Addresses are game-specific (RE of the player loop); leave the
+    // table 0 to fall back to button injection. Tomba: table 0x80077728,
+    // movie_id 0x1F8001CD, end_total 3 (the player's "total - 3" offset).
+    uint32_t              video_fmv_skip_total_table = 0;
+    uint32_t              video_fmv_skip_movie_id    = 0;
+    int                   video_fmv_skip_end_total   = 0;  // 0 => runtime default (3)
 
     // aspect_ratio: display aspect "W:H" (default "4:3" = native). A wider
     // aspect (e.g. "16:9") enables the widescreen hack: the GTE squashes

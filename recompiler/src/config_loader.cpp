@@ -175,6 +175,18 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("auto_skip_fmv")) {
             rt.video_auto_skip_fmv = toml::find<bool>(video, "auto_skip_fmv");
         }
+        if (video.contains("fmv_skip_total_table")) {
+            rt.video_fmv_skip_total_table =
+                (uint32_t)toml::find<int64_t>(video, "fmv_skip_total_table");
+        }
+        if (video.contains("fmv_skip_movie_id")) {
+            rt.video_fmv_skip_movie_id =
+                (uint32_t)toml::find<int64_t>(video, "fmv_skip_movie_id");
+        }
+        if (video.contains("fmv_skip_end_total")) {
+            rt.video_fmv_skip_end_total =
+                (int)toml::find<int64_t>(video, "fmv_skip_end_total");
+        }
         if (video.contains("low_latency_input")) {
             rt.video_low_latency_input = toml::find<bool>(video, "low_latency_input");
         }

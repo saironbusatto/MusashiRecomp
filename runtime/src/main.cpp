@@ -131,7 +131,17 @@ static int           g_video_renderer = 0;  /* 0=software, 1=opengl (requested) 
 static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitron */
 static int           g_video_win_w    = 1280; /* window width (height follows aspect) */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
-static int           g_auto_skip_fmv  = 0;   /* fast-forward FMVs invisibly to EOF */
+static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
+/* FMV instant-skip via the game's OWN end-of-movie path. Tomba's MDEC player
+ * (FUN_8001efe8) tears a movie down when the streamed frame number reaches that
+ * movie's per-movie total minus 3; writing the current movie's total down to
+ * g_fmv_skip_end_total makes the player end it on the next frame — a natural end
+ * that reaches EVERY movie. g_fmv_skip_total_table = base of the per-movie u16
+ * total table; g_fmv_skip_movie_id = guest addr of the current-movie-id byte.
+ * 0 table => fall back to START injection. See [video] fmv_skip_* in game.toml. */
+static uint32_t      g_fmv_skip_total_table = 0;
+static uint32_t      g_fmv_skip_movie_id    = 0;
+static int           g_fmv_skip_end_total   = 3;
 /* Low-latency present options (see [video] in config_loader). Measured on a
  * 60Hz box the dominant input->photon cost is NOT vsync at the swap (that
  * blocks ~tens of us) but that input is sampled ~one pacer-wait (~13.6ms)
@@ -1378,16 +1388,19 @@ static void sdl_vblank_present(void) {
     }
 
     /* FMV auto-skip ([video] auto_skip_fmv). A streaming FMV is XA audio + MDEC
-     * video running together. Rather than fast-forward the stream (flooding XA
-     * sectors desyncs and hangs the player; even safe uncapped playback is slow
-     * and choppy), we trigger the GAME'S OWN skip: hold START while the movie is
-     * detected, and the FMV player tears the movie down cleanly and jumps to the
-     * next screen — instant, desync-free, with all state correct (verified: a
-     * START press during Tomba's opening movie lands exactly on the next scene).
-     * Detect "MDEC produced a frame since the last vblank AND XA is streaming";
-     * a short hold rides out brief inter-frame gaps. Injection (and the present/
-     * pacing safety-net below) stop the instant XA ends, so START doesn't bleed
-     * into the next screen. */
+     * video together. Detect "MDEC produced a frame since the last vblank AND XA
+     * is streaming"; a short hold rides out brief inter-frame gaps. The present/
+     * pacing safety-net + audio mute below hide the one or two transition frames.
+     *
+     * End the movie the GAME's own way, chosen per game:
+     *  - fmv_skip_total_table set (Tomba): write the CURRENT movie's per-movie
+     *    frame-total down to fmv_skip_end_total, so the player's MDEC loop
+     *    (FUN_8001efe8: teardown when streamed frame# >= total - 3) terminates on
+     *    its next frame — a NATURAL end that reaches EVERY movie, including ones
+     *    whose caller never polls the skip button. Only the active movie's table
+     *    entry is touched (via the movie-id byte), so nothing else is disturbed.
+     *  - no table configured (generic): hold START so a movie whose handler polls
+     *    the pad aborts itself (can't reach unskippable movies). */
     int fmv_skip_active = 0;
     if (g_auto_skip_fmv) {
         static uint32_t s_last_mdec = 0;
@@ -1400,9 +1413,16 @@ static void sdl_vblank_present(void) {
         else if (s_fmv_hold > 0) s_fmv_hold--;
         fmv_skip_active = (s_fmv_hold > 0) && xa;
         if (fmv_skip_active) {
-            /* Inject START (PSX pad word is active-low; START is bit 3) into
-             * port 1 so the game's FMV player aborts the movie itself. */
-            sio_set_pad_state_slot(0, (uint16_t)~(1u << 3));
+            if (g_fmv_skip_total_table) {
+                /* End the active movie via its own frame-count teardown. */
+                uint8_t mid = psx_read_byte(g_fmv_skip_movie_id);
+                psx_write_half(g_fmv_skip_total_table + (uint32_t)mid * 2u,
+                               (uint16_t)g_fmv_skip_end_total);
+            } else {
+                /* Generic fallback: hold START (PSX pad word is active-low; START
+                 * is bit 3) so the game's FMV handler aborts the movie itself. */
+                sio_set_pad_state_slot(0, (uint16_t)~(1u << 3));
+            }
         }
     }
 
@@ -1820,6 +1840,10 @@ int main(int argc, char** argv) {
             g_video_aspect_den = gc.runtime.video_aspect_den;
             g_low_latency_input = gc.runtime.video_low_latency_input ? 1 : 0;
             g_video_vsync       = gc.runtime.video_vsync;
+            g_fmv_skip_total_table = gc.runtime.video_fmv_skip_total_table;
+            g_fmv_skip_movie_id    = gc.runtime.video_fmv_skip_movie_id;
+            if (gc.runtime.video_fmv_skip_end_total)
+                g_fmv_skip_end_total = gc.runtime.video_fmv_skip_end_total;
             g_ws_anchor_addr   = gc.ws_sprite_anchor_addr;
             g_ws_hud_sprt      = gc.ws_hud_sprt_squash;
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
