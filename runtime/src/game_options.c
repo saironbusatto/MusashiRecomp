@@ -29,16 +29,28 @@ extern uint8_t psx_read_byte(uint32_t addr);   /* memory.c */
 
 #define GO_MAX_FIELDS 32
 
+/* State-file format version. Written as `format_version=N` on save; on load a
+ * file declaring a HIGHER version than this is rejected wholesale (a format we
+ * don't understand). A missing version is treated as legacy 0 and still accepted
+ * (the field set is name-keyed + value-validated, so old files stay safe). Bump
+ * this only on an incompatible format change. */
+#define GO_FORMAT_VERSION 1
+
 static int      g_count = 0;
 static uint32_t g_addr[GO_MAX_FIELDS];
 static uint8_t  g_size[GO_MAX_FIELDS];
 static char     g_name[GO_MAX_FIELDS][32];
+static int32_t  g_vmin[GO_MAX_FIELDS];       /* inclusive valid range (restore)   */
+static int32_t  g_vmax[GO_MAX_FIELDS];
 static char     g_path[1024];
 
 static int      g_have_file = 0;             /* a saved state file was loaded     */
 static uint32_t g_loaded[GO_MAX_FIELDS];     /* values from the state file        */
+static uint8_t  g_loaded_valid[GO_MAX_FIELDS]; /* in-range AND matched a field    */
 static int      g_dbg_fopen = 0;             /* load_state_file: fopen succeeded  */
-static int      g_dbg_matched = 0;           /* load_state_file: fields matched   */
+static int      g_dbg_matched = 0;           /* load_state_file: in-range matches */
+static int      g_dbg_rejected = 0;          /* values dropped (out of range)     */
+static int      g_dbg_ver_bad = 0;           /* file rejected: version too new    */
 
 static uint32_t read_field(int i) {
     uint32_t v = 0;
@@ -47,11 +59,18 @@ static uint32_t read_field(int i) {
     return v;
 }
 
-/* Load "name=value" lines into g_loaded[] (matched by name). */
+/* Load "name=value" lines into g_loaded[] (matched by name), validating each
+ * value against its declared range and honouring a format_version line. A value
+ * outside [g_vmin,g_vmax] is DROPPED (the field keeps its default), so a corrupt
+ * or stale file can never inject an out-of-range value; a file declaring a newer
+ * format_version than we understand is rejected wholesale. */
 static void load_state_file(void) {
     g_have_file = 0;
     g_dbg_fopen = 0;
     g_dbg_matched = 0;
+    g_dbg_rejected = 0;
+    g_dbg_ver_bad = 0;
+    for (int i = 0; i < g_count; i++) g_loaded_valid[i] = 0;
     FILE *f = fopen(g_path, "r");
     if (!f) return;
     g_dbg_fopen = 1;
@@ -63,8 +82,21 @@ static void load_state_file(void) {
         if (!eq) continue;
         *eq = '\0';
         long val = strtol(eq + 1, NULL, 0);
+        /* Reserved key: a file from a newer (incompatible) format is dropped. */
+        if (strcmp(line, "format_version") == 0) {
+            if (val > GO_FORMAT_VERSION) { g_dbg_ver_bad = 1; fclose(f); return; }
+            continue;
+        }
         for (int i = 0; i < g_count; i++) {
-            if (strcmp(line, g_name[i]) == 0) { g_loaded[i] = (uint32_t)val; matched++; break; }
+            if (strcmp(line, g_name[i]) != 0) continue;
+            if ((long)val < (long)g_vmin[i] || (long)val > (long)g_vmax[i]) {
+                g_dbg_rejected++;            /* out of range -> keep the default */
+            } else {
+                g_loaded[i] = (uint32_t)val;
+                g_loaded_valid[i] = 1;
+                matched++;
+            }
+            break;
         }
     }
     fclose(f);
@@ -76,6 +108,8 @@ void game_options_configure(const char *state_path,
                             const uint32_t *addrs,
                             const uint8_t  *sizes,
                             const char *const *names,
+                            const int32_t  *vmins,
+                            const int32_t  *vmaxs,
                             int count) {
     g_count = 0;
     if (!state_path || count <= 0) return;
@@ -85,6 +119,8 @@ void game_options_configure(const char *state_path,
         g_addr[i] = addrs[i];
         g_size[i] = (sizes[i] == 2) ? 2 : 1;
         snprintf(g_name[i], sizeof(g_name[i]), "%s", names[i] ? names[i] : "f");
+        g_vmin[i] = vmins ? vmins[i] : (int32_t)0x80000000; /* INT32_MIN default */
+        g_vmax[i] = vmaxs ? vmaxs[i] : (int32_t)0x7FFFFFFF; /* INT32_MAX default */
     }
     g_count = count;
     load_state_file();
@@ -99,7 +135,8 @@ int psx_game_option_store(uint32_t addr, int val) {
     if (!g_have_file) return val;
     uint32_t a = addr & 0x1FFFFFFFu;
     for (int i = 0; i < g_count; i++)
-        if ((g_addr[i] & 0x1FFFFFFFu) == a) return (int)g_loaded[i];
+        if ((g_addr[i] & 0x1FFFFFFFu) == a)
+            return g_loaded_valid[i] ? (int)g_loaded[i] : val; /* dropped -> default */
     return val;
 }
 
@@ -116,6 +153,7 @@ void game_options_save_now(void) {
     FILE *f = fopen(g_path, "w");
     if (!f) return;
     fputs("# Persistent game options (issue #5). Written by the runtime on exit.\n", f);
+    fprintf(f, "format_version=%d\n", GO_FORMAT_VERSION);
     for (int i = 0; i < g_count; i++)
         fprintf(f, "%s=%u\n", g_name[i], (unsigned)cur[i]);
     fclose(f);
@@ -128,13 +166,16 @@ int game_options_debug_json(char *out, int cap) {
     snprintf(p, sizeof(p), "%s", g_path);
     for (char *c = p; *c; c++) if (*c == '\\') *c = '/';
     int n = snprintf(out, cap,
-        "{\"count\":%d,\"have_file\":%d,\"fopen\":%d,\"matched\":%d,\"path\":\"%s\",\"fields\":[",
-        g_count, g_have_file, g_dbg_fopen, g_dbg_matched, p);
+        "{\"count\":%d,\"have_file\":%d,\"fopen\":%d,\"matched\":%d,\"rejected\":%d,"
+        "\"version_rejected\":%d,\"format_version\":%d,\"path\":\"%s\",\"fields\":[",
+        g_count, g_have_file, g_dbg_fopen, g_dbg_matched, g_dbg_rejected,
+        g_dbg_ver_bad, GO_FORMAT_VERSION, p);
     for (int i = 0; i < g_count && n < cap; i++) {
         n += snprintf(out + n, cap - n,
-            "%s{\"name\":\"%s\",\"addr\":\"0x%08X\",\"size\":%d,\"loaded\":%u,\"cur\":%u}",
-            i ? "," : "", g_name[i], g_addr[i], g_size[i],
-            (unsigned)g_loaded[i], (unsigned)read_field(i));
+            "%s{\"name\":\"%s\",\"addr\":\"0x%08X\",\"size\":%d,\"min\":%d,\"max\":%d,"
+            "\"loaded\":%u,\"valid\":%d,\"cur\":%u}",
+            i ? "," : "", g_name[i], g_addr[i], g_size[i], g_vmin[i], g_vmax[i],
+            (unsigned)g_loaded[i], g_loaded_valid[i], (unsigned)read_field(i));
     }
     n += snprintf(out + n, (cap - n) > 0 ? cap - n : 0, "]}");
     return n;

@@ -19,14 +19,20 @@
 extern "C" {
 #endif
 
-/* Configure the persisted-options set. addrs/sizes have `count` entries
- * (size is 1 or 2 bytes per field); names[i] is the field key written to the
- * state file. state_path is the absolute file to persist into. Copies what it
- * needs; safe to call once at startup. count==0 disables the feature. */
+/* Configure the persisted-options set. addrs/sizes/names/vmins/vmaxs have
+ * `count` entries (size is 1 or 2 bytes per field); names[i] is the field key
+ * written to the state file. vmins[i]/vmaxs[i] are the inclusive valid range for
+ * RESTORE-time validation: a saved value outside [vmin,vmax] is rejected (the
+ * game default is used) so a corrupt/stale file can't inject an out-of-range
+ * value. Pass [INT32_MIN, INT32_MAX] for a field that needs no validation.
+ * state_path is the absolute file to persist into. Copies what it needs; safe
+ * to call once at startup. count==0 disables the feature. */
 void game_options_configure(const char *state_path,
                             const uint32_t *addrs,
                             const uint8_t  *sizes,
                             const char *const *names,
+                            const int32_t  *vmins,
+                            const int32_t  *vmaxs,
                             int count);
 
 /* Recompiler hook (called from generated code at each config global's boot-init

@@ -1960,15 +1960,22 @@ int main(int argc, char** argv) {
                 std::vector<uint32_t>    go_addrs;
                 std::vector<uint8_t>     go_sizes;
                 std::vector<const char*> go_names;
+                std::vector<int32_t>     go_vmins;
+                std::vector<int32_t>     go_vmaxs;
                 for (const auto& o : go.options) {
                     go_addrs.push_back(o.addr);
                     go_sizes.push_back((uint8_t)o.size);
                     go_names.push_back(o.name.c_str());
+                    /* Declared range validates the persisted value at restore; no
+                     * range => full int32 span (accept anything that fits). */
+                    go_vmins.push_back(o.has_range ? (int32_t)o.vmin : (int32_t)0x80000000);
+                    go_vmaxs.push_back(o.has_range ? (int32_t)o.vmax : (int32_t)0x7FFFFFFF);
                 }
                 std::string go_state = (memcard_dir /
                     ((game_id.empty() ? std::string("game") : game_id) + ".options")).string();
                 game_options_configure(go_state.c_str(), go_addrs.data(), go_sizes.data(),
-                                       go_names.data(), (int)go_addrs.size());
+                                       go_names.data(), go_vmins.data(), go_vmaxs.data(),
+                                       (int)go_addrs.size());
                 std::fprintf(stdout,
                     "psxrecomp: game options persistence armed (%d field(s)) -> %s\n",
                     (int)go_addrs.size(), go_state.c_str());

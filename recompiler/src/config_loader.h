@@ -423,6 +423,16 @@ struct GameOption {
     uint32_t    init_store_pc = 0; // PC of the boot-init sb/sh that writes this
                                    // global's default; the recompiler rewrites it
                                    // to apply the persisted value (restore-at-init).
+    // Optional valid-value range for RESTORE-time validation. When has_range is
+    // true (game_options.toml declared `max`, and optionally `min`), a persisted
+    // value outside [vmin, vmax] is rejected at load — the game's own default is
+    // used instead — so a corrupt/stale options file can never inject an out-of-
+    // range value (e.g. an enum used as a jump-table index -> wild jump). Absent
+    // => no validation (e.g. signed screen offsets). Only the runtime consumes
+    // this; the recompiler ignores it (no codegen impact, no regen needed).
+    bool        has_range = false;
+    int64_t     vmin = 0;
+    int64_t     vmax = 0;
 };
 struct GameOptions {
     std::vector<GameOption> options;     // empty => feature off for this game

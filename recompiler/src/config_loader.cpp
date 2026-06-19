@@ -678,6 +678,16 @@ GameOptions load_game_options(const fs::path& path) {
         if (item.contains("init_store_pc"))
             o.init_store_pc = parse_hex(toml::find<std::string>(item, "init_store_pc"),
                                         fmt::format("game_options '{}' init_store_pc", o.name));
+        // Optional restore-time value range. `max` (with optional `min`, default 0)
+        // marks the field validated; a saved value outside [min,max] is dropped.
+        if (item.contains("max")) {
+            o.vmax = toml::find<int64_t>(item, "max");
+            o.vmin = item.contains("min") ? toml::find<int64_t>(item, "min") : 0;
+            if (o.vmax < o.vmin)
+                throw std::runtime_error(fmt::format(
+                    "game_options '{}' max ({}) < min ({})", o.name, o.vmax, o.vmin));
+            o.has_range = true;
+        }
         go.options.push_back(o);
     }
     return go;
