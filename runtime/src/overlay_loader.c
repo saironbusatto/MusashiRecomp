@@ -523,8 +523,9 @@ static void scan_one_cache_dir(const char *dir) {
  * older flat / unversioned caches are simply ignored and regenerated.) */
 static void scan_cache_dir(void) {
     char dir[768];
-    snprintf(dir, sizeof(dir), "%s/%s/gcc/%s/cg%d",
-             s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER);
+    snprintf(dir, sizeof(dir), "%s/%s/gcc/%s/cg%d_%08x",
+             s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
+             (unsigned)PSX_OVERLAY_CODEGEN_HASH);
     scan_one_cache_dir(dir);
 }
 
@@ -564,8 +565,9 @@ int      overlay_loader_sljit_persist_on(void) { return s_sljit_persist; }
 int      overlay_loader_sljit_persist_dbg(void) { return s_persist_dbg; }
 
 static void sljit_cache_dir(char *buf, size_t n) {
-    snprintf(buf, n, "%s/%s/sljit/%s/cg%d",
-             s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER);
+    snprintf(buf, n, "%s/%s/sljit/%s/cg%d_%08x",
+             s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
+             (unsigned)PSX_OVERLAY_CODEGEN_HASH);
 }
 
 #ifdef _WIN32

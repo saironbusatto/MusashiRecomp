@@ -41,6 +41,10 @@ sdl2-msvc/
 *.log
 *.jsonl
 
+# Build-generated codegen-hash header (hash_codegen.cmake): folds an emitter
+# content hash into the overlay cache path; regenerated each build, never committed.
+runtime/include/overlay_codegen_hash.h
+
 # Runtime diagnostic/crash files
 psx_crash.txt
 psx_diag.txt

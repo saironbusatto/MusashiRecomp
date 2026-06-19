@@ -58,6 +58,23 @@ def codegen_ver(runtime_include: str) -> int:
     return int(m.group(1))
 
 
+def codegen_hash(runtime_include: str) -> int:
+    """Parse PSX_OVERLAY_CODEGEN_HASH from the build-generated overlay_codegen_hash.h
+    (next to overlay_api.h). Folded into the cache path as cg<N>_<hash> so ANY
+    emitter change auto-invalidates the cache (no stale-but-cgN reuse). Falls back
+    to 0 when the header is absent (a tree not yet built) — matching overlay_api.h's
+    __has_include fallback, so the loader and compiler still agree on the path."""
+    hdr = os.path.join(runtime_include, 'overlay_codegen_hash.h')
+    try:
+        with open(hdr) as f:
+            m = re.search(r'#define\s+PSX_OVERLAY_CODEGEN_HASH\s+0x([0-9A-Fa-f]+)', f.read())
+        if m:
+            return int(m.group(1), 16)
+    except FileNotFoundError:
+        pass
+    return 0
+
+
 def cache_arch_abi() -> str:
     """Canonical cache arch-abi tag, IDENTICAL to overlay_loader.c's
     PSX_OVERLAY_ARCH_ABI ("<os>-<arch>": win|linux|macos + x64|arm64|x86).
@@ -1154,9 +1171,11 @@ def main():
         # build never reuses a stale DLL, old versions coexist). MUST match
         # overlay_loader.c scan_cache_dir(). Pre-1.0: no legacy fallback.
         cg = codegen_ver(args.runtime_include)
-        cache_dir = os.path.join(args.out_dir, game_id, 'gcc', cache_arch_abi(), f'cg{cg}')
+        ch = codegen_hash(args.runtime_include)
+        cache_dir = os.path.join(args.out_dir, game_id, 'gcc', cache_arch_abi(),
+                                 f'cg{cg}_{ch:08x}')
         os.makedirs(cache_dir, exist_ok=True)
-        print(f'Cache dir: {cache_dir}  (codegen ver {cg})')
+        print(f'Cache dir: {cache_dir}  (codegen ver {cg}, hash {ch:08x})')
 
     with open(args.captures) as f:
         captures = json.load(f)

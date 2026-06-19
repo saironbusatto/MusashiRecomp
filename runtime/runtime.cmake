@@ -239,6 +239,35 @@ function(psxrecomp_add_runtime_target target)
         ${PSXRT_EXTRAS_SOURCES}
     )
 
+    # ---- overlay codegen hash (auto cache key) -----------------------------
+    # Hash the recompiler's codegen sources into runtime/include/overlay_codegen_hash.h
+    # (gitignored) so the overlay cache path carries cg<N>_<hash>: any emitter change
+    # auto-invalidates the cache instead of silently reusing a stale-but-cgN DLL (the
+    # v0.3.0 black-screen). The loader (via overlay_api.h) and compile_overlays.py both
+    # read the same generated PSX_OVERLAY_CODEGEN_HASH, so they never drift. Defined
+    # once (shared across psx-runtime/psx-beetle); idempotent write avoids rebuilds.
+    set(_codegen_hash_hdr ${PSXRECOMP_ROOT}/runtime/include/overlay_codegen_hash.h)
+    if(NOT TARGET psxrecomp_codegen_hash)
+        set(_codegen_srcs
+            ${PSXRECOMP_ROOT}/recompiler/src/code_generator.cpp
+            ${PSXRECOMP_ROOT}/recompiler/src/mips_decoder.cpp
+            ${PSXRECOMP_ROOT}/recompiler/src/control_flow.cpp
+            ${PSXRECOMP_ROOT}/recompiler/src/basic_block.cpp
+            ${PSXRECOMP_ROOT}/recompiler/src/function_analysis.cpp
+            ${PSXRECOMP_ROOT}/recompiler/src/full_function_emitter.h
+            ${PSXRECOMP_ROOT}/recompiler/src/strict_translator.h
+            ${PSXRECOMP_ROOT}/recompiler/src/function_discovery.h)
+        add_custom_command(
+            OUTPUT  ${_codegen_hash_hdr}
+            COMMAND ${CMAKE_COMMAND} -DOUT=${_codegen_hash_hdr} "-DSRCS=${_codegen_srcs}"
+                    -P ${PSXRECOMP_ROOT}/runtime/hash_codegen.cmake
+            DEPENDS ${_codegen_srcs} ${PSXRECOMP_ROOT}/runtime/hash_codegen.cmake
+            COMMENT "Hashing recompiler codegen -> overlay_codegen_hash.h"
+            VERBATIM)
+        add_custom_target(psxrecomp_codegen_hash DEPENDS ${_codegen_hash_hdr})
+    endif()
+    add_dependencies(${target} psxrecomp_codegen_hash)
+
     target_include_directories(${target} PRIVATE
         ${PSXRECOMP_RUNTIME_INCLUDE_DIRS}
         ${SDL2_INCLUDE_DIRS}
