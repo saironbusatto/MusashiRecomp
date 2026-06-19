@@ -84,7 +84,19 @@ OverlayBackend overlay_backend_resolve(const char *cfg, int autocompile_configur
 
 OverlayBackend overlay_backend_active(void) { return s_active; }
 
-int overlay_sljit_available(void) { return 1; }
+int overlay_sljit_available(void) {
+    /* Debug A/B knob: PSX_NO_SLJIT=1 makes sljit report unavailable, so the
+     * overlay path falls through to the dirty-RAM interpreter (no JIT shards).
+     * Paired with [runtime] overlay_cache=false (no gcc DLLs / autocompile) this
+     * forces INTERP-ONLY overlay execution — isolates the static<->interp
+     * boundary/dispatch from JIT codegen when bisecting a regression. */
+    static int disabled = -1;
+    if (disabled < 0) {
+        const char *e = getenv("PSX_NO_SLJIT");
+        disabled = (e && *e && *e != '0') ? 1 : 0;
+    }
+    return disabled ? 0 : 1;
+}
 
 /* ---- smoke test: JIT a trivial leaf and run it ------------------------- */
 /* Produces machine code for `sljit_sw f(sljit_sw a) { return a + 1234; }`,
