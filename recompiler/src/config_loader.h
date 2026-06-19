@@ -381,6 +381,11 @@ struct UserSettings {
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
     bool has_screen_kind    = false; int  screen_kind    = 0; // 0..3 (ScreenKind)
     bool has_auto_skip_fmv  = false; bool auto_skip_fmv  = false; // skip FMVs
+    // Turbo through in-game load screens: run the guest unpaced (host speed) +
+    // mute audio while the CD data stream is active. Faster loads, but the audio
+    // briefly cuts/fades. Ships OFF (default) so loads play at natural speed with
+    // continuous audio (disc_speed=instant already keeps the data delivery fast).
+    bool has_turbo_loads    = false; bool turbo_loads    = false;
     // Low-latency present knobs. low_latency_input re-samples the pad after the
     // wall-clock pacer (just before present) so the next CPU frame reads fresh
     // input instead of input ~one frame stale (the dominant input->photon cost

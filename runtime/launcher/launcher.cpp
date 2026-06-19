@@ -99,6 +99,7 @@ struct LauncherModel {
     int  texture_filter  = 0;  // 0=nearest, 1=bilinear
     int  crt             = 0;  // 0=raw,1=crt,2=composite,3=trinitron
     bool auto_skip_fmv   = false; // skip FMVs via the game's own skip
+    bool turbo_loads     = false; // speed through load screens (mutes audio); default off
     bool spu_hq          = false;
     int  aspect_index    = 0;  // index into kAspects (0 = 4:3 native)
     int  window_width    = 1280; // window size (height = width*den/num per aspect)
@@ -647,6 +648,7 @@ Result run(SDL_Window* window, void* gl_context,
     m.texture_filter = io.texture_filter;
     m.crt            = io.screen_kind;
     m.auto_skip_fmv  = io.auto_skip_fmv;
+    m.turbo_loads    = io.turbo_loads;
     m.spu_hq         = io.spu_hq;
     m.aspect_index   = io.has_aspect_ratio ? aspect_index_for(io.aspect_num, io.aspect_den) : 0;
     m.window_width   = kWinWidths[winsize_index(io.has_window_width ? io.window_width : 1280)];
@@ -691,6 +693,7 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("supersampling",  &m.supersampling);
     c.Bind("antialiasing",   &m.antialiasing);
     c.Bind("auto_skip_fmv",  &m.auto_skip_fmv);
+    c.Bind("turbo_loads",    &m.turbo_loads);
     c.Bind("spu_hq",         &m.spu_hq);
     c.Bind("renderer_label", &m.renderer_label);
     c.Bind("crt_label",      &m.crt_label);
@@ -803,6 +806,11 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.auto_skip_fmv = !m.auto_skip_fmv;
             handle.DirtyVariable("auto_skip_fmv");
+        });
+    c.BindEventCallback("toggle_turbo_loads",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.turbo_loads = !m.turbo_loads;
+            handle.DirtyVariable("turbo_loads");
         });
     c.BindEventCallback("browse_bios",
         [&m, window, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -990,6 +998,7 @@ Result run(SDL_Window* window, void* gl_context,
         io.texture_filter = m.texture_filter; io.has_texture_filter = true;
         io.screen_kind = m.crt;               io.has_screen_kind = true;
         io.auto_skip_fmv = m.auto_skip_fmv;   io.has_auto_skip_fmv = true;
+        io.turbo_loads = m.turbo_loads;       io.has_turbo_loads = true;
         io.spu_hq = m.spu_hq;                 io.has_spu_hq = true;
         io.aspect_num = kAspects[m.aspect_index][0];
         io.aspect_den = kAspects[m.aspect_index][1];
