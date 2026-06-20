@@ -206,6 +206,19 @@ static int apply_speed(int delay) {
     return d < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : d;
 }
 
+/* Command-completion latency (Pause/Init/SeekL/GetID/ReadTOC second response).
+ * These are CONTROLLER/FIRMWARE operations whose timing is essentially FIXED on
+ * real hardware — a faster-spinning drive does NOT complete them proportionally
+ * faster. Scaling them by the disc-speed divisor (as apply_speed does for DATA
+ * sectors) desyncs the BIOS CD driver: only 1x booted, while 4x and instant both
+ * wedged the Pause (0x09) completion handshake in a black-screen spin. So
+ * command latencies use authentic timing regardless of disc_speed; only sector
+ * DATA delivery (sector_delay_cycles) scales with speed — and since essentially
+ * all load time is sector reads, loads still get as fast as the speed allows. */
+static int cmd_latency(int cycles) {
+    return cycles < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : cycles;
+}
+
 /* ---- CD load-burst ring (always-on; CLAUDE.md ring-buffer rule) ----------
  * A "burst" is a run of delivered sectors with no gap longer than
  * CD_BURST_GAP_FRAMES — i.e. one load. Records make "load duration" a
@@ -272,6 +285,41 @@ typedef struct {
     int phase;
 } PendingCmd;
 static PendingCmd pending;
+
+/* ---- Response arbiter (CLAUDE.md: hardware-accurate, not a rate hack) -------
+ * The PS1 CD controller SERIALIZES responses: only one occupies the IRQ slot
+ * (irq_flag + the response FIFO) at a time; a later response is queued and
+ * exposed only after the guest ACKs the current one. A command written while a
+ * response is still visible is LATCHED (the controller is busy) and executed
+ * when the guest ACKs. The old model overwrote irq_flag directly, which DROPPED
+ * responses whenever they arrived faster than the guest acked — proven to cause
+ * 24 dropped responses (INT2 over unacked INT3, INT3 over INT3) at MMX6 boot
+ * under disc_speed=instant, wedging the loader. With the arbiter, the guest's
+ * own ACK cadence paces delivery, so "instant" needs no per-game sectors/frame
+ * cap. set_irq() now enqueues-or-exposes; the guest ACK actively pumps the
+ * arbiter (the wakeup path a naive defer-guard lacked). */
+typedef struct {
+    uint8_t int_type;
+    uint8_t bytes[RESPONSE_FIFO_SIZE];
+    uint8_t count;
+} CdQResp;
+#define CD_RESP_Q 8
+static CdQResp cd_respq[CD_RESP_Q];
+static int      cd_respq_head;
+static int      cd_respq_len;
+static int      cd_gap_remaining;     /* guest cycles until the slot may expose the next response */
+#define CD_MIN_IRQ_GAP 800            /* controller delivery latency (~DuckStation MINIMUM_INTERRUPT_DELAY) */
+uint32_t        g_cd_resp_drops = 0;  /* queue overflow (should stay 0 with correct pacing) */
+
+/* Single pending-command latch: a command written while the slot is busy is
+ * held and executed at the guest ACK (real HW: transmission begins at ACK). */
+static int      cd_cmd_latched;
+static uint8_t  cd_cmd_latched_cmd;
+static uint8_t  cd_cmd_latched_params[PARAM_FIFO_SIZE];
+static int      cd_cmd_latched_pcount;
+
+static void exec_command(uint8_t cmd);   /* forward decl (arbiter pumps it on ACK) */
+static void cd_arbiter_pump(void);
 
 /* ISO reader */
 static void* iso_handle = NULL;
@@ -394,11 +442,109 @@ static void response_push(uint8_t val) {
     }
 }
 
-static void set_irq(int type) {
-    irq_flag = (uint8_t)type;
-    trace_cdrom('I', 0, (uint32_t)type, 0);
+/* Overwrite (dropped-response) accounting — survives the trace ring's eviction.
+ * Counts how many times a new response clobbered an unacked one, and captures
+ * the first occurrence's context. Queryable via cdrom_state. */
+uint32_t g_cd_overwrite_count = 0;
+uint8_t  g_cd_overwrite_first_prev = 0;
+uint8_t  g_cd_overwrite_first_new  = 0;
+uint32_t g_cd_overwrite_first_frame = 0;
+uint8_t  g_cd_overwrite_last_prev = 0;
+uint8_t  g_cd_overwrite_last_new  = 0;
+uint32_t g_cd_overwrite_last_frame = 0;
+
+static void fire_cdrom_irq(void);
+
+/* Load a response into the visible hardware slot (irq_flag + response FIFO) and
+ * raise the line. The slot must be free (irq_flag==0) on entry. */
+static void cd_expose(const CdQResp *r) {
+    irq_flag       = r->int_type;
+    response_read  = 0;
+    response_count = r->count;
+    if (r->count) memcpy(response_fifo, r->bytes, r->count);
+    cd_gap_remaining = CD_MIN_IRQ_GAP;
+    trace_cdrom('I', 0, (uint32_t)r->int_type, 0);
     /* DEQUEUE: CD response/data event fired (aux = CD irq type). */
-    event_ring_record_aux(EV_DEQ, (uint8_t)SRC_CD_IRQ, (uint32_t)type);
+    event_ring_record_aux(EV_DEQ, (uint8_t)SRC_CD_IRQ, (uint32_t)r->int_type);
+    fire_cdrom_irq();
+}
+
+/* set_irq() — the single response-producing entry point. Callers build the
+ * response bytes in response_fifo (via response_clear/response_push) then call
+ * set_irq(int_type). We SNAPSHOT those bytes and either expose immediately (slot
+ * free, nothing queued ahead, inter-IRQ gap elapsed) or QUEUE behind the visible
+ * response. The guest ACK (and the advance pump) drains the queue in order, so
+ * no response is ever clobbered — this replaces the old direct irq_flag=type
+ * overwrite that DROPPED responses under fast (instant) disc timing. */
+static void set_irq(int type) {
+    /* Authentic-1x bypass. The response arbiter (queue + inter-IRQ gap + command
+     * latch) exists to stop responses being DROPPED when we deliver them FASTER
+     * than hardware (disc_speed 2x/4x/instant), where a new response can land
+     * before the guest acks the previous one. At authentic 1x that race cannot
+     * happen — responses arrive at hardware cadence — and any queue/gap we add
+     * only PERTURBS timing the game was validated against. That perturbation
+     * desynced CD-streamed audio (boss/stage-select music looped/restarted
+     * early). So at 1x, behave exactly as the pre-arbiter code did: set the
+     * visible IRQ immediately; the caller's fire_cdrom_irq() raises the line. */
+    if (g_disc_speed_divisor == 1) {
+        irq_flag = (uint8_t)type;
+        cd_gap_remaining = 0;
+        trace_cdrom('I', 0, (uint32_t)type, 0);
+        event_ring_record_aux(EV_DEQ, (uint8_t)SRC_CD_IRQ, (uint32_t)type);
+        return;
+    }
+
+    CdQResp r;
+    r.int_type = (uint8_t)type;
+    r.count    = (uint8_t)(response_count > RESPONSE_FIFO_SIZE ? RESPONSE_FIFO_SIZE : response_count);
+    if (r.count) memcpy(r.bytes, response_fifo, r.count);
+
+    if (irq_flag == 0 && cd_respq_len == 0 && cd_gap_remaining <= 0) {
+        cd_expose(&r);
+    } else if (cd_respq_len < CD_RESP_Q) {
+        cd_respq[(cd_respq_head + cd_respq_len) % CD_RESP_Q] = r;
+        cd_respq_len++;
+        trace_cdrom('Q', 0, (uint32_t)type, 0);   /* queued behind a visible/earlier response */
+    } else {
+        /* Queue overflow — should never happen with correct ACK pacing. Fall
+         * back to clobber and count it so a regression is visible, not silent. */
+        g_cd_resp_drops++;
+        if (g_cd_overwrite_count == 0) {
+            g_cd_overwrite_first_prev  = irq_flag;
+            g_cd_overwrite_first_new   = (uint8_t)type;
+            g_cd_overwrite_first_frame = (uint32_t)s_frame_count;
+        }
+        g_cd_overwrite_count++;
+        g_cd_overwrite_last_prev  = irq_flag;
+        g_cd_overwrite_last_new   = (uint8_t)type;
+        g_cd_overwrite_last_frame = (uint32_t)s_frame_count;
+        irq_flag = 0;          /* force expose to proceed */
+        cd_gap_remaining = 0;
+        cd_expose(&r);
+    }
+}
+
+/* Advance the controller when the visible slot frees: drain the older queued
+ * responses first (they precede any latched command on the wire), then start a
+ * command latched while the controller was busy. Driven by the guest ACK edge
+ * and by cdrom_advance once the inter-IRQ gap elapses. */
+static void cd_arbiter_pump(void) {
+    if (irq_flag != 0)        return;   /* slot still holds an unacked response */
+    if (cd_gap_remaining > 0) return;   /* controller inter-IRQ delivery latency */
+    if (cd_respq_len > 0) {
+        CdQResp r = cd_respq[cd_respq_head];
+        cd_respq_head = (cd_respq_head + 1) % CD_RESP_Q;
+        cd_respq_len--;
+        cd_expose(&r);
+        return;
+    }
+    if (cd_cmd_latched) {
+        cd_cmd_latched = 0;
+        memcpy(param_fifo, cd_cmd_latched_params, cd_cmd_latched_pcount);
+        param_count = (uint8_t)cd_cmd_latched_pcount;
+        trace_cdrom('X', 0, (uint32_t)cd_cmd_latched_cmd, 0);   /* latched cmd now executing */
+        exec_command(cd_cmd_latched_cmd);   /* its ACK flows through set_irq -> exposes */
+    }
 }
 
 /* Fire CDROM IRQ into the interrupt controller */
@@ -798,7 +944,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x09;
         pending.pending = 1;
-        pending.delay = apply_speed(10000);
+        pending.delay = cmd_latency(10000);
         pending.phase = 1;
         break;
 
@@ -811,7 +957,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x0A;
         pending.pending = 1;
-        pending.delay = apply_speed(50000);
+        pending.delay = cmd_latency(50000);
         pending.phase = 1;
         break;
 
@@ -916,7 +1062,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x15;
         pending.pending = 1;
-        pending.delay = apply_speed(20000);
+        pending.delay = cmd_latency(20000);
         pending.phase = 1;
         break;
 
@@ -928,7 +1074,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x1A;
         pending.pending = 1;
-        pending.delay = apply_speed(30000);
+        pending.delay = cmd_latency(30000);
         pending.phase = 1;
         break;
 
@@ -948,7 +1094,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x1E;
         pending.pending = 1;
-        pending.delay = apply_speed(100000);
+        pending.delay = cmd_latency(100000);
         pending.phase = 1;
         break;
 
@@ -1108,6 +1254,12 @@ void cdrom_init(const char* cue_path) {
     spu_cd_audio_reset();
     pending.pending = 0;
     seek_min = seek_sec = seek_sect = 0;
+    /* Response arbiter / command latch state */
+    cd_respq_head = 0;
+    cd_respq_len = 0;
+    cd_gap_remaining = 0;
+    cd_cmd_latched = 0;
+    cd_cmd_latched_pcount = 0;
     cdrom_debug_clear_sector_history();
 
     if (cue_path) {
@@ -1176,8 +1328,23 @@ void cdrom_write(uint32_t addr, uint32_t value) {
 
     case 0x1F801801:
         if (index_reg == 0) {
-            exec_command(val);
-            fire_cdrom_irq();
+            /* The controller is busy while a response is still visible/unacked,
+             * something is queued ahead, a command is already latched, or the
+             * inter-IRQ gap hasn't elapsed. Real HW lets software write the next
+             * command but holds its processing until the slot frees — LATCH it
+             * (the guest ACK pumps the arbiter, which executes it). Only execute
+             * inline when the controller is genuinely idle. */
+            if (g_disc_speed_divisor != 1 &&
+                (irq_flag != 0 || cd_respq_len > 0 || cd_cmd_latched || cd_gap_remaining > 0)) {
+                cd_cmd_latched        = 1;
+                cd_cmd_latched_cmd    = val;
+                cd_cmd_latched_pcount = param_count;
+                memcpy(cd_cmd_latched_params, param_fifo, param_count);
+                param_count = 0;            /* params consumed by the latch */
+                trace_cdrom('L', 0, (uint32_t)val, 0);   /* command latched (controller busy) */
+            } else {
+                exec_command(val);
+            }
         }
         break;
 
@@ -1198,9 +1365,20 @@ void cdrom_write(uint32_t addr, uint32_t value) {
                 sector_read_pos = 0;
             }
         } else if (index_reg == 1) {
+            /* TRACE 'K': guest ACK of CD IRQ bits (clears irq_flag). Pairs with
+             * 'I'/'W' to reconstruct the response<->ack lifecycle and prove
+             * whether a response was overwritten before the guest acked it. */
+            trace_cdrom('K', 0, (uint32_t)(val & 0x1F), 0);
             irq_flag &= ~(val & 0x1F);
             if (val & 0x40) {
                 param_count = 0;
+            }
+            /* The ACK edge is the wakeup that drives the arbiter forward: once
+             * the visible response is retired, expose the next queued response
+             * or start a latched command. (A naive "defer + return" guard
+             * deadlocks precisely because it lacks this active pump.) */
+            if (g_disc_speed_divisor != 1 && irq_flag == 0) {
+                cd_arbiter_pump();
             }
         }
         break;
@@ -1211,8 +1389,17 @@ void cdrom_write(uint32_t addr, uint32_t value) {
 }
 
 void cdrom_advance(uint32_t cycles) {
+    /* Bleed down the controller inter-IRQ gap, then run the producers and pump
+     * the arbiter so a queued response is exposed as soon as the slot is free
+     * and the gap elapses (covers the case where the guest already acked and no
+     * further ACK edge will arrive to drive delivery). */
+    if (cd_gap_remaining > 0) {
+        cd_gap_remaining -= (int)cycles;
+        if (cd_gap_remaining < 0) cd_gap_remaining = 0;
+    }
     process_pending(cycles);
     process_read_stream(cycles);
+    cd_arbiter_pump();
 }
 
 void cdrom_tick(void) {

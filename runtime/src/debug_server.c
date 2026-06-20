@@ -8149,6 +8149,25 @@ static void handle_cdrom_instant_rate(int id, const char *json)
              id, cdrom_get_instant_rate());
 }
 
+/* CD response-overwrite (dropped-response) accounting — proves the instant-mode
+ * race: a new controller response clobbering an unacked one. */
+static void handle_cd_overwrite(int id, const char *json)
+{
+    (void)json;
+    extern uint32_t g_cd_overwrite_count, g_cd_overwrite_first_frame,
+                    g_cd_overwrite_last_frame;
+    extern uint8_t  g_cd_overwrite_first_prev, g_cd_overwrite_first_new,
+                    g_cd_overwrite_last_prev,  g_cd_overwrite_last_new;
+    send_fmt("{\"id\":%d,\"ok\":true,\"overwrites\":%u,"
+             "\"first\":{\"prev_int\":%u,\"new_int\":%u,\"frame\":%u},"
+             "\"last\":{\"prev_int\":%u,\"new_int\":%u,\"frame\":%u}}\n",
+             id, g_cd_overwrite_count,
+             g_cd_overwrite_first_prev, g_cd_overwrite_first_new,
+             g_cd_overwrite_first_frame,
+             g_cd_overwrite_last_prev, g_cd_overwrite_last_new,
+             g_cd_overwrite_last_frame);
+}
+
 /* turbo_loads: get/set the turbo-through-loads enable (step 4). Param "n"
  * (optional: 0/1). Reports the enable, whether the load predicate holds RIGHT
  * NOW, and how many vblanks have run unpaced. */
@@ -9281,6 +9300,7 @@ static const CmdEntry s_commands[] = {
     { "overlay_native_off",   handle_overlay_native_off },
     { "overlay_capture_dump", handle_overlay_capture_dump },
     { "cdrom_instant_rate",   handle_cdrom_instant_rate },
+    { "cd_overwrite",         handle_cd_overwrite },
     { "cdrom_bursts",         handle_cdrom_bursts },
     { "turbo_loads",          handle_turbo_loads },
     { "autocompile_status",   handle_autocompile_status },
