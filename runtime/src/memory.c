@@ -744,6 +744,31 @@ uint8_t psx_read_byte(uint32_t addr) {
     return 0;
 }
 
+/* ---- CPU guest-side data reads: model PS1 main-RAM read latency ----
+ * The R3000A has no usable D-cache (its data cache is repurposed as the 1 KB
+ * scratchpad), so every CPU data read from main DRAM costs 1 opcode cycle plus
+ * 6 wait-state cycles (DuckStation RAM_READ_TICKS = 6; "1 opcode + 6 waitstates
+ * = 7 cycles"). The base opcode cycle is already charged by the per-block
+ * psx_advance_cycles(instruction_count); here we add only the +6 wait states,
+ * and only for main-RAM targets — scratchpad, MMIO, BIOS ROM and open-bus are
+ * excluded (they have their own access timing). The penalty is keyed on the
+ * runtime effective physical address (all of KUSEG/KSEG0/KSEG1 alias the same
+ * DRAM), NOT on the code region, so relocated kernel code is timed correctly.
+ *
+ * These wrappers are wired to cpu->read_* (see main.cpp), so the penalty
+ * applies to BOTH statically-recompiled and dirty-RAM-interpreted guest loads,
+ * but NOT to debug-server / device reads that call psx_read_* directly. */
+#define PSX_RAM_READ_WAIT_CYCLES 6u
+extern void psx_advance_cycles(uint32_t cycles);
+
+static inline void charge_main_ram_read(uint32_t addr) {
+    if ((addr & 0x1FFFFFFFu) < RAM_SIZE) psx_advance_cycles(PSX_RAM_READ_WAIT_CYCLES);
+}
+
+uint32_t psx_guest_read_word(uint32_t addr) { charge_main_ram_read(addr); return psx_read_word(addr); }
+uint16_t psx_guest_read_half(uint32_t addr) { charge_main_ram_read(addr); return psx_read_half(addr); }
+uint8_t  psx_guest_read_byte(uint32_t addr) { charge_main_ram_read(addr); return psx_read_byte(addr); }
+
 void psx_write_byte(uint32_t addr, uint8_t val) {
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 

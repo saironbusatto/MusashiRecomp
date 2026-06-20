@@ -64,6 +64,15 @@ static uint8_t pad_response[8];
 static uint8_t pad_response_len = 0;
 static uint8_t pad_response_idx = 0;
 static uint8_t pad_current_cmd = 0;
+/* DualShock config-mode latch, per slot. A real controller only answers the
+ * config commands (0x44/0x45/0x46/0x47/0x4C/0x4D/0x4F) and reports the config
+ * ID 0xF3 while it is IN config mode; outside config it reports its normal ID
+ * (0x41 digital / 0x73 analog) and ignores config commands. Config is entered/
+ * exited by command 0x43 with the data byte 0x01(enter)/0x00(exit). Faking
+ * "always in config" (constant 0xF3) wedges games that probe the pad type via
+ * 0x43 before polling — e.g. Mega Man X6 loops 01 43 00 00 forever and never
+ * reaches 0x42. (MMX6 ISSUES.md #2.) */
+static uint8_t pad_in_config[2] = { 0, 0 };
 
 /* Memory card SIO state machine */
 typedef enum {
@@ -591,94 +600,86 @@ static void pad_process_byte(uint8_t tx_byte) {
     case PAD_WAIT_ACCESS:
         pad_current_cmd = tx_byte;
         pad_response_idx = 1;
+        /* Controller ID reported as the first response byte. Real hardware
+         * reports the config ID (0xF3) ONLY while in config mode; otherwise the
+         * normal mode ID (0x41 digital / 0x73 analog). */
+        {
+        const uint8_t cur_id = pad_in_config[selected_slot] ? 0xF3
+                               : (pad_analog[selected_slot] ? 0x73 : 0x41);
         if (tx_byte == 0x42) {
+            /* Read poll. Analog (or in-config) uses the 8-byte format with the
+             * four stick axes; a plain digital pad uses the 4-byte format. */
             const uint16_t btn = pad_buttons[selected_slot];
-            if (pad_analog[selected_slot]) {
-                /* DualShock analog poll: id 0x73, then buttons, then the four
-                 * stick axes (right X/Y, left X/Y) per the SIO pad protocol. */
-                pad_response[0] = 0x73;
-                pad_response[1] = 0x5A;
-                pad_response[2] = (uint8_t)(btn & 0xFF);
-                pad_response[3] = (uint8_t)(btn >> 8);
+            pad_response[0] = cur_id;
+            pad_response[1] = 0x5A;
+            pad_response[2] = (uint8_t)(btn & 0xFF);
+            pad_response[3] = (uint8_t)(btn >> 8);
+            if (pad_analog[selected_slot] || pad_in_config[selected_slot]) {
                 pad_response[4] = pad_stick[selected_slot][2]; /* right X */
                 pad_response[5] = pad_stick[selected_slot][3]; /* right Y */
                 pad_response[6] = pad_stick[selected_slot][0]; /* left X */
                 pad_response[7] = pad_stick[selected_slot][1]; /* left Y */
                 pad_response_len = 8;
             } else {
-                pad_response[0] = 0x41; /* Digital pad poll */
-                pad_response[1] = 0x5A;
-                pad_response[2] = (uint8_t)(btn & 0xFF);
-                pad_response[3] = (uint8_t)(btn >> 8);
                 pad_response_len = 4;
             }
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;
         } else if (tx_byte == 0x43) {
-            static const uint8_t resp_43[8] = {
-                0xF3, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-            };
-            memcpy(pad_response, resp_43, sizeof(resp_43));
-            pad_response_len = (uint8_t)sizeof(resp_43);
+            /* Enter/exit config mode. The ID byte reflects the CURRENT mode; the
+             * enter(0x01)/exit(0x00) flag is the second data byte, latched in
+             * PAD_SEND_RESPONSE so it takes effect after this transaction. */
+            pad_response[0] = cur_id;
+            pad_response[1] = 0x5A;
+            pad_response[2] = 0x00; pad_response[3] = 0x00;
+            pad_response[4] = 0x00; pad_response[5] = 0x00;
+            pad_response[6] = 0x00; pad_response[7] = 0x00;
+            pad_response_len = 8;
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;
-        } else if (tx_byte == 0x45) {
-            static const uint8_t resp_45[8] = {
-                0xF3, 0x5A, 0x03, 0x02, 0x01, 0x02, 0x01, 0x00
-            };
-            memcpy(pad_response, resp_45, sizeof(resp_45));
-            pad_response_len = (uint8_t)sizeof(resp_45);
-            pad_state = PAD_SEND_RESPONSE;
-            sio_rx_data = pad_response[0];
-            sio_stat |= SIO_STAT_ACK;
-        } else if (tx_byte == 0x46) {
-            static const uint8_t resp_46[8] = {
-                0xF3, 0x5A, 0x00, 0x00, 0x01, 0x02, 0x00, 0x0A
-            };
-            memcpy(pad_response, resp_46, sizeof(resp_46));
-            pad_response_len = (uint8_t)sizeof(resp_46);
-            pad_state = PAD_SEND_RESPONSE;
-            sio_rx_data = pad_response[0];
-            sio_stat |= SIO_STAT_ACK;
-        } else if (tx_byte == 0x47) {
-            static const uint8_t resp_47[8] = {
-                0xF3, 0x5A, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00
-            };
-            memcpy(pad_response, resp_47, sizeof(resp_47));
-            pad_response_len = (uint8_t)sizeof(resp_47);
-            pad_state = PAD_SEND_RESPONSE;
-            sio_rx_data = pad_response[0];
-            sio_stat |= SIO_STAT_ACK;
-        } else if (tx_byte == 0x4C) {
-            static const uint8_t resp_4c[8] = {
-                0xF3, 0x5A, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00
-            };
-            memcpy(pad_response, resp_4c, sizeof(resp_4c));
-            pad_response_len = (uint8_t)sizeof(resp_4c);
-            pad_state = PAD_SEND_RESPONSE;
-            sio_rx_data = pad_response[0];
-            sio_stat |= SIO_STAT_ACK;
-        } else if (tx_byte == 0x4D) {
-            static const uint8_t resp_4d[8] = {
-                0xF3, 0x5A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-            };
-            memcpy(pad_response, resp_4d, sizeof(resp_4d));
-            pad_response_len = (uint8_t)sizeof(resp_4d);
+        } else if (pad_in_config[selected_slot] &&
+                   (tx_byte == 0x44 || tx_byte == 0x45 || tx_byte == 0x46 ||
+                    tx_byte == 0x47 || tx_byte == 0x4C || tx_byte == 0x4D ||
+                    tx_byte == 0x4F)) {
+            /* Config-only commands (analog/rumble init handshake). Canned
+             * responses; only valid while in config mode (a digital pad ignores
+             * them, handled by the else branch below). */
+            static const uint8_t r_def[8] = { 0xF3,0x5A,0x00,0x00,0x00,0x00,0x00,0x00 };
+            static const uint8_t r_45[8]  = { 0xF3,0x5A,0x03,0x02,0x01,0x02,0x01,0x00 };
+            static const uint8_t r_46[8]  = { 0xF3,0x5A,0x00,0x00,0x01,0x02,0x00,0x0A };
+            static const uint8_t r_47[8]  = { 0xF3,0x5A,0x00,0x00,0x02,0x00,0x01,0x00 };
+            static const uint8_t r_4c[8]  = { 0xF3,0x5A,0x00,0x00,0x00,0x04,0x00,0x00 };
+            const uint8_t *r = r_def;
+            if      (tx_byte == 0x45) r = r_45;
+            else if (tx_byte == 0x46) r = r_46;
+            else if (tx_byte == 0x47) r = r_47;
+            else if (tx_byte == 0x4C) r = r_4c;
+            memcpy(pad_response, r, 8);
+            pad_response_len = 8;
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;
         } else {
+            /* Unknown command, or a config command issued OUTSIDE config mode:
+             * a real pad does not respond — return hi-z and end the transaction. */
             pad_state = PAD_IDLE;
             pad_response_len = 0;
             pad_response_idx = 0;
             pad_current_cmd = 0;
             sio_rx_data = 0xFF;
         }
+        }
         break;
 
     case PAD_SEND_RESPONSE:
+        /* For 0x43 (enter/exit config), the data byte selecting enter(0x01)/
+         * exit(0x00) arrives paired with response index 2. Latch the new config
+         * state; it takes effect from the next transaction (the ID byte already
+         * reported the mode that was current at the start of this one). */
+        if (pad_current_cmd == 0x43 && pad_response_idx == 2)
+            pad_in_config[selected_slot] = (tx_byte == 0x01) ? 1 : 0;
         if (pad_response_idx < pad_response_len) {
             sio_rx_data = pad_response[pad_response_idx++];
             if (pad_response_idx < pad_response_len) {

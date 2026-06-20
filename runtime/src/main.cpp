@@ -96,6 +96,12 @@ extern "C" uint16_t psx_read_half(uint32_t addr);
 extern "C" void     psx_write_half(uint32_t addr, uint16_t val);
 extern "C" uint8_t  psx_read_byte(uint32_t addr);
 extern "C" void     psx_write_byte(uint32_t addr, uint8_t val);
+/* Guest-side data-read wrappers: same as psx_read_* but charge PS1 main-RAM
+ * read wait states (R3000A has no D-cache). Wired to cpu->read_* below so the
+ * timing applies to recompiled + interpreted guest loads, not debug/device reads. */
+extern "C" uint32_t psx_guest_read_word(uint32_t addr);
+extern "C" uint16_t psx_guest_read_half(uint32_t addr);
+extern "C" uint8_t  psx_guest_read_byte(uint32_t addr);
 
 /* ---- SDL state ---- */
 static SDL_Window*   sdl_window;
@@ -1197,6 +1203,18 @@ static bool hybrid_dpad_active(const PlayerInput& p, bool kb_always) {
  * (stick -> analog, D-pad -> digital) so the game runs its own analog or
  * digital input path exactly as on hardware (mirrors the inline block this
  * helper was extracted from for the low-latency re-sample). */
+/* Dev builds (PSX_DEBUG_TOOLS — the dev/debug configuration) ALWAYS feed the
+ * keyboard into Player 1 alongside whatever device the launcher routed to port 1,
+ * so a tester can drive the game from EITHER the keyboard OR the selected
+ * controller (e.g. a DualShock) at the same time, with no reconfiguration. The
+ * keyboard map and the controller are merged (active-low AND) onto the P1 pad
+ * word. Release builds keep the single launcher-selected device per port. */
+#if defined(PSX_DEBUG_TOOLS)
+static const bool g_dev_kb_p1 = true;
+#else
+static const bool g_dev_kb_p1 = false;
+#endif
+
 static void sample_pad_into_sio(int override) {
     if (override >= 0) {
         sio_set_pad_state_slot(0, (uint16_t)override);
@@ -1204,22 +1222,39 @@ static void sample_pad_into_sio(int override) {
     }
     for (int s = 0; s < 2; s++) {
         PlayerInput& p = g_players[s];
-        if (p.kind == 0) continue;  /* no device in this port */
-        sio_set_pad_state_slot(s, pad_buttons_for(p));
+        const bool kb_here = (g_dev_kb_p1 && s == 0);
+        if (p.kind == 0 && !kb_here) continue;  /* no device in this port */
 
-        /* Resolve the pad type this frame from the player's mode. */
+        /* Buttons: merge the assigned device with the keyboard (PSX pad word is
+         * active-low, so AND combines "pressed on either source"). */
+        uint16_t btn = (p.kind != 0) ? pad_buttons_for(p) : (uint16_t)0xFFFF;
+        if (kb_here) btn &= pad_from_keyboard();
+        sio_set_pad_state_slot(s, btn);
+
+        /* Resolve the pad type this frame from the player's mode (a port driven
+         * by the keyboard alone presents as a digital pad). */
+        const int mode = (p.kind != 0) ? p.mode : (int)PSXRecompV4::PAD_MODE_DIGITAL;
         int eff_analog;
         uint8_t st[4] = { 0x80, 0x80, 0x80, 0x80 };
-        if (p.mode == PSXRecompV4::PAD_MODE_DIGITAL) {
+        if (mode == PSXRecompV4::PAD_MODE_DIGITAL) {
             eff_analog = 0;
-        } else if (p.mode == PSXRecompV4::PAD_MODE_ANALOG) {
+        } else if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
             eff_analog = 1;
             pad_sticks_for(p, st, /*fold_dpad=*/true);
         } else { /* HYBRID */
-            if (hybrid_stick_active(p))            p.hybrid_analog = true;
-            else if (hybrid_dpad_active(p, false)) p.hybrid_analog = false;
+            if (hybrid_stick_active(p))               p.hybrid_analog = true;
+            else if (hybrid_dpad_active(p, kb_here))  p.hybrid_analog = false;
             eff_analog = p.hybrid_analog ? 1 : 0;
             if (eff_analog) pad_sticks_for(p, st, /*fold_dpad=*/false);
+        }
+        /* In dev builds also fold the keyboard arrows onto the analog stick, so an
+         * analog-mode P1 still steers from the keyboard. */
+        if (kb_here && eff_analog) {
+            const Uint8* keys = SDL_GetKeyboardState(NULL);
+            if (keys[SDL_SCANCODE_LEFT])  st[0] = 0x00;
+            if (keys[SDL_SCANCODE_RIGHT]) st[0] = 0xFF;
+            if (keys[SDL_SCANCODE_UP])    st[1] = 0x00;
+            if (keys[SDL_SCANCODE_DOWN])  st[1] = 0xFF;
         }
         sio_set_pad_analog(s, eff_analog, st[0], st[1], st[2], st[3]);
     }
@@ -1796,7 +1831,16 @@ int main(int argc, char** argv) {
     bool memcard1_enabled = true;
     bool memcard2_enabled = true;
     /* [controller] device routing (defaults: P1 keyboard/digital, P2 none). */
+    /* Dev builds default Player 1 to the first connected controller ("auto"):
+     * combined with the always-on keyboard merge (g_dev_kb_p1) this means the
+     * selected controller AND the keyboard both drive P1 with no launcher setup.
+     * If no controller is present, "auto" opens nothing and the keyboard merge
+     * still drives P1. Release keeps "keyboard" (the launcher assigns devices). */
+#if defined(PSX_DEBUG_TOOLS)
+    std::string p1_device = "auto";
+#else
     std::string p1_device = "keyboard";
+#endif
     std::string p2_device = "none";
     int  p1_mode = PSXRecompV4::PAD_MODE_HYBRID;
     int  p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
@@ -2212,7 +2256,10 @@ int main(int argc, char** argv) {
     set_player_device(g_players[0], p1_device, p1_mode);
     set_player_device(g_players[1], p2_device, p2_mode);
     for (int s = 0; s < 2; s++) {
-        sio_set_pad_connected(s, g_players[s].kind != 0 ? 1 : 0);
+        /* Dev builds keep P1 connected even with no controller so the always-on
+         * keyboard (g_dev_kb_p1) can drive port 1 standalone. */
+        const bool kb_p1 = (g_dev_kb_p1 && s == 0);
+        sio_set_pad_connected(s, (g_players[s].kind != 0 || kb_p1) ? 1 : 0);
         sio_set_pad_analog(s, pad_mode_boot_analog(g_players[s].mode), 0x80, 0x80, 0x80, 0x80);
     }
     /* SPU float-shadow gate must be set before spu_init() (which runs
@@ -2435,11 +2482,11 @@ int main(int argc, char** argv) {
     std::memset(&cpu, 0, sizeof(cpu));
 
     /* Wire memory function pointers. */
-    cpu.read_word  = psx_read_word;
+    cpu.read_word  = psx_guest_read_word;  /* +6cyc main-RAM read wait states */
     cpu.write_word = psx_write_word;
-    cpu.read_half  = psx_read_half;
+    cpu.read_half  = psx_guest_read_half;
     cpu.write_half = psx_write_half;
-    cpu.read_byte  = psx_read_byte;
+    cpu.read_byte  = psx_guest_read_byte;
     cpu.write_byte = psx_write_byte;
     /* Wire the sljit JIT host-helper table (cpu-relative => position-independent
      * shards; prerequisite for the persisted sljit shard cache). Harmless when

@@ -546,24 +546,30 @@ void debug_server_log_restore_event(uint32_t kind, uint32_t target_pc, uint32_t 
     e->in_exception  = (uint8_t)psx_get_in_exception();
 }
 
+extern uint16_t psx_read_half(uint32_t addr);
 static uint32_t trace_read_word(CPUState *cpu, uint32_t addr)
 {
+    (void)cpu;
     uint32_t phys = addr & 0x1FFFFFFFu;
     if (phys > 0x001FFFFCu &&
         (phys < 0x1F800000u || phys > 0x1F8003FCu)) {
         return 0;
     }
-    return cpu ? cpu->read_word(addr) : 0;
+    /* Use psx_read_word directly (NOT cpu->read_word): debug instrumentation
+     * must not charge guest main-RAM read wait states, and runs on the IO
+     * thread where psx_advance_cycles would race the emulation thread. */
+    return psx_read_word(addr);
 }
 
 static uint32_t trace_read_half(CPUState *cpu, uint32_t addr)
 {
+    (void)cpu;
     uint32_t phys = addr & 0x1FFFFFFFu;
     if (phys > 0x001FFFFEu &&
         (phys < 0x1F800000u || phys > 0x1F8003FEu)) {
         return 0;
     }
-    return cpu ? cpu->read_half(addr) : 0;
+    return psx_read_half(addr);
 }
 
 static int sreg_trace_focus_func(uint32_t func)
