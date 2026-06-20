@@ -821,6 +821,48 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         // overlay variant: addr is different code here — fall through to vanilla.
     }
 
+    // Widescreen pure-2D background tile-loop widen ([widescreen.bg2d]). MMX6's
+    // per-layer BG renderer draws `count` 16px tile columns from a start column /
+    // start screen-x derived from the camera scroll. Rewrite those three values
+    // (via the gpu.c psx_ws_mmx6_bg_* helpers — identity at 4:3 / 512 hi-res) so
+    // the loop draws the 16:9 reveal columns on both sides. Each site's opcode is
+    // verified; a mismatch is a loud build error (main-EXE addresses).
+    if (config_.ws_bg2d_count_site && addr == config_.ws_bg2d_count_site) {
+        if (opcode == 0x09 || opcode == 0x0D) {  // addiu / ori  (li rt,imm)
+            uint32_t rt = get_rt(instr);
+            uint16_t imm = get_imm16_u(instr);
+            return fmt::format("{} = (uint32_t)psx_ws_mmx6_bg_cols({});{}",
+                               reg_name(rt), (int)imm, comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.bg2d] count_site 0x{:08X} is not "
+                       "addiu/ori (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+    }
+    if (config_.ws_bg2d_startcol_site && addr == config_.ws_bg2d_startcol_site) {
+        if (opcode == 0x0C) {  // andi rt,rs,imm  (start tile-column mask)
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            uint16_t imm = get_imm16_u(instr);
+            return fmt::format("{} = (uint32_t)psx_ws_mmx6_bg_startcol((int)({} & 0x{:X}u));{}",
+                               reg_name(rt), reg_name(rs), imm, comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.bg2d] startcol_site 0x{:08X} is not "
+                       "andi (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+    }
+    if (config_.ws_bg2d_startx_site && addr == config_.ws_bg2d_startx_site) {
+        if (opcode == 0x00 && (instr & 0x3F) == 0x03) {  // sra rd,rt,sa  (start screen-x)
+            uint32_t rt = get_rt(instr), rd = get_rd(instr), sh = get_shamt(instr);
+            return fmt::format("{} = (uint32_t)psx_ws_mmx6_bg_startx((int32_t){} >> {});{}",
+                               reg_name(rd), reg_name(rt), sh, comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.bg2d] startx_site 0x{:08X} is not "
+                       "sra (instr 0x{:08X})\n", addr, instr);
+            std::exit(1);
+        }
+    }
+
     // Persistent game-option init store ([persist_options] in game_options.toml).
     // The site is the boot-init sb/sh that writes a config global's DEFAULT value
     // (Tomba MESSAGE / SOUND / VIBRATION / ADJUST SCREEN). Route the stored value
@@ -2018,6 +2060,9 @@ std::string CodeGenerator::generate_file(
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
     ss << "extern int  psx_ws_backdrop_x(int x);  /* widescreen backdrop screenX squash (gpu.c) */\n";
+    ss << "extern int  psx_ws_mmx6_bg_cols(int base);     /* ws 2D bg tile-loop widen: col count (gpu.c) */\n";
+    ss << "extern int  psx_ws_mmx6_bg_startcol(int col);  /* ws 2D bg tile-loop widen: start tile col (gpu.c) */\n";
+    ss << "extern int  psx_ws_mmx6_bg_startx(int x);       /* ws 2D bg tile-loop widen: start screen-x (gpu.c) */\n";
     ss << "extern int  psx_game_option_store(uint32_t addr, int val);  /* persisted OPTION restore-at-init (game_options.c) */\n";
     ss << "extern uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);  /* ws backdrop preload (gpu.c) */\n";
     ss << "extern void gte_ws_set_suppress(int on);  /* widescreen far-backdrop un-squash (gte.cpp) */\n\n";

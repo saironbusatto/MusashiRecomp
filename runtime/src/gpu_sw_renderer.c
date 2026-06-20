@@ -1610,3 +1610,22 @@ int sw_render_wide_display(uint32_t *out_pixels, int out_pitch, int base_x,
 }
 
 int sw_wide_width(void) { return g_wide_w; }
+
+/* Diagnostic: dump the ENTIRE active wide surface for base_x (full g_wide_w*scale
+ * × VRAM_HEIGHT*scale — BOTH double-buffer y-bands, all margins) to ARGB. Lets a
+ * probe see exactly where the over-draw lands, independent of the per-frame band
+ * the present selects. *ow/*oh receive the surface dims. Returns pixels written,
+ * or 0 if no surface for base_x / it won't fit in cap_pixels. */
+int sw_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_x) {
+    uint16_t *surf = NULL;
+    for (int i = 0; i < WIDE_MAX_SURF; i++)
+        if (g_wide_surf[i] && g_wide_base[i] == base_x) { surf = g_wide_surf[i]; break; }
+    if (!surf || g_wide_w <= 0) return 0;
+    int s = g_scale;
+    int W = g_wide_w * s, H = VRAM_HEIGHT * s;
+    if ((long long)W * H > cap_pixels) return 0;
+    for (int i = 0; i < W * H; i++) out[i] = rgb555_to_argb(surf[i]);
+    if (ow) *ow = W;
+    if (oh) *oh = H;
+    return W * H;
+}

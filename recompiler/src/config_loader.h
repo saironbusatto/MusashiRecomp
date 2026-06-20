@@ -358,6 +358,30 @@ struct GameConfig {
     // are overlay-resident, so the overlay compile must see this (--ws-config).
     // 0 at 4:3 (native-wide inactive) => byte-identical. Off by default; regen.
     bool ws_auto_backdrop_preload = false;
+
+    // [widescreen] full_2d — pure-2D sprite game (e.g. Mega Man X6) that never
+    // emits the sprite_tag hook the 3D detector relies on. When true, every
+    // in-game frame is treated as "gameplay" so native-wide engages and the 2D
+    // scene is presented widescreen (the framework's normal full-2D screens
+    // pillarbox 4:3, which is wrong for a game that IS 2D end-to-end). Runtime-
+    // only (read at startup; no codegen impact) — no regen required. The wider
+    // field of view itself is supplied by [widescreen.cull]/engine hooks; this
+    // flag only opts the title into the 2D widescreen present path. Off by
+    // default; the env var PSX_WS_FORCE_2D=1 forces it on for testing.
+    bool ws_full_2d = false;
+
+    // [widescreen.bg2d] — pure-2D background tile-loop widen (e.g. MMX6's
+    // FUN_800270d0). Three instruction addresses in the per-layer BG renderer
+    // whose column count and loop start are rewritten so the loop draws the
+    // 16:9 reveal columns on both sides of the 320 view (see gpu.c
+    // psx_ws_mmx6_bg_* helpers — identity at 4:3 / 512 hi-res mode). Regen-class.
+    //   count_site:    the `li rt,21` column-count load (addiu/ori).
+    //   startcol_site: the `andi rt,rs,0x3f` start tile-column mask.
+    //   startx_site:   the `sra rd,rt,sa` start screen-x.
+    // 0 = unset (feature off). Verified by opcode at gen time.
+    uint32_t ws_bg2d_count_site    = 0;
+    uint32_t ws_bg2d_startcol_site = 0;
+    uint32_t ws_bg2d_startx_site   = 0;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

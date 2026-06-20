@@ -6204,6 +6204,47 @@ static void handle_wide_shot(int id, const char *json)
              id, path, W, H);
 }
 
+/* wide_full: dump the ENTIRE active wide compositor surface (both double-buffer
+ * y-bands, full width incl. both reveal margins) to a PNG. Unlike wide_shot
+ * (which crops to the displayed band), this shows where the over-draw actually
+ * lands across the whole surface. SW backend only (diagnostic). base_x defaults
+ * to 0 (the common vertical-double-buffer origin). */
+static void handle_wide_full(int id, const char *json)
+{
+    extern int sw_wide_dump_full(uint32_t *out, int cap_pixels, int *ow, int *oh, int base_x);
+    int base_x = json_get_int(json, "base_x", 0);
+    char path[512];
+    if (!json_get_str(json, "path", path, sizeof(path)))
+        strncpy(path, "psx_wide_full.png", sizeof(path) - 1);
+    path[sizeof(path) - 1] = '\0';
+
+    int cap = 1024 * 1024 * 4;  /* up to 4 Mpix (e.g. 426*512*S^2) */
+    uint32_t *buf = (uint32_t *)malloc((size_t)cap * sizeof(uint32_t));
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    int W = 0, H = 0;
+    int n = sw_wide_dump_full(buf, cap, &W, &H, base_x);
+    if (n <= 0) { free(buf); send_err(id, "no wide surface (SW backend? native-wide engaged?)"); return; }
+
+    uint8_t *rgb = (uint8_t *)malloc((size_t)W * H * 3);
+    if (!rgb) { free(buf); send_err(id, "alloc failed"); return; }
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) {
+            uint32_t px = buf[(size_t)y * W + x];
+            uint8_t *p = rgb + ((size_t)y * W + x) * 3;
+            p[0] = (uint8_t)((px >> 16) & 0xFF);
+            p[1] = (uint8_t)((px >> 8) & 0xFF);
+            p[2] = (uint8_t)(px & 0xFF);
+        }
+    free(buf);
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(rgb); send_err(id, "cannot open file"); return; }
+    int ok = png_write_rgb(f, rgb, (uint32_t)W, (uint32_t)H);
+    free(rgb); fclose(f);
+    if (!ok) { send_err(id, "png encode failed"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"path\":\"%s\",\"width\":%d,\"height\":%d}",
+             id, path, W, H);
+}
+
 static void handle_vram_peek(int id, const char *json)
 {
     int x = json_get_int(json, "x", 0);
@@ -9254,6 +9295,7 @@ static const CmdEntry s_commands[] = {
     { "get_snapshots",     handle_get_snapshots },
     { "screenshot",        handle_screenshot_file },
     { "screenshot_file",   handle_screenshot_file },   /* alias */
+    { "wide_full",         handle_wide_full },
     { "wide_shot",         handle_wide_shot },
     { "gpu_opcodes",       handle_gpu_opcodes },
     { "gpu_ring_stats",    handle_gpu_ring_stats },

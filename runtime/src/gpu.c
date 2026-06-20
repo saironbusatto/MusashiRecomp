@@ -103,16 +103,19 @@ static int32_t ws_disp_w(void);
  * within the last couple of frames => the actor render funnel is running =>
  * gameplay. A menu/title/save screen draws no tagged prims. The 2-frame window
  * makes this frame-stable regardless of per-prim ordering within a frame. */
+/* Full-2D widescreen ([widescreen] full_2d). A pure 2D sprite game (e.g. MMX6)
+ * never emits the sprite-tag hook the 3D gameplay detector keys on, so every
+ * in-game frame would be misclassified as a "full-2D menu" and pillarboxed 4:3.
+ * When this is set, treat every in-game frame as gameplay so native-wide engages
+ * and the 2D scene presents widescreen. Set once from game.toml at widescreen-
+ * engage (gpu_ws_set_full_2d); PSX_WS_FORCE_2D=1 forces it on for testing. */
+static int ws_full_2d = 0;
+void gpu_ws_set_full_2d(int on) { ws_full_2d = on ? 1 : 0; }
+
 static int ws_game_mode(void) {
-    /* EXPERIMENT (PSX_WS_FORCE_2D=1): force "gameplay" so native-wide engages on
-     * an all-2D sprite game (MMX6) that never emits the sprite-tag hook. This is
-     * the 2D "overscan reveal" path — the game over-draws past the 320 viewport
-     * (clipped by the draw area), and native-wide's draw_offset shift + draw-area
-     * widen + wide-mirror + widened present reveal it. Env-gated so it's regen-
-     * free and off for tagged 3D games. */
-    static int force = -1;
-    if (force < 0) { const char *e = getenv("PSX_WS_FORCE_2D"); force = (e && e[0] == '1') ? 1 : 0; }
-    if (force) return 1;
+    static int env = -1;
+    if (env < 0) { const char *e = getenv("PSX_WS_FORCE_2D"); env = (e && e[0] == '1') ? 1 : 0; }
+    if (ws_full_2d || env) return 1;
     return (uint32_t)s_frame_count - ws_last_tag_stamp <= 2;
 }
 
@@ -190,6 +193,41 @@ int psx_ws_x_margin(void) {
     if (!ws_active()) return 0;
     return (160 * (ws_xden - ws_xnum) + ws_xnum / 2) / ws_xnum;
 }
+
+/* ---- MMX6 2D background tile-loop widen ([widescreen.bg2d]) ---------------
+ * Mega Man X6 is a pure-2D sprite engine that renders only a 4:3 (320px) field
+ * of view — there is no overscan to "reveal." Its per-layer background renderer
+ * (FUN_800270d0) draws `count` 16px tile columns × 16 rows from a start tile
+ * column / start screen-x derived from the camera scroll. To produce a TRUE
+ * wider FOV we widen that loop so it draws extra columns on BOTH sides of the
+ * 320 view, filling the 16:9 reveal margins with real adjacent stage. The three
+ * helpers below are hooked at the renderer's count / start-col / start-x
+ * instructions by the recompiler (gen-time). They are IDENTITY unless native-
+ * wide is engaged on a ~320 screen, so 4:3 (and the engine's own 512 hi-res
+ * mode, which already draws 33 columns) stay byte-identical.
+ *
+ * LEFT = per-side reveal in whole 16px tile columns = ceil(nw_offset / 16). The
+ * loop start moves LEFT columns earlier (tile col -LEFT in the 64-col ring,
+ * screen-x -LEFT*16) and the count grows by 2*LEFT, so existing columns keep
+ * their screen positions (stay aligned with objects/player) while new columns
+ * are prepended left and appended right. The 64-column tile ring (mask 0x3f) is
+ * far wider than the visible window, so the prepended columns fetch the correct
+ * already-streamed adjacent tiles. */
+static int ws_mmx6_left_cols(void) {
+    if (!ws_native_wide_active()) return 0;
+    /* Only the ~320 gameplay mode; the engine's 512 hi-res mode (title) draws
+     * its own 33 columns and centres itself — never double-shift it. */
+    if (ws_disp_w() > 384) return 0;
+    int off = ws_nw_offset();           /* per-side reveal in screen px */
+    if (off <= 0) return 0;
+    return (off + 15) / 16;             /* ceil to whole tile columns */
+}
+/* Column count: base (21) + the columns revealed on both sides. */
+int psx_ws_mmx6_bg_cols(int base)    { return base + 2 * ws_mmx6_left_cols(); }
+/* Start tile column: LEFT earlier, wrapped in the 64-column ring (mask 0x3f). */
+int psx_ws_mmx6_bg_startcol(int col) { return (col - ws_mmx6_left_cols()) & 0x3f; }
+/* Start screen-x: LEFT*16 further left (more negative). */
+int psx_ws_mmx6_bg_startx(int x)     { return x - ws_mmx6_left_cols() * 16; }
 
 /* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x),
  * called identically by the gcc emit, the sljit JIT, and the interpreter so every
