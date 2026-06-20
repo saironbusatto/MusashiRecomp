@@ -100,7 +100,9 @@ int main(int argc, char** argv) {
     std::set<uint32_t>    persist_init_sites;   // [persist_options] init-store hooks (game_options.toml)
     bool                  ws_auto_backdrop_preload = false; // [widescreen.cull] auto_backdrop
     uint32_t              ws_bg2d_count_site = 0, ws_bg2d_startcol_site = 0,
-                          ws_bg2d_startx_site = 0; // [widescreen.bg2d]
+                          ws_bg2d_startx_site = 0,
+                          ws_bg2d_stream_left_site = 0,
+                          ws_bg2d_stream_right_site = 0; // [widescreen.bg2d]
     std::filesystem::path out_dir = "generated";
 
     if (!config_path.empty()) {
@@ -121,6 +123,8 @@ int main(int argc, char** argv) {
         if (cfg.ws_bg2d_count_site)    ws_bg2d_count_site    = cfg.ws_bg2d_count_site;
         if (cfg.ws_bg2d_startcol_site) ws_bg2d_startcol_site = cfg.ws_bg2d_startcol_site;
         if (cfg.ws_bg2d_startx_site)   ws_bg2d_startx_site   = cfg.ws_bg2d_startx_site;
+        if (cfg.ws_bg2d_stream_left_site)  ws_bg2d_stream_left_site  = cfg.ws_bg2d_stream_left_site;
+        if (cfg.ws_bg2d_stream_right_site) ws_bg2d_stream_right_site = cfg.ws_bg2d_stream_right_site;
         // [persist_options] init-store hook sites live in a dedicated
         // game_options.toml next to game.toml (the game's own native OPTION
         // settings, kept separate from game.toml/settings.toml). Best-effort:
@@ -693,6 +697,8 @@ int main(int argc, char** argv) {
     codegen_config.ws_bg2d_count_site    = ws_bg2d_count_site;
     codegen_config.ws_bg2d_startcol_site = ws_bg2d_startcol_site;
     codegen_config.ws_bg2d_startx_site   = ws_bg2d_startx_site;
+    codegen_config.ws_bg2d_stream_left_site  = ws_bg2d_stream_left_site;
+    codegen_config.ws_bg2d_stream_right_site = ws_bg2d_stream_right_site;
     if (ws_bg2d_count_site || ws_bg2d_startcol_site || ws_bg2d_startx_site)
         fmt::print("  ws_bg2d 2D-background widen = ON (count=0x{:08X} startcol=0x{:08X} startx=0x{:08X})\n",
                    ws_bg2d_count_site, ws_bg2d_startcol_site, ws_bg2d_startx_site);

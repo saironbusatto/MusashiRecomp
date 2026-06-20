@@ -229,6 +229,19 @@ int psx_ws_mmx6_bg_startcol(int col) { return (col - ws_mmx6_left_cols()) & 0x3f
 /* Start screen-x: LEFT*16 further left (more negative). */
 int psx_ws_mmx6_bg_startx(int x)     { return x - ws_mmx6_left_cols() * 16; }
 
+/* Tile-RING STREAMER widen (same [widescreen.bg2d], FUN_800273e4). The renderer
+ * above now draws LEFT extra columns each side, but the engine's 64-column tile
+ * ring is only refreshed at its leading edge: the streamer re-streams ONE column
+ * per side per frame at world-X scrollX-16 (left) and scrollX+16+width (right),
+ * so the columns the widened renderer reaches are never populated (they show
+ * empty=black or stale=old tiles, the "stale margins"). Push the streamed left/
+ * right edge out by LEFT*16 so the ring stays valid across the widened window as
+ * the camera scrolls (the incremental streamer fills each newly-leading column).
+ * Identity (no extra streaming) at 4:3 / 512 hi-res, so the ring is byte-identical
+ * there. The 64-col ring has ample slack (visible ~21 cols) for ±LEFT more. */
+int psx_ws_mmx6_bg_stream_left(int x)  { return x - ws_mmx6_left_cols() * 16; }
+int psx_ws_mmx6_bg_stream_right(int x) { return x + ws_mmx6_left_cols() * 16; }
+
 /* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x),
  * called identically by the gcc emit, the sljit JIT, and the interpreter so every
  * overlay execution path widens the same way. sx = the GTE screen-X as loaded by

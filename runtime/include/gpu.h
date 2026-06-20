@@ -104,6 +104,8 @@ void gpu_ws_set_full_2d(int on);
 int psx_ws_mmx6_bg_cols(int base);
 int psx_ws_mmx6_bg_startcol(int col);
 int psx_ws_mmx6_bg_startx(int x);
+int psx_ws_mmx6_bg_stream_left(int x);
+int psx_ws_mmx6_bg_stream_right(int x);
 struct CPUState;
 void psx_ws_sprite_tag(struct CPUState* cpu);
 

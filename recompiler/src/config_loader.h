@@ -382,6 +382,13 @@ struct GameConfig {
     uint32_t ws_bg2d_count_site    = 0;
     uint32_t ws_bg2d_startcol_site = 0;
     uint32_t ws_bg2d_startx_site   = 0;
+    //   stream_left_site / stream_right_site: the addiu instructions in the tile-
+    //   RING STREAMER that compute the left (scrollX-16) and right (scrollX+16,
+    //   before +width) leading-edge world-X. Pushed out by LEFT*16 so the ring is
+    //   populated across the widened column window (else the extra columns show
+    //   empty/stale tiles). 0 = unset.
+    uint32_t ws_bg2d_stream_left_site  = 0;
+    uint32_t ws_bg2d_stream_right_site = 0;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.

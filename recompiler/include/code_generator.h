@@ -99,6 +99,8 @@ struct CodeGenConfig {
     uint32_t ws_bg2d_count_site    = 0;
     uint32_t ws_bg2d_startcol_site = 0;
     uint32_t ws_bg2d_startx_site   = 0;
+    uint32_t ws_bg2d_stream_left_site  = 0;  // tile-ring streamer left leading-edge addiu
+    uint32_t ws_bg2d_stream_right_site = 0;  // tile-ring streamer right leading-edge addiu
 
     // Persistent game-option init-store hooks ([persist_options] in
     // game_options.toml). Each entry is the PC of a boot-init sb/sh that writes a
