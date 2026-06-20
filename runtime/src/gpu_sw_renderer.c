@@ -146,17 +146,23 @@ static inline RTarget rt_hires(void) {
     return t;
 }
 
-/* Native-wide mirror target: the active wide surface (g_wide_cur). Clip is the
- * full surface; callers pass coordinates already translated into surface space
- * (vram_x - base_x + OFFSET) and y-clipped to the buffer's band via the source
- * primitive. Scale matches the SSAA scale. Only used when g_wide_cur != NULL. */
+/* Native-wide mirror target: the active wide surface (g_wide_cur). X spans the
+ * full wide width (that is where the revealed margins live), but Y is clipped to
+ * the canonical DRAW AREA — exactly like rt_native — so a primitive that bleeds
+ * past the current framebuffer's vertical band is confined to it. This matters
+ * for VERTICALLY double-buffered games (e.g. MMX6: front y0..239 / back
+ * y240..479, same base_x): the background tile loop starts a partial row at
+ * y = buffer_top - (scrollY & 0xf), which without the band clip would draw up
+ * into the OTHER buffer's band in the shared wide surface and corrupt it
+ * (top/bottom edge flicker as the buffers flip). Canonical VRAM never showed
+ * this because its draw-area clip already confines it. Scale matches SSAA. */
 static inline RTarget rt_wide(void) {
     int s = g_scale;
     RTarget t;
     t.buf = g_wide_cur;
     t.w = g_wide_w * s; t.h = VRAM_HEIGHT * s; t.s = s;
-    t.cx1 = 0; t.cy1 = 0;
-    t.cx2 = g_wide_w * s - 1; t.cy2 = VRAM_HEIGHT * s - 1;
+    t.cx1 = 0;             t.cy1 = g_clip_y1 * s;
+    t.cx2 = g_wide_w * s - 1; t.cy2 = g_clip_y2 * s + (s - 1);
     return t;
 }
 
