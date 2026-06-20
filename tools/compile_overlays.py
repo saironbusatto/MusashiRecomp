@@ -1086,6 +1086,36 @@ def write_overlay_ranges(src_path: str, out_path: str,
     return n
 
 
+def _toolchain_env(gcc: str):
+    """Build an environment that guarantees gcc's toolchain dir is on PATH.
+
+    A mingw gcc invoked by absolute path (as the runtime's cmd.exe autocompile
+    spawn does, and as any launch without mingw64/bin on PATH does) fails
+    SILENTLY — exit 1, empty stderr — because cc1/as/ld/collect2 and the runtime
+    DLLs (libwinpthread-1, libgcc_s_seh-1, libstdc++-6) are resolved via PATH and
+    can't be found, so gcc never actually compiles. Auto-detect the toolchain
+    bin dir and prepend it. Detection order: $PSX_MINGW_BIN override, the dir of
+    the given --gcc path, `which gcc`, then common install locations. Returns
+    (env, resolved_gcc_dir_or_None)."""
+    import shutil
+    env = os.environ.copy()
+    cands = []
+    if os.environ.get('PSX_MINGW_BIN'):
+        cands.append(os.environ['PSX_MINGW_BIN'])
+    if ('/' in gcc) or ('\\' in gcc):
+        cands.append(os.path.dirname(os.path.abspath(gcc)))
+    w = shutil.which(gcc)
+    if w:
+        cands.append(os.path.dirname(w))
+    cands += [r'C:\msys64\mingw64\bin', r'C:\mingw64\bin', '/usr/bin']
+    for d in cands:
+        if d and (os.path.isfile(os.path.join(d, 'gcc.exe')) or
+                  os.path.isfile(os.path.join(d, 'gcc'))):
+            env['PATH'] = d + os.pathsep + env.get('PATH', '')
+            return env, d
+    return env, None
+
+
 def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
                 gcc: str = 'gcc', flavor: int = 0) -> bool:
     import platform
@@ -1094,6 +1124,7 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
     # forward-slash paths; absolute backslash paths work in every context.
     c_path  = os.path.abspath(c_path)
     out_dll = os.path.abspath(out_dll)
+    env, tc_dir = _toolchain_env(gcc)
     includes = [f'-I{os.path.abspath(d)}' for d in include_dirs]
     # On Windows, DLLs use PE relocations — -fPIC triggers GCC CRT init
     # that conflicts with the host process. Use -shared without -fPIC.
@@ -1111,8 +1142,11 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
         *includes,
         '-lm',
     ]
+    if tc_dir is None:
+        print('  WARNING: no gcc toolchain dir found (PSX_MINGW_BIN / --gcc dir / '
+              'PATH / common locations); compile will likely fail silently.')
     print(f'  compile: {" ".join(cmd)}')
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if r.returncode != 0:
         print(f'  COMPILE ERROR (exit {r.returncode}):\n{r.stderr or r.stdout}')
         return False
