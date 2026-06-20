@@ -104,6 +104,15 @@ static int32_t ws_disp_w(void);
  * gameplay. A menu/title/save screen draws no tagged prims. The 2-frame window
  * makes this frame-stable regardless of per-prim ordering within a frame. */
 static int ws_game_mode(void) {
+    /* EXPERIMENT (PSX_WS_FORCE_2D=1): force "gameplay" so native-wide engages on
+     * an all-2D sprite game (MMX6) that never emits the sprite-tag hook. This is
+     * the 2D "overscan reveal" path — the game over-draws past the 320 viewport
+     * (clipped by the draw area), and native-wide's draw_offset shift + draw-area
+     * widen + wide-mirror + widened present reveal it. Env-gated so it's regen-
+     * free and off for tagged 3D games. */
+    static int force = -1;
+    if (force < 0) { const char *e = getenv("PSX_WS_FORCE_2D"); force = (e && e[0] == '1') ? 1 : 0; }
+    if (force) return 1;
     return (uint32_t)s_frame_count - ws_last_tag_stamp <= 2;
 }
 
