@@ -99,7 +99,7 @@ struct LauncherModel {
     int  texture_filter  = 0;  // 0=nearest, 1=bilinear
     int  crt             = 0;  // 0=raw,1=crt,2=composite,3=trinitron
     bool auto_skip_fmv   = false; // skip FMVs via the game's own skip
-    bool turbo_loads     = false; // speed through load screens (mutes audio); default off
+    bool turbo_loads     = true;  // fast-forward the machine through load screens (audio plays through); default on
     bool spu_hq          = false;
     int  aspect_index    = 0;  // index into kAspects (0 = 4:3 native)
     int  window_width    = 1280; // window size (height = width*den/num per aspect)

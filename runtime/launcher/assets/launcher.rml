@@ -342,7 +342,7 @@ button:hover { background-color: #232d3c; }
 					<button class="toggle" data-event-click="toggle_skip_fmv"><span class="value" data-if="auto_skip_fmv">On</span><span class="value" data-if="auto_skip_fmv == false">Off</span></button></span></div>
 				<div class="set-row"><span class="set-lbl">Turbo loads</span><span class="set-ctl">
 					<button class="toggle" data-event-click="toggle_turbo_loads"><span class="value" data-if="turbo_loads">On</span><span class="value" data-if="turbo_loads == false">Off</span></button>
-					<span class="ws-hint" data-if="turbo_loads">faster loading, briefly mutes audio</span></span></div>
+					<span class="ws-hint" data-if="turbo_loads">much faster loading, audio plays through</span></span></div>
 			<div class="set-row" data-if="ws_eligible"><span class="set-lbl">Widescreen <span class="exp-tag">EXPERIMENTAL</span></span><span class="set-ctl">
 				<button class="toggle" data-event-click="toggle_widescreen"><span class="value" data-if="widescreen">On</span><span class="value" data-if="widescreen == false">Off</span></button>
 				<span class="ws-hint" data-if="widescreen">16:9 native field-of-view</span></span></div>
