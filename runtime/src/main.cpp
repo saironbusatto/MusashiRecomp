@@ -1915,6 +1915,10 @@ int main(int argc, char** argv) {
                 g_fmv_skip_end_total = gc.runtime.video_fmv_skip_end_total;
             g_ws_anchor_addr   = gc.ws_sprite_anchor_addr;
             g_ws_hud_sprt      = gc.ws_hud_sprt_squash;
+            /* [widescreen] full_2d — opt a pure-2D sprite game (MMX6) into the
+             * widescreen present path. Applied to the GPU layer up front so the
+             * ws engage at game entry classifies every frame as gameplay. */
+            gpu_ws_set_full_2d(gc.ws_full_2d ? 1 : 0);
             /* Register the [widescreen.backdrop] store PCs so the dirty-RAM
              * interpreter applies the backdrop screenX squash on the interp
              * path (overlay backdrop handlers run interpreted when no cache

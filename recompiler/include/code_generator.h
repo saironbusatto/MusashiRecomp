@@ -90,6 +90,16 @@ struct CodeGenConfig {
     // FOV (identity at 4:3). Overlay-resident; see config_loader.h. Empty=default.
     std::set<uint32_t> ws_backdrop_x_sites;
 
+    // Widescreen pure-2D background tile-loop widen ([widescreen.bg2d]). Three
+    // instruction addresses in a 2D game's per-layer BG renderer (MMX6's
+    // FUN_800270d0): the column-count load, the start tile-column mask, and the
+    // start screen-x shift, rewritten through the gpu.c psx_ws_mmx6_bg_* helpers
+    // so the loop draws the 16:9 reveal columns on both sides (identity at 4:3 /
+    // 512 hi-res). 0 = unset. Main-EXE addresses; verified by opcode at gen time.
+    uint32_t ws_bg2d_count_site    = 0;
+    uint32_t ws_bg2d_startcol_site = 0;
+    uint32_t ws_bg2d_startx_site   = 0;
+
     // Persistent game-option init-store hooks ([persist_options] in
     // game_options.toml). Each entry is the PC of a boot-init sb/sh that writes a
     // config global's DEFAULT value; the store is rewritten to route the value

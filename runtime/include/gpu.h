@@ -95,6 +95,15 @@ void gpu_set_screen_kind(int kind);
  * (render the wider FOV into a wider frame, present 1:1; GTE not squashed). */
 void gpu_ws_configure(int aspect_num, int aspect_den,
                       uint32_t sprite_anchor_addr, int hud_sprt_squash, int mode);
+/* [widescreen] full_2d: opt a pure-2D sprite game into the widescreen present
+ * path (treat every in-game frame as gameplay, since it never tags 3D prims). */
+void gpu_ws_set_full_2d(int on);
+/* [widescreen.bg2d] MMX6 background tile-loop widen — hooked at the renderer's
+ * column-count / start-tile-col / start-screen-x instructions. Identity at 4:3
+ * and in the engine's 512 hi-res mode. */
+int psx_ws_mmx6_bg_cols(int base);
+int psx_ws_mmx6_bg_startcol(int col);
+int psx_ws_mmx6_bg_startx(int x);
 struct CPUState;
 void psx_ws_sprite_tag(struct CPUState* cpu);
 

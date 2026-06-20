@@ -572,6 +572,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::vector<uint32_t> ws_sprite_tag_funcs;
     uint32_t ws_sprite_anchor_addr = 0;
     bool ws_hud_sprt_squash = false;
+    bool ws_full_2d = false;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("sprite_tag_funcs")) {
@@ -591,6 +592,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                 config_path.string()));
         if (ws.contains("hud_sprt_squash"))
             ws_hud_sprt_squash = toml::find<bool>(ws, "hud_sprt_squash");
+        if (ws.contains("full_2d"))
+            ws_full_2d = toml::find<bool>(ws, "full_2d");
     }
 
     // Optional [widescreen.cull] block — world-space draw-cull widening.
@@ -613,6 +616,24 @@ GameConfig load_game_config(const fs::path& config_path_in) {
                 ws_auto_screen_x_cull = toml::find<bool>(cull, "auto_screen_x");
             if (cull.contains("auto_backdrop"))
                 ws_auto_backdrop_preload = toml::find<bool>(cull, "auto_backdrop");
+        }
+    }
+
+    // Optional [widescreen.bg2d] block — pure-2D background tile-loop widen.
+    uint32_t ws_bg2d_count_site = 0, ws_bg2d_startcol_site = 0, ws_bg2d_startx_site = 0;
+    if (cfg.contains("widescreen")) {
+        const toml::value& ws = toml::find(cfg, "widescreen");
+        if (ws.contains("bg2d")) {
+            const toml::value& bg = toml::find(ws, "bg2d");
+            auto load1 = [&](const char* key) -> uint32_t {
+                return bg.contains(key)
+                    ? parse_hex(toml::find<std::string>(bg, key),
+                                fmt::format("widescreen.bg2d.{}", key))
+                    : 0u;
+            };
+            ws_bg2d_count_site    = load1("count_site");
+            ws_bg2d_startcol_site = load1("startcol_site");
+            ws_bg2d_startx_site   = load1("startx_site");
         }
     }
 
@@ -665,6 +686,10 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_backdrop_unsquash_funcs*/ ws_backdrop_unsquash_funcs,
         /*ws_auto_screen_x_cull*/ ws_auto_screen_x_cull,
         /*ws_auto_backdrop_preload*/ ws_auto_backdrop_preload,
+        /*ws_full_2d*/            ws_full_2d,
+        /*ws_bg2d_count_site*/    ws_bg2d_count_site,
+        /*ws_bg2d_startcol_site*/ ws_bg2d_startcol_site,
+        /*ws_bg2d_startx_site*/   ws_bg2d_startx_site,
     };
 }
 
