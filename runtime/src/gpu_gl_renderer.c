@@ -971,6 +971,46 @@ static int   s_tb_semi = -2;
 static int   s_tb_mask = 0, s_tb_filter = 0;
 static int   s_tb_twin[4] = {0, 0, 0, 0};
 
+/* Draw the queued textured batch with correct PSX mask-bit handling AND correct
+ * painter's order. The mask bit lives in both the colour-attachment alpha
+ * (frag.a) and the stencil; STP=1 texels must always set it.
+ *
+ * OPAQUE batch (semi < 0): the STP bit does NOT gate COLOUR (every texel is
+ * opaque), so colour is drawn in ONE ordered pass over all texels — frag.a still
+ * carries the per-texel mask bit, so the alpha mask is correct — followed by a
+ * COLOUR-MASKED pass that only fixes the STENCIL for STP=1 texels. The old code
+ * split colour into STP=0 (pass 1) then STP=1 (pass 2) across the WHOLE batch,
+ * which let a behind prim's STP=1 texels overwrite a front prim's STP=0 colour
+ * (the Tomba character drew behind an AP-block's letters / a save post on GL
+ * only). Same draw count, order preserved, mask preserved.
+ *
+ * SEMI batch (semi >= 0): genuine two-pass — STP=0 texels opaque, STP=1 texels
+ * blended per the PSX mode. Cross-prim order is kept by isolating semi prims to
+ * one per batch (see gpu_textured_triangle), so this batch holds a single prim
+ * whose two passes do not self-overlap. */
+static void tex_batch_draw_passes(int nverts, int semi) {
+    if (semi < 0) {
+        glDisable(GL_BLEND);
+        mask_stencil(s_tb_mask);
+        p_glUniform1i(s_uSemipass, 0);                 /* all texels, one ordered colour pass */
+        glDrawArrays(GL_TRIANGLES, 0, nverts);
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);  /* stencil-only fixup */
+        mask_stencil(1);
+        p_glUniform1i(s_uSemipass, 2);                 /* STP=1 texels set the mask bit */
+        glDrawArrays(GL_TRIANGLES, 0, nverts);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    } else {
+        glDisable(GL_BLEND);                           /* Pass 1: STP=0 texels (opaque) */
+        mask_stencil(s_tb_mask);
+        p_glUniform1i(s_uSemipass, 1);
+        glDrawArrays(GL_TRIANGLES, 0, nverts);
+        apply_psx_blend(semi);                         /* Pass 2: STP=1 texels (blended) */
+        mask_stencil(1);
+        p_glUniform1i(s_uSemipass, 2);
+        glDrawArrays(GL_TRIANGLES, 0, nverts);
+    }
+}
+
 static void flush_tex_batch(void) {
     if (s_tb_n == 0) return;
     int nverts = s_tb_n, semi = s_tb_semi;
@@ -988,28 +1028,14 @@ static void flush_tex_batch(void) {
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_tex_vbo);
     p_glBufferData(PSXGL_ARRAY_BUFFER, (ptrdiff_t)(nverts * TEXV * sizeof(float)), s_tb, PSXGL_STREAM_DRAW);
 
-    glDisable(GL_BLEND);                    /* Pass 1: STP=0 texels */
-    mask_stencil(s_tb_mask);
-    p_glUniform1i(s_uSemipass, 1);
-    glDrawArrays(GL_TRIANGLES, 0, nverts);
-    if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);  /* Pass 2: STP=1 */
-    mask_stencil(1);
-    p_glUniform1i(s_uSemipass, 2);
-    glDrawArrays(GL_TRIANGLES, 0, nverts);
+    tex_batch_draw_passes(nverts, semi);
 
-    if (g_wide_cur) {                       /* native-wide mirror (both STP passes) */
+    if (g_wide_cur) {                       /* native-wide mirror */
         int dx = wide_dx();
         s_bd_gate = s_tb_gate;              /* this batch is uniform-gate (flushed on change) */
         wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
         wide_set_bd_scale(s_tex_uXscale, s_tex_uXcenter);
-        glDisable(GL_BLEND);
-        mask_stencil(s_tb_mask);
-        p_glUniform1i(s_uSemipass, 1);
-        glDrawArrays(GL_TRIANGLES, 0, nverts);
-        if (semi >= 0) apply_psx_blend(semi); else glDisable(GL_BLEND);
-        mask_stencil(1);
-        p_glUniform1i(s_uSemipass, 2);
-        glDrawArrays(GL_TRIANGLES, 0, nverts);
+        tex_batch_draw_passes(nverts, semi);
         wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
         wide_target_end(s_tex_uXoff, s_tex_uXhalf);
     }
@@ -1128,8 +1154,25 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
     {
         int twx = s_tw_mask_x, twy = s_tw_mask_y, tox = s_tw_off_x, toy = s_tw_off_y;
         int gate = bd_prim_gate(xs, 3);  /* backdrop-stretch gate is also a batch key */
+        /* STP draw-ORDER correctness. flush_tex_batch draws a batch in two passes
+         * over the WHOLE batch (pass 1 = every prim's STP=0/opaque texels, pass 2
+         * = every prim's STP=1/semi texels with the PSX blend). For overlapping
+         * prims that share a batch, a BEHIND prim's semi texels (pass 2) then
+         * paint OVER a FRONT prim's opaque texels (pass 1) — a painter's-order
+         * violation that only exists on GL (Tomba: the character drew behind the
+         * AP-block letters / a save post on GL, correct on software). So a
+         * semi-transparent prim must NOT coalesce with its neighbours: drain the
+         * open batch, draw this prim alone (its own STP=0+STP=1 passes, which do
+         * not self-overlap → composited fully before the next prim, exactly like
+         * the software renderer), and let opaque prims keep batching. Opaque
+         * content (terrain/foliage — the batching perf win) is untouched; the cost
+         * is one draw per semi prim, which are sparse. (A future single-pass
+         * optimization for modes 0/1/3 via GL_ONE,GL_SRC_ALPHA with a per-fragment
+         * destination factor in alpha could re-batch semi prims — see memory
+         * tomba_sprite_zorder_bug; mode 2 subtractive still needs isolation.) */
+        int isolate = (semi >= 0);
         if (s_tb_n > 0 &&
-            (semi != s_tb_semi || s_mask_set != s_tb_mask || s_tex_filter != s_tb_filter || gate != s_tb_gate ||
+            (isolate || semi != s_tb_semi || s_mask_set != s_tb_mask || s_tex_filter != s_tb_filter || gate != s_tb_gate ||
              twx != s_tb_twin[0] || twy != s_tb_twin[1] || tox != s_tb_twin[2] || toy != s_tb_twin[3]))
             flush_tex_batch();
         if (s_tb_n + 3 > TEXBATCH_MAXV) flush_tex_batch();
@@ -1149,6 +1192,7 @@ static void gpu_textured_triangle(const int *xs, const int *ys,
             vp[16] = (float)lim[2];  vp[17] = (float)lim[3];
         }
         s_tb_n += 3;
+        if (isolate) flush_tex_batch();   /* draw this semi prim alone, in submission order */
     }
 }
 
