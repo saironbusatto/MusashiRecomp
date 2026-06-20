@@ -477,6 +477,23 @@ static void cd_expose(const CdQResp *r) {
  * no response is ever clobbered — this replaces the old direct irq_flag=type
  * overwrite that DROPPED responses under fast (instant) disc timing. */
 static void set_irq(int type) {
+    /* Authentic-1x bypass. The response arbiter (queue + inter-IRQ gap + command
+     * latch) exists to stop responses being DROPPED when we deliver them FASTER
+     * than hardware (disc_speed 2x/4x/instant), where a new response can land
+     * before the guest acks the previous one. At authentic 1x that race cannot
+     * happen — responses arrive at hardware cadence — and any queue/gap we add
+     * only PERTURBS timing the game was validated against. That perturbation
+     * desynced CD-streamed audio (boss/stage-select music looped/restarted
+     * early). So at 1x, behave exactly as the pre-arbiter code did: set the
+     * visible IRQ immediately; the caller's fire_cdrom_irq() raises the line. */
+    if (g_disc_speed_divisor == 1) {
+        irq_flag = (uint8_t)type;
+        cd_gap_remaining = 0;
+        trace_cdrom('I', 0, (uint32_t)type, 0);
+        event_ring_record_aux(EV_DEQ, (uint8_t)SRC_CD_IRQ, (uint32_t)type);
+        return;
+    }
+
     CdQResp r;
     r.int_type = (uint8_t)type;
     r.count    = (uint8_t)(response_count > RESPONSE_FIFO_SIZE ? RESPONSE_FIFO_SIZE : response_count);
@@ -1317,7 +1334,8 @@ void cdrom_write(uint32_t addr, uint32_t value) {
              * command but holds its processing until the slot frees — LATCH it
              * (the guest ACK pumps the arbiter, which executes it). Only execute
              * inline when the controller is genuinely idle. */
-            if (irq_flag != 0 || cd_respq_len > 0 || cd_cmd_latched || cd_gap_remaining > 0) {
+            if (g_disc_speed_divisor != 1 &&
+                (irq_flag != 0 || cd_respq_len > 0 || cd_cmd_latched || cd_gap_remaining > 0)) {
                 cd_cmd_latched        = 1;
                 cd_cmd_latched_cmd    = val;
                 cd_cmd_latched_pcount = param_count;
@@ -1359,7 +1377,7 @@ void cdrom_write(uint32_t addr, uint32_t value) {
              * the visible response is retired, expose the next queued response
              * or start a latched command. (A naive "defer + return" guard
              * deadlocks precisely because it lacks this active pump.) */
-            if (irq_flag == 0) {
+            if (g_disc_speed_divisor != 1 && irq_flag == 0) {
                 cd_arbiter_pump();
             }
         }

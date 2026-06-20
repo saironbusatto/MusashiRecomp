@@ -237,6 +237,13 @@ extern "C" {
 int      g_turbo_loads_enabled = 0;
 uint64_t g_turbo_loads_frames  = 0;   /* vblanks run unpaced (observability) */
 }
+/* Engage turbo only after a load has been continuously in progress for this many
+ * frames. Filters brief incidental reads (e.g. a boss/stage-select screen that
+ * streams XA music and reads a few preview sectors as you hover): each 1-2 frame
+ * blip would otherwise flip turbo on, muting the music for the audio hangover and
+ * stuttering the frame rate. Real loads hold for hundreds of frames, so they
+ * lose only this brief authentic-paced prefix. */
+#define TURBO_LOADS_ENGAGE_FRAMES 20
 static SDL_AudioDeviceID sdl_audio_device;
 static int16_t       sdl_audio_buf[2048 * 2];
 
@@ -1418,7 +1425,19 @@ static void sdl_vblank_present(void) {
     int turbo_loads_active = 0;
     if (g_turbo_loads_enabled) {
         extern int fntrace_is_game_started(void);
-        if (fntrace_is_game_started() && cdrom_load_in_progress())
+        /* Hysteresis: count consecutive frames the load has held, and only
+         * engage turbo once it is SUSTAINED (TURBO_LOADS_ENGAGE_FRAMES). This
+         * stops brief incidental reads on music screens (boss/stage select) from
+         * flickering turbo on and chopping the audio. cdrom_load_in_progress()
+         * already bridges short intra-load gaps (CD_BURST_GAP_FRAMES), so a real
+         * load's counter does not reset mid-load. */
+        static int load_run = 0;
+        if (fntrace_is_game_started() && cdrom_load_in_progress()) {
+            if (load_run < (1 << 20)) load_run++;
+        } else {
+            load_run = 0;
+        }
+        if (load_run >= TURBO_LOADS_ENGAGE_FRAMES)
             turbo_loads_active = 1;
     }
 
@@ -1462,7 +1481,13 @@ static void sdl_vblank_present(void) {
     }
 
 #ifndef PSX_SDL_NO_AUDIO
-    sdl_audio_update(turbo_loads_active || fmv_skip_active);
+    /* Turbo-loads no longer mutes audio. Loads at 1x+turbo are sub-second, and
+     * the mute/fade/hangover model produced more audible disruption (cuts and
+     * "restarts") than just letting the stream play through; the audio queue is
+     * capped (sdl_audio_pump max_queue_bytes) so a brief turbo burst can't build
+     * unbounded latency. FMV-skip still mutes: it fast-forwards an entire movie,
+     * where rendering the time-compressed audio would be pure noise. */
+    sdl_audio_update(fmv_skip_active);
 #endif
 
     /* TCP turbo is for automated validation and trace capture. It keeps the
