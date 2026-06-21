@@ -176,6 +176,7 @@ button:hover { background-color: #232d3c; }
 	border-top: 1dp #1e2733; padding-top: 16dp; }
 .foot-link { color: #8b949e; margin-right: 22dp; }
 .foot-link:hover { color: #e6e9ef; }
+.skip-lbl { color: #adbac7; font-size: 13dp; margin-left: 9dp; margin-right: 22dp; }
 .foot-status { display: flex; flex-direction: row; align-items: center; flex: 1 1 auto; }
 #launch {
 	background-color: #2563eb; border-color: #3b82f6; color: #ffffff; font-weight: bold;
@@ -183,6 +184,19 @@ button:hover { background-color: #232d3c; }
 }
 #launch:hover { background-color: #3b82f6; }
 .back-btn { margin-right: 14dp; }
+
+/* ---- confirmation modal ---- */
+.modal-backdrop { position: fixed; left: 0dp; top: 0dp; width: 100%; height: 100%;
+	background-color: #000000cc; display: flex; flex-direction: row; align-items: center; z-index: 100; }
+.modal-box { display: block; width: 460dp; margin: 0dp auto;
+	background-color: #11161f; border: 1dp #2b3543; border-radius: 12dp; padding: 22dp 24dp; }
+.modal-title { display: block; font-size: 19dp; font-weight: bold; color: #ffffff; margin-bottom: 10dp; }
+.modal-text { display: block; color: #adbac7; font-size: 14dp; line-height: 20dp; margin-bottom: 20dp; }
+.modal-btns { display: flex; flex-direction: row; align-items: center; }
+.modal-spacer { flex: 1 1 auto; }
+.modal-btns button { margin-left: 10dp; }
+.modal-confirm { background-color: #2563eb; border-color: #3b82f6; color: #ffffff; font-weight: bold; }
+.modal-confirm:hover { background-color: #3b82f6; }
 </style>
 </head>
 
@@ -343,6 +357,8 @@ button:hover { background-color: #232d3c; }
 				<div class="set-row"><span class="set-lbl">Turbo loads</span><span class="set-ctl">
 					<button class="toggle" data-event-click="toggle_turbo_loads"><span class="value" data-if="turbo_loads">On</span><span class="value" data-if="turbo_loads == false">Off</span></button>
 					</span></div>
+				<div class="set-row"><span class="set-lbl">Fullscreen on launch</span><span class="set-ctl">
+					<button class="toggle" data-event-click="toggle_fullscreen"><span class="value" data-if="fullscreen">On</span><span class="value" data-if="fullscreen == false">Off</span></button></span></div>
 			<div class="set-row" data-if="ws_eligible"><span class="set-lbl">Widescreen <span class="exp-tag">EXPERIMENTAL</span></span><span class="set-ctl">
 				<button class="toggle" data-event-click="toggle_widescreen"><span class="value" data-if="widescreen">On</span><span class="value" data-if="widescreen == false">Off</span></button>
 				<span class="ws-hint" data-if="widescreen">16:9 native field-of-view</span></span></div>
@@ -372,10 +388,23 @@ button:hover { background-color: #232d3c; }
 
 	<!-- ================= FOOTER ================= -->
 	<div class="footer">
-		<span class="foot-link" data-if="view == 'dashboard'" data-event-click="show_settings">Settings</span>
-		<span class="foot-link back-btn" data-if="view == 'settings'" data-event-click="show_dashboard">‹ Back</span>
+		<span class="switch" data-class-on="skip_launcher" data-event-click="toggle_skip_launcher"><span class="knob"></span></span>
+		<span class="skip-lbl">Skip Launcher on Boot</span>
 		<span class="foot-status"><span class="dot"></span><span class="status-txt">Recompiler ready</span></span>
 		<button id="launch" data-event-click="launch">LAUNCH GAME</button>
+	</div>
+
+	<!-- ================= SKIP-LAUNCHER CONFIRM MODAL ================= -->
+	<div class="modal-backdrop" data-if="show_skip_modal">
+		<div class="modal-box">
+			<span class="modal-title">Skip the launcher on boot?</span>
+			<span class="modal-text">The launcher will no longer appear &#8212; the game boots straight in every time. To get the launcher back, run the game with the --launcher argument, or set skip_launcher = false in settings.toml.</span>
+			<div class="modal-btns">
+				<span class="modal-spacer"></span>
+				<button data-event-click="skip_modal_cancel">Cancel</button>
+				<button class="modal-confirm" data-event-click="skip_modal_confirm">Skip on Boot</button>
+			</div>
+		</div>
 	</div>
 
 </div>
