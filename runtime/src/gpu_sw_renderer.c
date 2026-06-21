@@ -1260,6 +1260,36 @@ void sw_draw_textured_rect(int x, int y, int w, int h,
     }
 }
 
+/* ---- MMX6 native-wide reveal-column tile (host-side, WIDE SURFACE ONLY) --------
+ * Rasterize ONE 16x16 textured tile into the active wide surface for a given vertical
+ * band, leaving canonical VRAM AND the hi-res mirror byte-identical. This fills the
+ * 16:9 reveal margins with background columns the guest BG renderer (kept at its native
+ * 21-column window) never draws — so the guest packet buffer / OT / 999-tile cap and the
+ * 4:3 image are completely untouched (no guest-RAM mutation, elective, 4:3 identical).
+ *
+ * `x`,`y` are guest screen coords; `y` already includes the band offset. The clip is the
+ * EXPLICIT band [band_y, band_y+240) — not g_clip — because this runs at the per-frame
+ * fill/clear, before the guest applies E3/E4/E5 for the new frame. Texture state globals
+ * are set transiently; the next real GP0 draw's setup overwrites them. */
+void sw_wide_emit_tile(int band_y, int x, int y, int u, int v,
+                       uint16_t clut_x, uint16_t clut_y, uint16_t texpage,
+                       uint32_t color24, int semi_trans, int semi_mode, int raw_texture) {
+    if (!g_wide_cur) return;
+    int s = g_scale, dx = wide_dx();
+    RTarget t;
+    t.buf = g_wide_cur; t.w = g_wide_w * s; t.h = VRAM_HEIGHT * s; t.s = s;
+    t.cx1 = 0;            t.cx2 = g_wide_w * s - 1;
+    t.cy1 = band_y * s;   t.cy2 = (band_y + 240) * s - 1;
+    g_mod_r = (uint8_t)((color24 & 0xff) >> 3);
+    g_mod_g = (uint8_t)(((color24 >> 8) & 0xff) >> 3);
+    g_mod_b = (uint8_t)(((color24 >> 16) & 0xff) >> 3);
+    g_raw_texture        = raw_texture ? 1 : 0;
+    g_semi_trans_enabled = semi_trans ? 1 : 0;
+    g_semi_trans_mode    = semi_mode & 3;
+    raster_textured_rect(&t, (x + dx) * s, y * s, 16 * s, 16 * s,
+                         u, v, clut_x, clut_y, texpage);
+}
+
 static void raster_textured_rect_scaled(const RTarget *t, int x, int y,
                                         int w, int h,
                                         int u0, int v0, int u1, int v1,

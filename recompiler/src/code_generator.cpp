@@ -889,6 +889,33 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             std::exit(1);
         }
     }
+    // BG packet-buffer RELOCATION (cure for the 1024-slot/1000-cap overflow that the
+    // widen causes in dense stages). bufbase_site = the driver addu computing the buffer
+    // address (base + bufidx*0x4000); cap_site = the renderer's per-frame tile-cap slti.
+    // Helpers relocate to a larger free buffer + raise the cap when the widen is active,
+    // identity otherwise (4:3 / other games byte-identical).
+    if (config_.ws_bg2d_bufbase_site && addr == config_.ws_bg2d_bufbase_site) {
+        if (opcode == 0x00 && (instr & 0x3F) == 0x21) {  // addu rd,rs,rt  (BG buffer address)
+            uint32_t rs = get_rs(instr), rt = get_rt(instr), rd = get_rd(instr);
+            return fmt::format("{} = (uint32_t)psx_ws_mmx6_bg_bufbase((int)({} + {}));{}",
+                               reg_name(rd), reg_name(rs), reg_name(rt), comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.bg2d] bufbase_site 0x{:08X} is not "
+                       "addu (instr 0x{:08X})\n", addr, instr);
+            std::exit(1);
+        }
+    }
+    if (config_.ws_bg2d_cap_site && addr == config_.ws_bg2d_cap_site) {
+        if (opcode == 0x0A) {  // slti rt,rs,imm  (BG per-frame tile cap compare)
+            uint32_t rs = get_rs(instr), rt = get_rt(instr);
+            return fmt::format("{} = (uint32_t)psx_ws_mmx6_bg_undercap((int32_t){});{}",
+                               reg_name(rt), reg_name(rs), comment);
+        } else if (!config_.overlay_mode) {
+            fmt::print(stderr, "ERROR: [widescreen.bg2d] cap_site 0x{:08X} is not "
+                       "slti (opcode 0x{:02X})\n", addr, opcode);
+            std::exit(1);
+        }
+    }
 
     // Persistent game-option init store ([persist_options] in game_options.toml).
     // The site is the boot-init sb/sh that writes a config global's DEFAULT value
@@ -2092,6 +2119,8 @@ std::string CodeGenerator::generate_file(
     ss << "extern int  psx_ws_mmx6_bg_startx(int x);       /* ws 2D bg tile-loop widen: start screen-x (gpu.c) */\n";
     ss << "extern int  psx_ws_mmx6_bg_stream_left(int x);  /* ws 2D bg tile-ring streamer: left edge (gpu.c) */\n";
     ss << "extern int  psx_ws_mmx6_bg_stream_right(int x); /* ws 2D bg tile-ring streamer: right edge (gpu.c) */\n";
+    ss << "extern int  psx_ws_mmx6_bg_bufbase(int addr);   /* ws 2D bg packet-buffer relocation (gpu.c) */\n";
+    ss << "extern int  psx_ws_mmx6_bg_undercap(int counter);/* ws 2D bg per-frame tile cap (gpu.c) */\n";
     ss << "extern int  psx_game_option_store(uint32_t addr, int val);  /* persisted OPTION restore-at-init (game_options.c) */\n";
     ss << "extern uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);  /* ws backdrop preload (gpu.c) */\n";
     ss << "extern void gte_ws_set_suppress(int on);  /* widescreen far-backdrop un-squash (gte.cpp) */\n\n";

@@ -98,6 +98,11 @@ void sw_wide_configure(int wide_w, int offset);
 void sw_wide_set_target(int base_x);
 void sw_wide_disable_target(void);
 void sw_wide_clear(int base_x, int y, int h, uint16_t color);
+/* MMX6 native-wide reveal-column tile: rasterize a 16x16 textured tile into the
+ * wide surface ONLY (canonical VRAM + hi-res mirror untouched). See definition. */
+void sw_wide_emit_tile(int band_y, int x, int y, int u, int v,
+                       uint16_t clut_x, uint16_t clut_y, uint16_t texpage,
+                       uint32_t color24, int semi_trans, int semi_mode, int raw_texture);
 int  sw_render_wide_display(uint32_t* out_pixels, int out_pitch, int base_x,
                             int disp_y, int disp_h);
 int  sw_wide_width(void);

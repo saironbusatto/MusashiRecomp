@@ -389,6 +389,12 @@ struct GameConfig {
     //   empty/stale tiles). 0 = unset.
     uint32_t ws_bg2d_stream_left_site  = 0;
     uint32_t ws_bg2d_stream_right_site = 0;
+    //   bufbase_site: the driver addu computing the BG packet-buffer address
+    //   (base 0x800B91C0 + bufidx*0x4000); relocated to a larger free buffer when the
+    //   widen is active. cap_site: the renderer's per-frame tile-cap slti (counter<1000);
+    //   raised to match the bigger buffer. Together they cure the dense-stage overflow.
+    uint32_t ws_bg2d_bufbase_site = 0;
+    uint32_t ws_bg2d_cap_site     = 0;
 };
 
 // UserSettings — the launcher-written, user-editable override layer.
