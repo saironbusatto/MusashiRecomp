@@ -256,6 +256,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
                 toml::find<std::string>(ct, "p2_mode"), PAD_MODE_HYBRID);
             rt.has_default_mode = true;
         }
+        if (ct.contains("allow_hybrid")) {
+            rt.controller_allow_hybrid = toml::find<bool>(ct, "allow_hybrid");
+        }
         if (ct.contains("deadzone")) {
             const auto n = toml::find<int64_t>(ct, "deadzone");
             if (n < 0 || n > 32767)

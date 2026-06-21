@@ -191,6 +191,12 @@ struct RuntimeConfig {
     int                   default_p1_mode  = PAD_MODE_HYBRID;
     int                   default_p2_mode  = PAD_MODE_HYBRID;
 
+    // allow_hybrid: whether the launcher offers the "Hybrid" pad mode at all.
+    // Default true (Hybrid | Analog | D-Pad). A game that needs an explicit
+    // analog/digital choice (e.g. one that hard-requires a DualShock) can set
+    // [controller] allow_hybrid = false to drop Hybrid from the selector.
+    bool                  controller_allow_hybrid = true;
+
     // deadzone: default analog-stick deadzone in raw SDL axis units (0..32767).
     // Applied both to the stick->d-pad press threshold and the analog-axis centre
     // dead-band. Absent => runtime default (12000). Overridden per-install by

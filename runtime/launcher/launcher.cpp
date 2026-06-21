@@ -138,6 +138,7 @@ struct LauncherModel {
     // 2=digital. Bound to the segmented 3-way selector in each player card.
     int  p1_mode      = 0;
     int  p2_mode      = 0;
+    bool allow_hybrid = true;  // game.allow_hybrid: when false the Hybrid segment is hidden
     int  deadzone_pct = 37;    // analog-stick deadzone 0-100% (raw = pct*32767/100)
     Rml::String p1_dev_label = "Keyboard";
     Rml::String p2_dev_label = "None";
@@ -670,6 +671,13 @@ Result run(SDL_Window* window, void* gl_context,
     std::vector<DeviceOption> dev_opts = enumerate_devices();
     m.p1_mode = io.has_p1_mode ? io.p1_mode : PSXRecompV4::PAD_MODE_HYBRID;
     m.p2_mode = io.has_p2_mode ? io.p2_mode : PSXRecompV4::PAD_MODE_HYBRID;
+    // When the game hides Hybrid, never leave a port selected on it (a stale
+    // settings.toml or the Hybrid default would otherwise highlight nothing).
+    m.allow_hybrid = game.allow_hybrid;
+    if (!m.allow_hybrid) {
+        if (m.p1_mode == PSXRecompV4::PAD_MODE_HYBRID) m.p1_mode = PSXRecompV4::PAD_MODE_ANALOG;
+        if (m.p2_mode == PSXRecompV4::PAD_MODE_HYBRID) m.p2_mode = PSXRecompV4::PAD_MODE_ANALOG;
+    }
     m.deadzone_pct = io.has_deadzone ? (io.deadzone * 100 / 32767) : 37;
     if (io.has_p1_device) {
         m.p1_dev_index = find_or_add_device_index(dev_opts, io.p1_device);
@@ -716,6 +724,7 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("view",           &m.view);
     c.Bind("p1_mode",        &m.p1_mode);
     c.Bind("p2_mode",        &m.p2_mode);
+    c.Bind("allow_hybrid",   &m.allow_hybrid);
     c.Bind("deadzone_pct",   &m.deadzone_pct);
     c.Bind("p1_dev_label",   &m.p1_dev_label);
     c.Bind("p2_dev_label",   &m.p2_dev_label);

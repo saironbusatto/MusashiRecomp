@@ -232,7 +232,7 @@ button:hover { background-color: #232d3c; }
 				<div class="card-head">
 					<span class="card-name">PLAYER 1</span>
 					<div class="seg">
-						<span class="seg-opt hybrid" data-class-on="p1_mode == 0" data-event-click="set_mode_p1(0)">Hybrid<span class="seg-tip">Nudge the analog stick for smooth analog movement, or use the D-pad for classic digital control. It switches automatically based on what you touch.</span></span>
+						<span class="seg-opt hybrid" data-if="allow_hybrid" data-class-on="p1_mode == 0" data-event-click="set_mode_p1(0)">Hybrid<span class="seg-tip">Nudge the analog stick for smooth analog movement, or use the D-pad for classic digital control. It switches automatically based on what you touch.</span></span>
 						<span class="seg-opt" data-class-on="p1_mode == 1" data-event-click="set_mode_p1(1)">Analog</span>
 						<span class="seg-opt" data-class-on="p1_mode == 2" data-event-click="set_mode_p1(2)">D-Pad</span>
 					</div>
@@ -256,7 +256,7 @@ button:hover { background-color: #232d3c; }
 				<div class="card-head">
 					<span class="card-name">PLAYER 2</span>
 					<div class="seg">
-						<span class="seg-opt hybrid" data-class-on="p2_mode == 0" data-event-click="set_mode_p2(0)">Hybrid<span class="seg-tip">Nudge the analog stick for smooth analog movement, or use the D-pad for classic digital control. It switches automatically based on what you touch.</span></span>
+						<span class="seg-opt hybrid" data-if="allow_hybrid" data-class-on="p2_mode == 0" data-event-click="set_mode_p2(0)">Hybrid<span class="seg-tip">Nudge the analog stick for smooth analog movement, or use the D-pad for classic digital control. It switches automatically based on what you touch.</span></span>
 						<span class="seg-opt" data-class-on="p2_mode == 1" data-event-click="set_mode_p2(1)">Analog</span>
 						<span class="seg-opt" data-class-on="p2_mode == 2" data-event-click="set_mode_p2(2)">D-Pad</span>
 					</div>
@@ -342,7 +342,7 @@ button:hover { background-color: #232d3c; }
 					<button class="toggle" data-event-click="toggle_skip_fmv"><span class="value" data-if="auto_skip_fmv">On</span><span class="value" data-if="auto_skip_fmv == false">Off</span></button></span></div>
 				<div class="set-row"><span class="set-lbl">Turbo loads</span><span class="set-ctl">
 					<button class="toggle" data-event-click="toggle_turbo_loads"><span class="value" data-if="turbo_loads">On</span><span class="value" data-if="turbo_loads == false">Off</span></button>
-					<span class="ws-hint" data-if="turbo_loads">much faster loading, audio plays through</span></span></div>
+					</span></div>
 			<div class="set-row" data-if="ws_eligible"><span class="set-lbl">Widescreen <span class="exp-tag">EXPERIMENTAL</span></span><span class="set-ctl">
 				<button class="toggle" data-event-click="toggle_widescreen"><span class="value" data-if="widescreen">On</span><span class="value" data-if="widescreen == false">Off</span></button>
 				<span class="ws-hint" data-if="widescreen">16:9 native field-of-view</span></span></div>

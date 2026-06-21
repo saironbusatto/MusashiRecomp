@@ -34,6 +34,7 @@ struct GameInfo {
     const char* expected_serial  = nullptr;  // game id "SCUS-94236" (null = no serial check)
     uint32_t    expected_crc     = 0;        // full-file CRC32 of the data track
     bool        has_expected_crc = false;    // whether expected_crc is meaningful
+    bool        allow_hybrid     = true;     // offer the "Hybrid" pad mode (false => Analog | D-Pad only)
 };
 
 // Run the launcher loop to completion. `gl_context` is an SDL_GLContext (void*

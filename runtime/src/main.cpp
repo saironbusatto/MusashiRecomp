@@ -1869,6 +1869,7 @@ int main(int argc, char** argv) {
     std::string p2_device = "none";
     int  p1_mode = PSXRecompV4::PAD_MODE_HYBRID;
     int  p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
+    bool ctrl_allow_hybrid = true;  /* game.toml [controller] allow_hybrid; false hides Hybrid in the launcher */
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     std::filesystem::path resolved_disc;
     std::string window_title = PSX_WINDOW_TITLE;
@@ -1934,6 +1935,7 @@ int main(int argc, char** argv) {
                 p1_mode = gc.runtime.default_p1_mode;
                 p2_mode = gc.runtime.default_p2_mode;
             }
+            ctrl_allow_hybrid = gc.runtime.controller_allow_hybrid;
             if (gc.runtime.has_deadzone) resolved_deadzone = gc.runtime.deadzone;
             { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
@@ -2155,6 +2157,7 @@ int main(int argc, char** argv) {
                     ginfo.expected_serial  = game_id.empty()   ? nullptr : game_id.c_str();
                     ginfo.expected_crc     = game_disc_crc;
                     ginfo.has_expected_crc = game_has_disc_crc;
+                    ginfo.allow_hybrid     = ctrl_allow_hybrid;
                     lr = psx_launcher::run(lwin, lctx, seed, ginfo, assets.c_str());
                     SDL_GL_DeleteContext(lctx);
                 }
