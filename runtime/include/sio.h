@@ -66,6 +66,15 @@ void sio_set_pad_state_slot(int slot, uint16_t buttons);
 void sio_set_pad_analog(int slot, int enabled,
                         uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
 
+/* Per-frame input plumbing for the coherent-DualShock model. Update the sticks
+ * every frame with sio_set_pad_sticks; change the reported pad type with
+ * sio_request_pad_type (the emulated "analog button"), which is applied
+ * atomically at the next idle, non-config bus boundary so a hybrid stick/d-pad
+ * flip can never split a poll or a config handshake. Do NOT call
+ * sio_set_pad_analog every frame for the type — that is for boot/hotplug only. */
+void sio_set_pad_sticks(int slot, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
+void sio_request_pad_type(int slot, int analog);
+
 /* Connect / disconnect a pad on a slot (0=port1, 1=port2). By default no pads
  * are connected during initial BIOS boot. */
 void sio_connect_pad(int slot);
@@ -198,6 +207,11 @@ typedef struct {
 } SioIrqEntry;
 
 uint32_t sio_get_irq_ring(const SioIrqEntry **buf_out, int *write_idx_out);
+
+/* Phantom-input regression A/B instrument: select pre/post-98aa688 pad config
+ * behavior at runtime (0 = new state machine, 1 = legacy always-0xF3). */
+int  sio_get_legacy_cfg(void);
+void sio_set_legacy_cfg(int v);
 
 #ifdef __cplusplus
 }
