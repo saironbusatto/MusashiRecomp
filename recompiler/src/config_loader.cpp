@@ -622,6 +622,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     // Optional [widescreen.bg2d] block — pure-2D background tile-loop widen.
     uint32_t ws_bg2d_count_site = 0, ws_bg2d_startcol_site = 0, ws_bg2d_startx_site = 0;
     uint32_t ws_bg2d_stream_left_site = 0, ws_bg2d_stream_right_site = 0;
+    uint32_t ws_bg2d_bufbase_site = 0, ws_bg2d_cap_site = 0;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
         if (ws.contains("bg2d")) {
@@ -637,6 +638,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_bg2d_startx_site   = load1("startx_site");
             ws_bg2d_stream_left_site  = load1("stream_left_site");
             ws_bg2d_stream_right_site = load1("stream_right_site");
+            ws_bg2d_bufbase_site = load1("bufbase_site");
+            ws_bg2d_cap_site     = load1("cap_site");
         }
     }
 
@@ -695,6 +698,8 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_bg2d_startx_site*/   ws_bg2d_startx_site,
         /*ws_bg2d_stream_left_site*/  ws_bg2d_stream_left_site,
         /*ws_bg2d_stream_right_site*/ ws_bg2d_stream_right_site,
+        /*ws_bg2d_bufbase_site*/  ws_bg2d_bufbase_site,
+        /*ws_bg2d_cap_site*/      ws_bg2d_cap_site,
     };
 }
 

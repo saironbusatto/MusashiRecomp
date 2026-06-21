@@ -101,6 +101,8 @@ struct CodeGenConfig {
     uint32_t ws_bg2d_startx_site   = 0;
     uint32_t ws_bg2d_stream_left_site  = 0;  // tile-ring streamer left leading-edge addiu
     uint32_t ws_bg2d_stream_right_site = 0;  // tile-ring streamer right leading-edge addiu
+    uint32_t ws_bg2d_bufbase_site = 0;       // driver addu: BG packet-buffer address (relocate)
+    uint32_t ws_bg2d_cap_site     = 0;       // renderer slti: per-frame BG tile cap (raise)
 
     // Persistent game-option init-store hooks ([persist_options] in
     // game_options.toml). Each entry is the PC of a boot-init sb/sh that writes a

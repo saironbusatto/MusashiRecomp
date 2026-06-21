@@ -5617,6 +5617,43 @@ static void handle_ws_census(int id, const char *json)
              id, n, path, (unsigned long long)gpu_ws_census_seq());
 }
 
+static void handle_mmx6_reveal(int id, const char *json)
+{
+    extern void gpu_ws_mmx6_set_hostside(int on);
+    extern int  gpu_ws_mmx6_hostside_get(void);
+    extern int  gpu_ws_mmx6_reveal_is_active(void);
+    extern long gpu_ws_mmx6_emit_tiles(void);
+    extern long gpu_ws_mmx6_emit_calls(void);
+    extern int  gpu_ws_mmx6_clut_count(void);
+    extern void gpu_ws_mmx6_set_reloc(int on);
+    extern int  gpu_ws_mmx6_reloc_get(void);
+    int on = json_get_int(json, "on", -1);
+    if (on >= 0) gpu_ws_mmx6_set_hostside(on);
+    int reloc = json_get_int(json, "reloc", -1);
+    if (reloc >= 0) gpu_ws_mmx6_set_reloc(reloc);
+    (void)gpu_ws_mmx6_reloc_get;
+    send_fmt("{\"id\":%d,\"ok\":true,\"hostside\":%d,\"active\":%d,"
+             "\"clut_cached\":%d,\"last_emit_tiles\":%ld,\"emit_calls\":%ld}",
+             id, gpu_ws_mmx6_hostside_get(), gpu_ws_mmx6_reveal_is_active(),
+             gpu_ws_mmx6_clut_count(), gpu_ws_mmx6_emit_tiles(),
+             gpu_ws_mmx6_emit_calls());
+}
+
+static void handle_mmx6_freshfix(int id, const char *json)
+{
+    extern void gpu_ws_mmx6_set_freshfix(int on);
+    extern int  gpu_ws_mmx6_freshfix_get(void);
+    extern long gpu_ws_mmx6_refill_cols(void);
+    extern int  gpu_ws_mmx6_validate(int *bad_out);
+    int on = json_get_int(json, "on", -1);
+    if (on >= 0) gpu_ws_mmx6_set_freshfix(on);
+    int total = 0, bad = -1;
+    if (json_get_int(json, "validate", 0) > 0) total = gpu_ws_mmx6_validate(&bad);
+    send_fmt("{\"id\":%d,\"ok\":true,\"freshfix\":%d,\"last_refill_cols\":%ld,"
+             "\"validate_total\":%d,\"validate_bad\":%d}",
+             id, gpu_ws_mmx6_freshfix_get(), gpu_ws_mmx6_refill_cols(), total, bad);
+}
+
 static void handle_turbo(int id, const char *json)
 {
     int enabled = json_get_int(json, "enabled", -1);
@@ -9158,6 +9195,8 @@ static const CmdEntry s_commands[] = {
     { "ws_dbg_stretch",    handle_ws_dbg_stretch },
     { "ws_far_threshold",  handle_ws_far_threshold },
     { "ws_census",         handle_ws_census },
+    { "mmx6_freshfix",     handle_mmx6_freshfix },
+    { "mmx6_reveal",       handle_mmx6_reveal },
     { "mem_words",         handle_mem_words },
     { "vram_peek",         handle_vram_peek },
     { "gl_coh_ring",       handle_gl_coh_ring },
