@@ -103,6 +103,7 @@ and by `runtime/src/main.cpp` as the source of compiled-in defaults.
 [runtime]
 debug_port    = 4370            # TCP port for the debug server
 window_title  = "..."           # SDL window title
+controller    = "digital"       # "digital" or "dualshock"
 memcard_dir   = "."             # memcard files location, relative to project root
 ```
 

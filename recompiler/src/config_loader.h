@@ -51,6 +51,10 @@ struct RuntimeConfig {
     bool                  has_window_title = false;
     std::string           window_title;
 
+    // controller: "digital" (default) | "dualshock"
+    bool                  has_controller = false;
+    std::string           controller;
+
     bool                  has_memcard_dir = false;
     std::filesystem::path memcard_dir;     // absolute path (resolved against project root)
 

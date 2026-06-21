@@ -11,6 +11,7 @@
  */
 
 #include "cdrom.h"
+#include "dma.h"
 #include "spu.h"
 #include "event_ring.h"
 #include <string.h>
@@ -26,6 +27,7 @@
 extern void* iso_open(const char* path);
 extern int iso_read_sector(void* handle, uint32_t lba, uint8_t* buffer, int size);
 extern int iso_read_raw_sector(void* handle, uint32_t lba, uint8_t* buffer, int size);
+extern uint32_t iso_sector_count(void* handle);
 extern void iso_close(void* handle);
 
 /* I_STAT owned by memory.c — set bit 2 for CDROM IRQ */
@@ -79,6 +81,8 @@ static uint8_t last_sector_xa_submode;
 static uint8_t last_sector_xa_coding;
 static CDROMSectorHistoryEntry sector_history[CDROM_SECTOR_HISTORY_CAP];
 static uint64_t sector_history_seq;
+static CDROMCommandHistoryEntry command_history[CDROM_COMMAND_HISTORY_CAP];
+static uint64_t command_history_seq;
 
 /* Seek target */
 static uint8_t seek_min, seek_sec, seek_sect;
@@ -183,10 +187,6 @@ void cdrom_set_instant_rate(int per_frame) {
 }
 int cdrom_get_instant_rate(void) { return g_instant_max_per_frame; }
 
-/* Frontend FMV detector reads this to distinguish FMV/streaming XA from other
- * sector traffic (FMV = streaming XA + active MDEC). */
-int cdrom_xa_stream_active(void) { return xa_stream_active; }
-
 static int instant_period(void) {
     int p = VBLANK_CYCLES_NTSC / g_instant_max_per_frame;
     return p < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : p;
@@ -195,28 +195,11 @@ static int instant_period(void) {
 static int apply_speed(int delay) {
     /* XA streaming (FMV / CDDA background music): preserve authentic timing.
      * FMVs interleave XA audio + MDEC video — speeding up sector delivery
-     * would desync the player (it depends on the authentic per-sector cadence;
-     * flooding it instantly hangs the movie on a white screen). FMV auto-skip
-     * therefore does NOT touch CD timing — it runs the whole machine faster via
-     * uncapped frame pacing (frontend), which speeds XA+MDEC+display together,
-     * preserving their relative sync. */
+     * would cause both to play faster than the display refresh rate. */
     if (xa_stream_active) return delay;
     if (g_disc_speed_divisor == 0) return instant_period(); /* bounded 'instant' */
     int d = delay / g_disc_speed_divisor;
     return d < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : d;
-}
-
-/* Command-completion latency (Pause/Init/SeekL/GetID/ReadTOC second response).
- * These are CONTROLLER/FIRMWARE operations whose timing is essentially FIXED on
- * real hardware — a faster-spinning drive does NOT complete them proportionally
- * faster. Scaling them by the disc-speed divisor (as apply_speed does for DATA
- * sectors) desyncs the BIOS CD driver: only 1x booted, while 4x and instant both
- * wedged the Pause (0x09) completion handshake in a black-screen spin. So
- * command latencies use authentic timing regardless of disc_speed; only sector
- * DATA delivery (sector_delay_cycles) scales with speed — and since essentially
- * all load time is sector reads, loads still get as fast as the speed allows. */
-static int cmd_latency(int cycles) {
-    return cycles < CDROM_MIN_DELAY ? CDROM_MIN_DELAY : cycles;
 }
 
 /* ---- CD load-burst ring (always-on; CLAUDE.md ring-buffer rule) ----------
@@ -286,40 +269,15 @@ typedef struct {
 } PendingCmd;
 static PendingCmd pending;
 
-/* ---- Response arbiter (CLAUDE.md: hardware-accurate, not a rate hack) -------
- * The PS1 CD controller SERIALIZES responses: only one occupies the IRQ slot
- * (irq_flag + the response FIFO) at a time; a later response is queued and
- * exposed only after the guest ACKs the current one. A command written while a
- * response is still visible is LATCHED (the controller is busy) and executed
- * when the guest ACKs. The old model overwrote irq_flag directly, which DROPPED
- * responses whenever they arrived faster than the guest acked — proven to cause
- * 24 dropped responses (INT2 over unacked INT3, INT3 over INT3) at MMX6 boot
- * under disc_speed=instant, wedging the loader. With the arbiter, the guest's
- * own ACK cadence paces delivery, so "instant" needs no per-game sectors/frame
- * cap. set_irq() now enqueues-or-exposes; the guest ACK actively pumps the
- * arbiter (the wakeup path a naive defer-guard lacked). */
 typedef struct {
-    uint8_t int_type;
-    uint8_t bytes[RESPONSE_FIFO_SIZE];
-    uint8_t count;
-} CdQResp;
-#define CD_RESP_Q 8
-static CdQResp cd_respq[CD_RESP_Q];
-static int      cd_respq_head;
-static int      cd_respq_len;
-static int      cd_gap_remaining;     /* guest cycles until the slot may expose the next response */
-#define CD_MIN_IRQ_GAP 800            /* controller delivery latency (~DuckStation MINIMUM_INTERRUPT_DELAY) */
-uint32_t        g_cd_resp_drops = 0;  /* queue overflow (should stay 0 with correct pacing) */
+    uint8_t cmd;
+    uint8_t params[PARAM_FIFO_SIZE];
+    int param_count;
+    int pending;
+} QueuedCmd;
+static QueuedCmd queued_cmd;
 
-/* Single pending-command latch: a command written while the slot is busy is
- * held and executed at the guest ACK (real HW: transmission begins at ACK). */
-static int      cd_cmd_latched;
-static uint8_t  cd_cmd_latched_cmd;
-static uint8_t  cd_cmd_latched_params[PARAM_FIFO_SIZE];
-static int      cd_cmd_latched_pcount;
-
-static void exec_command(uint8_t cmd);   /* forward decl (arbiter pumps it on ACK) */
-static void cd_arbiter_pump(void);
+static void exec_command(uint8_t cmd);
 
 /* ISO reader */
 static void* iso_handle = NULL;
@@ -356,6 +314,43 @@ static void trace_cdrom(uint8_t kind, uint32_t addr, uint32_t val, uint8_t width
     e->reading = (uint8_t)reading;
     e->read_cmd = read_cmd;
     e->read_delay = read_delay;
+}
+
+static void record_command_history(uint8_t kind, uint8_t cmd,
+                                   const uint8_t* params, int count) {
+    CDROMCommandHistoryEntry *e =
+        &command_history[command_history_seq % CDROM_COMMAND_HISTORY_CAP];
+    memset(e, 0, sizeof(*e));
+    e->seq = command_history_seq++;
+    e->frame = (uint32_t)s_frame_count;
+    e->func = g_debug_current_func_addr;
+    e->pc = g_debug_last_store_pc;
+    e->i_stat = i_stat;
+    e->kind = kind;
+    e->cmd = cmd;
+    if (count < 0) count = 0;
+    if (count > PARAM_FIFO_SIZE) count = PARAM_FIFO_SIZE;
+    e->param_count = (uint8_t)count;
+    if (params && count > 0) {
+        memcpy(e->params, params, (size_t)count);
+    }
+    e->stat = stat_reg;
+    e->request = request_reg;
+    e->irq_enable = irq_enable;
+    e->irq_flag = irq_flag;
+    e->mode = mode_reg;
+    e->seek_min = seek_min;
+    e->seek_sec = seek_sec;
+    e->seek_sect = seek_sect;
+    e->read_min = (uint8_t)read_min;
+    e->read_sec = (uint8_t)read_sec;
+    e->read_sect = (uint8_t)read_sect;
+    e->read_cmd = read_cmd;
+    e->reading = (uint8_t)(reading ? 1 : 0);
+    e->pending_cmd = pending.cmd;
+    e->pending_pending = (uint8_t)(pending.pending ? 1 : 0);
+    e->queued_cmd = queued_cmd.cmd;
+    e->queued_pending = (uint8_t)(queued_cmd.pending ? 1 : 0);
 }
 
 static int xa_is_audio_realtime(const CDROMSectorDelivery *d) {
@@ -442,109 +437,11 @@ static void response_push(uint8_t val) {
     }
 }
 
-/* Overwrite (dropped-response) accounting — survives the trace ring's eviction.
- * Counts how many times a new response clobbered an unacked one, and captures
- * the first occurrence's context. Queryable via cdrom_state. */
-uint32_t g_cd_overwrite_count = 0;
-uint8_t  g_cd_overwrite_first_prev = 0;
-uint8_t  g_cd_overwrite_first_new  = 0;
-uint32_t g_cd_overwrite_first_frame = 0;
-uint8_t  g_cd_overwrite_last_prev = 0;
-uint8_t  g_cd_overwrite_last_new  = 0;
-uint32_t g_cd_overwrite_last_frame = 0;
-
-static void fire_cdrom_irq(void);
-
-/* Load a response into the visible hardware slot (irq_flag + response FIFO) and
- * raise the line. The slot must be free (irq_flag==0) on entry. */
-static void cd_expose(const CdQResp *r) {
-    irq_flag       = r->int_type;
-    response_read  = 0;
-    response_count = r->count;
-    if (r->count) memcpy(response_fifo, r->bytes, r->count);
-    cd_gap_remaining = CD_MIN_IRQ_GAP;
-    trace_cdrom('I', 0, (uint32_t)r->int_type, 0);
-    /* DEQUEUE: CD response/data event fired (aux = CD irq type). */
-    event_ring_record_aux(EV_DEQ, (uint8_t)SRC_CD_IRQ, (uint32_t)r->int_type);
-    fire_cdrom_irq();
-}
-
-/* set_irq() — the single response-producing entry point. Callers build the
- * response bytes in response_fifo (via response_clear/response_push) then call
- * set_irq(int_type). We SNAPSHOT those bytes and either expose immediately (slot
- * free, nothing queued ahead, inter-IRQ gap elapsed) or QUEUE behind the visible
- * response. The guest ACK (and the advance pump) drains the queue in order, so
- * no response is ever clobbered — this replaces the old direct irq_flag=type
- * overwrite that DROPPED responses under fast (instant) disc timing. */
 static void set_irq(int type) {
-    /* Authentic-1x bypass. The response arbiter (queue + inter-IRQ gap + command
-     * latch) exists to stop responses being DROPPED when we deliver them FASTER
-     * than hardware (disc_speed 2x/4x/instant), where a new response can land
-     * before the guest acks the previous one. At authentic 1x that race cannot
-     * happen — responses arrive at hardware cadence — and any queue/gap we add
-     * only PERTURBS timing the game was validated against. That perturbation
-     * desynced CD-streamed audio (boss/stage-select music looped/restarted
-     * early). So at 1x, behave exactly as the pre-arbiter code did: set the
-     * visible IRQ immediately; the caller's fire_cdrom_irq() raises the line. */
-    if (g_disc_speed_divisor == 1) {
-        irq_flag = (uint8_t)type;
-        cd_gap_remaining = 0;
-        trace_cdrom('I', 0, (uint32_t)type, 0);
-        event_ring_record_aux(EV_DEQ, (uint8_t)SRC_CD_IRQ, (uint32_t)type);
-        return;
-    }
-
-    CdQResp r;
-    r.int_type = (uint8_t)type;
-    r.count    = (uint8_t)(response_count > RESPONSE_FIFO_SIZE ? RESPONSE_FIFO_SIZE : response_count);
-    if (r.count) memcpy(r.bytes, response_fifo, r.count);
-
-    if (irq_flag == 0 && cd_respq_len == 0 && cd_gap_remaining <= 0) {
-        cd_expose(&r);
-    } else if (cd_respq_len < CD_RESP_Q) {
-        cd_respq[(cd_respq_head + cd_respq_len) % CD_RESP_Q] = r;
-        cd_respq_len++;
-        trace_cdrom('Q', 0, (uint32_t)type, 0);   /* queued behind a visible/earlier response */
-    } else {
-        /* Queue overflow — should never happen with correct ACK pacing. Fall
-         * back to clobber and count it so a regression is visible, not silent. */
-        g_cd_resp_drops++;
-        if (g_cd_overwrite_count == 0) {
-            g_cd_overwrite_first_prev  = irq_flag;
-            g_cd_overwrite_first_new   = (uint8_t)type;
-            g_cd_overwrite_first_frame = (uint32_t)s_frame_count;
-        }
-        g_cd_overwrite_count++;
-        g_cd_overwrite_last_prev  = irq_flag;
-        g_cd_overwrite_last_new   = (uint8_t)type;
-        g_cd_overwrite_last_frame = (uint32_t)s_frame_count;
-        irq_flag = 0;          /* force expose to proceed */
-        cd_gap_remaining = 0;
-        cd_expose(&r);
-    }
-}
-
-/* Advance the controller when the visible slot frees: drain the older queued
- * responses first (they precede any latched command on the wire), then start a
- * command latched while the controller was busy. Driven by the guest ACK edge
- * and by cdrom_advance once the inter-IRQ gap elapses. */
-static void cd_arbiter_pump(void) {
-    if (irq_flag != 0)        return;   /* slot still holds an unacked response */
-    if (cd_gap_remaining > 0) return;   /* controller inter-IRQ delivery latency */
-    if (cd_respq_len > 0) {
-        CdQResp r = cd_respq[cd_respq_head];
-        cd_respq_head = (cd_respq_head + 1) % CD_RESP_Q;
-        cd_respq_len--;
-        cd_expose(&r);
-        return;
-    }
-    if (cd_cmd_latched) {
-        cd_cmd_latched = 0;
-        memcpy(param_fifo, cd_cmd_latched_params, cd_cmd_latched_pcount);
-        param_count = (uint8_t)cd_cmd_latched_pcount;
-        trace_cdrom('X', 0, (uint32_t)cd_cmd_latched_cmd, 0);   /* latched cmd now executing */
-        exec_command(cd_cmd_latched_cmd);   /* its ACK flows through set_irq -> exposes */
-    }
+    irq_flag = (uint8_t)type;
+    trace_cdrom('I', 0, (uint32_t)type, 0);
+    /* DEQUEUE: CD response/data event fired (aux = CD irq type). */
+    event_ring_record_aux(EV_DEQ, (uint8_t)SRC_CD_IRQ, (uint32_t)type);
 }
 
 /* Fire CDROM IRQ into the interrupt controller */
@@ -555,6 +452,12 @@ static void fire_cdrom_irq(void) {
         trace_cdrom('F', 0, irq_flag, 0);
     } else {
         trace_cdrom('f', 0, irq_flag, 0);
+    }
+}
+
+static void refresh_cdrom_irq_line(void) {
+    if (irq_flag && (irq_enable & (1 << (irq_flag - 1)))) {
+        i_stat |= (1u << 2); /* IRQ_CDROM */
     }
 }
 
@@ -885,6 +788,12 @@ static void stop_read_stream(void) {
     read_delay = 0;
 }
 
+static int data_fifo_ready(void) {
+    return (request_reg & CDROM_REQUEST_BFRD) &&
+           sector_available &&
+           sector_read_pos < sector_size;
+}
+
 static int deliver_read_sector(void) {
     int delivered = read_sector_at(read_min, read_sec, read_sect);
     advance_msf(&read_min, &read_sec, &read_sect);
@@ -896,10 +805,59 @@ static int deliver_read_sector(void) {
     return 1;
 }
 
+static int deliver_read_sector_without_irq(void) {
+    int delivered = read_sector_at(read_min, read_sec, read_sect);
+    advance_msf(&read_min, &read_sec, &read_sect);
+    return delivered;
+}
+
+static void try_execute_queued_command(void) {
+    if (!queued_cmd.pending || irq_flag != 0) return;
+
+    uint8_t cmd = queued_cmd.cmd;
+    int count = queued_cmd.param_count;
+    if (count < 0) count = 0;
+    if (count > PARAM_FIFO_SIZE) count = PARAM_FIFO_SIZE;
+
+    memcpy(param_fifo, queued_cmd.params, (size_t)count);
+    param_count = count;
+
+    queued_cmd.pending = 0;
+    queued_cmd.cmd = 0;
+    queued_cmd.param_count = 0;
+    memset(queued_cmd.params, 0, sizeof(queued_cmd.params));
+
+    exec_command(cmd);
+}
+
+static void queue_or_exec_command(uint8_t cmd) {
+    if (irq_flag == 0) {
+        exec_command(cmd);
+        return;
+    }
+
+    queued_cmd.cmd = cmd;
+    queued_cmd.param_count = param_count;
+    if (queued_cmd.param_count < 0) queued_cmd.param_count = 0;
+    if (queued_cmd.param_count > PARAM_FIFO_SIZE) queued_cmd.param_count = PARAM_FIFO_SIZE;
+    memcpy(queued_cmd.params, param_fifo, (size_t)queued_cmd.param_count);
+    queued_cmd.pending = 1;
+    param_count = 0;
+    trace_cdrom('Q', 0, cmd, 0);
+    record_command_history('Q', cmd, queued_cmd.params, queued_cmd.param_count);
+}
+
 static void exec_command(uint8_t cmd) {
     trace_cdrom('C', 0, cmd, 0);
     /* ENQUEUE: a CD command was issued (aux = command byte). */
     event_ring_record_aux(EV_ENQ, (uint8_t)SRC_CD_CMD, (uint32_t)cmd);
+    /* Snapshot the param FIFO before handlers consume it, so the
+     * command-history record at the end sees the original params. */
+    uint8_t cmd_params[PARAM_FIFO_SIZE];
+    int cmd_param_count = param_count;
+    if (cmd_param_count < 0) cmd_param_count = 0;
+    if (cmd_param_count > PARAM_FIFO_SIZE) cmd_param_count = PARAM_FIFO_SIZE;
+    memcpy(cmd_params, param_fifo, (size_t)cmd_param_count);
     response_clear();
 
     switch (cmd) {
@@ -944,7 +902,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x09;
         pending.pending = 1;
-        pending.delay = cmd_latency(10000);
+        pending.delay = apply_speed(10000);
         pending.phase = 1;
         break;
 
@@ -957,7 +915,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x0A;
         pending.pending = 1;
-        pending.delay = cmd_latency(50000);
+        pending.delay = apply_speed(50000);
         pending.phase = 1;
         break;
 
@@ -1049,6 +1007,33 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         break;
 
+    case 0x14: { /* GetTD */
+        if (!has_disc()) {
+            response_push(stat_reg | CDSTAT_ERROR);
+            response_push(0x80);
+            set_irq(CDIRQ_ERROR);
+            break;
+        }
+
+        int track = (param_count >= 1) ? bcd_to_bin(param_fifo[0]) : 0;
+        int lba = 0;
+        if (track == 0 || track == 0xAA) {
+            uint32_t sectors = iso_sector_count(iso_handle);
+            lba = sectors ? (int)sectors : 0;
+        } else {
+            lba = 0; /* Single data track starts at absolute MSF 00:02:00. */
+        }
+
+        int m, s, f;
+        (void)f;
+        lba_to_msf(lba, 150, &m, &s, &f);
+        response_push(stat_reg);
+        response_push(bin_to_bcd(m));
+        response_push(bin_to_bcd(s));
+        set_irq(CDIRQ_ACK);
+        break;
+    }
+
     case 0x15: /* SeekL */
         if (!has_disc()) {
             response_push(stat_reg | CDSTAT_ERROR | CDSTAT_SEEKERR);
@@ -1062,7 +1047,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x15;
         pending.pending = 1;
-        pending.delay = cmd_latency(20000);
+        pending.delay = apply_speed(20000);
         pending.phase = 1;
         break;
 
@@ -1074,7 +1059,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x1A;
         pending.pending = 1;
-        pending.delay = cmd_latency(30000);
+        pending.delay = apply_speed(30000);
         pending.phase = 1;
         break;
 
@@ -1094,7 +1079,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = 0x1E;
         pending.pending = 1;
-        pending.delay = cmd_latency(100000);
+        pending.delay = apply_speed(100000);
         pending.phase = 1;
         break;
 
@@ -1122,6 +1107,7 @@ static void exec_command(uint8_t cmd) {
     /* Fire the CDROM IRQ for the immediate response.
      * Delayed responses (pending) fire from process_pending(). */
     fire_cdrom_irq();
+    record_command_history('C', cmd, cmd_params, cmd_param_count);
 }
 
 static void process_pending(uint32_t cycles) {
@@ -1130,6 +1116,7 @@ static void process_pending(uint32_t cycles) {
     if (cycles == 0) return;
     pending.delay -= (int)cycles;
     if (pending.delay > 0) return;
+    if (irq_flag != 0) return;
 
     pending.pending = 0;
     response_clear();
@@ -1202,19 +1189,33 @@ static void process_pending(uint32_t cycles) {
 static void process_read_stream(uint32_t cycles) {
     if (!reading) return;
 
+    /*
+     * The controller exposes one sector buffer. Do not let the stream timer
+     * accumulate a data backlog while software is still handling the previous
+     * data-ready IRQ. Once software acknowledges that IRQ, any unread tail is
+     * discardable: later sectors replace the controller's single data buffer.
+     *
+     * Software can also start a multi-sector CD DMA from inside the
+     * data-ready callback before acknowledging the IRQ. In that case the IRQ
+     * line remains asserted, but the disc stream must still refill an empty
+     * sector buffer so the active DMA can continue.
+     */
     if (cycles > 0) {
         read_delay -= (int)cycles;
     }
 
-    if (sector_available && irq_flag != 0) {
-        return;
-    }
+    if (irq_flag != 0 && !dma_cdrom_transfer_active()) return;
+    if (sector_available && irq_flag != 0) return;
 
     if (read_delay <= 0) {
-        if (sector_available) {
-            trace_cdrom('O', 0, (uint32_t)sector_read_pos, 0);
+        if (irq_flag == 0) {
+            if (sector_available) {
+                trace_cdrom('O', 0, (uint32_t)sector_read_pos, 0);
+            }
+            deliver_read_sector();
+        } else {
+            deliver_read_sector_without_irq();
         }
-        deliver_read_sector();
         read_delay += sector_delay_cycles();
     }
 }
@@ -1253,13 +1254,8 @@ void cdrom_init(const char* cue_path) {
     xa_reset_decode();
     spu_cd_audio_reset();
     pending.pending = 0;
+    memset(&queued_cmd, 0, sizeof(queued_cmd));
     seek_min = seek_sec = seek_sect = 0;
-    /* Response arbiter / command latch state */
-    cd_respq_head = 0;
-    cd_respq_len = 0;
-    cd_gap_remaining = 0;
-    cd_cmd_latched = 0;
-    cd_cmd_latched_pcount = 0;
     cdrom_debug_clear_sector_history();
 
     if (cue_path) {
@@ -1268,6 +1264,7 @@ void cdrom_init(const char* cue_path) {
 
     stat_reg = has_disc() ? CDSTAT_MOTOR : CDSTAT_SHELL;
     cdrom_debug_clear_trace();
+    cdrom_debug_clear_command_history();
     trace_cdrom('N', 0, has_disc() ? 1u : 0u, 0);
 }
 
@@ -1280,7 +1277,7 @@ uint32_t cdrom_read(uint32_t addr) {
         if (param_count == 0) s |= (1 << 3);
         if (param_count < PARAM_FIFO_SIZE) s |= (1 << 4);
         if (response_read < response_count) s |= (1 << 5);
-        if (request_reg & CDROM_REQUEST_BFRD) s |= (1 << 6);
+        if (data_fifo_ready()) s |= (1 << 6);
         ret = s;
         break;
     }
@@ -1292,11 +1289,10 @@ uint32_t cdrom_read(uint32_t addr) {
         break;
 
     case 0x1F801802:
-        if ((request_reg & CDROM_REQUEST_BFRD) && sector_available && sector_read_pos < sector_size) {
+        if (data_fifo_ready()) {
             ret = sector_buffer[sector_read_pos++];
             if (sector_read_pos >= sector_size) {
                 sector_available = 0;
-                request_reg &= (uint8_t)~CDROM_REQUEST_BFRD;
             }
         }
         break;
@@ -1328,23 +1324,7 @@ void cdrom_write(uint32_t addr, uint32_t value) {
 
     case 0x1F801801:
         if (index_reg == 0) {
-            /* The controller is busy while a response is still visible/unacked,
-             * something is queued ahead, a command is already latched, or the
-             * inter-IRQ gap hasn't elapsed. Real HW lets software write the next
-             * command but holds its processing until the slot frees — LATCH it
-             * (the guest ACK pumps the arbiter, which executes it). Only execute
-             * inline when the controller is genuinely idle. */
-            if (g_disc_speed_divisor != 1 &&
-                (irq_flag != 0 || cd_respq_len > 0 || cd_cmd_latched || cd_gap_remaining > 0)) {
-                cd_cmd_latched        = 1;
-                cd_cmd_latched_cmd    = val;
-                cd_cmd_latched_pcount = param_count;
-                memcpy(cd_cmd_latched_params, param_fifo, param_count);
-                param_count = 0;            /* params consumed by the latch */
-                trace_cdrom('L', 0, (uint32_t)val, 0);   /* command latched (controller busy) */
-            } else {
-                exec_command(val);
-            }
+            queue_or_exec_command(val);
         }
         break;
 
@@ -1365,21 +1345,11 @@ void cdrom_write(uint32_t addr, uint32_t value) {
                 sector_read_pos = 0;
             }
         } else if (index_reg == 1) {
-            /* TRACE 'K': guest ACK of CD IRQ bits (clears irq_flag). Pairs with
-             * 'I'/'W' to reconstruct the response<->ack lifecycle and prove
-             * whether a response was overwritten before the guest acked it. */
-            trace_cdrom('K', 0, (uint32_t)(val & 0x1F), 0);
             irq_flag &= ~(val & 0x1F);
             if (val & 0x40) {
                 param_count = 0;
             }
-            /* The ACK edge is the wakeup that drives the arbiter forward: once
-             * the visible response is retired, expose the next queued response
-             * or start a latched command. (A naive "defer + return" guard
-             * deadlocks precisely because it lacks this active pump.) */
-            if (g_disc_speed_divisor != 1 && irq_flag == 0) {
-                cd_arbiter_pump();
-            }
+            try_execute_queued_command();
         }
         break;
 
@@ -1389,17 +1359,11 @@ void cdrom_write(uint32_t addr, uint32_t value) {
 }
 
 void cdrom_advance(uint32_t cycles) {
-    /* Bleed down the controller inter-IRQ gap, then run the producers and pump
-     * the arbiter so a queued response is exposed as soon as the slot is free
-     * and the gap elapses (covers the case where the guest already acked and no
-     * further ACK edge will arrive to drive delivery). */
-    if (cd_gap_remaining > 0) {
-        cd_gap_remaining -= (int)cycles;
-        if (cd_gap_remaining < 0) cd_gap_remaining = 0;
-    }
+    refresh_cdrom_irq_line();
+    try_execute_queued_command();
     process_pending(cycles);
     process_read_stream(cycles);
-    cd_arbiter_pump();
+    refresh_cdrom_irq_line();
 }
 
 void cdrom_tick(void) {
@@ -1408,12 +1372,12 @@ void cdrom_tick(void) {
 
 uint32_t cdrom_dma_read(void) {
     uint32_t val = 0;
-    if ((request_reg & CDROM_REQUEST_BFRD) && sector_available && sector_read_pos + 4 <= sector_size) {
+    if ((request_reg & CDROM_REQUEST_BFRD) && sector_available &&
+        sector_read_pos + 4 <= sector_size) {
         memcpy(&val, sector_buffer + sector_read_pos, 4);
         sector_read_pos += 4;
         if (sector_read_pos >= sector_size) {
             sector_available = 0;
-            request_reg &= (uint8_t)~CDROM_REQUEST_BFRD;
         }
     }
     trace_cdrom('D', 0, val, 4);
@@ -1424,6 +1388,19 @@ int cdrom_dma_ready(void) {
     return (request_reg & CDROM_REQUEST_BFRD) &&
            sector_available &&
            (sector_read_pos + 4 <= sector_size);
+}
+
+uint32_t cdrom_dma_sector_word_count(void) {
+    int size = sector_size;
+
+    /* CD DMA BCR low half zero means transfer one sector-sized payload.
+     * If DMA is armed just before the next sector becomes available, fall
+     * back to the active mode's payload size. */
+    if (size <= 0) {
+        size = (mode_reg & 0x20u) ? WHOLE_SECTOR_SIZE : SECTOR_SIZE;
+    }
+
+    return (uint32_t)((size + 3) / 4);
 }
 
 void cdrom_debug_snapshot(CDROMDebugState* out) {
@@ -1440,6 +1417,9 @@ void cdrom_debug_snapshot(CDROMDebugState* out) {
     out->seek_sec = seek_sec;
     out->seek_sect = seek_sect;
     out->pending_cmd = pending.cmd;
+    out->queued_cmd = queued_cmd.cmd;
+    out->queued_pending = (uint8_t)queued_cmd.pending;
+    out->queued_param_count = (uint8_t)queued_cmd.param_count;
     out->has_disc = has_disc();
     out->param_count = param_count;
     out->response_read = response_read;
@@ -1475,6 +1455,16 @@ uint64_t cdrom_debug_get_trace(const CDROMTraceEntry** out_entries) {
 void cdrom_debug_clear_trace(void) {
     memset(cdrom_trace, 0, sizeof(cdrom_trace));
     cdrom_trace_seq = 0;
+}
+
+uint64_t cdrom_debug_get_command_history(const CDROMCommandHistoryEntry** out_entries) {
+    if (out_entries) *out_entries = command_history;
+    return command_history_seq;
+}
+
+void cdrom_debug_clear_command_history(void) {
+    memset(command_history, 0, sizeof(command_history));
+    command_history_seq = 0;
 }
 
 uint64_t cdrom_debug_get_sector_history(const CDROMSectorHistoryEntry** out_entries) {
