@@ -105,6 +105,12 @@ struct LauncherModel {
     int  window_width    = 1280; // window size (height = width*den/num per aspect)
     bool widescreen      = false; // EXPERIMENTAL 16:9 native-wide (aspect_index==1)
     bool ws_eligible     = true;  // toggle shown only when renderer==software (native-wide is SW-only)
+    bool fullscreen      = false; // launch the game window in desktop fullscreen
+    // Skip-launcher: boot straight into the game on subsequent launches. Turning
+    // it ON shows a confirmation modal (show_skip_modal) so the user is told how
+    // to get the launcher back (run with --launcher). Mirrors SMW's feature.
+    bool skip_launcher   = false;
+    bool show_skip_modal = false;
 
     Rml::String bios_path;
     Rml::String disc_path;
@@ -650,6 +656,8 @@ Result run(SDL_Window* window, void* gl_context,
     m.crt            = io.screen_kind;
     m.auto_skip_fmv  = io.auto_skip_fmv;
     m.turbo_loads    = io.turbo_loads;
+    m.fullscreen     = io.fullscreen;
+    m.skip_launcher  = io.skip_launcher;
     m.spu_hq         = io.spu_hq;
     m.aspect_index   = io.has_aspect_ratio ? aspect_index_for(io.aspect_num, io.aspect_den) : 0;
     m.window_width   = kWinWidths[winsize_index(io.has_window_width ? io.window_width : 1280)];
@@ -702,6 +710,9 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("antialiasing",   &m.antialiasing);
     c.Bind("auto_skip_fmv",  &m.auto_skip_fmv);
     c.Bind("turbo_loads",    &m.turbo_loads);
+    c.Bind("fullscreen",     &m.fullscreen);
+    c.Bind("skip_launcher",  &m.skip_launcher);
+    c.Bind("show_skip_modal",&m.show_skip_modal);
     c.Bind("spu_hq",         &m.spu_hq);
     c.Bind("renderer_label", &m.renderer_label);
     c.Bind("crt_label",      &m.crt_label);
@@ -820,6 +831,27 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.turbo_loads = !m.turbo_loads;
             handle.DirtyVariable("turbo_loads");
+        });
+    c.BindEventCallback("toggle_fullscreen",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.fullscreen = !m.fullscreen;
+            handle.DirtyVariable("fullscreen");
+        });
+    // Skip launcher: turning OFF is immediate; turning ON opens a confirm modal
+    // first, so the user learns the --launcher escape hatch before committing.
+    c.BindEventCallback("toggle_skip_launcher",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            if (m.skip_launcher) { m.skip_launcher = false; handle.DirtyVariable("skip_launcher"); }
+            else { m.show_skip_modal = true; handle.DirtyVariable("show_skip_modal"); }
+        });
+    c.BindEventCallback("skip_modal_confirm",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.skip_launcher = true; m.show_skip_modal = false;
+            handle.DirtyVariable("skip_launcher"); handle.DirtyVariable("show_skip_modal");
+        });
+    c.BindEventCallback("skip_modal_cancel",
+        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            m.show_skip_modal = false; handle.DirtyVariable("show_skip_modal");
         });
     c.BindEventCallback("browse_bios",
         [&m, window, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -1008,6 +1040,8 @@ Result run(SDL_Window* window, void* gl_context,
         io.screen_kind = m.crt;               io.has_screen_kind = true;
         io.auto_skip_fmv = m.auto_skip_fmv;   io.has_auto_skip_fmv = true;
         io.turbo_loads = m.turbo_loads;       io.has_turbo_loads = true;
+        io.fullscreen = m.fullscreen;         io.has_fullscreen = true;
+        io.skip_launcher = m.skip_launcher;   io.has_skip_launcher = true;
         io.spu_hq = m.spu_hq;                 io.has_spu_hq = true;
         io.aspect_num = kAspects[m.aspect_index][0];
         io.aspect_den = kAspects[m.aspect_index][1];

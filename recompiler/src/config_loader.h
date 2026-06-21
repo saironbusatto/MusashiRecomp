@@ -441,6 +441,10 @@ struct UserSettings {
     // (the per-game game.toml value seeds the launcher toggle; user choice in
     // settings.toml overrides it).
     bool has_turbo_loads    = false; bool turbo_loads    = true;
+    // [video] fullscreen: launch the game window in desktop fullscreen (the
+    // launcher's "Fullscreen on launch" toggle; the in-game F11 / Alt+Enter
+    // hotkey still toggles it live). false => windowed (default).
+    bool has_fullscreen     = false; bool fullscreen     = false;
     // Low-latency present knobs. low_latency_input re-samples the pad after the
     // wall-clock pacer (just before present) so the next CPU frame reads fresh
     // input instead of input ~one frame stale (the dominant input->photon cost
