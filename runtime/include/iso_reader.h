@@ -95,6 +95,12 @@ public:
     std::string GetBinPath() const;
 
     /**
+     * Get number of addressable sectors in the mounted image.
+     * Raw BIN images count 2352-byte sectors; cooked ISO images count 2048-byte sectors.
+     */
+    uint32_t GetSectorCount();
+
+    /**
      * Get root directory information
      * @return RootDirectoryInfo containing LBA and size
      */

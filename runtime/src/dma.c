@@ -107,11 +107,17 @@ static DMADelayedComplete delayed_complete[7];
 static uint32_t dpcr;  /* 0x1F8010F0: DMA control (enable bits) */
 static uint32_t dicr;  /* 0x1F8010F4: DMA interrupt control */
 
-#define DICR_WRITE_MASK 0x00FF803Fu
+#define DICR_WRITE_MASK 0x00FF807Fu
 #define DICR_RESET_MASK 0x7F000000u
 
 static DMATraceEntry dma_trace[DMA_TRACE_CAP];
 static uint64_t dma_trace_seq;
+static DMACDROMHistoryEntry cdrom_dma_history[DMA_CDROM_HISTORY_CAP];
+static uint64_t cdrom_dma_history_seq;
+static DMACDROMHistoryEntry cdrom_dma_active_entry;
+static uint8_t cdrom_dma_history_active;
+
+static uint32_t dicr_read_value(uint32_t v);
 
 static void trace_dma(uint32_t kind, int ch, uint32_t total_words,
                       uint32_t dicr_before, uint32_t i_stat_before) {
@@ -121,12 +127,39 @@ static void trace_dma(uint32_t kind, int ch, uint32_t total_words,
     e->kind = kind;
     e->channel = (uint32_t)ch;
     e->total_words = total_words;
+    e->addr = 0;
+    e->val = 0;
+    e->mask = 0;
     e->madr = (ch >= 0 && ch < 7) ? channels[ch].madr : 0;
     e->bcr = (ch >= 0 && ch < 7) ? channels[ch].bcr : 0;
     e->chcr = (ch >= 0 && ch < 7) ? channels[ch].chcr : 0;
     e->dpcr = dpcr;
-    e->dicr_before = dicr_before;
-    e->dicr_after = dicr;
+    e->dicr_before = dicr_read_value(dicr_before);
+    e->dicr_after = dicr_read_value(dicr);
+    e->i_stat_before = i_stat_before;
+    e->i_stat_after = i_stat;
+    e->func = g_debug_current_func_addr;
+    e->pc = g_debug_last_store_pc;
+}
+
+static void trace_dma_reg_write(uint32_t addr, uint32_t val, uint32_t mask,
+                                uint32_t dicr_before,
+                                uint32_t i_stat_before) {
+    DMATraceEntry *e = &dma_trace[dma_trace_seq % DMA_TRACE_CAP];
+    e->seq = dma_trace_seq++;
+    e->frame = (uint32_t)s_frame_count;
+    e->kind = 'W';
+    e->channel = 0xFFFFFFFFu;
+    e->total_words = 0;
+    e->addr = addr;
+    e->val = val;
+    e->mask = mask;
+    e->madr = 0;
+    e->bcr = 0;
+    e->chcr = 0;
+    e->dpcr = dpcr;
+    e->dicr_before = dicr_read_value(dicr_before);
+    e->dicr_after = dicr_read_value(dicr);
     e->i_stat_before = i_stat_before;
     e->i_stat_after = i_stat;
     e->func = g_debug_current_func_addr;
@@ -141,15 +174,95 @@ static void update_master_irq(void) {
      *
      * We store bits 0-30 in dicr and compute bit 31 on read.
      *
-     * I_STAT bit 3 is set by direct assertion in complete_transfer(),
-     * not here.  The BIOS shell DMA-IRQ handler at 0x80058628 only
-     * clears DICR bit 27 (ch3 flag) — any other channel flag (e.g. ch2
-     * after a GPU DMA) stays high.  If this routine re-asserted
-     * i_stat |= (1<<3) on every DICR read or write, the BIOS handler's
-     * "lw $v0, 0($v1)" of DICR right after writing 0xFFFFFFF7 to I_STAT
-     * would put bit 3 back, and the kernel would loop forever in the
-     * exception handler.  Discless BIOS boot (memcard / CD player
-     * screen) is the case that exhibits this.  */
+     * I_STAT bit 3 is set on the aggregate DICR bit31 0->1 transition.
+     * Per-channel DICR flags are latched by complete_transfer() only
+     * when both master IRQ and that channel IRQ are enabled. */
+}
+
+static uint32_t dicr_master_flag(uint32_t v) {
+    return ((v & (1u << 15)) ||
+            ((v & (1u << 23)) && (v & DICR_RESET_MASK))) ? (1u << 31) : 0;
+}
+
+static uint32_t dicr_read_value(uint32_t v) {
+    return (v & ~(1u << 31)) | dicr_master_flag(v);
+}
+
+static void raise_dma_irq_on_master_edge(uint32_t before) {
+    /* IRQ3 is latched only when DICR's aggregate master flag transitions
+     * from 0 to 1. Pending channel flags keep bit 31 high, but do not
+     * continuously re-latch I_STAT after software acknowledges IRQ3. */
+    if (!dicr_master_flag(before) && dicr_master_flag(dicr)) {
+        i_stat |= (1u << 3);
+    }
+}
+
+static void start_cdrom_dma_capture(uint32_t requested_words) {
+    CDROMDebugState s;
+    cdrom_debug_snapshot(&s);
+
+    memset(&cdrom_dma_active_entry, 0, sizeof(cdrom_dma_active_entry));
+    cdrom_dma_active_entry.seq = cdrom_dma_history_seq++;
+    cdrom_dma_active_entry.frame_start = (uint32_t)s_frame_count;
+    cdrom_dma_active_entry.start_addr = channels[3].madr & 0x1FFFFCu;
+    cdrom_dma_active_entry.final_addr = cdrom_dma_active_entry.start_addr;
+    cdrom_dma_active_entry.requested_words = requested_words;
+    cdrom_dma_active_entry.bcr = channels[3].bcr;
+    cdrom_dma_active_entry.chcr = channels[3].chcr;
+    cdrom_dma_active_entry.dpcr = dpcr;
+    cdrom_dma_active_entry.dicr_start = dicr_read_value(dicr);
+    cdrom_dma_active_entry.i_stat_start = i_stat;
+    cdrom_dma_active_entry.func = g_debug_current_func_addr;
+    cdrom_dma_active_entry.pc = g_debug_last_store_pc;
+    cdrom_dma_active_entry.lba = s.last_sector_lba;
+    cdrom_dma_active_entry.sector_size =
+        (s.sector_size > 0) ? s.sector_size : s.last_sector_size;
+    cdrom_dma_active_entry.sector_read_pos_start = s.sector_read_pos;
+    cdrom_dma_active_entry.mode =
+        s.last_sector_mode ? s.last_sector_mode : s.mode_reg;
+    cdrom_dma_active_entry.sector_available_start =
+        (uint8_t)(s.sector_available ? 1 : 0);
+    cdrom_dma_history_active = 1;
+}
+
+static void record_cdrom_dma_word(uint32_t word) {
+    if (!cdrom_dma_history_active) return;
+
+    DMACDROMHistoryEntry *e = &cdrom_dma_active_entry;
+    if (e->first_count < DMA_CDROM_HISTORY_WORDS) {
+        e->first_words[e->first_count++] = word;
+    }
+
+    if (e->last_count < DMA_CDROM_HISTORY_WORDS) {
+        e->last_words[e->last_count++] = word;
+    } else {
+        memmove(e->last_words, e->last_words + 1,
+                sizeof(e->last_words[0]) * (DMA_CDROM_HISTORY_WORDS - 1));
+        e->last_words[DMA_CDROM_HISTORY_WORDS - 1] = word;
+    }
+
+    e->moved_words++;
+}
+
+static void finish_cdrom_dma_capture(uint32_t final_addr, uint8_t completed) {
+    if (!cdrom_dma_history_active) return;
+
+    CDROMDebugState s;
+    cdrom_debug_snapshot(&s);
+
+    cdrom_dma_active_entry.frame_end = (uint32_t)s_frame_count;
+    cdrom_dma_active_entry.final_addr = final_addr & 0x1FFFFCu;
+    cdrom_dma_active_entry.dicr_end = dicr_read_value(dicr);
+    cdrom_dma_active_entry.i_stat_end = i_stat;
+    cdrom_dma_active_entry.sector_read_pos_end = s.sector_read_pos;
+    cdrom_dma_active_entry.sector_available_end =
+        (uint8_t)(s.sector_available ? 1 : 0);
+    cdrom_dma_active_entry.completed = completed ? 1 : 0;
+
+    cdrom_dma_history[
+        cdrom_dma_active_entry.seq % DMA_CDROM_HISTORY_CAP] =
+        cdrom_dma_active_entry;
+    cdrom_dma_history_active = 0;
 }
 
 static int channel_enabled(int ch) {
@@ -158,7 +271,12 @@ static int channel_enabled(int ch) {
     return (dpcr >> (ch * 4 + 3)) & 1;
 }
 
-static int channel_irq_enabled(int ch) {
+static int channel_irq_flag_armed(int ch) {
+    /* DICR channel completion flags (24+n) are latched only when both
+     * the per-channel interrupt bit and the master DMA interrupt bit are
+     * enabled at completion time. Old flags still contribute to bit31
+     * until acknowledged, but masked/master-disabled completions do not
+     * create new stale flags. */
     return ((dicr >> (16 + ch)) & 1u) && ((dicr >> 23) & 1u);
 }
 
@@ -167,6 +285,10 @@ static uint32_t transfer_word_count(int ch) {
     uint32_t sync_mode = (chcr >> 9) & 3;
     uint32_t block_size = channels[ch].bcr & 0xFFFFu;
     uint32_t block_count = (channels[ch].bcr >> 16) & 0xFFFFu;
+
+    if (ch == 3 && block_size == 0) {
+        return cdrom_dma_sector_word_count();
+    }
 
     if (sync_mode == 1) {
         if (block_size == 0) block_size = 0x10000u;
@@ -206,12 +328,9 @@ static void complete_transfer(int ch) {
     uint32_t dicr_before = dicr;
     uint32_t i_stat_before = i_stat;
     channels[ch].chcr &= ~((1u << 24) | (1u << 28));
-    if (channel_irq_enabled(ch)) {
+    if (channel_irq_flag_armed(ch)) {
         dicr |= (1u << (24 + ch));
-        update_master_irq();
-        /* Edge-trigger I_STAT bit 3 once per completion. See comment in
-         * update_master_irq() for why this is not done there. */
-        i_stat |= (1u << 3);
+        raise_dma_irq_on_master_edge(dicr_before);
     }
     trace_dma('C', ch, 0, dicr_before, i_stat_before);
     event_ring_record_aux(EV_DMA_DONE, (uint8_t)ch, channels[ch].chcr);
@@ -229,6 +348,7 @@ static void cancel_async_transfer(int ch) {
         mdec_async[ch].cycles_accum = 0;
     }
     if (ch == 3) {
+        finish_cdrom_dma_capture(channels[3].madr & 0x1FFFFCu, 0);
         cdrom_async.active = 0;
         cdrom_async.debug_started = 0;
         cdrom_async.total_words = 0;
@@ -310,14 +430,17 @@ static void start_async_cdrom_transfer(void) {
     a->remaining_words = a->total_words;
     a->cycles_accum = 0;
     a->start_addr = channels[3].madr & 0x1FFFFCu;
+    start_cdrom_dma_capture(a->total_words);
 
     if (a->total_words == 0) {
+        finish_cdrom_dma_capture(channels[3].madr & 0x1FFFFCu, 1);
         cancel_async_transfer(3);
         complete_transfer(3);
     }
 }
 
 static void finish_async_cdrom_transfer(uint32_t final_addr) {
+    finish_cdrom_dma_capture(final_addr, 1);
     DMAAsyncChannel *a = &cdrom_async;
     uint32_t step       = (channels[3].chcr >> 1) & 1u;
     uint32_t load_start = a->start_addr;
@@ -662,15 +785,21 @@ static void try_execute(int ch) {
 
 /* ---- Public interface ---- */
 
-uint32_t dma_get_dicr(void) { update_master_irq(); return dicr; }
+uint32_t dma_get_dicr(void) { return dicr_read_value(dicr); }
 uint32_t dma_get_dpcr(void) { return dpcr; }
+int dma_cdrom_transfer_active(void) {
+    return cdrom_async.active &&
+           ((channels[3].chcr >> 24) & 1u) &&
+           channel_enabled(3) &&
+           ((channels[3].chcr & 1u) == 0);
+}
 
 void dma_advance(uint32_t cycles) {
     if (cycles == 0) return;
     advance_mdec_channel(0, cycles);
     advance_mdec_channel(1, cycles);
     DMAAsyncChannel *a = &cdrom_async;
-    if (a->active && ((channels[3].chcr >> 24) & 1u) && channel_enabled(3)) {
+    if (dma_cdrom_transfer_active()) {
         uint32_t chcr = channels[3].chcr;
         uint32_t direction = chcr & 1u;
         uint32_t step = (chcr >> 1) & 1u;
@@ -692,6 +821,7 @@ void dma_advance(uint32_t cycles) {
             while (a->remaining_words > 0 && words_budget > 0 && cdrom_dma_ready()) {
                 uint32_t word = cdrom_dma_read();
                 psx_write_word(addr, word);
+                record_cdrom_dma_word(word);
                 dirty_ram_mark_executable_range(addr, 4);
                 addr = (addr + addr_step) & 0x1FFFFCu;
                 a->remaining_words--;
@@ -719,6 +849,7 @@ void dma_init(void) {
     dpcr = 0x07654321u; /* default: priorities set, no channels enabled */
     dicr = 0;
     dma_debug_clear_trace();
+    dma_debug_clear_cdrom_history();
 }
 
 uint32_t dma_read(uint32_t addr) {
@@ -726,8 +857,7 @@ uint32_t dma_read(uint32_t addr) {
     if (addr == 0x1F8010F0u) return dpcr;
     /* DICR */
     if (addr == 0x1F8010F4u) {
-        update_master_irq();
-        return dicr;
+        return dma_get_dicr();
     }
 
     /* Per-channel registers: 0x1F801080 + ch*0x10 + offset */
@@ -770,11 +900,14 @@ void dma_write_masked(uint32_t addr, uint32_t val, uint32_t mask) {
         /* Bit 23: master IRQ enable */
         /* Bits 24-30: IRQ flags, write 1 to clear */
         /* Bit 31: master flag, read-only (computed) */
+        uint32_t dicr_before = dicr;
+        uint32_t i_stat_before = i_stat;
         uint32_t write_mask = DICR_WRITE_MASK & mask;
         uint32_t reset_mask = DICR_RESET_MASK & mask;
         dicr = (dicr & ~write_mask) | (val & write_mask);
         dicr &= ~(val & reset_mask);
-        update_master_irq();
+        raise_dma_irq_on_master_edge(dicr_before);
+        trace_dma_reg_write(addr, val, mask, dicr_before, i_stat_before);
         return;
     }
 
@@ -830,6 +963,18 @@ uint64_t dma_debug_get_trace(const DMATraceEntry** out_entries) {
 void dma_debug_clear_trace(void) {
     memset(dma_trace, 0, sizeof(dma_trace));
     dma_trace_seq = 0;
+}
+
+uint64_t dma_debug_get_cdrom_history(const DMACDROMHistoryEntry** out_entries) {
+    if (out_entries) *out_entries = cdrom_dma_history;
+    return cdrom_dma_history_seq;
+}
+
+void dma_debug_clear_cdrom_history(void) {
+    memset(cdrom_dma_history, 0, sizeof(cdrom_dma_history));
+    memset(&cdrom_dma_active_entry, 0, sizeof(cdrom_dma_active_entry));
+    cdrom_dma_history_seq = 0;
+    cdrom_dma_history_active = 0;
 }
 
 void dma_debug_get_state(DMADebugState* out) {

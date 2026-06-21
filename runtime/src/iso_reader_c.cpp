@@ -31,6 +31,12 @@ int iso_read_raw_sector(void* handle, uint32_t lba, uint8_t* buffer, int size) {
     return reader->ReadRawSector(lba, buffer) ? 1 : 0;
 }
 
+uint32_t iso_sector_count(void* handle) {
+    if (!handle) return 0;
+    auto* reader = static_cast<PS1::ISOReader*>(handle);
+    return reader->GetSectorCount();
+}
+
 void iso_close(void* handle) {
     if (!handle) return;
     auto* reader = static_cast<PS1::ISOReader*>(handle);

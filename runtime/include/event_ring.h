@@ -80,6 +80,8 @@ typedef enum {
     GATE_COOLDOWN     = 2,  /* post-exception cooldown block                   */
     GATE_SR_IE        = 3,  /* COP0 SR IEc clear (interrupts globally off)     */
     GATE_SR_IM2       = 4,  /* COP0 SR IM2 clear (HW int line masked)          */
+    GATE_CALL_DEPTH   = 5,  /* ape-fw: inside nested generated call, not a safe point */
+    GATE_BAD_RESUME   = 6,  /* ape-fw: no valid guest resume PC at this check  */
 } EventGateReason;
 
 typedef enum {

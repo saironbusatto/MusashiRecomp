@@ -206,7 +206,7 @@ typedef struct {
     uint32_t new_mask;
     uint32_t caller;     /* g_debug_current_func_addr */
     uint32_t store_pc;   /* g_debug_last_store_pc — exact PC of the SW/SH */
-    uint8_t  width;      /* 16 or 32 */
+    uint8_t  width;      /* 8, 16, or 32 */
     uint8_t  bit7_set;   /* 1 if this write SET bit 7 */
     uint8_t  bit7_clear; /* 1 if this write CLEARED bit 7 */
     uint8_t  in_exc;
@@ -236,6 +236,17 @@ static void imask_trace_record(uint32_t old_val, uint32_t new_val, uint8_t width
     imask_trace_count++;
 }
 
+static void interrupt_write_stat_masked(uint32_t val, uint32_t mask) {
+    uint32_t ack_mask = mask & 0x7FFu;
+    i_stat = (i_stat & ~ack_mask) | (i_stat & val & ack_mask);
+}
+
+static void interrupt_write_mask_masked(uint32_t val, uint32_t mask, uint8_t width) {
+    uint32_t old = i_mask;
+    i_mask = ((i_mask & ~mask) | (val & mask)) & 0x7FFu;
+    imask_trace_record(old, i_mask, width);
+}
+
 /* Getters for debug server */
 int memory_get_imask_bit7_set_count(void) { return imask_bit7_set_count; }
 int memory_get_imask_bit7_clear_count(void) { return imask_bit7_clear_count; }
@@ -249,6 +260,8 @@ const ImaskTraceEntry *memory_get_imask_trace(int *idx_out, int *count_out) {
 extern void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                            uint32_t new_val, uint8_t width);
 extern void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
+extern void debug_server_trace_entryint_write(uint32_t phys, uint32_t old_val,
+                                              uint32_t new_val, uint8_t width);
 extern CPUState *debug_cpu_ptr;
 extern uint32_t g_debug_last_store_pc;
 
@@ -390,8 +403,8 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
         return;
     }
     /* Interrupts: 0x1F801070, 0x1F801074 */
-    if (addr == 0x1F801070u) { i_stat &= val; return; } /* AND-acknowledge */
-    if (addr == 0x1F801074u) { uint32_t old = i_mask; i_mask = val & 0x7FFu; imask_trace_record(old, i_mask, 32); return; }
+    if (addr == 0x1F801070u) { interrupt_write_stat_masked(val, 0xFFFFFFFFu); return; }
+    if (addr == 0x1F801074u) { interrupt_write_mask_masked(val, 0xFFFFFFFFu, 32); return; }
     /* DMA: 0x1F801080..0x1F8010FF */
     if (addr >= 0x1F801080u && addr <= 0x1F8010FFu) {
         dma_write(addr, val);
@@ -439,8 +452,15 @@ static uint16_t mmio_read16(uint32_t addr) {
         return (uint16_t)sio_read(addr);
     }
     /* Interrupts */
-    if (addr == 0x1F801070u) { sio_tick(0); return (uint16_t)i_stat; }
-    if (addr == 0x1F801074u) return (uint16_t)i_mask;
+    if (addr >= 0x1F801070u && addr <= 0x1F801072u) {
+        sio_tick(0);
+        uint32_t shift = (addr & 2u) ? 16u : 0u;
+        return (uint16_t)(i_stat >> shift);
+    }
+    if (addr >= 0x1F801074u && addr <= 0x1F801076u) {
+        uint32_t shift = (addr & 2u) ? 16u : 0u;
+        return (uint16_t)(i_mask >> shift);
+    }
     /* Timers: 0x1F801100..0x1F80112F */
     if (addr >= 0x1F801100u && addr <= 0x1F80112Fu) {
         return (uint16_t)timers_read(addr);
@@ -472,8 +492,16 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
         return;
     }
     /* Interrupts */
-    if (addr == 0x1F801070u) { i_stat &= val; return; }
-    if (addr == 0x1F801074u) { uint32_t old = i_mask; i_mask = val & 0x7FFu; imask_trace_record(old, i_mask, 16); return; }
+    if (addr >= 0x1F801070u && addr <= 0x1F801072u) {
+        uint32_t shift = (addr & 2u) ? 16u : 0u;
+        interrupt_write_stat_masked((uint32_t)val << shift, 0xFFFFu << shift);
+        return;
+    }
+    if (addr >= 0x1F801074u && addr <= 0x1F801076u) {
+        uint32_t shift = (addr & 2u) ? 16u : 0u;
+        interrupt_write_mask_masked((uint32_t)val << shift, 0xFFFFu << shift, 16);
+        return;
+    }
     /* Timers: 0x1F801100..0x1F80112F */
     if (addr >= 0x1F801100u && addr <= 0x1F80112Fu) {
         timers_write(addr, val);
@@ -546,6 +574,17 @@ static uint8_t mmio_read8(uint32_t addr) {
 static void mmio_write8(uint32_t addr, uint8_t val) {
     SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, (uint32_t)val, 1);
+    /* Interrupts: partial stores affect only the addressed byte lane. */
+    if (addr >= 0x1F801070u && addr <= 0x1F801073u) {
+        uint32_t shift = 8u * (addr & 3u);
+        interrupt_write_stat_masked((uint32_t)val << shift, 0xFFu << shift);
+        return;
+    }
+    if (addr >= 0x1F801074u && addr <= 0x1F801077u) {
+        uint32_t shift = 8u * (addr & 3u);
+        interrupt_write_mask_masked((uint32_t)val << shift, 0xFFu << shift, 8);
+        return;
+    }
     /* SIO: 0x1F801040..0x1F80105F */
     if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
         sio_write(addr & ~3u, (uint32_t)val);

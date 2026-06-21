@@ -201,6 +201,26 @@ std::string ISOReader::GetBinPath() const {
     return bin_path_;
 }
 
+uint32_t ISOReader::GetSectorCount() {
+    if (!is_open_) {
+        return 0;
+    }
+
+    file_.clear();
+    file_.seekg(0, std::ios::end);
+    std::streampos file_size = file_.tellg();
+    file_.clear();
+    if (file_size <= 0) {
+        return 0;
+    }
+
+    const uint64_t size = static_cast<uint64_t>(file_size);
+    if ((size % RAW_SECTOR_SIZE) == 0) {
+        return static_cast<uint32_t>(size / RAW_SECTOR_SIZE);
+    }
+    return static_cast<uint32_t>(size / SECTOR_SIZE);
+}
+
 RootDirectoryInfo ISOReader::GetRootDirectory() const {
     return root_dir_;
 }

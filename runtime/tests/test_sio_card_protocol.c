@@ -42,6 +42,30 @@ uint32_t g_debug_current_func_addr = 0;
 int psx_get_in_exception(void) { return 0; }
 uint8_t psx_read_byte(uint32_t addr) { (void)addr; return 0; }
 uint32_t memory_get_sr(void) { return 0; }
+void debug_server_poll(void) {}
+void debug_server_log_sio_write(uint32_t addr, uint32_t value, uint8_t width) {
+    (void)addr; (void)value; (void)width;
+}
+void starvation_ring_record(uint8_t kind, uint8_t tx, uint8_t rx,
+                            uint16_t ctrl, uint16_t stat, uint8_t active_device,
+                            uint8_t selected_slot, uint16_t mc_state,
+                            uint8_t mc_cmd, uint16_t mc_sector,
+                            uint8_t mc_data_idx, uint32_t func_addr) {
+    (void)kind; (void)tx; (void)rx; (void)ctrl; (void)stat;
+    (void)active_device; (void)selected_slot; (void)mc_state;
+    (void)mc_cmd; (void)mc_sector; (void)mc_data_idx; (void)func_addr;
+}
+void card_read_summary_record(uint8_t slot, uint8_t cmd, uint16_t sector,
+                              uint8_t end, uint8_t checksum,
+                              uint8_t data0, uint8_t data1,
+                              uint32_t func_addr) {
+    (void)slot; (void)cmd; (void)sector; (void)end; (void)checksum;
+    (void)data0; (void)data1; (void)func_addr;
+}
+void card_data_writes_arm(uint8_t value, uint16_t mc_state,
+                          uint8_t mc_data_idx, uint8_t slot) {
+    (void)value; (void)mc_state; (void)mc_data_idx; (void)slot;
+}
 
 /* ---- Test harness ---- */
 
@@ -81,10 +105,17 @@ static uint8_t card_xchg(uint8_t tx, int slot) {
                   | (slot ? CTRL_SLOT : 0);
     sio_write(SIO_CTRL, ctrl);
     sio_write(SIO_TX_DATA, tx);
+    sio_tick(2000);
     uint8_t rx = (uint8_t)sio_read(SIO_RX_DATA);
     /* Acknowledge IRQ between bytes (BIOS pattern) */
     sio_write(SIO_CTRL, ctrl | CTRL_ACK);
     return rx;
+}
+
+static void card_deselect(int slot) {
+    uint16_t ctrl = CTRL_TX_EN | CTRL_ACK_IRQ_EN | (slot ? CTRL_SLOT : 0);
+    sio_write(SIO_CTRL, ctrl);
+    sio_tick(2000);
 }
 
 /* Drive a complete card READ for the given sector and capture every RX byte.
@@ -110,6 +141,30 @@ static int run_card_read(int slot, uint16_t sector, uint8_t out_rx[140]) {
     }
     out_rx[n++] = card_xchg(0x00, slot);   /* idx 138: checksum */
     out_rx[n++] = card_xchg(0x00, slot);   /* idx 139: end byte */
+    return n;
+}
+
+static int run_card_write(int slot, uint16_t sector, const uint8_t data[128],
+                          uint8_t out_rx[140]) {
+    int n = 0;
+    uint8_t msb = (uint8_t)(sector >> 8);
+    uint8_t lsb = (uint8_t)(sector & 0xFF);
+    uint8_t chk = msb ^ lsb;
+    for (int i = 0; i < 128; i++) chk ^= data[i];
+
+    out_rx[n++] = card_xchg(0x81, slot);   /* idx 0: prefix */
+    out_rx[n++] = card_xchg(0x57, slot);   /* idx 1: cmd -> FLAG */
+    out_rx[n++] = card_xchg(0x00, slot);   /* idx 2: -> 5A */
+    out_rx[n++] = card_xchg(0x00, slot);   /* idx 3: -> 5D */
+    out_rx[n++] = card_xchg(msb,  slot);   /* idx 4: address MSB */
+    out_rx[n++] = card_xchg(lsb,  slot);   /* idx 5: address LSB */
+    for (int i = 0; i < 128; i++) {
+        out_rx[n++] = card_xchg(data[i], slot);
+    }
+    out_rx[n++] = card_xchg(chk,  slot);
+    out_rx[n++] = card_xchg(0x00, slot);   /* ack 1 */
+    out_rx[n++] = card_xchg(0x00, slot);   /* ack 2 */
+    out_rx[n++] = card_xchg(0x00, slot);   /* end byte */
     return n;
 }
 
@@ -214,6 +269,27 @@ static void test_card_read_sector_0(void) {
     EXPECT_EQ("read.idx[138]_checksum", expected_chk, rx[138]);
     /* idx 139: end byte */
     EXPECT_EQ("read.idx[139]_end",       0x47, rx[139]);
+
+    EXPECT_EQ("read2.prefix",            0xFF, card_xchg(0x81, 0));
+    EXPECT_EQ("read2.flag_still_set",    0x08, card_xchg(0x52, 0));
+}
+
+static void test_flag_clears_on_write(void) {
+    sio_init();
+    memcard_init("test_dir");
+
+    uint8_t data[128];
+    memset(data, 0x00, sizeof(data));
+    data[0] = 'M';
+    data[1] = 'C';
+    uint8_t rx[140];
+    int n = run_card_write(0, 0x003F, data, rx);
+    EXPECT_EQ("write.count", 138, n);
+    EXPECT_EQ("write.idx[1]_initial_FLAG", 0x08, rx[1]);
+    EXPECT_EQ("write.end", 0x47, rx[137]);
+
+    EXPECT_EQ("post_write.prefix",       0xFF, card_xchg(0x81, 0));
+    EXPECT_EQ("post_write.flag_clear",   0x00, card_xchg(0x52, 0));
 }
 
 /* Test 3: pad-poll mid-card-read — does our SIO model preserve card state? */
@@ -232,6 +308,7 @@ static void test_pad_poll_during_card_read(void) {
     EXPECT_EQ("pad_intr.0x52", 0x08, card_xchg(0x52, 0));
     EXPECT_EQ("pad_intr.id1",  0x5A, card_xchg(0x00, 0));
     EXPECT_EQ("pad_intr.id2",  0x5D, card_xchg(0x00, 0));
+    card_deselect(0);
 
     /* Inject pad poll between card bytes */
     (void)card_xchg(0x01, 0);  /* pad select — by spec, breaks card protocol */
@@ -241,6 +318,7 @@ static void test_pad_poll_during_card_read(void) {
     (void)card_xchg(0x00, 0);
 
     /* Resume card protocol by issuing 0x81 again — must restart cleanly */
+    card_deselect(0);
     EXPECT_EQ("pad_intr.restart_0x81", 0xFF, card_xchg(0x81, 0));
     EXPECT_EQ("pad_intr.restart_0x52", 0x08, card_xchg(0x52, 0));
     /* Note: FLAG should still be 0x08 since no successful WRITE has occurred */
@@ -254,11 +332,13 @@ static void test_per_slot_state(void) {
     /* Start protocol on slot 0 */
     EXPECT_EQ("perslot.s0_0x81", 0xFF, card_xchg(0x81, 0));
     EXPECT_EQ("perslot.s0_0x52", 0x08, card_xchg(0x52, 0));
+    card_deselect(0);
     /* Switch to slot 1 mid-protocol — start fresh on slot 1 */
     EXPECT_EQ("perslot.s1_0x81", 0xFF, card_xchg(0x81, 1));
     /* Slot 1 might have no card (test_dir/card2.mcd doesn't exist) — accept either */
 
     /* Switch back to slot 0 — should restart fresh (real card forgets state) */
+    card_deselect(1);
     EXPECT_EQ("perslot.s0_resume_0x81", 0xFF, card_xchg(0x81, 0));
     EXPECT_EQ("perslot.s0_resume_0x52", 0x08, card_xchg(0x52, 0));
 }
@@ -286,6 +366,12 @@ int main(void) {
     int prev_checks = g_checks, prev_fails = g_failures;
     test_card_read_sector_0();
     fprintf(stderr, "test_card_read_sector_0:            %d/%d ok\n",
+            (g_checks - prev_checks) - (g_failures - prev_fails),
+            g_checks - prev_checks);
+
+    prev_checks = g_checks; prev_fails = g_failures;
+    test_flag_clears_on_write();
+    fprintf(stderr, "test_flag_clears_on_write:          %d/%d ok\n",
             (g_checks - prev_checks) - (g_failures - prev_fails),
             g_checks - prev_checks);
 
