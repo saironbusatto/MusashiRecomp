@@ -267,6 +267,13 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             rt.deadzone = static_cast<int>(n);
             rt.has_deadzone = true;
         }
+        // LEGACY per-game pad-config opt-in (default modern). Tomba sets this so
+        // its launcher Hybrid mode's analog<->digital type flip doesn't make libpad
+        // manufacture a disconnect; no other title is affected. Full history and
+        // the removal plan live in psxrecomp runtime/src/sio.c (g_pad_legacy_cfg).
+        if (ct.contains("legacy_pad_config")) {
+            rt.legacy_pad_config = toml::find<bool>(ct, "legacy_pad_config");
+        }
     }
 
     return rt;

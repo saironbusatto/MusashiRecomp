@@ -4869,6 +4869,21 @@ static void handle_sio_trace(int id, const char *json)
     send_fmt("]}\n");
 }
 
+/* Live get/set of the pad config-SM mode, for A/B testing the LEGACY Tomba
+ * Hybrid compatibility path (normally driven per-game by [controller]
+ * legacy_pad_config; see sio.c g_pad_legacy_cfg for the full story).
+ *   {"cmd":"pad_cfg"}            -> report current mode
+ *   {"cmd":"pad_cfg","set":1}   -> legacy pre-98aa688 "always 0xF3" config
+ *   {"cmd":"pad_cfg","set":0}   -> modern DualShock config state machine (default) */
+static void handle_pad_cfg(int id, const char *json)
+{
+    int set = json_get_int(json, "set", -1);
+    if (set >= 0) sio_set_legacy_cfg(set);
+    int mode = sio_get_legacy_cfg();
+    send_fmt("{\"id\":%d,\"ok\":true,\"legacy_cfg\":%d,\"mode\":\"%s\"}\n",
+             id, mode, mode ? "legacy-0xF3" : "new-state-machine");
+}
+
 static void handle_sio_trace_window(int id, const char *json)
 {
     int seq = json_get_int(json, "seq", -1);
@@ -9228,6 +9243,7 @@ static const CmdEntry s_commands[] = {
     { "chain_trace",       handle_chain_trace },
     { "sio_trace",         handle_sio_trace },
     { "sio_trace_window",  handle_sio_trace_window },
+    { "pad_cfg",           handle_pad_cfg },
     { "sio_pc_trace",      handle_sio_pc_trace },
     { "sio_pc_window",     handle_sio_pc_window },
     { "sio_ctrl_reg_trace", handle_sio_ctrl_reg_trace },

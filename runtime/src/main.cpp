@@ -1017,7 +1017,11 @@ static void open_player(PlayerInput& p, const PlayerInput& other) {
  * hotplug). analog pins DualShock; digital and hybrid both start as a digital
  * pad (hybrid only flips to DualShock once the player nudges the stick). */
 static int pad_mode_boot_analog(int mode) {
-    return mode == PSXRecompV4::PAD_MODE_ANALOG ? 1 : 0;
+    /* Hybrid boots ANALOG-on (matches a DualShock powered up with the analog LED
+     * lit): the seamless auto-switch then drops to digital only if the player
+     * reaches for the d-pad. Pinned-analog also boots analog; digital boots off. */
+    return (mode == PSXRecompV4::PAD_MODE_ANALOG ||
+            mode == PSXRecompV4::PAD_MODE_HYBRID) ? 1 : 0;
 }
 
 /* Open/close SDL handles so they match g_players, and (re)assert each slot's
@@ -1036,7 +1040,9 @@ static void refresh_player_devices(void) {
  *   "none" -> no pad; "keyboard" -> keyboard map; otherwise an SDL GUID. */
 static void set_player_device(PlayerInput& p, const std::string& dev, int mode) {
     p.mode = mode;
-    p.hybrid_analog = false;   /* hybrid starts digital until the stick moves */
+    /* Hybrid starts in ANALOG (analog LED on); the auto-switch drops to digital
+     * only when the player uses the d-pad. */
+    p.hybrid_analog = true;
     p.guid[0] = '\0';
     std::string d = lower_copy(trim_copy(dev));
     if (d.empty() || d == "none") { p.kind = 0; }
@@ -1263,7 +1269,15 @@ static void sample_pad_into_sio(int override) {
             if (keys[SDL_SCANCODE_UP])    st[1] = 0x00;
             if (keys[SDL_SCANCODE_DOWN])  st[1] = 0xFF;
         }
-        sio_set_pad_analog(s, eff_analog, st[0], st[1], st[2], st[3]);
+        /* Push sticks every frame; request the pad type (digital/analog) through
+         * the coherent channel so a hybrid stick<->d-pad flip is applied only at
+         * an idle, non-config bus boundary (never mid-poll / mid-handshake). This
+         * is the fix for the v0.5.0 phantom-input regression: slamming the type
+         * each frame raced Tomba's DualShock config handshake -> garbage button
+         * reads. eff_analog still reflects this frame's mode (digital / analog /
+         * hybrid auto-switch). */
+        sio_set_pad_sticks(s, st[0], st[1], st[2], st[3]);
+        sio_request_pad_type(s, eff_analog);
     }
 }
 
@@ -1937,6 +1951,12 @@ int main(int argc, char** argv) {
             }
             ctrl_allow_hybrid = gc.runtime.controller_allow_hybrid;
             if (gc.runtime.has_deadzone) resolved_deadzone = gc.runtime.deadzone;
+            /* LEGACY per-game pad-config opt-in (default modern). Only Tomba sets
+             * it, so its launcher Hybrid mode's analog<->digital flip doesn't make
+             * libpad manufacture a 1-frame "pad unplugged". sio_init() does not
+             * touch this flag, so applying it here (config-load time) is stable.
+             * Full history + removal plan: psxrecomp sio.c g_pad_legacy_cfg. */
+            sio_set_legacy_cfg(gc.runtime.legacy_pad_config ? 1 : 0);
             { const char *e = std::getenv("PSX_GL_FORCE_CPU_PRESENT");
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
