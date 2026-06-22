@@ -3440,6 +3440,22 @@ static MmioTraceEntry *s_gp1_trace = NULL;
 static uint64_t s_gp1_trace_seq  = 0;
 static uint32_t s_gp1_trace_head = 0;
 
+/* ---- MMIO-READ trace (rtrace) ----
+ * The read counterpart to the MMIO write ring. CPU loads are far more
+ * voluminous than stores, so this ring is RANGE-FILTERED (default-armed to the
+ * CD regs + I_STAT/I_MASK — the device regs the IRQ handler reads to decide
+ * whether to ack). This is THE decisive signal for the verifier-vs-lowering
+ * classification: what value did 0x2458 actually read from 0x1F801803 (CD
+ * IRQ-flag) / I_STAT at exception time. Reuses MmioTraceEntry so each read also
+ * snapshots func/pc/ra + i_stat/i_mask at read time. Always-on for the armed
+ * ranges from init (Rule: ring buffers capture continuously, probes query). */
+static MmioTraceEntry *s_mmio_rtrace = NULL;
+static uint64_t s_mmio_rtrace_seq  = 0;
+static uint32_t s_mmio_rtrace_head = 0;
+#define MMIO_RTRACE_MAX_RANGES 8
+static struct { uint32_t lo, hi; } s_mmio_rtrace_ranges[MMIO_RTRACE_MAX_RANGES];
+static int s_mmio_rtrace_range_count = 0;
+
 /* ---- Platform helpers ---- */
 static void set_nonblocking(sock_t s)
 {
@@ -6684,6 +6700,47 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
     }
 }
 
+/* MMIO read trace — called from memory.c mmio_read32/16/8 wrappers AFTER the
+ * value is computed. Range-filtered (default CD + I_STAT) so the ring retains a
+ * long window of just the device-register reads of interest, even across a
+ * livelock that polls them. `val` is the value the CPU actually loaded. */
+void debug_server_trace_mmio_read(uint32_t addr, uint32_t val, uint8_t width)
+{
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)addr; (void)val; (void)width;
+    return;
+#endif
+    if (!s_mmio_rtrace || s_mmio_rtrace_range_count == 0) return;
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    int hit = 0;
+    for (int i = 0; i < s_mmio_rtrace_range_count; i++) {
+        if (phys + width > s_mmio_rtrace_ranges[i].lo &&
+            phys < s_mmio_rtrace_ranges[i].hi) { hit = 1; break; }
+    }
+    if (!hit) return;
+
+    MmioTraceEntry *e = &s_mmio_rtrace[s_mmio_rtrace_head];
+    e->seq       = s_mmio_rtrace_seq++;
+    e->addr      = addr;
+    e->val       = val;
+    e->func_addr = g_debug_current_func_addr;
+    e->pc        = g_debug_last_store_pc;
+    e->cpu_pc    = debug_cpu_ptr ? debug_cpu_ptr->pc      : 0;
+    e->ra        = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
+    e->sp        = debug_cpu_ptr ? debug_cpu_ptr->gpr[29] : 0;
+    e->a0        = debug_cpu_ptr ? debug_cpu_ptr->gpr[4]  : 0;
+    e->a1        = debug_cpu_ptr ? debug_cpu_ptr->gpr[5]  : 0;
+    e->a2        = debug_cpu_ptr ? debug_cpu_ptr->gpr[6]  : 0;
+    e->a3        = debug_cpu_ptr ? debug_cpu_ptr->gpr[7]  : 0;
+    e->sr        = debug_cpu_ptr ? debug_cpu_ptr->cop0[12] : 0;
+    e->epc       = debug_cpu_ptr ? debug_cpu_ptr->cop0[14] : 0;
+    e->istat     = i_stat;
+    e->imask     = i_mask;
+    e->frame     = (uint32_t)s_frame_count;
+    e->width     = width;
+    s_mmio_rtrace_head = (s_mmio_rtrace_head + 1) % MMIO_TRACE_CAP;
+}
+
 static void handle_wtrace_range(int id, const char *json)
 {
     /* Backward compat: sets slot 0, clears all other slots. */
@@ -7694,6 +7751,120 @@ static void handle_mmio_clear(int id, const char *json)
     s_mmio_trace_head = 0;
     if (s_mmio_trace) memset(s_mmio_trace, 0, (size_t)MMIO_TRACE_CAP * sizeof(MmioTraceEntry));
     send_ok(id);
+}
+
+/* ---- rtrace (MMIO-READ trace) command handlers ----
+ * Field names of the dumped entries are a SUPERSET of the oracle's rtrace_dump
+ * (addr/val/pc/ra/frame/w common; func/cpu_pc/sr/epc/i_stat/i_mask extra) so a
+ * cross-port tool reads both ports with one parser (Rule 16). */
+static void handle_rtrace_dump(int id, const char *json)
+{
+    if (!s_mmio_rtrace) { send_err(id, "rtrace not initialized"); return; }
+
+    char addr_str[32];
+    uint32_t filter_addr = 0;
+    int has_filter = json_get_str(json, "addr", addr_str, sizeof(addr_str)) != NULL;
+    if (has_filter) filter_addr = hex_to_u32(addr_str);
+
+    uint64_t total = s_mmio_rtrace_seq;
+    uint32_t avail = (total < MMIO_TRACE_CAP) ? (uint32_t)total : MMIO_TRACE_CAP;
+    uint32_t start = (total < MMIO_TRACE_CAP) ? 0 : s_mmio_rtrace_head;
+
+    int max_out = json_get_int(json, "count", 65536);
+    if (max_out < 1) max_out = 1;
+    if (max_out > (int)MMIO_TRACE_CAP) max_out = (int)MMIO_TRACE_CAP;
+    int newest_first = json_get_int(json, "newest", 0) != 0;
+
+    const uint32_t MAX_OUT = (uint32_t)max_out;
+    size_t BUF_SZ = 256u + (size_t)MAX_OUT * 512u;
+    if (BUF_SZ > (size_t)128 * 1024 * 1024) BUF_SZ = (size_t)128 * 1024 * 1024;
+    char *buf = (char *)malloc(BUF_SZ);
+    if (!buf) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    uint32_t emitted = 0;
+    pos += snprintf(buf + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
+                    id, (unsigned long long)total, avail);
+    for (uint32_t i = 0; i < avail && emitted < MAX_OUT && pos < BUF_SZ - 256; i++) {
+        uint32_t idx;
+        if (newest_first) {
+            uint32_t newest = (s_mmio_rtrace_head + MMIO_TRACE_CAP - 1u) % MMIO_TRACE_CAP;
+            idx = (newest + MMIO_TRACE_CAP - (i % MMIO_TRACE_CAP)) % MMIO_TRACE_CAP;
+        } else {
+            idx = (start + i) % MMIO_TRACE_CAP;
+        }
+        MmioTraceEntry *e = &s_mmio_rtrace[idx];
+        if (has_filter && e->addr != filter_addr) continue;
+        pos += snprintf(buf + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"val\":\"0x%08X\","
+                        "\"func\":\"0x%08X\",\"pc\":\"0x%08X\",\"cpu_pc\":\"0x%08X\","
+                        "\"ra\":\"0x%08X\",\"sp\":\"0x%08X\","
+                        "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                        "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+                        "\"sr\":\"0x%08X\",\"epc\":\"0x%08X\","
+                        "\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
+                        "\"frame\":%u,\"w\":%u}",
+                        (emitted == 0) ? "" : ",",
+                        (unsigned long long)e->seq,
+                        e->addr, e->val, e->func_addr, e->pc, e->cpu_pc,
+                        e->ra, e->sp, e->a0, e->a1, e->a2, e->a3,
+                        e->sr, e->epc, e->istat, e->imask,
+                        e->frame, (unsigned)e->width);
+        emitted++;
+    }
+    pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%u}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_rtrace_clear(int id, const char *json)
+{
+    (void)json;
+    s_mmio_rtrace_seq = 0;
+    s_mmio_rtrace_head = 0;
+    if (s_mmio_rtrace) memset(s_mmio_rtrace, 0, (size_t)MMIO_TRACE_CAP * sizeof(MmioTraceEntry));
+    send_ok(id);
+}
+
+static void handle_rtrace_arm(int id, const char *json)
+{
+    if (s_mmio_rtrace_range_count >= MMIO_RTRACE_MAX_RANGES) {
+        send_err(id, "max ranges reached"); return;
+    }
+    char lo_str[32], hi_str[32];
+    if (!json_get_str(json, "lo", lo_str, sizeof(lo_str))) { send_err(id, "missing lo"); return; }
+    if (!json_get_str(json, "hi", hi_str, sizeof(hi_str))) { send_err(id, "missing hi"); return; }
+    int slot = s_mmio_rtrace_range_count++;
+    s_mmio_rtrace_ranges[slot].lo = hex_to_u32(lo_str) & 0x1FFFFFFFu;
+    s_mmio_rtrace_ranges[slot].hi = hex_to_u32(hi_str) & 0x1FFFFFFFu;
+    send_fmt("{\"id\":%d,\"ok\":true,\"slot\":%d,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}",
+             id, slot, s_mmio_rtrace_ranges[slot].lo, s_mmio_rtrace_ranges[slot].hi);
+}
+
+static void handle_rtrace_ranges(int id, const char *json)
+{
+    (void)json;
+    send_fmt("{\"id\":%d,\"ok\":true,\"count\":%d,\"ranges\":[",
+             id, s_mmio_rtrace_range_count);
+    for (int i = 0; i < s_mmio_rtrace_range_count; i++) {
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"slot\":%d,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}",
+                 i, s_mmio_rtrace_ranges[i].lo, s_mmio_rtrace_ranges[i].hi);
+    }
+    send_fmt("]}");
+}
+
+static void handle_rtrace_stats(int id, const char *json)
+{
+    (void)json;
+    uint64_t total = s_mmio_rtrace_seq;
+    uint64_t oldest = (total <= (uint64_t)MMIO_TRACE_CAP) ? 0 : total - (uint64_t)MMIO_TRACE_CAP;
+    uint64_t newest = (total > 0) ? total - 1 : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"capacity\":%d,"
+             "\"oldest_seq\":%llu,\"newest_seq\":%llu,\"ranges\":%d}",
+             id, (unsigned long long)total, (int)MMIO_TRACE_CAP,
+             (unsigned long long)oldest, (unsigned long long)newest,
+             s_mmio_rtrace_range_count);
 }
 
 /* gp1_dump — dump the dedicated GP1 display-control ring. Optional
@@ -9323,6 +9494,11 @@ static const CmdEntry s_commands[] = {
     { "freeze_check",      handle_freeze_check },
     { "mmio_dump",         handle_mmio_dump },
     { "mmio_clear",        handle_mmio_clear },
+    { "rtrace_dump",       handle_rtrace_dump },
+    { "rtrace_clear",      handle_rtrace_clear },
+    { "rtrace_arm",        handle_rtrace_arm },
+    { "rtrace_ranges",     handle_rtrace_ranges },
+    { "rtrace_stats",      handle_rtrace_stats },
     { "gp1_dump",          handle_gp1_dump },
     { "mdec_state",        handle_mdec_state },
     { "mdec_trace",        handle_mdec_trace },
@@ -9766,6 +9942,19 @@ void debug_server_init(int port)
     }
     s_gp1_trace_seq = 0;
     s_gp1_trace_head = 0;
+
+    /* MMIO-READ trace ring (range-filtered). Default-armed from init to the CD
+     * regs + I_STAT/I_MASK so the IRQ handler's reads of the CD IRQ-flag and
+     * interrupt status are captured continuously (Rule: always-on ring; probes
+     * query the window). Reuses MMIO_TRACE_CAP entries (~21 MB). */
+    if (!s_mmio_rtrace) {
+        s_mmio_rtrace = (MmioTraceEntry *)calloc(MMIO_TRACE_CAP, sizeof(MmioTraceEntry));
+    }
+    s_mmio_rtrace_seq = 0;
+    s_mmio_rtrace_head = 0;
+    s_mmio_rtrace_ranges[0].lo = 0x1F801800u; s_mmio_rtrace_ranges[0].hi = 0x1F801804u; /* CD regs (idx/IRQ-flag) */
+    s_mmio_rtrace_ranges[1].lo = 0x1F801070u; s_mmio_rtrace_ranges[1].hi = 0x1F801078u; /* I_STAT / I_MASK */
+    s_mmio_rtrace_range_count = 2;
 
     memset(s_watchpoints, 0, sizeof(s_watchpoints));
     memset(s_snapshot_addrs, 0, sizeof(s_snapshot_addrs));

@@ -260,6 +260,7 @@ const ImaskTraceEntry *memory_get_imask_trace(int *idx_out, int *count_out) {
 extern void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                            uint32_t new_val, uint8_t width);
 extern void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
+extern void debug_server_trace_mmio_read(uint32_t addr, uint32_t val, uint8_t width);
 extern void debug_server_trace_entryint_write(uint32_t phys, uint32_t old_val,
                                               uint32_t new_val, uint8_t width);
 extern CPUState *debug_cpu_ptr;
@@ -338,7 +339,7 @@ static void unmapped_fatal(uint32_t vaddr, uint32_t phys, const char* op) {
 
 /* --- MMIO read/write helpers --- */
 
-static uint32_t mmio_read32(uint32_t addr) {
+static uint32_t mmio_read32_impl(uint32_t addr) {
     SHADOW_NOTE_MMIO();
     /* Memory control: 0x1F801000..0x1F801020 */
     if (addr >= 0x1F801000u && addr <= 0x1F80103Cu) {
@@ -382,6 +383,15 @@ static uint32_t mmio_read32(uint32_t addr) {
     }
     mmio_fatal(addr, addr, "READ32");
     return 0;
+}
+
+/* Thin wrapper: record the loaded value into the MMIO-READ trace ring AFTER the
+ * single (side-effecting) read. Callers use mmio_read32; the body is _impl, so
+ * the device read executes exactly once. */
+static uint32_t mmio_read32(uint32_t addr) {
+    uint32_t v = mmio_read32_impl(addr);
+    debug_server_trace_mmio_read(addr, v, 4);
+    return v;
 }
 
 static void mmio_write32(uint32_t addr, uint32_t val) {
@@ -445,7 +455,7 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
     mmio_fatal(addr, addr, "WRITE32");
 }
 
-static uint16_t mmio_read16(uint32_t addr) {
+static uint16_t mmio_read16_impl(uint32_t addr) {
     SHADOW_NOTE_MMIO();
     /* SIO: 0x1F801040..0x1F80105F */
     if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
@@ -481,6 +491,12 @@ static uint16_t mmio_read16(uint32_t addr) {
     }
     mmio_fatal(addr, addr, "READ16");
     return 0;
+}
+
+static uint16_t mmio_read16(uint32_t addr) {
+    uint16_t v = mmio_read16_impl(addr);
+    debug_server_trace_mmio_read(addr, (uint32_t)v, 2);
+    return v;
 }
 
 static void mmio_write16(uint32_t addr, uint16_t val) {
@@ -534,7 +550,7 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
     mmio_fatal(addr, addr, "WRITE16");
 }
 
-static uint8_t mmio_read8(uint32_t addr) {
+static uint8_t mmio_read8_impl(uint32_t addr) {
     SHADOW_NOTE_MMIO();
     /* Interrupts: 0x1F801070..0x1F801077 (I_STAT, I_MASK) */
     if (addr >= 0x1F801070u && addr <= 0x1F801077u) {
@@ -569,6 +585,12 @@ static uint8_t mmio_read8(uint32_t addr) {
     }
     mmio_fatal(addr, addr, "READ8");
     return 0;
+}
+
+static uint8_t mmio_read8(uint32_t addr) {
+    uint8_t v = mmio_read8_impl(addr);
+    debug_server_trace_mmio_read(addr, (uint32_t)v, 1);
+    return v;
 }
 
 static void mmio_write8(uint32_t addr, uint8_t val) {
