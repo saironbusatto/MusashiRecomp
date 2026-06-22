@@ -88,7 +88,39 @@ re-dispatches a wrong target, and it **degenerates into an infinite bail loop** 
 68k/frame spin. (Interrupt is healthy at the controller level — raised/delivered/acked
 1/frame — yet the guest *continuation* after RFE is corrupted.)
 
-### Fix design (ChatGPT-converged, Architecture-A-legal)
+### CORRECTION (confirm tripwire, commit d965d6e) — it is NOT the exception path
+
+The `$ra->1` tripwire + first-bail `in_exception` latch **refuted the exception/EPC
+model above** (data over theory, per recomp-debug):
+
+- `bail_first_in_exc = 0` — the `0xB0 -> 0x8008AE50` trigger bail is **NOT** during an
+  exception.
+- `ra_tw`: site = INTERP, `in_exc = 0`, `pc = 0x8008B018`, `prev_ra = 0x8008AF10` -> 1.
+- `0x8008B018` disassembles to **`lw $ra, 0x34($sp)`** — a normal function **epilogue**
+  restoring `$ra` from the stack. The loaded value is `1`, so the **saved `$ra` on the
+  stack is corrupt** (the stack/`$sp` is wrong), and this happens in **plain
+  non-exception execution**.
+
+**Corrected mechanism:** a B0 syscall (reached inside `jal 0x80085900` from caller F at
+`0x8008AE48`) returns **non-locally** to F's continuation `0x8008AE50` (a tail-call
+shape) — *not* an interrupt. Our bail/flatten handles the control transfer but leaves
+the **stack / `$sp` wrong** (the skipped frame isn't unwound / `$sp` not restored).
+Later F's epilogue `lw $ra, 0x34($sp)` reads a corrupt saved-`$ra` (`1`) → degenerate
+`$ra=$sp=1` → infinite bail loop. So the real bug is a **control-flow / stack-contract
+bug in the bail/flatten handling of a B0 non-local (tail-call) return** (recomp-debug
+Class 3), NOT exception/RFE/EPC. The EPC-separation fix below is therefore the WRONG
+fix and is retained only as a refuted hypothesis.
+
+### Revised fix direction (data-driven)
+
+The bail/flatten of a B0 (kernel-vector) non-local return from dirty/overlay code must
+restore the **correct guest `$sp`** (and unwind the skipped frame) so the resumed
+caller's stack is valid — OR the B0-vector tail-call must be dispatched as a tail
+transfer (no spurious `stop_addr`) rather than a call whose contract bails. Next probe:
+trace `$sp` and the `stop_addr` across the first B0 bail (latch them at the first bail),
+and read what `0x80085900` does at its end (tail `j`/`jr 0xB0` vs `jal`).
+
+### (REFUTED) Fix design (ChatGPT-converged, Architecture-A-legal)
 
 1. **Do not overload guest EPC as a host longjmp token.** Keep the host
    exception-return mechanism as *separate runtime metadata*
