@@ -2792,6 +2792,16 @@ int main(int argc, char** argv) {
         }
     }
 
+    /* Diagnostic: the guest published a null PC at the top level (abnormal). With
+     * PSX_EXIT_HALT set, halt-and-serve here instead of shutting down so the
+     * still-loaded overlays + full guest state are live-inspectable over TCP. */
+    { const char *e = std::getenv("PSX_EXIT_HALT");
+      if (e && e[0] && e[0] != '0') {
+          extern void psx_fatal_halt(const char *reason);
+          psx_fatal_halt("top-level dispatch returned PC=0 (abnormal boot exit — inspect live)");
+      }
+    }
+
     std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
 
     shutdown_runtime();
