@@ -61,19 +61,52 @@ Tomba 2's splash drives this **68,000 times per frame** (Tomba 1 at gameplay doe
   - `k0 = 0xBFC0193C` (**BIOS exception handler**), `epc = 0x80000048` (our EPC
     sentinel) → the spin runs in **exception-handler context**.
 
-### Mechanism (current best model)
+### Mechanism (grounded model — binary truth + actual code + oracle-aware)
 
-A VBLANK exception (delivered cleanly, 1/frame) fires while the high-RAM code is
-**mid-call across the B0 / dirty-RAM boundary**. The exception delivery + resume/RFE
-path does **not** correctly restore the interrupted frame's `$ra` (and, in the
-degenerate steady state, `$sp`): the resumed code's `$ra` is clobbered to `1`. The
-next return is therefore "wild" (`$ra != stop_addr`), the contract bails and flattens,
-the flatten re-dispatches a wrong target, that corrupts state further, and it
-**degenerates into an infinite bail loop** — the 68k-bails/frame splash spin.
+**Binary truth (PS-EXE header):** `0x80085900` / `0x8008AE50` are **NOT in the boot
+EXE** (`t_addr=0x80010000`, `t_size=0x28800`, file = exactly that). They are a **disc
+overlay loaded to high RAM (~0x80085000) at runtime**, executed by the **dirty-RAM
+interpreter** (the boot EXE is small; the bulk of Tomba 2 is disc overlays).
 
-This is consistent with the interrupt being *healthy at the controller level* (raised/
-delivered/acked 1/frame) yet the *guest continuation* after RFE being corrupted — the
-boundary between a delivered exception and an interrupted wild/dirty call.
+So the freeze is at the **dirty-interp/overlay ⟷ compiled-BIOS boundary when an async
+interrupt is delivered mid-call** — NOT a broken BIOS exception handler (that platform
+infra works for Tomba 1 / MMX6 / Ape; per the recomp-debug "platform infra is almost
+always correct" trap, doubting it was the mistake). My interrupt-pump fix (`0a6920a`)
+is what now delivers interrupts *during* dirty execution, which exposes this.
+
+**Root mechanism (confirmed in interrupts.c:355-384):** exception delivery sets
+`COP0_EPC = 0x80000048` — a **host longjmp sentinel, NOT the real interrupted PC** —
+and relies on saving/restoring GPRs around the handler `return;`. The recompiled
+handler RFEs by setting `cpu->pc = EPC = 0x80000048`; `psx_unknown_dispatch`
+(traps.c:524) longjmps on that sentinel. **Overloading the guest EPC as a host token
+collides with the BIOS's *architectural* use of EPC** (it saves/restores EPC via the
+TCB). When the interrupt is delivered mid-dirty-interp/overlay-call, the GPR
+save/restore + sentinel-RFE does not preserve the interrupted continuation: the
+resumed code's `$ra` is clobbered to `1` (degenerate steady state: `$ra=$sp=1`). The
+next return is then "wild" (`$ra != stop_addr`), the contract bails+flattens,
+re-dispatches a wrong target, and it **degenerates into an infinite bail loop** = the
+68k/frame spin. (Interrupt is healthy at the controller level — raised/delivered/acked
+1/frame — yet the guest *continuation* after RFE is corrupted.)
+
+### Fix design (ChatGPT-converged, Architecture-A-legal)
+
+1. **Do not overload guest EPC as a host longjmp token.** Keep the host
+   exception-return mechanism as *separate runtime metadata*
+   (`host_exception_return_kind` / `host_exception_jmp_target` /
+   `exception_resume_pc`). At entry set `EPC = real_interrupted_pc`,
+   `pc = exception_vector`, `in_exception=true` (let the BIOS do its TCB/EPC work
+   normally). At RFE restore per RFE semantics; **do not invent or use `$ra`/`$sp` as
+   host sentinels**; `restore_host_call_contract(frame)`.
+2. The async interrupt path must either **fully suspend + restore the active host
+   call-contract frame** across the exception, or **defer delivery to a committed
+   guest safe point** (a valid resume point for an async HW interrupt — not HLE).
+
+### Confirm-first (do this BEFORE the fix)
+
+Single tripwire: latch the **exact moment `$ra` becomes `1`** (`old_ra != 1 &&
+gpr[31] == 1`), capturing site (interp insn / exception-exit / bail), PC, prev `$ra`,
+`in_exception`, frame, full regs — surfaced in the heartbeat. That pins whether the
+clobber is an overlay instruction, the exception-restore, or the bail-flatten.
 
 ## Open questions (for the fix)
 
