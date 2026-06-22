@@ -49,6 +49,22 @@ typedef struct {
 static Timer timers[3];
 static uint32_t timer_frac[3];
 
+/* Always-on RootCounter/Timer IRQ-fire telemetry (Tomba 2 RCnt-wait diag):
+ * counts how many times each timer raised its IRQ. If a game spins on an
+ * RCnt-based wait that never completes, the matching counter here stays flat
+ * (timer never reaches target / IRQ never fires) — visible in the freeze
+ * heartbeat even when the main thread is saturated. */
+uint64_t g_timer_irq_fired[3] = { 0, 0, 0 };
+
+void timers_get_debug(int t, uint16_t *counter, uint16_t *target,
+                      uint32_t *mode, uint64_t *irq_fired) {
+    if (t < 0 || t > 2) return;
+    if (counter)   *counter   = timers[t].counter;
+    if (target)    *target    = timers[t].target;
+    if (mode)      *mode      = timers[t].mode;
+    if (irq_fired) *irq_fired = g_timer_irq_fired[t];
+}
+
 /* I_STAT is owned by memory.c — we poke it directly via this extern. */
 extern uint32_t i_stat;
 
@@ -96,6 +112,8 @@ static int timer_uses_sysclk(int t) {
  * the recompiled BIOS checks (i_stat & i_mask) on its own schedule. */
 static void timer_fire_irq(int t) {
     Timer* tm = &timers[t];
+
+    g_timer_irq_fired[t]++;
 
     if (tm->mode & MODE_IRQ_TOGGLE) {
         tm->irq_line ^= 1;
