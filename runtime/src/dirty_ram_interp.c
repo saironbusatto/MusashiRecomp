@@ -40,6 +40,13 @@ uint64_t g_dirty_ram_insns_run  = 0;
 uint64_t g_dirty_window_dispatches = 0;  /* capture-window interp dispatches */
 uint64_t g_dirty_ram_aborts     = 0;
 uint64_t g_dirty_ram_guard_yields = 0;
+/* Scheduling-contract pump telemetry (see dirty_ram_dispatch). Always-on:
+ * g_dirty_pump_max_gap_insns is the largest interpreted-insn gap ever seen
+ * between two interrupt pumps — must stay bounded (~4096 + one block) once the
+ * region-independent pump is in place; a runaway value means a dirty path is
+ * advancing cycles without surfacing to psx_check_interrupts (the softlock). */
+uint64_t g_dirty_pump_max_gap_insns = 0;
+uint64_t g_dirty_pump_count         = 0;
 
 /* Mid-block unsupported-opcode counters. Bumped instead of fprintf-spamming
  * stderr (CLAUDE.md §3). Read via dirty_ram_get_unsupported(). The "last_*"
@@ -1337,6 +1344,35 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     int prev = g_dirty_interp_active;
     g_dirty_interp_active = 1;
     int r = dirty_ram_dispatch_inner(cpu, addr, stop_addr);
+
+    /* Dirty-RAM scheduling contract (Tomba 2 Whoopee-Camp softlock fix):
+     * ANY path that advanced guest cycles must periodically expose the CPU to
+     * the interrupt/event pump, regardless of RAM region. The local-dirty-flow
+     * fast path (overlay region, phys >= OVERLAY_REGION_FLOOR) already pumps
+     * psx_check_interrupts() every 4096 insns internally — but a LOW-RAM kernel
+     * dirty loop (e.g. 0x2CA8 / 0xE10 / 0xB0 polling for VBlank) takes the
+     * per-block-return path instead and re-dispatches through the CPS chain
+     * WITHOUT ever surfacing to the top-level interrupt check. Result: VBlank is
+     * never raised, i_stat stays 0, the wait-loop deadlocks (frame frozen,
+     * total_checks frozen, dirty_ram_insns -> billions). OVERLAY_REGION_FLOOR may
+     * decide HOW dirty code is dispatched; it must never decide whether time
+     * exists. So pump here on a region-independent insn budget. This is a clean
+     * poll boundary: the inner committed cpu->pc, the executed instruction and
+     * its delay slot are fully retired, and psx_check_interrupts() clears
+     * g_dirty_interp_active at its longjmp landing (same contract as the inner
+     * local-flow pump), so a deliver-via-longjmp here is safe. */
+    if (r == 1) {
+        static uint64_t s_last_pump_insns = 0;
+        uint64_t now = g_dirty_ram_insns_run;
+        uint64_t gap = now - s_last_pump_insns;
+        if (gap > g_dirty_pump_max_gap_insns) g_dirty_pump_max_gap_insns = gap;
+        if (gap >= 4096u) {
+            s_last_pump_insns = now;
+            g_dirty_pump_count++;
+            psx_check_interrupts(cpu);   /* may exception-enter / longjmp */
+        }
+    }
+
     g_dirty_interp_active = prev;
     return r;
 }
