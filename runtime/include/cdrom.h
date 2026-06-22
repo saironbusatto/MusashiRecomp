@@ -64,6 +64,7 @@ void cdrom_tick(void);
 /* DMA channel 3 interface */
 uint32_t cdrom_dma_read(void);
 int cdrom_dma_ready(void);
+uint32_t cdrom_dma_sector_word_count(void);
 
 typedef struct CDROMDebugState {
     uint64_t seq;
@@ -77,6 +78,9 @@ typedef struct CDROMDebugState {
     uint8_t seek_sec;
     uint8_t seek_sect;
     uint8_t pending_cmd;
+    uint8_t queued_cmd;
+    uint8_t queued_pending;
+    uint8_t queued_param_count;
     int has_disc;
     int param_count;
     int response_read;
@@ -146,8 +150,38 @@ typedef struct CDROMTraceEntry {
 } CDROMTraceEntry;
 
 #define CDROM_TRACE_CAP (1 << 16)
-#define CDROM_SECTOR_HISTORY_CAP (1 << 10)
+#define CDROM_COMMAND_HISTORY_CAP (1 << 13)
+#define CDROM_SECTOR_HISTORY_CAP (1 << 13)
 #define CDROM_SECTOR_HISTORY_BYTES 128
+
+typedef struct CDROMCommandHistoryEntry {
+    uint64_t seq;
+    uint32_t frame;
+    uint32_t func;
+    uint32_t pc;
+    uint32_t i_stat;
+    uint8_t kind;
+    uint8_t cmd;
+    uint8_t param_count;
+    uint8_t params[16];
+    uint8_t stat;
+    uint8_t request;
+    uint8_t irq_enable;
+    uint8_t irq_flag;
+    uint8_t mode;
+    uint8_t seek_min;
+    uint8_t seek_sec;
+    uint8_t seek_sect;
+    uint8_t read_min;
+    uint8_t read_sec;
+    uint8_t read_sect;
+    uint8_t read_cmd;
+    uint8_t reading;
+    uint8_t pending_cmd;
+    uint8_t pending_pending;
+    uint8_t queued_cmd;
+    uint8_t queued_pending;
+} CDROMCommandHistoryEntry;
 
 typedef struct CDROMSectorHistoryEntry {
     uint64_t seq;
@@ -171,6 +205,8 @@ typedef struct CDROMSectorHistoryEntry {
 void cdrom_debug_snapshot(CDROMDebugState* out);
 uint64_t cdrom_debug_get_trace(const CDROMTraceEntry** out_entries);
 void cdrom_debug_clear_trace(void);
+uint64_t cdrom_debug_get_command_history(const CDROMCommandHistoryEntry** out_entries);
+void cdrom_debug_clear_command_history(void);
 uint32_t cdrom_debug_copy_last_sector(uint32_t offset, uint32_t len,
                                       uint8_t* out,
                                       CDROMSectorDebugState* state);

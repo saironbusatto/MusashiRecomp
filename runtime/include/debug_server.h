@@ -83,6 +83,10 @@ typedef struct {
  * port=0 uses the default (4370). */
 void debug_server_init(int port);
 
+/* Current listener status for heartbeat diagnostics. error is the platform
+ * socket error captured by init, or 0 when the listener is active. */
+void debug_server_get_status(int *listening, int *port, int *error);
+
 /* Poll for incoming connections and commands. Non-blocking.
  * Call once per vblank. */
 void debug_server_poll(void);
@@ -125,6 +129,7 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
 
 /* Dispatch trace — record every function dispatched. */
 void debug_server_trace_dispatch(uint32_t func_addr);
+void debug_server_trace_dispatch_return(uint32_t func_addr, CPUState *cpu);
 
 /* Direct-call entry hook — emitted by the recompiler at the top of every
  * generated function so we can see direct-jal targets that never go through
@@ -132,6 +137,7 @@ void debug_server_trace_dispatch(uint32_t func_addr);
  * touching the shadow stack — the native C call/return discipline already
  * handles unwinding for direct calls. */
 void debug_server_log_call_entry(uint32_t func_addr);
+void debug_server_log_call_entry_cpu(uint32_t func_addr, CPUState *cpu);
 
 /* Last store instruction PC — set by the recompiler before every memory
  * store (sb/sh/sw/swl/swr/swc2).  Read by SIO/MMIO write handlers to
@@ -157,6 +163,12 @@ void debug_server_log_thread_event(uint32_t kind, CPUState *cpu,
                                    uint32_t current_tcb,
                                    uint32_t target_tcb,
                                    uint32_t target_pc);
+void debug_server_log_thread_event_ex(uint32_t kind, CPUState *cpu,
+                                      uint32_t current_tcb,
+                                      uint32_t target_tcb,
+                                      uint32_t target_pc,
+                                      uintptr_t current_fiber,
+                                      uintptr_t target_fiber);
 
 /* Dirty-RAM dispatch break.  Used by the dynamic-code interpreter to pause
  * immediately when dispatch enters a configured address range, before a hot
@@ -172,6 +184,14 @@ void debug_server_check_watchpoints(void);
 /* Returns >= 0 if the debug server wants to override pad input,
  * -1 if no override is active. Value is PS1 16-bit button mask. */
 int debug_server_get_input_override(void);
+int debug_server_get_input_state(uint16_t *buttons,
+                                 int *axes_override,
+                                 uint8_t *lx, uint8_t *ly,
+                                 uint8_t *rx, uint8_t *ry);
+
+/* TCP-controlled turbo mode. When enabled the frontend skips presentation and
+ * wall-clock pacing at vblank, matching the keyboard TAB turbo path. */
+int debug_server_turbo_enabled(void);
 
 /* TCP-controlled turbo mode. When enabled the frontend skips presentation and
  * wall-clock pacing at vblank, matching the keyboard TAB turbo path. */
@@ -204,12 +224,25 @@ void debug_server_send_fmt(const char *fmt, ...);
  * stable. */
 void debug_server_freeze_dump_wtrace_all_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_wtrace_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_mmio_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_frame_history_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_sio_pc_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_thread_trace_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_restore_trace_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_irq_check_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_first_zero_restore_json(FILE *f);
+void debug_server_freeze_dump_entryint_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_cdrom_state_json(FILE *f);
+void debug_server_freeze_dump_cdrom_trace_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_cdrom_sector_history_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_dma_state_json(FILE *f);
+void debug_server_freeze_dump_dma_trace_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_exception_trace_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_thread_ctx_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_fn_entry_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_dirty_block_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_dirty_insn_json(FILE *f, uint32_t max_count);
+void debug_server_freeze_dump_evcb_json(FILE *f, uint32_t max_count);
 
 #ifdef __cplusplus
 }

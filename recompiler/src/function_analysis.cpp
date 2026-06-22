@@ -114,6 +114,51 @@ bool FunctionAnalyzer::is_branch_or_jump(uint32_t instr) {
     return false;
 }
 
+static bool is_load_imm_zero_u16(uint32_t instr, uint32_t& rt_out, uint32_t& imm_out) {
+    uint32_t opcode = (instr >> 26) & 0x3F;
+    uint32_t rs = (instr >> 21) & 0x1F;
+    if ((opcode != 0x09 && opcode != 0x0D) || rs != 0) {
+        return false;
+    }
+    rt_out = (instr >> 16) & 0x1F;
+    imm_out = instr & 0xFFFFu;
+    return true;
+}
+
+bool FunctionAnalyzer::is_bios_dispatch_thunk(uint32_t addr, uint32_t& jr_addr_out) const {
+    auto w0 = exe_.read_word(addr);
+    auto w1 = exe_.read_word(addr + 4);
+    auto w2 = exe_.read_word(addr + 8);
+    if (!w0.has_value() || !w1.has_value() || !w2.has_value()) {
+        return false;
+    }
+
+    uint32_t target_reg = 0;
+    uint32_t vector = 0;
+    if (!is_load_imm_zero_u16(*w0, target_reg, vector)) {
+        return false;
+    }
+    if (vector != 0xA0u && vector != 0xB0u && vector != 0xC0u) {
+        return false;
+    }
+
+    uint32_t op1 = (*w1 >> 26) & 0x3F;
+    uint32_t rs1 = (*w1 >> 21) & 0x1F;
+    uint32_t fn1 = *w1 & 0x3F;
+    if (op1 != 0 || fn1 != 0x08u || rs1 != target_reg) {
+        return false;
+    }
+
+    uint32_t index_reg = 0;
+    uint32_t index = 0;
+    if (!is_load_imm_zero_u16(*w2, index_reg, index) || index_reg != 9) {
+        return false;
+    }
+
+    jr_addr_out = addr + 4;
+    return true;
+}
+
 static bool is_sw_reg_base(uint32_t instr, uint32_t base_reg, uint32_t value_reg) {
     uint32_t opcode = (instr >> 26) & 0x3F;
     uint32_t rs = (instr >> 21) & 0x1F;
@@ -132,11 +177,162 @@ static bool is_lui(uint32_t instr, uint32_t& rt_out) {
     return true;
 }
 
-static bool is_lw_same_reg_base(uint32_t instr, uint32_t reg) {
+static bool is_nop(uint32_t instr) {
+    return instr == 0;
+}
+
+static uint32_t skip_leading_padding_nops(const PS1Executable& exe,
+                                          uint32_t start_addr,
+                                          uint32_t limit_addr) {
+    constexpr uint32_t max_padding_bytes = 32;
+    uint32_t addr = start_addr;
+    uint32_t skipped = 0;
+
+    while (addr + 4u <= limit_addr && skipped < max_padding_bytes) {
+        auto word_opt = exe.read_word(addr);
+        if (!word_opt.has_value() || !is_nop(*word_opt)) {
+            break;
+        }
+        addr += 4u;
+        skipped += 4u;
+    }
+
+    return addr;
+}
+
+static bool is_load_from_reg_base(uint32_t instr, uint32_t base_reg, uint32_t& rt_out) {
     uint32_t opcode = (instr >> 26) & 0x3F;
     uint32_t rs = (instr >> 21) & 0x1F;
     uint32_t rt = (instr >> 16) & 0x1F;
-    return opcode == 0x23 && rs == reg && rt == reg;
+    switch (opcode) {
+        case 0x20: /* lb */
+        case 0x21: /* lh */
+        case 0x22: /* lwl */
+        case 0x23: /* lw */
+        case 0x24: /* lbu */
+        case 0x25: /* lhu */
+        case 0x26: /* lwr */
+            break;
+        default:
+            return false;
+    }
+    if (rs != base_reg) return false;
+    rt_out = rt;
+    return true;
+}
+
+static bool is_load_imm_zero(uint32_t instr, uint32_t& rt_out) {
+    uint32_t opcode = (instr >> 26) & 0x3F;
+    uint32_t rs = (instr >> 21) & 0x1F;
+    if ((opcode != 0x09 && opcode != 0x0D) || rs != 0) return false;
+    rt_out = (instr >> 16) & 0x1F;
+    return rt_out != 0;
+}
+
+static bool preprologue_window_is_valid(const PS1Executable& exe,
+                                        uint32_t start_addr,
+                                        uint32_t prologue_addr,
+                                        uint32_t exe_start) {
+    if (start_addr >= prologue_addr) return false;
+
+    /* The candidate may start immediately after a previous return delay slot,
+     * but it cannot itself be a branch delay slot. */
+    if (start_addr >= exe_start + 4) {
+        auto prev_opt = exe.read_word(start_addr - 4);
+        if (prev_opt.has_value() && FunctionAnalyzer::is_branch_or_jump(*prev_opt)) {
+            return false;
+        }
+    }
+
+    std::set<uint32_t> global_base_regs;
+    bool saw_global_load = false;
+
+    for (uint32_t addr = start_addr; addr < prologue_addr; addr += 4) {
+        auto word_opt = exe.read_word(addr);
+        if (!word_opt.has_value()) return false;
+        uint32_t instr = *word_opt;
+
+        if (FunctionAnalyzer::is_branch_or_jump(instr)) return false;
+
+        uint32_t rt = 0;
+        if (is_lui(instr, rt) && rt != 0 && rt != 29 && rt != 31) {
+            global_base_regs.insert(rt);
+            continue;
+        }
+
+        if (is_load_imm_zero(instr, rt) && rt != 29 && rt != 31) {
+            continue;
+        }
+
+        bool valid_load = false;
+        for (uint32_t base_reg : global_base_regs) {
+            uint32_t load_rt = 0;
+            if (is_load_from_reg_base(instr, base_reg, load_rt) &&
+                load_rt != 0 && load_rt != 29 && load_rt != 31) {
+                valid_load = true;
+                saw_global_load = true;
+                break;
+            }
+        }
+        if (valid_load) continue;
+
+        return false;
+    }
+
+    return saw_global_load;
+}
+
+static bool find_preprologue_setup_start(const PS1Executable& exe,
+                                         uint32_t prologue_addr,
+                                         uint32_t exe_start,
+                                         uint32_t& setup_start_out) {
+    constexpr uint32_t max_setup_insns = 6;
+    bool found = false;
+    uint32_t best_start = prologue_addr;
+
+    for (uint32_t count = 1; count <= max_setup_insns; count++) {
+        uint32_t bytes = count * 4u;
+        if (prologue_addr < exe_start + bytes) break;
+        uint32_t candidate = prologue_addr - bytes;
+        if (preprologue_window_is_valid(exe, candidate, prologue_addr, exe_start)) {
+            best_start = candidate;
+            found = true;
+        }
+    }
+
+    if (!found) return false;
+    setup_start_out = best_start;
+    return true;
+}
+
+static bool pointer_target_has_near_prologue(const PS1Executable& exe,
+                                             uint32_t target,
+                                             uint32_t exe_start,
+                                             uint32_t exe_end,
+                                             uint32_t& prologue_addr_out) {
+    constexpr uint32_t max_prelude_bytes = 32;
+    for (uint32_t addr = target;
+         addr < exe_end && addr <= target + max_prelude_bytes;
+         addr += 4) {
+        auto word_opt = exe.read_word(addr);
+        if (!word_opt.has_value()) break;
+
+        int32_t stack_size = 0;
+        if (!FunctionAnalyzer::is_prologue(*word_opt, stack_size)) continue;
+
+        if (addr == target) {
+            prologue_addr_out = addr;
+            return true;
+        }
+
+        uint32_t setup_start = 0;
+        if (find_preprologue_setup_start(exe, addr, exe_start, setup_start) &&
+            setup_start == target) {
+            prologue_addr_out = addr;
+            return true;
+        }
+    }
+    return false;
 }
 
 uint32_t FunctionAnalyzer::find_function_start(uint32_t return_addr) {
@@ -176,15 +372,12 @@ uint32_t FunctionAnalyzer::find_function_start(uint32_t return_addr) {
                     continue;  // delay slot, not a real prologue — keep scanning
                 }
             }
-            if (search_addr >= exe_.header.load_address + 8) {
-                auto prev2_opt = exe_.read_word(search_addr - 8);
-                auto prev1_opt = exe_.read_word(search_addr - 4);
-                if (prev2_opt.has_value() && prev1_opt.has_value()) {
-                    uint32_t lui_rt = 0;
-                    if (is_lui(*prev2_opt, lui_rt) &&
-                        is_lw_same_reg_base(*prev1_opt, lui_rt)) {
-                        return search_addr - 8;
-                    }
+            {
+                uint32_t setup_start = 0;
+                if (find_preprologue_setup_start(exe_, search_addr,
+                                                 exe_.header.load_address,
+                                                 setup_start)) {
+                    return setup_start;
                 }
             }
             return search_addr;
@@ -193,8 +386,11 @@ uint32_t FunctionAnalyzer::find_function_start(uint32_t return_addr) {
         // Check if we hit another function's return
         if (is_jr_ra(instr)) {
             // We've gone too far backward and hit another function
-            // Return the address after this jr $ra (+ 8 for delay slot and alignment)
-            return search_addr + 8;
+            // Return the address after this jr $ra (+ 8 for delay slot), then
+            // skip alignment padding. Explicit JAL/forced entries still keep
+            // their exact target addresses; this only normalizes starts inferred
+            // from the previous function's trailing gap.
+            return skip_leading_padding_nops(exe_, search_addr + 8, return_addr);
         }
     }
 
@@ -604,6 +800,7 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     result.prologue_count = 0;
     result.call_discovered_count = 0;
     result.strong_prologue_count = 0;
+    result.bios_thunk_count = 0;
     result.state_continuation_count = 0;
 
     fmt::print("\n=== Function Boundary Detection ===\n\n");
@@ -680,6 +877,16 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
 
             // Only add if target is within EXE range and word-aligned
             if (target >= exe_start && target < exe_end && (target & 3) == 0) {
+                auto target_word = exe_.read_word(target);
+                int32_t target_stack_size = 0;
+                if (target_word.has_value() &&
+                    is_prologue(*target_word, target_stack_size)) {
+                    uint32_t setup_start = 0;
+                    if (find_preprologue_setup_start(exe_, target, exe_start,
+                                                     setup_start)) {
+                        target = setup_start;
+                    }
+                }
                 function_starts.insert(target);
             }
         }
@@ -712,24 +919,18 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
             }
         }
 
-        if (addr >= exe_start + 8) {
-            auto prev2_opt = exe_.read_word(addr - 8);
-            auto prev1_opt = exe_.read_word(addr - 4);
-            if (prev2_opt.has_value() && prev1_opt.has_value()) {
-                uint32_t lui_rt = 0;
-                if (is_lui(*prev2_opt, lui_rt) &&
-                    is_lw_same_reg_base(*prev1_opt, lui_rt)) {
-                    continue;
-                }
-            }
+        uint32_t entry_addr = addr;
+        uint32_t setup_start = 0;
+        if (find_preprologue_setup_start(exe_, addr, exe_start, setup_start)) {
+            entry_addr = setup_start;
         }
 
-        auto existing_it = function_starts.upper_bound(addr);
+        auto existing_it = function_starts.upper_bound(entry_addr);
         if (existing_it != function_starts.begin()) {
             --existing_it;
             auto return_it = function_last_return.find(*existing_it);
             if (return_it != function_last_return.end() &&
-                return_it->second + 8u > addr) {
+                return_it->second + 8u > entry_addr) {
                 continue;
             }
         }
@@ -747,13 +948,81 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
             }
         }
 
-        if (saves_ra && function_starts.insert(addr).second) {
+        if (saves_ra && function_starts.insert(entry_addr).second) {
+            if (entry_addr != addr) {
+                function_starts.erase(addr);
+            }
             strong_prologues++;
         }
     }
     result.strong_prologue_count = strong_prologues;
     fmt::print("Identified {} strong prologue entries\n\n",
                result.strong_prologue_count);
+
+    // Pass 2.56: promote packed PSY-Q BIOS dispatch thunks.
+    //
+    // PSY-Q libraries often pack tiny A0/B0/C0 syscall thunks back-to-back:
+    //   addiu rN, $zero, 0xA0/0xB0/0xC0
+    //   jr    rN
+    //   addiu $t1, $zero, index
+    //
+    // They do not contain jr $ra and may sit directly before data tables, so
+    // return/prologue scanning either misses them or lets the following data
+    // make the region look like a data section. Treat each thunk as a real
+    // function and cap it after the JR delay slot.
+    fmt::print("Finding packed BIOS dispatch thunk entries...\n");
+    int bios_thunks = 0;
+    int bios_thunks_skipped = 0;
+    for (uint32_t addr = exe_start; addr + 12u <= exe_end; addr += 4) {
+        uint32_t jr_addr = 0;
+        if (!is_bios_dispatch_thunk(addr, jr_addr)) continue;
+
+        // A li/jr BIOS-dispatch sequence is only a STANDALONE thunk when it
+        // sits in a gap that earlier discovery (prologue scan, jr-$ra scan,
+        // call-target following) missed. A real function may legitimately
+        // *begin* with this sequence (a tail call into the BIOS) yet continue
+        // with reachable code — e.g. a libcard routine that calls the BIOS and
+        // then polls card status. Treating such a function as a thunk and
+        // capping function_last_return at its first JR silently truncates the
+        // rest of its body. That is exactly what gutted Tomba's card-poll
+        // routine func_8005CDB8 (104B -> 12B) and stalled LOAD GAME.
+        //
+        // Mirror segagenesisrecomp's boundary-split discipline: a pattern
+        // heuristic must never shrink or split an already-discovered function.
+        // Only promote+cap thunks that are NOT already a known entry and do
+        // NOT fall inside an existing function's discovered extent.
+        if (function_starts.count(addr)) {
+            // Already discovered as a real function start — leave its extent
+            // alone; do not re-cap it to the first JR.
+            bios_thunks_skipped++;
+            continue;
+        }
+        auto owner_it = function_starts.upper_bound(addr); // first start > addr
+        if (owner_it != function_starts.begin()) {
+            --owner_it;                                     // greatest start <= addr
+            uint32_t owner = *owner_it;
+            auto ret_it = function_last_return.find(owner);
+            if (owner < addr && ret_it != function_last_return.end() &&
+                addr <= ret_it->second) {
+                // Inside an existing function's body — promoting here would
+                // split that function. Leave it whole.
+                bios_thunks_skipped++;
+                continue;
+            }
+        }
+
+        if (function_starts.insert(addr).second) {
+            bios_thunks++;
+        }
+        auto it = function_last_return.find(addr);
+        if (it == function_last_return.end() || jr_addr > it->second) {
+            function_last_return[addr] = jr_addr;
+        }
+    }
+    result.bios_thunk_count = bios_thunks;
+    fmt::print("Identified {} packed BIOS dispatch thunk entries "
+               "({} candidates skipped: already discovered / inside a function)\n\n",
+               result.bios_thunk_count, bios_thunks_skipped);
 
     // Pass 2.6: discover continuations saved by setjmp/SaveState-style helpers.
     //
@@ -788,6 +1057,60 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     result.state_continuation_count = state_continuations;
     fmt::print("Identified {} SaveState continuation entries\n\n",
                result.state_continuation_count);
+
+    // Pass 2.65: promote executable pointer-table entries.
+    //
+    // Many PS1 libraries store callback vectors as raw function addresses in
+    // the loaded EXE image. Some callback entries perform a few global loads
+    // before allocating their stack frame, so prologue-only discovery emits
+    // the later ADDIU $sp address while the game calls the earlier table
+    // address. Treat aligned image words that point at a near-prologue entry
+    // as first-class function starts, and collapse the later prologue-only
+    // start when it belongs to that prelude.
+    fmt::print("Finding executable pointer-table function entries...\n");
+    std::map<uint32_t, uint32_t> pointer_refs;
+    for (uint32_t addr = exe_start; addr < exe_end; addr += 4) {
+        auto word_opt = exe_.read_word(addr);
+        if (!word_opt.has_value()) break;
+        uint32_t target = *word_opt;
+        if ((target & 3u) != 0) continue;
+        if (target < exe_start || target >= exe_end) continue;
+
+        uint32_t prologue_addr = 0;
+        if (!pointer_target_has_near_prologue(exe_, target, exe_start, exe_end,
+                                              prologue_addr)) {
+            continue;
+        }
+
+        pointer_refs[target]++;
+
+        if (prologue_addr != target) {
+            auto prologue_it = function_starts.find(prologue_addr);
+            if (prologue_it != function_starts.end()) {
+                auto ret_it = function_last_return.find(prologue_addr);
+                if (ret_it != function_last_return.end()) {
+                    auto dst_it = function_last_return.find(target);
+                    if (dst_it == function_last_return.end() ||
+                        ret_it->second > dst_it->second) {
+                        function_last_return[target] = ret_it->second;
+                    }
+                    function_last_return.erase(ret_it);
+                }
+                function_starts.erase(prologue_it);
+            }
+        }
+    }
+
+    int pointer_entries = 0;
+    for (const auto& [target, refs] : pointer_refs) {
+        (void)refs;
+        if (function_starts.insert(target).second) {
+            pointer_entries++;
+        }
+    }
+    result.pointer_table_entry_count = pointer_entries;
+    fmt::print("Identified {} pointer-table function entries\n\n",
+               result.pointer_table_entry_count);
 
     // Pass 2.7: Add forced entry points
     // These are function starts that do not have a standard prologue (e.g. the

@@ -96,6 +96,18 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         rt.window_title = toml::find<std::string>(runtime, "window_title");
         rt.has_window_title = true;
     }
+    if (runtime.contains("controller")) {
+        rt.controller = toml::find<std::string>(runtime, "controller");
+        for (char& c : rt.controller) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (rt.controller != "digital" && rt.controller != "dualshock") {
+            throw std::runtime_error(
+                fmt::format("[runtime] controller must be 'digital' or 'dualshock', got '{}'",
+                            rt.controller));
+        }
+        rt.has_controller = true;
+    }
     if (runtime.contains("memcard_dir")) {
         const auto rel = toml::find<std::string>(runtime, "memcard_dir");
         rt.memcard_dir = fs::absolute(root / rel);
