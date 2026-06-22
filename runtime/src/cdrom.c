@@ -1138,7 +1138,28 @@ static void exec_command(uint8_t cmd) {
         break;
     }
 
-    case 0x15: /* SeekL */
+    case 0x03: /* Play — start CD-DA audio playback (from SetLoc, or optional
+                * param[0] = BCD track). Multi-track / CD-DA discs (Tomba 2's
+                * Whoopee Camp jingle) issue this; an unhandled Play (default ->
+                * ERROR) stalls the boot. Ack + enter PLAY state so the game's
+                * audio sequence proceeds. (Red Book sample output is not yet
+                * decoded -- silent for now -- but the flow no longer stalls.) */
+        if (!has_disc()) {
+            response_push(stat_reg | CDSTAT_ERROR);
+            set_irq(CDIRQ_ERROR);
+            break;
+        }
+        stat_reg = (stat_reg & ~(CDSTAT_SEEK | CDSTAT_READ)) | CDSTAT_MOTOR | CDSTAT_PLAY;
+        response_push(stat_reg);
+        set_irq(CDIRQ_ACK);
+        break;
+
+    case 0x15: /* SeekL (data-mode seek, uses sector headers) */
+    case 0x16: /* SeekP (audio-mode seek, uses subchannel Q) — our hw-sim seeks
+                * to the SetLoc position the same way for both. Needed for
+                * multi-track / CD-DA discs (Tomba 2): the game seeks the audio
+                * track with SeekP, and an unhandled SeekP (default -> ERROR)
+                * makes its CD setup loop forever. */
         if (!has_disc()) {
             response_push(stat_reg | CDSTAT_ERROR | CDSTAT_SEEKERR);
             set_irq(CDIRQ_ERROR);
@@ -1149,7 +1170,7 @@ static void exec_command(uint8_t cmd) {
         stat_reg |= CDSTAT_SEEK;
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
-        pending.cmd = 0x15;
+        pending.cmd = cmd;   /* 0x15 or 0x16 — completed in process_pending */
         pending.pending = 1;
         pending.delay = apply_speed(20000);
         pending.phase = 1;
@@ -1257,6 +1278,7 @@ static void process_pending(uint32_t cycles) {
         break;
 
     case 0x15: /* SeekL complete */
+    case 0x16: /* SeekP complete */
         stat_reg &= ~CDSTAT_SEEK;
         response_push(stat_reg);
         set_irq(CDIRQ_COMPLETE);
@@ -1517,6 +1539,7 @@ void cdrom_tick(void) {
 
 uint32_t cdrom_dma_read(void) {
     uint32_t val = 0;
+    int got = 0;
     if ((request_reg & CDROM_REQUEST_BFRD) && sector_available &&
         sector_read_pos + 4 <= sector_size) {
         memcpy(&val, sector_buffer + sector_read_pos, 4);
@@ -1524,8 +1547,11 @@ uint32_t cdrom_dma_read(void) {
         if (sector_read_pos >= sector_size) {
             sector_available = 0;
         }
+        got = 1;
     }
-    trace_cdrom('D', 0, val, 4);
+    /* Only trace real data reads; the no-data case (polled empties) flooded the
+     * CD trace ring and evicted the command/IRQ history (Rule 15). */
+    if (got) trace_cdrom('D', 0, val, 4);
     return val;
 }
 
