@@ -2,6 +2,65 @@
 
 Branch: `wt/tomba2`. Single source of truth for the splash freeze. Update as we learn.
 
+---
+
+## ✅ RESOLVED (2026-06-22) — root cause was the overlay-region FLOOR, not a contract bug
+
+The splash freeze is **fixed**. Both prior theories below (exception/EPC, then "B0
+non-local-return contract bail") were **symptoms, not the cause** — they were
+artifacts of the real bug. Data-confirmed root cause and fixes:
+
+**Root cause: `OVERLAY_REGION_FLOOR` was hardcoded to Tomba 1's main-EXE text end
+(`0x98000` = `0x10000 + 0x88000`).** Tomba 2's boot EXE is only `0x28800`, so its
+text ends at **`0x38800`** and its disc overlays load at **`0x80085000`+** — i.e.
+in the range `[0x38800, 0x98000)` that the hardcoded floor wrongly classified as
+"statically-recompiled main-EXE text." Consequences for every Tomba 2 overlay:
+1. `allow_local_dirty_flow` / `is_local_dirty_target` were **false**, so overlay
+   code ran **block-by-block** (each guest branch surfaces to the trampoline and
+   re-dispatches). A ~295 KB overlay-init `memset` at `0x800896F0` became ~73 K
+   trampoline round-trips (the "slow" red-herring symptom).
+2. Intra-overlay calls routed through **`dispatch_nonlocal_call` → `psx_dispatch_call`
+   with a live `stop_addr` contract** instead of chaining in-interpreter. When the
+   per-frame interrupt pump fired mid-contract, the contract was violated and
+   **bail/flatten cascaded into the `$ra=$sp=1` storm** (the symptom the prior
+   handoff chased as a "B0 wild-return contract bug").
+
+**Evidence:** the §18 xprobe ring + dispatch_tail + live disasm showed the trigger
+code (`0x80085900`, `0x800896F0`, `0x8008AE50`) all at phys `0x85xxx`–`0x8Axxx`,
+**below** the `0x98000` floor; the header comment itself (`dirty_ram_interp.h:55`)
+documented the floor as "Tomba: load 0x10000 + text 0x88000".
+
+**Fix 1 (overlay floor, the root fix):** `OVERLAY_REGION_FLOOR` is now the runtime
+variable `g_overlay_region_floor`, pinned at game load to
+`(gc.load_address + gc.text_size) & 0x1FFFFFFF` (= `0x38800` for Tomba 2).
+Default `0x98000` for BIOS-only. For Tomba 1 this evaluates to the same `0x98000`
+(no behavior change); it is correct-by-construction for every game. Files:
+`dirty_ram_interp.h`, `dirty_ram_interp.c`, `main.cpp`. **Result: bail storm gone
+(`bail_first=0`), splash advances at 60 fps past the old frame-1823 wedge.**
+
+**Fix 2 (latent dispatch-depth desync, exposed next in the cascade):** with overlays
+now on the local-flow path, the per-4096-insn pump delivers interrupts from a
+**nested** dispatch (depth > 0). `psx_check_interrupts` reset `g_psx_dispatch_depth`
+to 0 around the handler but never restored the interrupted code's nesting, and a
+ReturnFromException longjmp skips the handler frames' decrements — so the outer
+frames unwound to **`dispatch_depth = -1`**, the `outermost` test misfired, and the
+top-level dispatch returned to PC=0 ("execution completed" exit). Fix: save the
+depth before the handler, run the handler at 0, restore after. File: `interrupts.c`.
+
+**Current cascade frontier (NEXT bug):** with both fixes, Tomba 2 runs cleanly to
+**frame ~1997**, then a guest function in the overlay chain
+`0x80089784 → 0x80080FC4 → 0x800499E8 → 0x80050CEC` performs a **`jr` to a null
+register** (final_ra `0x80050CC8`, but PC=0 → exit). `0x80050CEC` is called every
+~2 frames with `a1=0x1F801110` (timer MMIO) — likely a VSync/timer routine indexing
+a not-yet-initialized function pointer. This is a genuine **guest-state divergence**
+(deterministic at frame 1997); the next step is an **oracle first-divergence**
+comparison (psxref @4380) to find where recomp state diverged before frame 1997.
+This is unrelated to the floor/contract bugs above.
+
+---
+
+### Original investigation (history — superseded by the RESOLVED section above)
+
 ## Symptom
 
 Tomba 2 (SCUS-94454) boots to the Whoopee-Camp publisher splash and **freezes there**

@@ -428,6 +428,18 @@ void psx_check_interrupts(CPUState* cpu) {
      * so the EPC-sentinel longjmp can't leave the flag wrong. */
     int prev_interp_active = g_dirty_interp_active;
     g_dirty_interp_active = 0;
+    /* Dispatch-depth contract across the async handler (Tomba 2 splash, post
+     * overlay-floor fix). The interrupt can be delivered from a NESTED dispatch
+     * (the local-flow pump runs inside dirty_ram_dispatch at depth > 0). The
+     * handler must run as its OWN outermost context (so its tail-call trampoline
+     * flattens), and a ReturnFromException longjmp skips the handler frames'
+     * `--g_psx_dispatch_depth` decrements — so we cannot leave the counter at 0.
+     * Save the interrupted code's nesting here and RESTORE it after the handler;
+     * otherwise the outer frames unwind below zero (dispatch_depth -> -1), the
+     * `outermost` test misfires, and the top-level dispatch returns to PC=0
+     * ("execution completed" abnormal exit). */
+    int saved_dispatch_depth = g_psx_dispatch_depth;
+    g_psx_dispatch_depth = 0;
     for (;;) {
         int jmp_val = setjmp(exception_jmpbuf);
         if (jmp_val == 2) {
@@ -455,6 +467,10 @@ void psx_check_interrupts(CPUState* cpu) {
     g_exception_owner_fiber = prev_owner_fiber;
     g_pending_exception_longjmp = prev_pending;
     g_dirty_interp_active = prev_interp_active;
+    /* Restore the interrupted code's dispatch nesting (see save above). The
+     * handler's frames were unwound by longjmp without decrementing, so the
+     * live counter is meaningless here — overwrite, don't decrement. */
+    g_psx_dispatch_depth = saved_dispatch_depth;
 
     /* Restore the interrupted code's registers.
      *
