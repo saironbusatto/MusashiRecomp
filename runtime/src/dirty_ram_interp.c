@@ -1496,7 +1496,14 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         uint32_t next_pc = 0;
         uint32_t insn = fetch_word(pc & 0x1FFFFFFFu);
         uint32_t before_s0 = cpu->gpr[16];
+        uint32_t before_ra = cpu->gpr[31];
         int transferred = exec_one(cpu, pc, &next_pc);
+        /* $ra->1 corruption tripwire (confirm-first probe): did THIS overlay
+         * instruction clobber $ra to 1? Latches once, cheap after. */
+        if (cpu->gpr[31] == 1u && before_ra != 1u) {
+            extern void psx_ra_tripwire(CPUState *, uint32_t, uint32_t, uint32_t);
+            psx_ra_tripwire(cpu, before_ra, pc, 0u /*INTERP*/);
+        }
 #ifdef PSX_ENABLE_BLOCK_CYCLES
         psx_advance_cycles(1u);
 #endif

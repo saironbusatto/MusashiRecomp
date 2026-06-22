@@ -51,9 +51,13 @@ extern void psx_bail_ledger_top(uint32_t *site_ra, uint32_t *wild_pc,
                                 uint32_t *site_sp, uint32_t *guest_sp,
                                 uint64_t *count, uint32_t *unique);
 extern uint32_t g_bail_first_site_ra, g_bail_first_wild_pc, g_bail_first_frame;
+extern uint32_t g_bail_first_in_exc;  /* was the trigger bail during an exception? */
 /* IRQ raise/deliver/ack telemetry (interrupts.c + memory.c) — exception-reentry. */
 extern uint64_t g_vblank_raise_count, g_vblank_deliver_count, g_irq_deliver_count;
 extern uint64_t g_vblank_ack_count;
+/* $ra->1 corruption tripwire (traps.c) — pins the clobber site. */
+extern uint32_t g_ra_tw_latched, g_ra_tw_site, g_ra_tw_pc, g_ra_tw_prev_ra;
+extern uint32_t g_ra_tw_frame, g_ra_tw_in_exc, g_ra_tw_sp;
 
 /* Vsync self-heal counters — defined in main.cpp. Included in the dump
  * so a slow_frames wedge can be attributed to driver present
@@ -683,6 +687,14 @@ static void heartbeat_write(void) {
         "  \"bail_first_site_ra\":\"0x%08X\",\n"
         "  \"bail_first_wild_pc\":\"0x%08X\",\n"
         "  \"bail_first_frame\":%u,\n"
+        "  \"bail_first_in_exc\":%u,\n"
+        "  \"ra_tw_latched\":%u,\n"
+        "  \"ra_tw_site\":%u,\n"
+        "  \"ra_tw_pc\":\"0x%08X\",\n"
+        "  \"ra_tw_prev_ra\":\"0x%08X\",\n"
+        "  \"ra_tw_frame\":%u,\n"
+        "  \"ra_tw_in_exc\":%u,\n"
+        "  \"ra_tw_sp\":\"0x%08X\",\n"
         "  \"vblank_raise_count\":%llu,\n"
         "  \"vblank_deliver_count\":%llu,\n"
         "  \"vblank_ack_count\":%llu,\n"
@@ -734,6 +746,14 @@ static void heartbeat_write(void) {
         g_bail_first_site_ra,
         g_bail_first_wild_pc,
         g_bail_first_frame,
+        g_bail_first_in_exc,
+        g_ra_tw_latched,
+        g_ra_tw_site,
+        g_ra_tw_pc,
+        g_ra_tw_prev_ra,
+        g_ra_tw_frame,
+        g_ra_tw_in_exc,
+        g_ra_tw_sp,
         (unsigned long long)g_vblank_raise_count,
         (unsigned long long)g_vblank_deliver_count,
         (unsigned long long)g_vblank_ack_count,
