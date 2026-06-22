@@ -24,6 +24,79 @@ uint64_t g_psx_bail_resolved  = 0;
 uint64_t g_psx_bail_flattened = 0;
 uint64_t g_psx_bail_anomaly   = 0;
 
+/* ---- Deduped bail-source ledger (Tomba 2 wild-return / splash-spin diag) ----
+ * psx_call_contract (cpu_state.h) calls psx_bail_record() at each FIRST-detected
+ * contract violation with the call site's expected return address (site_ra — the
+ * caller's continuation, i.e. the GAME wait-site that called into the kernel) and
+ * the guest's actual wild target ($ra). We aggregate by (site_ra, wild_pc) and
+ * surface the dominant key + unique-key count in the freeze heartbeat, so the
+ * wild-return SOURCE is readable even when the bail storm saturates the main
+ * thread and the window goes "Not Responding". unique_keys==1 ⇒ one bad call site
+ * (a real contract bug); many ⇒ normal trampolines (just the cost of the spin). */
+extern uint64_t s_frame_count;
+#define BAIL_LEDGER_SLOTS 1024u
+typedef struct {
+    uint32_t site_ra;     /* expected return = caller continuation (game wait-site) */
+    uint32_t wild_pc;     /* guest's actual $ra = wild-return destination          */
+    uint32_t site_sp;
+    uint32_t guest_sp;
+    uint64_t count;
+    uint32_t first_frame;
+    uint8_t  used;
+} BailLedgerSlot;
+static BailLedgerSlot s_bail_ledger[BAIL_LEDGER_SLOTS];
+static uint32_t s_bail_unique = 0;
+/* First-ever wild return, latched (never overwritten) — the trigger instance. */
+uint32_t g_bail_first_site_ra = 0, g_bail_first_wild_pc = 0;
+uint32_t g_bail_first_site_sp = 0, g_bail_first_guest_sp = 0, g_bail_first_frame = 0;
+static int s_bail_first_latched = 0;
+
+void psx_bail_record(uint32_t site_ra, uint32_t site_sp,
+                     uint32_t wild_pc, uint32_t guest_sp) {
+    if (!s_bail_first_latched) {
+        s_bail_first_latched   = 1;
+        g_bail_first_site_ra   = site_ra;  g_bail_first_wild_pc  = wild_pc;
+        g_bail_first_site_sp   = site_sp;  g_bail_first_guest_sp = guest_sp;
+        g_bail_first_frame     = (uint32_t)s_frame_count;
+    }
+    uint32_t h = (site_ra * 2654435761u) ^ (wild_pc * 40503u);
+    uint32_t start = h & (BAIL_LEDGER_SLOTS - 1u);
+    for (uint32_t i = 0; i < 16u; i++) {
+        BailLedgerSlot *s = &s_bail_ledger[(start + i) & (BAIL_LEDGER_SLOTS - 1u)];
+        if (s->used && s->site_ra == site_ra && s->wild_pc == wild_pc) {
+            s->count++;
+            return;
+        }
+        if (!s->used) {
+            s->used = 1; s->site_ra = site_ra; s->wild_pc = wild_pc;
+            s->site_sp = site_sp; s->guest_sp = guest_sp;
+            s->count = 1; s->first_frame = (uint32_t)s_frame_count;
+            s_bail_unique++;
+            return;
+        }
+    }
+    /* Probe window exhausted (>16 collisions): fold into the hashed slot so the
+     * total stays honest even if the precise key is lost. */
+    s_bail_ledger[start].count++;
+}
+
+/* Read the highest-count ledger entry (the dominant wild-return source). */
+void psx_bail_ledger_top(uint32_t *site_ra, uint32_t *wild_pc, uint32_t *site_sp,
+                         uint32_t *guest_sp, uint64_t *count, uint32_t *unique) {
+    uint64_t best = 0; const BailLedgerSlot *bs = NULL;
+    for (uint32_t i = 0; i < BAIL_LEDGER_SLOTS; i++) {
+        if (s_bail_ledger[i].used && s_bail_ledger[i].count > best) {
+            best = s_bail_ledger[i].count; bs = &s_bail_ledger[i];
+        }
+    }
+    if (site_ra)  *site_ra  = bs ? bs->site_ra  : 0;
+    if (wild_pc)  *wild_pc  = bs ? bs->wild_pc  : 0;
+    if (site_sp)  *site_sp  = bs ? bs->site_sp  : 0;
+    if (guest_sp) *guest_sp = bs ? bs->guest_sp : 0;
+    if (count)    *count    = best;
+    if (unique)   *unique   = s_bail_unique;
+}
+
 static void trap_crash(const char* msg) {
     FILE* cf = fopen("psx_crash.txt", "w");
     if (cf) { fprintf(cf, "%s\n", msg); fclose(cf); }

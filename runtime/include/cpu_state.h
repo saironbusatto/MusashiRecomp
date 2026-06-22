@@ -136,6 +136,13 @@ extern uint64_t g_psx_bail_flattened;  /* unwinds flattened at outermost    */
 extern uint64_t g_psx_bail_anomaly;    /* bail flag seen where impossible   */
 #endif
 
+/* Deduped wild-return source ledger (traps.c). Not present in overlay DLLs
+ * (they share runtime bail state via pointers, not this recorder). */
+#ifndef PSX_OVERLAY_DLL_BUILD
+extern void psx_bail_record(uint32_t site_ra, uint32_t site_sp,
+                            uint32_t wild_pc, uint32_t guest_sp);
+#endif
+
 /* Validate a direct call site after the callee's C return.
  * Returns 1 if the caller must `return;` immediately (bail in progress),
  * 0 if the continuation is valid.  site_ra = the call's return address,
@@ -162,6 +169,9 @@ static inline int psx_call_contract(CPUState* cpu, uint32_t site_ra,
          * which is the same value). */
         g_psx_call_bail = 1;
         g_psx_bail_first++;
+#ifndef PSX_OVERLAY_DLL_BUILD
+        psx_bail_record(site_ra, site_sp, cpu->gpr[31], cpu->gpr[29]);
+#endif
         cpu->pc = cpu->gpr[31];
         return 1;
     }
