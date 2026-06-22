@@ -43,6 +43,52 @@ static uint8_t request_reg;
 static uint8_t irq_enable;
 static uint8_t irq_flag;
 
+/* CPS-native CD interrupt single-outstanding latch.
+ *
+ * The CD controller serializes responses: it presents one INT to the CPU
+ * interrupt controller per visible IRQ generation, and the next is presented
+ * only after the guest acknowledges the controller (write to 0x1F801803.1).
+ *
+ * Under the recompiled CPS interrupt model, psx_check_interrupts re-checks
+ * (i_stat & i_mask) at every dispatch boundary. Without this latch,
+ * refresh_cdrom_irq_line() re-asserts i_stat bit 2 from an already-set
+ * irq_flag on every cdrom_advance, so an unacked CD INT becomes an unbounded
+ * exception re-entry storm. The latch presents each generation to INTC exactly
+ * once; the next generation can raise i_stat only after a controller ack.
+ *
+ * cdrom_intc_request_latched == 1  -> the current CD INT has been presented.
+ * cdrom_irq_generation             -> increments per visible INT (set_irq); debug.
+ * cdrom_intc_latched_generation    -> the generation last presented to INTC; debug.
+ */
+static int cdrom_intc_request_latched;
+static uint32_t cdrom_irq_generation;
+static uint32_t cdrom_intc_latched_generation;
+
+/* CD response presentation latency.
+ *
+ * Real CD hardware does not produce a command's first response instantly: the
+ * controller takes thousands of cycles to process the command before raising
+ * the response IRQ. The previous model presented the first response (and the
+ * delayed second response) SYNCHRONOUSLY inside the guest's command/ack MMIO
+ * write. That re-creates a lost-interrupt hazard: when the BIOS issues the next
+ * CD command from *inside* its CD interrupt handler (e.g. SeekL, issued right
+ * before the handler's trailing I_STAT ack), the synchronous response raises
+ * i_stat bit2, the handler's own INTC ack then clears it while irq_flag is
+ * still set, and the single-outstanding latch suppresses re-presentation
+ * forever -> the command never completes (boot-EXE-load SeekL wedge).
+ *
+ * Fix: arm a presentation delay on every new response (set_irq) and gate
+ * present_cdrom_irq() on it. The present then lands at a later cdrom_advance,
+ * at a clean instruction boundary after the issuing ISR has returned and
+ * re-enabled interrupts — exactly as on real hardware. The latch is unchanged
+ * (it still models edge-latched delivery: one present per generation).
+ *
+ * Sized to comfortably outlast an ISR teardown (tens-to-hundreds of cycles)
+ * while staying well under the second-response delays (10k-30k), so command
+ * throughput is unaffected. */
+#define CDROM_IRQ_PRESENT_DELAY 5000
+static int cdrom_irq_present_delay;
+
 /* Parameter FIFO */
 #define PARAM_FIFO_SIZE 16
 static uint8_t param_fifo[PARAM_FIFO_SIZE];
@@ -151,6 +197,22 @@ void cdrom_notify_game_started(void) {
 }
 
 int cdrom_get_setloc_lba(void) { return s_setloc_lba; }
+
+/* Frontend XA-stream probe (FMV auto-skip / turbo-load gating in main.cpp). */
+int cdrom_xa_stream_active(void) { return xa_stream_active; }
+
+/* Response-overwrite diagnostics consumed by debug_server.c. master's CD
+ * response arbiter tracks how often an undelivered response was overwritten;
+ * this CD model (forwarded from the Ape bring-up branch) delivers responses
+ * directly and does not overwrite, so these stay zero. Defined here so the
+ * debug command links against either CD model. */
+uint32_t g_cd_overwrite_count = 0;
+uint8_t  g_cd_overwrite_first_prev = 0;
+uint8_t  g_cd_overwrite_first_new  = 0;
+uint32_t g_cd_overwrite_first_frame = 0;
+uint8_t  g_cd_overwrite_last_prev = 0;
+uint8_t  g_cd_overwrite_last_new  = 0;
+uint32_t g_cd_overwrite_last_frame = 0;
 
 /* Minimum cycles between CD-ROM IRQs in fast modes. Must be enough for the
  * interrupt handler to save state, check the IRQ flag, process data, and
@@ -439,26 +501,56 @@ static void response_push(uint8_t val) {
 
 static void set_irq(int type) {
     irq_flag = (uint8_t)type;
+    /* New visible CD INT generation: it has not yet been presented to INTC,
+     * so re-arm the latch (the delayed present below raises it once). */
+    cdrom_irq_generation++;
+    cdrom_intc_request_latched = 0;
+    /* Arm the presentation latency: this response must NOT be presented to INTC
+     * synchronously inside the guest store that triggered it (see the
+     * CDROM_IRQ_PRESENT_DELAY note). It is presented at a later cdrom_advance. */
+    cdrom_irq_present_delay = CDROM_IRQ_PRESENT_DELAY;
     trace_cdrom('I', 0, (uint32_t)type, 0);
     /* DEQUEUE: CD response/data event fired (aux = CD irq type). */
     event_ring_record_aux(EV_DEQ, (uint8_t)SRC_CD_IRQ, (uint32_t)type);
 }
 
-/* Fire CDROM IRQ into the interrupt controller */
-static void fire_cdrom_irq(void) {
-    if (irq_flag && (irq_enable & (1 << (irq_flag - 1)))) {
+/* Present the current CD INT to the CPU interrupt controller exactly once per
+ * generation. Re-presentation of the same unacked INT is suppressed by the
+ * latch (this is what stops the CPS exception re-entry storm). The next
+ * generation re-arms via set_irq; a controller ack re-arms via the ack path. */
+/* Present the current CD INT to INTC at most once per generation. Silent
+ * except when it actually raises i_stat (trace 'F', low-frequency: once per
+ * generation). Suppression of a duplicate presentation is intentionally NOT
+ * traced — refresh runs every cdrom_advance, so tracing it would flood the CD
+ * trace ring and evict useful history. Suppression is implicit (no 'F' fires
+ * between an ack and the next set_irq). */
+static void present_cdrom_irq(void) {
+    /* Presentation latency: hold off raising i_stat until the response's
+     * processing delay has elapsed (decremented in cdrom_advance). This is what
+     * keeps a freshly-issued response from being presented synchronously inside
+     * the guest's command/ack write — and thus from being lost to that ISR's
+     * own trailing INTC ack. */
+    if (cdrom_irq_present_delay > 0) return;
+    if (irq_flag && (irq_enable & (1 << (irq_flag - 1))) && !cdrom_intc_request_latched) {
         i_stat |= (1u << 2); /* IRQ_CDROM */
+        cdrom_intc_request_latched = 1;
+        cdrom_intc_latched_generation = cdrom_irq_generation;
         event_ring_record(EV_ISTAT_RAISE, 2 /* IRQ_CDROM bit */);
         trace_cdrom('F', 0, irq_flag, 0);
-    } else {
-        trace_cdrom('f', 0, irq_flag, 0);
     }
 }
 
-static void refresh_cdrom_irq_line(void) {
-    if (irq_flag && (irq_enable & (1 << (irq_flag - 1)))) {
-        i_stat |= (1u << 2); /* IRQ_CDROM */
+/* Fire CDROM IRQ into the interrupt controller (explicit, per command/response).
+ * Trace the masked case here only (low-frequency); refresh stays silent. */
+static void fire_cdrom_irq(void) {
+    if (irq_flag && !(irq_enable & (1 << (irq_flag - 1)))) {
+        trace_cdrom('f', 0, irq_flag, 0);
     }
+    present_cdrom_irq();
+}
+
+static void refresh_cdrom_irq_line(void) {
+    present_cdrom_irq();
 }
 
 static int bcd_to_bin(uint8_t bcd) {
@@ -1114,9 +1206,13 @@ static void process_pending(uint32_t cycles) {
     if (!pending.pending) return;
 
     if (cycles == 0) return;
+    /* Serialized responses: a delayed completion (e.g. SeekL / Init COMPLETE)
+     * cannot be presented while a prior response IRQ is still unacked. Freeze
+     * pending.delay while held so it does not accrue fake time debt and
+     * underflow once the guest finally acks (mirrors process_read_stream). */
+    if (irq_flag != 0) return;
     pending.delay -= (int)cycles;
     if (pending.delay > 0) return;
-    if (irq_flag != 0) return;
 
     pending.pending = 0;
     response_clear();
@@ -1200,12 +1296,22 @@ static void process_read_stream(uint32_t cycles) {
      * line remains asserted, but the disc stream must still refill an empty
      * sector buffer so the active DMA can continue.
      */
+    /* Serialized CD responses: hold the read stream while a controller INT is
+     * unacked (presenting a new sector INT would clobber the single irq_flag /
+     * response FIFO the guest is still reading), or while the single sector
+     * buffer holds unread data. The DMA-drain path is the exception: during an
+     * active CD DMA the data-ready INT stays asserted while the guest drains
+     * the sector via DMA, and the stream must still refill the buffer.
+     *
+     * CRITICAL: freeze read_delay while held. Decrementing it during the hold
+     * (the previous shape) accumulates fake time debt and underflows hard once
+     * the guest finally acks, so the next sector is never scheduled correctly. */
+    if (irq_flag != 0 && !dma_cdrom_transfer_active()) return;
+    if (sector_available && irq_flag != 0) return;
+
     if (cycles > 0) {
         read_delay -= (int)cycles;
     }
-
-    if (irq_flag != 0 && !dma_cdrom_transfer_active()) return;
-    if (sector_available && irq_flag != 0) return;
 
     if (read_delay <= 0) {
         if (irq_flag == 0) {
@@ -1217,6 +1323,11 @@ static void process_read_stream(uint32_t cycles) {
             deliver_read_sector_without_irq();
         }
         read_delay += sector_delay_cycles();
+        /* Clamp pathological underflow to one sector period: never replay a
+         * catch-up burst of missed sectors, never leave a huge negative debt. */
+        if (read_delay <= 0) {
+            read_delay = sector_delay_cycles();
+        }
     }
 }
 
@@ -1230,6 +1341,10 @@ void cdrom_init(const char* cue_path) {
     request_reg = 0;
     irq_enable = 0x1F;
     irq_flag = 0;
+    cdrom_intc_request_latched = 0;
+    cdrom_irq_generation = 0;
+    cdrom_intc_latched_generation = 0;
+    cdrom_irq_present_delay = 0;
     param_count = 0;
     response_read = 0;
     response_count = 0;
@@ -1345,7 +1460,17 @@ void cdrom_write(uint32_t addr, uint32_t value) {
                 sector_read_pos = 0;
             }
         } else if (index_reg == 1) {
+            /* Controller IRQ acknowledge. irq_flag is a single numeric response
+             * code (1=INT1 data, 2=INT2, 3=INT3 ack, ...); a full ack clears it
+             * to 0. When the current visible INT is fully acked, re-arm the
+             * latch so the NEXT generation can be presented to INTC. Use the
+             * active->inactive edge rather than a bare !=0->0 so partial-clear
+             * writes don't mis-rearm. */
+            int had_active_irq = (irq_flag & 0x1F) != 0;
             irq_flag &= ~(val & 0x1F);
+            if (had_active_irq && (irq_flag & 0x1F) == 0) {
+                cdrom_intc_request_latched = 0;
+            }
             if (val & 0x40) {
                 param_count = 0;
             }
@@ -1359,6 +1484,14 @@ void cdrom_write(uint32_t addr, uint32_t value) {
 }
 
 void cdrom_advance(uint32_t cycles) {
+    /* Age the response presentation latency. Once it elapses, the following
+     * refresh_cdrom_irq_line() presents the held response to INTC — at this
+     * cdrom_advance boundary, not synchronously inside the guest store that
+     * armed it. */
+    if (cdrom_irq_present_delay > 0) {
+        cdrom_irq_present_delay -= (int)cycles;
+        if (cdrom_irq_present_delay < 0) cdrom_irq_present_delay = 0;
+    }
     refresh_cdrom_irq_line();
     try_execute_queued_command();
     process_pending(cycles);
