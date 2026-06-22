@@ -41,6 +41,8 @@ extern int      sio_get_tx_writes(void);
  * would only fail at link time and is easy to catch. */
 extern uint64_t g_dirty_ram_blocks_run;
 extern uint64_t g_dirty_ram_insns_run;
+extern uint64_t g_dirty_pump_max_gap_insns;  /* largest insn gap between IRQ pumps */
+extern uint64_t g_dirty_pump_count;          /* region-independent dirty IRQ pumps */
 
 /* Vsync self-heal counters — defined in main.cpp. Included in the dump
  * so a slow_frames wedge can be attributed to driver present
@@ -328,6 +330,8 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         "  \"tx_writes\":%d,\n"
         "  \"dirty_ram_blocks\":%llu,\n"
         "  \"dirty_ram_insns\":%llu,\n"
+        "  \"dirty_pump_max_gap_insns\":%llu,\n"
+        "  \"dirty_pump_count\":%llu,\n"
         "  \"tcp_send_stall_ms\":%llu,\n"
         "  \"tcp_clients_dropped\":%u,\n"
         "  \"bail_first\":%llu,\n"
@@ -354,6 +358,8 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         mc_max, tx_writes,
         (unsigned long long)g_dirty_ram_blocks_run,
         (unsigned long long)g_dirty_ram_insns_run,
+        (unsigned long long)g_dirty_pump_max_gap_insns,
+        (unsigned long long)g_dirty_pump_count,
         (unsigned long long)debug_server_get_tcp_stall_ms(),
         debug_server_get_tcp_drops(),
         (unsigned long long)g_psx_bail_first,
@@ -627,6 +633,8 @@ static void heartbeat_write(void) {
         "  \"tx_writes\":%d,\n"
         "  \"dirty_ram_blocks\":%llu,\n"
         "  \"dirty_ram_insns\":%llu,\n"
+        "  \"dirty_pump_max_gap_insns\":%llu,\n"
+        "  \"dirty_pump_count\":%llu,\n"
         "  \"tcp_send_stall_ms\":%llu,\n"
         "  \"tcp_clients_dropped\":%u,\n"
         "  \"bail_first\":%llu,\n"
@@ -657,6 +665,8 @@ static void heartbeat_write(void) {
         tx_writes,
         (unsigned long long)g_dirty_ram_blocks_run,
         (unsigned long long)g_dirty_ram_insns_run,
+        (unsigned long long)g_dirty_pump_max_gap_insns,
+        (unsigned long long)g_dirty_pump_count,
         (unsigned long long)debug_server_get_tcp_stall_ms(),
         debug_server_get_tcp_drops(),
         (unsigned long long)g_psx_bail_first,
