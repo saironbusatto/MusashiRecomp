@@ -29,6 +29,10 @@ extern int iso_read_sector(void* handle, uint32_t lba, uint8_t* buffer, int size
 extern int iso_read_raw_sector(void* handle, uint32_t lba, uint8_t* buffer, int size);
 extern uint32_t iso_sector_count(void* handle);
 extern void iso_close(void* handle);
+/* Multi-track TOC accessors (CD-DA / multi-track discs). track is 1-based. */
+extern int iso_track_count(void* handle);
+extern uint32_t iso_track_start_lba(void* handle, int track);
+extern int iso_track_is_audio(void* handle, int track);
 
 /* I_STAT owned by memory.c — set bit 2 for CDROM IRQ */
 extern uint32_t i_stat;
@@ -1092,14 +1096,18 @@ static void exec_command(uint8_t cmd) {
         break;
     }
 
-    case 0x13: /* GetTN */
+    case 0x13: /* GetTN — first + last track numbers (BCD) */
         response_push(stat_reg);
-        response_push(0x01);
-        response_push(0x01);
+        response_push(0x01); /* first track is always 1 */
+        {
+            int last = iso_handle ? iso_track_count(iso_handle) : 1;
+            if (last < 1) last = 1;
+            response_push(bin_to_bcd(last));
+        }
         set_irq(CDIRQ_ACK);
         break;
 
-    case 0x14: { /* GetTD */
+    case 0x14: { /* GetTD — start MSF (BCD) of a track; track 0/0xAA = lead-out */
         if (!has_disc()) {
             response_push(stat_reg | CDSTAT_ERROR);
             response_push(0x80);
@@ -1107,13 +1115,17 @@ static void exec_command(uint8_t cmd) {
             break;
         }
 
-        int track = (param_count >= 1) ? bcd_to_bin(param_fifo[0]) : 0;
-        int lba = 0;
-        if (track == 0 || track == 0xAA) {
+        int raw = (param_count >= 1) ? param_fifo[0] : 0;
+        int track = bcd_to_bin(raw);
+        int lba;
+        if (raw == 0xAA || track == 0) {
+            /* Lead-out: end of the whole image. */
             uint32_t sectors = iso_sector_count(iso_handle);
             lba = sectors ? (int)sectors : 0;
         } else {
-            lba = 0; /* Single data track starts at absolute MSF 00:02:00. */
+            /* .bin-relative start LBA of the requested track (0 for track 1
+             * data; the CD-DA audio track's real start for multi-track discs). */
+            lba = iso_handle ? (int)iso_track_start_lba(iso_handle, track) : 0;
         }
 
         int m, s, f;
