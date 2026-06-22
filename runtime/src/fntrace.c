@@ -46,6 +46,28 @@ static inline int armed_match(uint32_t target) {
 }
 
 void fntrace_record(CPUState* cpu, uint32_t target) {
+    /* Dispatch-level bail-source capture (Tomba 2 wild-return spin, runtime-only,
+     * no BIOS regen). The generated psx_dispatch_impl calls us at the top of each
+     * dispatch iteration. When a previous iteration bail-FLATTENED a compiled
+     * function's wild return, g_psx_bail_flattened has incremented and
+     * g_debug_current_func_addr still holds that bailing function, while `target`
+     * is the wild destination it returned to. Feed (bailing_fn, wild_target) into
+     * the traps.c bail ledger (surfaced in the heartbeat as bail_top_site_ra /
+     * bail_top_wild_pc) so the dominant wild-returning function is readable even
+     * when the bail storm makes the window "Not Responding". */
+    {
+        extern uint64_t g_psx_bail_flattened;
+        extern uint32_t g_debug_current_func_addr;
+        extern void psx_bail_record(uint32_t site_ra, uint32_t site_sp,
+                                    uint32_t wild_pc, uint32_t guest_sp);
+        static uint64_t s_last_flat = 0;
+        uint64_t f = g_psx_bail_flattened;
+        if (f != s_last_flat) {
+            s_last_flat = f;
+            psx_bail_record(g_debug_current_func_addr, cpu->gpr[29], target, cpu->gpr[31]);
+        }
+    }
+
     if (!s_game_started && s_game_entry_phys != 0) {
         if ((target & 0x1FFFFFFFu) == s_game_entry_phys) {
             s_game_started = 1;
