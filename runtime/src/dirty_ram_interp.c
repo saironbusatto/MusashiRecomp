@@ -126,6 +126,11 @@ uint32_t g_insn_freeze_nth   = 0;  /* freeze before its Nth dispatch           *
 uint32_t g_insn_freeze_count = 0;
 int      g_insn_log_frozen   = 0;
 
+/* Overlay-region floor (phys) = the loaded game's main-EXE text end. Defaults to
+ * the BIOS-only value; main.cpp pins it to (load_address + text_size) at game
+ * load. See dirty_ram_interp.h for the per-game rationale. */
+uint32_t g_overlay_region_floor = OVERLAY_REGION_FLOOR_DEFAULT;
+
 #ifdef PSX_HAS_GAME_DISPATCH
 extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
 #endif

@@ -1965,6 +1965,21 @@ int main(int argc, char** argv) {
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
+            /* Pin the overlay-region floor to THIS game's main-EXE text end so
+             * runtime-loaded overlays (which load just above it) are dispatched
+             * via in-interpreter local-flow chaining, NOT the slow block-by-block
+             * + bail-prone non-local-call path. Hardcoding the floor to Tomba 1's
+             * text end (0x98000) wedged Tomba 2 (text ends 0x38800, overlays at
+             * 0x85000+) at the Whoopee-Camp splash. See dirty_ram_interp.h. */
+            {
+                extern uint32_t g_overlay_region_floor;
+                uint32_t text_end = (gc.load_address + gc.text_size) & 0x1FFFFFFFu;
+                if (text_end > 0x00010000u /* DIRTY_RAM_KERNEL_WINDOW_END */)
+                    g_overlay_region_floor = text_end;
+                std::fprintf(stdout,
+                    "psxrecomp: overlay_region_floor = 0x%05X (game text end)\n",
+                    g_overlay_region_floor);
+            }
             /* Overlay DLL cache (Layer A). Off unless enabled in [runtime];
              * when on, capture overlay bytes and scan cache/<game_id>/ for
              * precompiled overlay DLLs. */
