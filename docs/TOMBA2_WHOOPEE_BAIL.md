@@ -47,15 +47,35 @@ frames unwound to **`dispatch_depth = -1`**, the `outermost` test misfired, and 
 top-level dispatch returned to PC=0 ("execution completed" exit). Fix: save the
 depth before the handler, run the handler at 0, restore after. File: `interrupts.c`.
 
-**Current cascade frontier (NEXT bug):** with both fixes, Tomba 2 runs cleanly to
-**frame ~1997**, then a guest function in the overlay chain
-`0x80089784 → 0x80080FC4 → 0x800499E8 → 0x80050CEC` performs a **`jr` to a null
-register** (final_ra `0x80050CC8`, but PC=0 → exit). `0x80050CEC` is called every
-~2 frames with `a1=0x1F801110` (timer MMIO) — likely a VSync/timer routine indexing
-a not-yet-initialized function pointer. This is a genuine **guest-state divergence**
-(deterministic at frame 1997); the next step is an **oracle first-divergence**
-comparison (psxref @4380) to find where recomp state diverged before frame 1997.
-This is unrelated to the floor/contract bugs above.
+**Current cascade frontier (NEXT bug) — PINNED 2026-06-22:** with both fixes Tomba 2
+runs cleanly to **frame ~1997**, then the **top-level dispatch returns `cpu->pc=0`**
+("execution completed" abnormal exit; `dispatch_depth=0`, so NOT the depth bug).
+
+Pinned via `PSX_FNTRACE_ARM=all` (exit-trace dispatch tail) + `PSX_EXIT_HALT=1`
+(halt-and-serve at the PC=0 exit, overlays still loaded) + live disasm:
+- `last_store_pc = 0x80086208` decodes to `li $t2,0xB0; jr $t2; li $t1,0x17` =
+  a call to **B0:0x17 `ReturnFromException`**. The adjacent overlay thunks are
+  `0x80086210` → **B0:0x18 ResetEntryInt** and `0x80086220` → **B0:0x19 HookEntryInt**.
+- So **Tomba 2 installs its OWN interrupt handler via `HookEntryInt` and returns
+  from it by calling `ReturnFromException` directly.** Its per-frame VBlank callback
+  (`0x80085D1C → … → 0x80086200`) drives this.
+- Our exception model assumes the *default* BIOS path: `psx_check_interrupts` sets
+  `COP0_EPC = 0x80000048` (a host longjmp sentinel, NOT the real interrupted PC),
+  dispatches the handler, and resumes via `setjmp/longjmp` + a host GPR save/restore
+  — it does **not** drive the BIOS's real EPC/TCB exception save+restore that
+  `ReturnFromException` depends on. When the game's hooked handler calls
+  `ReturnFromException`, the RFE-to-sentinel eventually resolves to `cpu->pc=0`
+  (in_exception already cleared at the exit) → top dispatch returns → exit.
+
+This is the **EPC-overload tension** the (refuted-for-the-bail-storm) design notes
+below flagged — refuted as the bail cause (that was the floor), but it **is** the
+mechanism here. **Fix direction (delicate, risk of regressing T1/MMX6/Ape):** make
+the exception model support a game-installed `HookEntryInt` handler that calls
+`ReturnFromException` — i.e. stop overloading guest EPC as a host token; keep host
+exception-return state as separate runtime metadata; set `EPC = real interrupted
+PC`, let the BIOS/kernel exception path (and the game's hooked handler) run, and
+restore the host call-contract frame on RFE. Validate against the oracle
+(psxref @4380) frame-by-frame. Diagnostic tooling in place: `PSX_EXIT_HALT`.
 
 ---
 
