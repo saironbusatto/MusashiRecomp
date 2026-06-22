@@ -49,6 +49,10 @@ static uint32_t s_bail_unique = 0;
 /* First-ever wild return, latched (never overwritten) — the trigger instance. */
 uint32_t g_bail_first_site_ra = 0, g_bail_first_wild_pc = 0;
 uint32_t g_bail_first_site_sp = 0, g_bail_first_guest_sp = 0, g_bail_first_frame = 0;
+/* Exception context at the first bail — confirms the "async interrupt delivered
+ * mid-dirty-call" mechanism: in_exc=1 means the trigger bail happened while an
+ * exception was being handled (= interrupt landed mid-overlay-call). */
+uint32_t g_bail_first_in_exc = 0;
 static int s_bail_first_latched = 0;
 
 void psx_bail_record(uint32_t site_ra, uint32_t site_sp,
@@ -58,6 +62,7 @@ void psx_bail_record(uint32_t site_ra, uint32_t site_sp,
         g_bail_first_site_ra   = site_ra;  g_bail_first_wild_pc  = wild_pc;
         g_bail_first_site_sp   = site_sp;  g_bail_first_guest_sp = guest_sp;
         g_bail_first_frame     = (uint32_t)s_frame_count;
+        g_bail_first_in_exc    = (uint32_t)psx_get_in_exception();
     }
     uint32_t h = (site_ra * 2654435761u) ^ (wild_pc * 40503u);
     uint32_t start = h & (BAIL_LEDGER_SLOTS - 1u);
@@ -95,6 +100,32 @@ void psx_bail_ledger_top(uint32_t *site_ra, uint32_t *wild_pc, uint32_t *site_sp
     if (guest_sp) *guest_sp = bs ? bs->guest_sp : 0;
     if (count)    *count    = best;
     if (unique)   *unique   = s_bail_unique;
+}
+
+/* ---- $ra->1 corruption tripwire (Tomba 2 freeze confirm-first probe) ----
+ * Latch the EXACT first moment guest $ra transitions to 0x00000001 (the degenerate
+ * spin state $ra=$sp=1), tagged with the SITE that did it. Pins whether the clobber
+ * is an overlay instruction (interp), the exception GPR-restore (exc-exit), or the
+ * bail-flatten. Surfaced in the heartbeat. Site: 0=INTERP 1=EXC_EXIT 2=other. */
+uint32_t g_ra_tw_latched = 0;
+uint32_t g_ra_tw_site = 0;       /* which site clobbered $ra->1 */
+uint32_t g_ra_tw_pc = 0;         /* guest PC at the clobber */
+uint32_t g_ra_tw_prev_ra = 0;    /* $ra value immediately before */
+uint32_t g_ra_tw_frame = 0;
+uint32_t g_ra_tw_in_exc = 0;
+uint32_t g_ra_tw_sp = 0;
+
+void psx_ra_tripwire(CPUState *cpu, uint32_t prev_ra, uint32_t pc, uint32_t site) {
+    if (g_ra_tw_latched) return;
+    if (cpu->gpr[31] == 1u && prev_ra != 1u) {
+        g_ra_tw_latched = 1;
+        g_ra_tw_site    = site;
+        g_ra_tw_pc      = pc;
+        g_ra_tw_prev_ra = prev_ra;
+        g_ra_tw_frame   = (uint32_t)s_frame_count;
+        g_ra_tw_in_exc  = (uint32_t)psx_get_in_exception();
+        g_ra_tw_sp      = cpu->gpr[29];
+    }
 }
 
 static void trap_crash(const char* msg) {
