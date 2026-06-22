@@ -46,6 +46,14 @@ extern uint64_t g_dirty_pump_count;          /* region-independent dirty IRQ pum
 /* Timer/RootCounter debug accessor (timers.c) — Tomba 2 RCnt-wait diagnosis. */
 extern void timers_get_debug(int t, uint16_t *counter, uint16_t *target,
                              uint32_t *mode, uint64_t *irq_fired);
+/* Bail-source ledger (traps.c) — Tomba 2 wild-return / splash-spin diagnosis. */
+extern void psx_bail_ledger_top(uint32_t *site_ra, uint32_t *wild_pc,
+                                uint32_t *site_sp, uint32_t *guest_sp,
+                                uint64_t *count, uint32_t *unique);
+extern uint32_t g_bail_first_site_ra, g_bail_first_wild_pc, g_bail_first_frame;
+/* IRQ raise/deliver/ack telemetry (interrupts.c + memory.c) — exception-reentry. */
+extern uint64_t g_vblank_raise_count, g_vblank_deliver_count, g_irq_deliver_count;
+extern uint64_t g_vblank_ack_count;
 
 /* Vsync self-heal counters — defined in main.cpp. Included in the dump
  * so a slow_frames wedge can be attributed to driver present
@@ -625,6 +633,12 @@ static void heartbeat_write(void) {
     unsigned t1_clk = (unsigned)((t1_mode >> 8) & 3u);
     unsigned t1_irq_on_target = (unsigned)((t1_mode >> 4) & 1u);
 
+    /* Bail-source ledger: the dominant wild-return source (= the game wait-site
+     * spinning into the kernel) + how many distinct sites bail. */
+    uint32_t bl_site_ra = 0, bl_wild = 0, bl_ssp = 0, bl_gsp = 0, bl_uniq = 0;
+    uint64_t bl_count = 0;
+    psx_bail_ledger_top(&bl_site_ra, &bl_wild, &bl_ssp, &bl_gsp, &bl_count, &bl_uniq);
+
     /* Buffer sized for current-state JSON + ring (~256B per ring entry). */
     static char buf[64 * 1024];
     int n = snprintf(buf, sizeof(buf),
@@ -660,6 +674,19 @@ static void heartbeat_write(void) {
         "  \"t1_clock_src\":%u,\n"
         "  \"t1_irq_on_target\":%u,\n"
         "  \"t1_irq_fired\":%llu,\n"
+        "  \"bail_top_site_ra\":\"0x%08X\",\n"
+        "  \"bail_top_wild_pc\":\"0x%08X\",\n"
+        "  \"bail_top_site_sp\":\"0x%08X\",\n"
+        "  \"bail_top_guest_sp\":\"0x%08X\",\n"
+        "  \"bail_top_count\":%llu,\n"
+        "  \"bail_unique_keys\":%u,\n"
+        "  \"bail_first_site_ra\":\"0x%08X\",\n"
+        "  \"bail_first_wild_pc\":\"0x%08X\",\n"
+        "  \"bail_first_frame\":%u,\n"
+        "  \"vblank_raise_count\":%llu,\n"
+        "  \"vblank_deliver_count\":%llu,\n"
+        "  \"vblank_ack_count\":%llu,\n"
+        "  \"irq_deliver_count\":%llu,\n"
         "  \"tcp_send_stall_ms\":%llu,\n"
         "  \"tcp_clients_dropped\":%u,\n"
         "  \"bail_first\":%llu,\n"
@@ -698,6 +725,19 @@ static void heartbeat_write(void) {
         t1_clk,
         t1_irq_on_target,
         (unsigned long long)t1_irq_fired,
+        bl_site_ra,
+        bl_wild,
+        bl_ssp,
+        bl_gsp,
+        (unsigned long long)bl_count,
+        bl_uniq,
+        g_bail_first_site_ra,
+        g_bail_first_wild_pc,
+        g_bail_first_frame,
+        (unsigned long long)g_vblank_raise_count,
+        (unsigned long long)g_vblank_deliver_count,
+        (unsigned long long)g_vblank_ack_count,
+        (unsigned long long)g_irq_deliver_count,
         (unsigned long long)debug_server_get_tcp_stall_ms(),
         debug_server_get_tcp_drops(),
         (unsigned long long)g_psx_bail_first,

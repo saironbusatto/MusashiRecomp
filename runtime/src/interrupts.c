@@ -100,6 +100,18 @@ static uint64_t exception_reentry_blocks;
  * very next psx_check_interrupts re-enters immediately. */
 static int post_exception_cooldown;
 
+/* IRQ raise/deliver/ack telemetry (Tomba 2 exception-reentry-storm diagnosis).
+ * Always-on, surfaced in the freeze heartbeat. Distinguishes:
+ *   raise≈deliver≈ack≈1/frame  → healthy
+ *   deliver≫ack                → handler runs but doesn't clear i_stat (re-delivered)
+ *   raise≫1/frame              → something keeps RE-RAISING the bit (cycle/condition bug)
+ * g_vblank_ack_count is incremented in memory.c at the I_STAT write that clears
+ * the VBLANK bit. The others are incremented here. */
+uint64_t g_vblank_raise_count   = 0;  /* bit0 set at the cycle-paced raise site */
+uint64_t g_vblank_deliver_count = 0;  /* VBLANK delivered to the guest (exception taken) */
+uint64_t g_irq_deliver_count    = 0;  /* ANY hardware interrupt delivered */
+extern uint64_t g_vblank_ack_count;   /* defined in memory.c */
+
 /* Blocks of guaranteed main-code forward progress imposed after a CLAIMED
  * non-SIO interrupt (DMA/VBLANK/timer/...). With cooldown 0 (the prior blanket
  * policy, commit 6d2cb65) the block leader at the interrupted PC re-takes the
@@ -284,6 +296,7 @@ void psx_check_interrupts(CPUState* cpu) {
                 event_ring_record_aux(EV_ENQ, (uint8_t)SRC_VBLANK,
                                       (uint32_t)(psx_get_cycle_count() + VBLANK_CYCLES));
                 i_stat |= (1 << IRQ_VBLANK);
+                g_vblank_raise_count++;
                 event_ring_record(EV_ISTAT_RAISE, IRQ_VBLANK);
                 gpu_vblank_tick();  /* Toggle LCF (GPUSTAT bit 31) */
 #ifndef PSX_ENABLE_BLOCK_CYCLES
@@ -326,6 +339,8 @@ void psx_check_interrupts(CPUState* cpu) {
     if (!(sr & (1 << 10))) { irq_record_outcome(EV_IRQ_GATE, GATE_SR_IM2); return; } /* Hardware interrupt bit not enabled */
 
     irq_record_outcome(EV_IRQ_DELIVER, 0);
+    g_irq_deliver_count++;
+    if ((i_stat & i_mask) & (1u << IRQ_VBLANK)) g_vblank_deliver_count++;
     in_exception = 1;
     exception_entries_total++;
     uint32_t pre_handler_istat = i_stat;  /* snapshot for cooldown decision */

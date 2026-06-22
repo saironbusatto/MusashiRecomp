@@ -236,9 +236,16 @@ static void imask_trace_record(uint32_t old_val, uint32_t new_val, uint8_t width
     imask_trace_count++;
 }
 
+/* VBLANK-ack telemetry (Tomba 2 exception-reentry-storm diagnosis): counts how
+ * many times an I_STAT write clears the VBLANK bit (the handler's ack). Read in
+ * the freeze heartbeat against g_vblank_raise/deliver counts. */
+uint64_t g_vblank_ack_count = 0;
+
 static void interrupt_write_stat_masked(uint32_t val, uint32_t mask) {
     uint32_t ack_mask = mask & 0x7FFu;
+    uint32_t before = i_stat;
     i_stat = (i_stat & ~ack_mask) | (i_stat & val & ack_mask);
+    if ((before & 1u) && !(i_stat & 1u)) g_vblank_ack_count++;  /* VBLANK bit 1->0 */
 }
 
 static void interrupt_write_mask_masked(uint32_t val, uint32_t mask, uint8_t width) {
