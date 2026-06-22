@@ -22,7 +22,10 @@ code.
 
 PSXRecomp is a framework. Game-specific projects live in their own
 repositories and pull this one in to build a game binary. The active end-to-end
-target is [TombaRecomp](https://github.com/mstan/TombaRecomp).
+targets are:
+
+- [TombaRecomp](https://github.com/mstan/TombaRecomp) — *Tomba!*
+- [MegaManX6Recomp](https://github.com/mstan/MegaManX6Recomp) — *Mega Man X6*
 
 ## Philosophy — toward 100% static recompilation
 
@@ -103,7 +106,9 @@ Known follow-up work:
   are not complete.
 - The historical Windows "Not Responding" hang is mitigated but should stay on
   the watch list until longer in-game soak tests are clean.
-- Tomba is the only current game target validated end to end.
+- Neither game is fully validated end to end yet. Tomba has considerably more
+  coverage; Mega Man X6 is playable (stages, controller, and memory-card
+  save/load all work). Full playthroughs of both are still unverified.
 
 For the current game milestone, build and run the sibling TombaRecomp project:
 
