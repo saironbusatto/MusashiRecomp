@@ -1893,6 +1893,7 @@ int main(int argc, char** argv) {
     int  p1_mode = PSXRecompV4::PAD_MODE_HYBRID;
     int  p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     bool ctrl_allow_hybrid = true;  /* game.toml [controller] allow_hybrid; false hides Hybrid in the launcher */
+    bool ctrl_lock_mode    = false; /* game.toml [controller] lock_mode; true hides the whole pad-mode selector */
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     std::filesystem::path resolved_disc;
     std::string window_title = PSX_WINDOW_TITLE;
@@ -1959,6 +1960,7 @@ int main(int argc, char** argv) {
                 p2_mode = gc.runtime.default_p2_mode;
             }
             ctrl_allow_hybrid = gc.runtime.controller_allow_hybrid;
+            ctrl_lock_mode    = gc.runtime.controller_lock_mode;
             if (gc.runtime.has_deadzone) resolved_deadzone = gc.runtime.deadzone;
             /* LEGACY per-game pad-config opt-in (default modern). Only Tomba sets
              * it, so its launcher Hybrid mode's analog<->digital flip doesn't make
@@ -2263,6 +2265,8 @@ int main(int argc, char** argv) {
                     ginfo.expected_crc     = game_disc_crc;
                     ginfo.has_expected_crc = game_has_disc_crc;
                     ginfo.allow_hybrid     = ctrl_allow_hybrid;
+                    ginfo.lock_mode        = ctrl_lock_mode;
+                    ginfo.locked_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
                     lr = psx_launcher::run(lwin, lctx, seed, ginfo, assets.c_str());
                     SDL_GL_DeleteContext(lctx);
                 }

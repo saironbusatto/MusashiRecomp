@@ -211,6 +211,14 @@ struct RuntimeConfig {
     // [controller] allow_hybrid = false to drop Hybrid from the selector.
     bool                  controller_allow_hybrid = true;
 
+    // lock_mode: when true the launcher HIDES the whole pad-mode selector
+    // (Hybrid | Analog | D-Pad) and forces every port to default_p1_mode. For a
+    // game that supports exactly one pad type — e.g. Tomba 2, whose driver only
+    // works as a plain digital pad because the DualShock config-mode handshake
+    // is unhandled — so the player can't pick a broken mode. Supersedes
+    // allow_hybrid (which only hides the Hybrid segment). Default false.
+    bool                  controller_lock_mode = false;
+
     // deadzone: default analog-stick deadzone in raw SDL axis units (0..32767).
     // Applied both to the stick->d-pad press threshold and the analog-axis centre
     // dead-band. Absent => runtime default (12000). Overridden per-install by

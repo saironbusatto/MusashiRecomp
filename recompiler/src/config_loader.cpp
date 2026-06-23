@@ -276,6 +276,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (ct.contains("allow_hybrid")) {
             rt.controller_allow_hybrid = toml::find<bool>(ct, "allow_hybrid");
         }
+        if (ct.contains("lock_mode")) {
+            rt.controller_lock_mode = toml::find<bool>(ct, "lock_mode");
+        }
         if (ct.contains("deadzone")) {
             const auto n = toml::find<int64_t>(ct, "deadzone");
             if (n < 0 || n > 32767)
