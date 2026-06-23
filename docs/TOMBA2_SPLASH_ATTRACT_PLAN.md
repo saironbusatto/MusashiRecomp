@@ -193,3 +193,46 @@ next load; (c) a separate thread/TCB the recomp's scheduler never resumes.
    work — verify the game's per-frame callback chain fully runs in the recomp.
 Tooling debt (Rule 15): raw-socket cd_read_log parse fails on the big response (use debug_client);
 beetle lacks cd_read_log + a cdrom command trace — add them for clean cross-backend diffs.
+
+## DMA-3 trace + refined divergence point (2026-06-22 sess2)
+Armed `wtrace 0x1F8010B0` (DMA3/CDROM MADR) + `0x1F801800` (CD cmd) on a fresh oracle. During the
+splash the oracle does HEAVY CD streaming: DMA3 MADR is written ~1.1M times (to `0x1A2xxx` /
+`0x1A8xxx-0x1AExxx`, all via game DMA routine `pc=0x8008DB88`) — this is the splash's CD-DA / XA
+AUDIO (the Whoopee-Camp jingle, TRACK 02). The single `0x107xxx` code-load DMA is buried among them
+and evicted from the (small) ring before I can dump it — wtrace-on-MADR can't isolate it by value.
+
+**Refined divergence point (the precise lead):** the recomp's cd_read_log shows it DID the directory
+lookup (LBA 16/18/373 → scratch `0x104368`) **recently, right before it got stuck**, then CD activity
+FROZE (total stuck at 2651). The oracle does the SAME lookup and then issues the `0x107xxx` file load
++ keeps streaming. So the divergence is **immediately after the directory lookup: the recomp does not
+follow it with the file load.** Two sub-cases to decide:
+- (a) the recomp's directory-entry RESULT (the LBA 373 / `0x104368` record: file extent-LBA + size)
+  is WRONG → it computes "nothing to load" / wrong target. (Raw CD fidelity is OK — the 0x41800 load
+  was valid code — but verify the specific LBA-373 record content vs the oracle.)
+- (b) the record is correct but a later branch (a state/flag/event check after the lookup) diverges so
+  the load is skipped.
+Also notable: the recomp's cd_read_log dests are only `0x41800`/`0x104368` — NOT the `0x1Axxxxx` audio
+stream the oracle hammers — so the recomp may also not be streaming the CD-DA/XA splash audio (could be
+a related symptom of the same post-lookup divergence, or a separate XA path difference).
+
+### Concrete next step
+Restart the RECOMP with `wtrace` on the CD command reg `0x1F801801` (+ SetLoc params `0x1F801802`) and
+on `0x1F8010B0` from boot; catch the SetLoc+ReadN sequence for LBA 16/18/373 and the issuing PC/ra.
+That PC is the directory-lookup/file-open routine. Then disasm it (live RAM) and single-step/trace what
+it does AFTER the lookup — find the branch where the oracle issues the next ReadN (file→0x107xxx) and
+the recomp doesn't, and read the directory-entry record both sides consume. That pins (a) vs (b).
+
+## SUB-CASE (b) CONFIRMED — directory read is VALID; it's a file-search/load-DECISION divergence
+Decoded the recomp's `0x104368` buffer: it is a well-formed ISO9660 directory: rec0 = {len 48,
+extent_LBA 373, size 2048, flags 0x02 (directory), name "."}, rec1 = {extent_LBA 22, ".."}, more
+records follow. So the recomp READ AND PARSED the directory at LBA 373 correctly — the data is fine,
+CD fidelity is fine. ⇒ The divergence is **(b): after a correct directory read, the code that walks
+the directory to find the target file and issue its load (→0x107xxx) takes a different path in the
+recomp and never issues the ReadN.** So the next investigation is the FILE-SEARCH / LOAD-DECISION
+code, not the CD layer.
+
+Likely shapes of the (b) divergence: a filename compare that mis-matches; a directory-walk loop that
+exits early; a "load already done?" / state / event-flag check that's in the wrong state in the recomp;
+or a return value from the dir-read/open routine that differs. Find the routine that issued the LBA-373
+read (wtrace CD cmd reg from boot → PC/ra), disasm it live, and compare its post-read branch + the
+values it tests on recomp vs oracle.
