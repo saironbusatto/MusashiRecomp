@@ -650,6 +650,18 @@ static void mmio_write8(uint32_t addr, uint8_t val) {
         dma_write_masked(aligned, (uint32_t)val << shift, mask);
         return;
     }
+    /* Timers: 0x1F801100..0x1F80112F — byte writes update the addressed byte
+     * lane of the 32-bit register. Byte stores to timer registers are valid
+     * hardware accesses; mmio_write16/32 already route here via timers_write, so
+     * write8 must too (otherwise a guest `sb` to a timer fails loud). */
+    if (addr >= 0x1F801100u && addr <= 0x1F80112Fu) {
+        uint32_t aligned = addr & ~3u;
+        uint32_t cur = timers_read(aligned);
+        uint32_t shift = 8 * (addr & 3);
+        cur = (cur & ~(0xFFu << shift)) | ((uint32_t)val << shift);
+        timers_write(aligned, cur);
+        return;
+    }
     /* MDEC: 0x1F801820..0x1F801827 */
     if (addr >= 0x1F801820u && addr <= 0x1F801827u) {
         uint32_t aligned = addr & ~3u;
