@@ -4,6 +4,30 @@ Branch: `wt/tomba2`. Single source of truth for the splash freeze. Update as we 
 
 ---
 
+## 🎯 STATUS 2026-06-22 sess2 — FRAME-1997 EXIT FIXED; new frontier = splash→attract
+
+**FIXED (commit d016e3b):** the frame-1997 abnormal exit. Tomba 2 now runs past it —
+the Whoopee-Camp splash renders and the frame climbs steadily (16k+), `dirty_ram_aborts=0`.
+Root cause was **longjmp-landing-depth** (NOT async, NOT EPC de-overload): a game RFE
+longjmp at a BLOCK-RETURN pump left `cpu->pc=0`, which unwinds to the outermost dispatch
+and reads as a clean exit. Fix = restore the committed guest PC after the block-return
+pumps so the trampoline re-dispatches (details in the CORRECTION section below).
+
+**NEW FRONTIER — splash→attract divergence.** The recomp lingers on the splash with its
+**CD idle** (`reading=0`); the Beetle oracle on the same disc has moved on to the
+**attract/intro gameplay** (3D scene: Tomba on a grassy field). BOTH sit at the same idle
+PC `0x80050CE8` — so the recomp tracks the oracle's CODE but has diverged in game STATE:
+the oracle's splash logic triggered the attract-scene CD load, the recomp's did not.
+Likely a CD-streaming / scene-transition divergence (first-divergence work vs oracle @4380).
+This is the path to the user's "through to attract" goal.
+
+**PENDING GATES (before master-landing of the fix):** (1) T1/MMX6/Ape regression — the
+fix is in the SHARED dirty-pump path; argued low-risk (the restore only fires when a
+handler RFE clears a valid committed PC, which playable titles don't hit) but NOT yet
+run. (2) Clean up the dead async-EPC scaffolding (inert under the corrected model).
+
+---
+
 ## ✅ RESOLVED (2026-06-22) — root cause was the overlay-region FLOOR, not a contract bug
 
 The splash freeze is **fixed**. Both prior theories below (exception/EPC, then "B0
