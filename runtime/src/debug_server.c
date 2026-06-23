@@ -6861,6 +6861,13 @@ static void handle_freeze_check(int id, const char *json)
     extern uint64_t g_dirty_ram_blocks_run;
     extern uint64_t g_dirty_ram_insns_run;
     extern uint64_t g_dirty_ram_aborts;
+    extern uint32_t g_async_rfe_resume_pc;
+    extern uint32_t g_dirty_safe_resume_pc;
+    extern uint64_t g_async_rfe_set_count;
+    extern uint64_t g_async_rfe_fire_count;
+    extern uint64_t g_sentinel_reach_dirty;
+    extern uint64_t g_sentinel_reach_traps;
+    extern uint32_t g_sentinel_reach_async;
 
     /* Top-K fn_entry histogram over the last `window` slots. */
     typedef struct { uint32_t func; uint32_t count; } HistBucket;
@@ -6937,6 +6944,13 @@ static void handle_freeze_check(int id, const char *json)
                     "\"sio_card_active\":%d,"
                     "\"i_stat\":\"0x%08X\","
                     "\"i_mask\":\"0x%08X\","
+                    "\"async_rfe_resume_pc\":\"0x%08X\","
+                    "\"dirty_safe_resume_pc\":\"0x%08X\","
+                    "\"async_rfe_set\":%llu,"
+                    "\"async_rfe_fire\":%llu,"
+                    "\"reach_dirty\":%llu,"
+                    "\"reach_traps\":%llu,"
+                    "\"reach_async\":\"0x%08X\","
                     "\"dirty_ram_blocks\":%llu,"
                     "\"dirty_ram_insns\":%llu,"
                     "\"dirty_ram_aborts\":%llu,"
@@ -6974,6 +6988,12 @@ static void handle_freeze_check(int id, const char *json)
                     (unsigned)sio_ctrl,
                     card_active,
                     i_stat, i_mask,
+                    g_async_rfe_resume_pc, g_dirty_safe_resume_pc,
+                    (unsigned long long)g_async_rfe_set_count,
+                    (unsigned long long)g_async_rfe_fire_count,
+                    (unsigned long long)g_sentinel_reach_dirty,
+                    (unsigned long long)g_sentinel_reach_traps,
+                    g_sentinel_reach_async,
                     (unsigned long long)g_dirty_ram_blocks_run,
                     (unsigned long long)g_dirty_ram_insns_run,
                     (unsigned long long)g_dirty_ram_aborts,

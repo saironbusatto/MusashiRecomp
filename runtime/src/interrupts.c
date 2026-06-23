@@ -356,10 +356,38 @@ void psx_check_interrupts(CPUState* cpu) {
      * memory at [EPC] to check for COP2 branch delay. We use a dedicated
      * address in the kernel scratch area.  Address 0x80000048 is chosen
      * because it's between the exception vectors (0x80-0xBF) and the
-     * kernel data pointer area (0x100+), and not used by the BIOS. */
+     * kernel data pointer area (0x100+), and not used by the BIOS.
+     *
+     * The sentinel is the HOST escape token for the SYNCHRONOUS handler: when the
+     * recompiled handler RFEs to it while in_exception, psx_unknown_dispatch /
+     * dirty_ram_dispatch longjmp back here and resume the interrupted code via the
+     * host-GPR-restore below. This is unchanged (Tomba 1 / MMX6 / Ape rely on it). */
     uint32_t sentinel = 0x80000048u;
     cpu->write_word(sentinel, 0x00000000u); /* NOP */
     cpu->cop0[COP0_EPC] = sentinel;
+
+    /* ASYNC ReturnFromException resume PC (Tomba 2 frame-1997 fix). A game can install
+     * its own interrupt handler (HookEntryInt) that calls ReturnFromException ITSELF,
+     * possibly OUTSIDE this synchronous window (in_exception already 0). The recompiled
+     * BIOS RFE then restores the interrupted GPRs from the TCB and sets pc = saved EPC =
+     * sentinel; with in_exception==0 the sentinel cannot longjmp, and previously
+     * resolved to pc=0 -> abnormal exit. The interrupted code resumes via a real guest
+     * PC only when it was dirty-interpreted (the dirty pump commits cpu->pc before
+     * calling us, exposed as g_dirty_safe_resume_pc). Remember that real PC so the
+     * sentinel-with-in_exception==0 case can RESUME there instead of exiting. Only set
+     * on dirty-safe-point delivery; compiled-interrupted handlers RFE synchronously and
+     * never reach the async branch, so this stays Tomba-2-class behavior. */
+    extern uint32_t g_dirty_safe_resume_pc;
+    extern uint32_t g_async_rfe_resume_pc;
+    extern uint64_t g_async_rfe_set_count;
+    {
+        uint32_t safe_pc = g_dirty_safe_resume_pc;
+        if (safe_pc != 0u && (safe_pc & 0x3u) == 0u &&
+            (safe_pc & 0x1FFFFFFFu) < 0x00200000u) {
+            g_async_rfe_resume_pc = safe_pc;
+            g_async_rfe_set_count++;
+        }
+    }
 
     /* Save the interrupted code's full register state.
      *

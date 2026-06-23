@@ -629,6 +629,26 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
         cpu->pc = 0;
         psx_exception_longjmp(); /* does not return */
     }
+    /* Async ReturnFromException (Tomba 2 frame-1997 fix): a game-installed handler
+     * called ReturnFromException OUTSIDE our synchronous exception window (in_exception
+     * already 0). The recompiled BIOS RFE restored the interrupted GPRs from the TCB and
+     * set pc = saved EPC = sentinel; with in_exception==0 the longjmp above does not fire.
+     * Previously this fell through to pc=0 -> abnormal "execution completed" exit. The
+     * interrupted code was dirty-interpreted, so a real guest resume PC was latched at
+     * exception entry (g_async_rfe_resume_pc) — resume there instead of exiting. */
+    if (addr == 0x80000048u) {
+        extern uint32_t g_async_rfe_resume_pc;
+        extern uint64_t g_async_rfe_fire_count;
+        extern uint64_t g_sentinel_reach_traps;
+        extern uint32_t g_sentinel_reach_async;
+        g_sentinel_reach_traps++;
+        g_sentinel_reach_async = g_async_rfe_resume_pc;
+        if (g_async_rfe_resume_pc != 0u) {
+            g_async_rfe_fire_count++;
+            cpu->pc = g_async_rfe_resume_pc;
+            return;
+        }
+    }
 
     /* Exception handler chain-walk continuation: 0xBFC10910 (phys 0x00000E10)
      * is the return address set by jalr $s1 in the exception handler chain

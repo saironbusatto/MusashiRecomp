@@ -154,6 +154,53 @@ Consult package for the Recomp GPT: `docs/TOMBA2_EXC_CONSULT.md`.
 
 ---
 
+## ⚠️ CORRECTION (2026-06-22 session 2, impl pass) — it is NOT an async (in_exception=0) RFE
+
+Implementing the "Option A async-resume" idea and instrumenting it **refuted the
+in_exception=0 framing above**. Measured (freeze_check counters added this pass):
+`reach_dirty = 19921` (≈ one per exception), **`dirty_in_exc0 = 0`**, `async_rfe_fire = 0`.
+
+So the sentinel `0x80000048` is dispatched once per exception and **ALWAYS arrives at
+the `dirty_ram_dispatch_inner` gate with `in_exception == 1`** — it always takes the
+`psx_exception_longjmp()` branch. There is **no** `in_exception==0` dispatch of the
+sentinel. (The earlier "in_exception=0 at the RFE" reading was the POST-exit state:
+the botched longjmp landing clears `in_exception` and sets the cooldown gate.)
+
+**Corrected mechanism (longjmp-landing-depth, not async):**
+- The game's HookEntryInt handler calls `ReturnFromException`; the recompiled BIOS RFE
+  restores the interrupted GPRs from the TCB and sets `cpu->pc = saved_epc = sentinel`.
+- The trampoline dispatches the sentinel → `dirty_ram_dispatch_inner` sets `cpu->pc = 0`
+  then `psx_exception_longjmp()` (in_exception==1).
+- The longjmp lands in `psx_check_interrupts`' `setjmp` loop (jmp_val==1), which restores
+  GPRs and **returns** — but `cpu->pc` is still 0. Control returns up through the pump
+  (`dirty_ram_dispatch` → trampoline).
+- For ~19920 exceptions the longjmp lands at a **nested** dispatch (depth>0) and the
+  enclosing dirty-interp flow re-commits `cpu->pc`, so the game continues.
+- For the failing one the longjmp unwinds to the **outermost** trampoline (depth 0),
+  where `cpu->pc == 0` → `psx_dispatch` returns → main.cpp "execution completed" exit.
+
+So the bug is: **a `ReturnFromException` longjmp can unwind to the OUTERMOST dispatch and
+leave `cpu->pc = 0`, which the top loop reads as a clean exit.** The `g_psx_dispatch_depth`
+fix (d10bc12) addressed depth desync but not this: the longjmp itself reaches `psx_dispatch`'s
+outermost frame with a null PC. The single global `exception_jmpbuf` + the "resume via host
+return" model is the fragile core (matches the consult's "host continuation state bleeding").
+
+**Candidate fix (NOT yet implemented/validated):** when the RFE longjmp lands in
+`psx_check_interrupts` (jmp_val==1) and `cpu->pc == 0`, set `cpu->pc =
+g_async_rfe_resume_pc` (the latched real interrupted guest PC) before returning, so the
+trampoline re-dispatches the guest instead of treating the null PC as an exit. MUST be
+checked against the ~19920 normal sync RFEs (how do THEY restore the resume PC today? —
+trace one normal landing vs the exit landing) and re-regressed on T1/MMX6/Ape.
+
+**Tooling added this pass (kept, runtime-only):** `freeze_check` now reports
+`async_rfe_set/fire`, `reach_dirty/traps`, `reach_async`, `dirty_safe_resume_pc`,
+`async_rfe_resume_pc`; `g_dirty_safe_resume_pc` latched around the 3 dirty pumps;
+`g_async_rfe_resume_pc` latched at dirty-safe exception entry. The async-resume GATE code
+(traps.c / dirty_ram_interp.c sentinel branches) is present but **never fires** under the
+corrected model — it is scaffolding for the candidate fix, not a working fix.
+
+---
+
 ### Original investigation (history — superseded by the RESOLVED section above)
 
 ## Symptom
