@@ -158,3 +158,38 @@ DMA dest covers `0x107xxx` — if NO, a code-path/branch divergence skips the lo
 never reaches the load trigger); if YES-but-data-absent, a CD/DMA targeting or completion bug drops it.
 (3) On the oracle, trace what the state-0 loop does right before the load fires (the CD command +
 DeliverEvent/CdSync) and compare the recomp's same loop.
+
+## RECOMP-SIDE RESULT (2026-06-22 sess2) — the recomp NEVER issues the 0x107xxx CD read
+Restarted the recomp, dumped cd_read_log: total=2651 reads, dest range `0x41800..0x104368`,
+distinct LBAs {16,18,24,373}. **`covers 0x107xxx = False`.** The recomp does the directory lookup
+(LBA 16/18/373 → scratch buffer `0x104368`) but **never issues the actual file load to `0x107xxx`**,
+then goes quiet (total stuck at 2651 — no further CD activity while softlocked). So this is a
+**code-path / task divergence in the file-load DECISION**, not a DMA-targeting or CD-fidelity bug at
+the read level (the earlier `0x41800` load proved raw CD reads land correct, advancing MIPS code).
+
+So the chain is:
+1. splash state-0 loop runs (recomp + oracle).
+2. on HW something issues a CD load of the `0x80107xxx` overlay (the splash-advance task) mid-splash
+   (~frame 2289–3960) and DMAs it in.
+3. the recomp never issues that load → `0x80107xxx` stays zero → advance writer `0x80107268` never
+   runs → state stuck 0 → softlock.
+
+### Where the load-issuing task likely lives (next investigation)
+The state-0 handler (`0x80050D44`) only renders + loops — it does NOT issue a CD load. So the load is
+issued by ANOTHER task/callback during the splash that the recomp doesn't run. Strong candidates,
+in order: (a) a per-frame scheduler/event/callback driven off the game's VBlank handler — SAME
+neighborhood as the frame-1997 HookEntryInt handler, so the recomp's event/scheduler model may not
+run the scene-loader task; (b) a CD-complete-event (CdSync/DeliverEvent) callback that chains the
+next load; (c) a separate thread/TCB the recomp's scheduler never resumes.
+
+### Concrete next steps
+1. Trace the ORACLE's CD command stream (mmio writes @0x1F801801) around frame ~2289–3960 to find the
+   SetLoc+ReadN that targets the 0x107xxx file, and the PC/caller that issues it. (recomp has
+   mmio_dump / a CD command trace; beetle needs the same — Rule 15.)
+2. Find that issuing PC/function; check whether the recomp ever executes it. If it's reached from a
+   VBlank-callback / event chain, compare the recomp's event delivery + DeliverEvent/WaitEvent +
+   TCB/callback execution rings to the oracle's at the splash.
+3. If the issuing task is event/scheduler-driven, this likely shares root with the interrupt-model
+   work — verify the game's per-frame callback chain fully runs in the recomp.
+Tooling debt (Rule 15): raw-socket cd_read_log parse fails on the big response (use debug_client);
+beetle lacks cd_read_log + a cdrom command trace — add them for clean cross-backend diffs.
