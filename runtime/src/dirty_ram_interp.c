@@ -826,6 +826,12 @@ int dirty_ram_xprobe_json(char *out, int cap) {
 #ifdef PSX_HAS_GAME_DISPATCH
 static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
     if (target == 0x8001A954u) site_note(&g_site_interp);
+    /* Decline if the target page is dirty: an overlay overwrote it after the
+     * game-start baseline, so the compiled function is STALE. Returning 0 lets the
+     * JAL/JALR handler fall through to is_local_dirty_target -> local-flow interp of
+     * the live overlay, instead of running stale compiled code (the same staleness
+     * the dirty_ram_dispatch_inner gate guards). Clean targets run compiled. */
+    if (dirty_ram_is_dirty(target & 0x1FFFFFFFu)) return 0;
     if (psx_mixed_owner_enabled()
         && interp_host_stack_used() > psx_mixed_stack_watermark()) {
         cpu->pc = target;
@@ -1505,8 +1511,18 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 
 #ifdef PSX_HAS_GAME_DISPATCH
     xprobe_event(cpu->gpr[31], XOP_DD, XSITE_DD, addr, 0u, cpu->gpr[29], cpu->gpr[31], 0);
-    g_mixed_depth++;
-    { int _gc = psx_dispatch_game_compiled(cpu, addr); g_mixed_depth--; if (_gc) return 1; }
+    /* Run the statically-compiled game function ONLY for a CLEAN page (RAM matches
+     * the compiled image). A dirty page in the game-text region means an overlay
+     * overwrote it after the game-start baseline (dirty_ram_clear_image_baseline),
+     * so the compiled function is STALE and we must fall through to interpret the
+     * live overlay. Without this gate the loader thread's psx_dispatch(0x8001DB38)
+     * ran the stale compiled func_8001DB38 instead of the START.BIN-loader overlay
+     * (Tomba 2 Whoopee-Camp splash). Clean text still runs compiled (the fast path,
+     * unchanged for non-overlaying games once their text is baselined). */
+    if (!dirty_ram_is_dirty(phys)) {
+        g_mixed_depth++;
+        { int _gc = psx_dispatch_game_compiled(cpu, addr); g_mixed_depth--; if (_gc) return 1; }
+    }
 #endif
 
     /* B-2: statically-compiled overlay functions (generated/overlays_static.c).

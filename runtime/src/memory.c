@@ -72,6 +72,28 @@ static inline void dirty_ram_mark_kernel_write(uint32_t phys) {
     dirty_ram_mark_page(phys);
 }
 
+/* Establish the clean compiled-image baseline for the game-EXE text region.
+ * Called ONCE when the game entry is first reached (fntrace game-start): by then
+ * the BIOS has fully loaded the boot EXE into [0x10000, FLOOR) — which IS the
+ * compiled image — but no gameplay overlay has run yet. The EXE load (CD DMA via
+ * dirty_ram_mark_executable_range) marks the whole text dirty as a FALSE POSITIVE
+ * (RAM == compiled image); clearing it here means dirty_ram_is_dirty() afterwards
+ * is true ONLY for pages a later overlay actually overwrote. The dispatch can then
+ * trust a clean text page to run its compiled function and divert only truly-
+ * overlaid pages to the interpreter (Tomba 2 loads a loader overlay over
+ * 0x8001Dxxx). The kernel window [0,0x10000) (BIOS install stubs) and the overlay
+ * region [FLOOR, RAM) are left untouched. */
+extern uint32_t g_overlay_region_floor;
+void dirty_ram_clear_image_baseline(void) {
+    uint32_t floor = g_overlay_region_floor;
+    if (floor <= DIRTY_RAM_KERNEL_TRACK_BYTES) return;
+    if (floor > RAM_SIZE) floor = RAM_SIZE;
+    uint32_t first_page = DIRTY_RAM_KERNEL_TRACK_BYTES >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t last_page  = (floor - 1u) >> DIRTY_RAM_PAGE_SHIFT;
+    for (uint32_t page = first_page; page <= last_page; page++)
+        dirty_ram_bitmap[page >> 5] &= ~(1u << (page & 31u));
+}
+
 void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
     if (len == 0 || phys >= RAM_SIZE) return;
     uint32_t end = phys + len - 1u;
