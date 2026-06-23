@@ -84,6 +84,40 @@ provider for every function identity present right now?"
 - **P5 — Validate end to end.** Clean warm of Tomba 2, shadow-diff to catch any
   codegen divergence (the GP0 0xFE suspect), measure emu_cpu → target ~16ms.
 
+## P-region-start fix + P5 divergence findings (2026-06-23)
+
+- **THE slowness root cause (FIXED, psxrecomp bb62b20).** `try_load_region`'s
+  dirty-page walkback overshot `OVERLAY_REGION_FLOOR` (the boot-EXE image is
+  dirty and contiguous below the floor), computing `region_start=0x10000` while
+  the capture/DLL filename uses `0x38000`. So the hot overlay region's DLLs were
+  built+indexed but NEVER loaded — hot code (`0x50CE8`, >1e9 interp insns) could
+  never go native. Clamp the walkback to the window floor. Effect: loads 2→4,
+  native funcs 14→790.
+
+- **Remaining blocker: native-vs-interp divergence at `0x80051FA4`** (shadow-diff
+  pinned it; same address was in the native ring before the GP0 0xFE crash, so
+  likely the same root). With native on, the boot hangs at frame ~1828;
+  `overlay_native_off` → ~67fps.
+
+- **The alias/interior-entry keying smell (user-identified).** `0x80051FA4` is a
+  CPS CONTINUATION point inside host `0x80051F80` (block_80051F80 does a CPS
+  `jal 0x80080880` with return addr 0x51FA4; block_80051FA4 is the
+  continuation/epilogue). The recompiler emits BOTH:
+    - `func_80051F80` — the full 2-block host (with an entry-switch routing
+      `pc==0x51FA4 -> block_80051FA4`), AND
+    - `func_80051FA4` — an alias stub `psx_alias_body_80051F80(cpu, 0x51FA4)`
+      whose body contains ONLY block_80051FA4 (the epilogue).
+  In the `.ranges` BOTH carry the SAME range (`R 80051F80 34`) and the SAME
+  `code_crc` (`5CE0B05E`). So the loader registers TWO candidates covering the
+  same bytes — and a CPS continuation to 0x51FA4 can resolve via idx_head (the
+  alias, epilogue-only) OR overlay_find_by_range (either candidate, same range).
+  Hypothesis to confirm with the recompiler/ChatGPT: aliases/interior entries
+  should ROLL UP to the parent host shard (same range+crc => deduplicate, register
+  the parent and let overlay_find_by_range handle the interior PC), instead of
+  emitting a separate epilogue-only alias body that can be dispatched in place of
+  the full function. The divergence/hang is very likely this dual-compilation +
+  duplicate-candidate interacting with the CPS continuation path.
+
 ## Notes
 - The GP0 0xFE crash was NOT stale-provider execution (dispatch re-validates).
   It was either the stale/mixed cache (now wiped) or a real codegen divergence;
