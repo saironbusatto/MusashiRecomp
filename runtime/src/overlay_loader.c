@@ -1133,9 +1133,23 @@ static void try_load_region(uint32_t phys) {
     uint32_t page_sz = 4096u;
 
     /* Walk back over the contiguous dirty run to recover region_start — cache
-     * DLLs are keyed by this start address in their filename. */
+     * DLLs are keyed by this start address in their filename.
+     *
+     * CRITICAL: the capture clamps each region to its WINDOW — kernel
+     * [0, DIRTY_RAM_KERNEL_WINDOW_END) or overlay [OVERLAY_REGION_FLOOR, end) —
+     * so a DLL's region_start is the first dirty page AT OR ABOVE the window
+     * floor. But the dirty run is contiguous ACROSS the static-EXE gap between
+     * those windows: the boot EXE image (0x10000..floor) was written at load
+     * time, so its pages are dirty too. Walking back without the same floor
+     * clamp overshoots through the EXE region and yields a region_start (e.g.
+     * 0x10000) that NO DLL filename matches — so the overlay's DLLs never load
+     * and its functions interpret forever (the dominant slowness). Clamp the
+     * walkback to the window floor so region_start matches the capture. */
+    uint32_t floor_pg = (phys < DIRTY_RAM_KERNEL_WINDOW_END)
+                      ? 0u
+                      : (OVERLAY_REGION_FLOOR / page_sz);
     uint32_t pg = phys / page_sz;
-    while (pg > 0) {
+    while (pg > floor_pg) {
         uint32_t pp = pg - 1;
         if (!((dirty_ram_get_bitmap_word(pp >> 5) >> (pp & 31u)) & 1u)) break;
         pg = pp;
