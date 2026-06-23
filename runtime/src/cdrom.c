@@ -1549,9 +1549,18 @@ uint32_t cdrom_dma_read(void) {
         }
         got = 1;
     }
-    /* Only trace real data reads; the no-data case (polled empties) flooded the
-     * CD trace ring and evicted the command/IRQ history (Rule 15). */
-    if (got) trace_cdrom('D', 0, val, 4);
+    /* Per-word DMA data reads flood the CD trace ring (hundreds per sector) and
+     * evict the command/IRQ/seek/play history we actually need to read the
+     * streaming/audio flow (Rule 15). Gate them OFF by default; opt in with
+     * PSX_CD_DMA_TRACE=1 when specifically inspecting the data path. */
+    if (got) {
+        static int s_dma_trace = -1;
+        if (s_dma_trace < 0) {
+            const char *e = getenv("PSX_CD_DMA_TRACE");
+            s_dma_trace = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (s_dma_trace) trace_cdrom('D', 0, val, 4);
+    }
     return val;
 }
 
