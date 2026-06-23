@@ -155,13 +155,44 @@ file / DLL, a single audit failure skips the WHOLE region's DLL → coverage get
 WORSE (the previously-good 0x38000 region stopped compiling). The shared-region
 compile makes speculative roots fragile.
 
-ROBUST PATH (dedicated effort): isolate host recovery from the region compile.
-Either (A) compile each recovered host + its interior aliases as its OWN seed set
-→ its OWN DLL, so a bad recovery fails alone without poisoning the region (the
-loader already content-matches per function across DLLs at a region_start); or
-(B) validate each recovered host by compiling it in isolation and checking the
-audit BEFORE adding it to any seed set. (A) is preferred. Until then, the FMV
-driver's host stays interp-only.
+ROBUST PATH — ChatGPT architecture review (2026-06-23), the validated plan:
+
+CORE INVARIANT: speculative roots must NOT share a compile-failure domain with
+trusted roots. The regression = mixing speculative recovered-host roots into the
+trusted all-roots region DLL. Split into THREE build classes, each its own
+failure domain / isolated DLL:
+  1. REGION_TRUSTED — the existing all-roots region DLL (conservative roots only;
+     an audit failure here means a real bug). May use drop-and-retry to salvage.
+  2. RECOVERED_HOST_SPECULATIVE — backward-recovered host starts, isolated per
+     host; failure is local.
+  3. INTERIOR_ENTRY_FRAGMENT — starts EXACTLY at the observed executed PC; no host
+     recovery; isolated. **This is the recommended fix for the FMV driver.**
+
+PREFERRED FMV FIX = interior-entry "island" fragment (don't recover the host at
+all). Compile a unit that ENTERS at the executed interior PC (0x80083094) and
+covers the reachable CFG discovered by a WORKLIST from that entry (NOT a linear
+"run to next boundary" — that decodes data/jump-tables). Mid-function start is
+SAFE for a static MIPS->C recompiler PROVIDED the generated code makes no
+function-entry assumptions: read all regs from CPU state, all mem through the
+emulated accessors, do NOT synthesize a stack frame, do NOT assume $ra is a call
+return or that the prologue ran (the caller/interpreter already set up the frame).
+Conservative contract: decode reachable blocks from entry_pc; exits (unknown
+branch/jump, jal CPS handoff, jr $ra, MMIO yield) set cpu->pc and return to the
+dispatcher; a branch outside the island is an EXIT, not an audit failure.
+
+KEYING for interior shards: key/validate by the COVERED block ranges + a hash of
+ONLY the covered instruction bytes (NOT a guessed enclosing host range — that's
+what pulled in volatile/data bytes). The loader validates only those covered
+ranges. Dispatch priority for a PC: full host > recovered host > interior
+fragment > sljit > interp; an interior shard covers only its exact legal entries,
+never claims the whole host.
+
+PHASES: P1 separate the build classes (stop poisoning — REGION_TRUSTED only emits
+the all-roots DLL). P2 interior-entry fragment compiler (do this FIRST for the FMV
+hot path). P3 backward host recovery as an OPPORTUNISTIC upgrade (accept a
+recovered host only if: candidate found + its CFG provably REACHES the interior PC
++ compiles in isolation + strict audit passes + runtime byte-hash matches; don't
+require a prologue; score candidates rather than pattern-match a single boundary).
 - The GP0 0xFE crash was NOT stale-provider execution (dispatch re-validates).
   It was either the stale/mixed cache (now wiped) or a real codegen divergence;
   P5 shadow-diff isolates it.
