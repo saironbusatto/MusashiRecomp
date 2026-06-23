@@ -1149,6 +1149,122 @@ def load_region_coverage(cache_dir: str, phys_addr: int) -> set:
     return covered
 
 
+def _addr_in_func_ids(addr: int, func_ids: list) -> bool:
+    """True if addr falls inside any code range of the given func-id list."""
+    a = addr & 0x1FFFFFFF
+    for _ev, _crc, ranges in func_ids:
+        for lo, length in ranges:
+            lo &= 0x1FFFFFFF
+            if lo <= a < lo + length:
+                return True
+    return False
+
+
+def load_region_covered_ranges(cache_dir: str, phys_addr: int) -> list:
+    """List of (lo_phys, length) code ranges already provided by ALL built DLLs
+    (region + fragment) for this region_start, from their .ranges manifests. Used
+    to decide whether an executed orphan interior is already covered (so we don't
+    mint a redundant island fragment for it)."""
+    out = []
+    prefix = f'{phys_addr:08X}_'
+    try:
+        names = os.listdir(cache_dir)
+    except OSError:
+        return out
+    for name in names:
+        if not (name.startswith(prefix) and name.endswith('.ranges')):
+            continue
+        try:
+            with open(os.path.join(cache_dir, name)) as f:
+                for ln in f:
+                    p = ln.split()
+                    if len(p) >= 3 and p[0] == 'R':
+                        try:
+                            out.append((int(p[1], 16) & 0x1FFFFFFF, int(p[2], 16)))
+                        except ValueError:
+                            pass
+        except OSError:
+            pass
+    return out
+
+
+def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
+                              size: int, phys_addr: int, cache_dir: str,
+                              args, sub_env: dict):
+    """Compile an ISOLATED interior-entry 'island' fragment that ENTERS at an
+    executed orphan DISPATCH_INTERIOR PC (a host that static analysis never
+    discovered, e.g. an FMV driver reached via a computed jump) and covers the
+    recompiler's worklist-discovered reachable CFG from that PC — a single
+    `dispatch_root` seed; out-of-island branches become dispatcher exits.
+
+    Emitted as its OWN <region>_<key>.dll so a fragment that fails the
+    generated-C audit is dropped ALONE and never poisons the region's trusted DLL
+    (separate failure domain — the invariant the earlier host-recovery attempt
+    violated). Safe because: dispatch_root is exempt from the boundary re-check
+    that would reject a mid-function start; the recompiler translates mid-function
+    code literally (regs from CPU state, no synthesized stack frame — the caller
+    already set up the frame); and the loader's per-function live-RAM CRC gate
+    rejects any fragment whose bytes don't match. Returns the fragment func-id
+    list, or None on failure/skip."""
+    with tempfile.TemporaryDirectory() as tmp:
+        psx = os.path.join(tmp, 'frag.psx')
+        with open(psx, 'wb') as f:
+            f.write(make_psxexe(load_addr, interior, data))
+        seeds_path = os.path.join(tmp, 'seeds.txt')
+        with open(seeds_path, 'w') as f:
+            f.write(f'dispatch_root 0x{interior:08X}\n')
+        out_dir_tmp = os.path.join(tmp, 'out')
+        os.makedirs(out_dir_tmp)
+        cmd = [args.recompiler, psx, '--seeds', seeds_path,
+               '--out-dir', out_dir_tmp, '--overlay',
+               '--ws-config', os.path.abspath(args.game_toml)]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           cwd=os.path.dirname(os.path.abspath(args.game_toml)),
+                           env=sub_env)
+        if r.returncode != 0:
+            return None
+        full_c = ranges_src = None
+        for fn in os.listdir(out_dir_tmp):
+            if fn.endswith('_full.c'):
+                full_c = os.path.join(out_dir_tmp, fn)
+            elif fn.endswith('_full.ranges'):
+                ranges_src = os.path.join(out_dir_tmp, fn)
+        if not full_c or not ranges_src:
+            return None
+        with open(full_c) as f:
+            src = patch_generated_c(f.read(), load_addr, size)
+        c_audit = audit_generated_c(src, load_addr, size,
+                                    binascii.crc32(data) & 0xFFFFFFFF, {})
+        if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
+            return None   # isolated audit failure — drop THIS fragment only
+        frag_ids = parse_overlay_func_ids(ranges_src, data, load_addr, size)
+        if not frag_ids:
+            return None
+        # Key the fragment DLL by its func-identity SET (dedup like a region
+        # bundle); the loader keys DLLs by the region_start filename prefix and
+        # content-matches each function, so a fragment is just another DLL for
+        # this region_start.
+        key = binascii.crc32(b''.join(
+            struct.pack('<II', ev, crc)
+            for ev, crc, _ in sorted(frag_ids))) & 0xFFFFFFFF
+        dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{key:08X}.dll')
+        if os.path.exists(dll_path) and not args.force:
+            return frag_ids   # already built
+        patched_c = os.path.join(tmp, 'frag_patched.c')
+        with open(patched_c, 'w') as f:
+            f.write(src)
+        include_dirs = [args.runtime_include]
+        recomp_root = os.path.dirname(os.path.dirname(args.recompiler))
+        p = os.path.join(recomp_root, 'lib/fmt/include')
+        if os.path.isdir(p):
+            include_dirs.append(p)
+        if not compile_dll(patched_c, dll_path, include_dirs,
+                           gcc=args.gcc, flavor=args.flavor):
+            return None
+        write_overlay_ranges_from(frag_ids, dll_path[:-4] + '.ranges')
+        return frag_ids
+
+
 def _toolchain_env(gcc: str):
     """Build an environment that guarantees gcc's toolchain dir is on PATH.
 
@@ -1382,6 +1498,11 @@ def main():
     # redundant-build elimination). Lazily loaded from existing .ranges, kept warm
     # in-memory and updated as we build, so repeats within one run also dedup.
     region_coverage_cache = {}   # phys_addr -> set((ev, code_crc))
+    # Per-region info for the post-loop interior-entry fragment pass (decoupled
+    # from region-compile success): (phys, load_addr, size, data, interior_pcs,
+    # executed_pcs). Collected right after classification so it survives a region
+    # whose own compile is skipped or audit-fails.
+    interior_frag_jobs = []
 
     for cap in captures:
         load_addr = int(cap['load_addr'], 16)
@@ -1427,6 +1548,17 @@ def main():
 
         seeds, seed_audit = classify_overlay_seeds(cap, data, load_addr, size,
                                                    crc32, toml)
+        this_ids = None   # region func-ids once recompiled (None if skipped early)
+
+        # Record this region's executed interiors for the decoupled fragment pass
+        # (runs after the loop, regardless of this region's compile outcome).
+        if not args.static:
+            _interiors = {a for a, r in seed_audit['included_reasons'].items()
+                          if r == 'DISPATCH_INTERIOR'}
+            _executed = seed_audit.get('executed_pcs', set())
+            if _interiors and _executed:
+                interior_frag_jobs.append((phys_addr, load_addr, size, data,
+                                           _interiors, _executed))
 
         if not args.static:
             dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{crc32:08X}.dll')
@@ -1590,6 +1722,42 @@ def main():
                     print(f'  OK -> {dll_path}\n')
                 else:
                     print(f'  FAILED\n')
+
+    # Interior-entry "island" fragments (overlay-cache v2): the FMV-driver class.
+    # Run as a SEPARATE pass AFTER all region compiles, so it is DECOUPLED from
+    # region success — an executed orphan interior gets its isolated island shard
+    # even if its region's trusted compile failed/audit-failed (that is the whole
+    # point of the separate failure domain). For each region, find DISPATCH_INTERIOR
+    # PCs that ACTUALLY EXECUTED this session but that NO built DLL covers (orphan
+    # interiors — host never discovered, so the region can't alias them), and
+    # compile each as its OWN isolated <region>_<key>.dll that ENTERS at the
+    # interior PC (recovers no host). Isolated => a bad fragment fails alone and
+    # never poisons a region's trusted DLL.
+    if not args.static:
+        frag_env = dict(os.environ)
+        if args.cps:
+            frag_env['PSX_CPS'] = '1'
+        for job in interior_frag_jobs:
+            phys_addr, load_addr, size, data, interior_pcs, executed = job
+            covered = load_region_covered_ranges(cache_dir, phys_addr)
+            def _is_covered(a):
+                a &= 0x1FFFFFFF
+                return any(lo <= a < lo + length for lo, length in covered)
+            orphans = sorted(a for a in interior_pcs
+                             if a in executed and not _is_covered(a))
+            if not orphans:
+                continue
+            built = 0
+            for a in orphans:
+                frag_ids = compile_interior_fragment(a, data, load_addr, size,
+                                                     phys_addr, cache_dir, args,
+                                                     frag_env)
+                if frag_ids:
+                    built += 1
+                    for ev, _cc, ranges in frag_ids:
+                        covered.extend((lo & 0x1FFFFFFF, L) for lo, L in ranges)
+            print(f'  interior fragments @0x{phys_addr:08X}: {built}/{len(orphans)} '
+                  f'executed orphan interior(s) -> isolated island shards')
 
     # B-2: write combined static C file
     if args.static and static_parts:
