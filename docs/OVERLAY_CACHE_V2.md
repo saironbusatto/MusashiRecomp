@@ -118,7 +118,34 @@ provider for every function identity present right now?"
   the full function. The divergence/hang is very likely this dual-compilation +
   duplicate-candidate interacting with the CPS continuation path.
 
-## Notes
+## Session outcome 2026-06-23 — native execution stabilized; FMV-speed wall identified
+
+Fixes landed (all on wt/tomba2):
+- `bb62b20` region_start walkback clamp — overlay DLLs actually load (native 14→790).
+- `47f3f15` interior/alias entries roll up into the single host body (no shadow
+  body); killed the GP0 0xFE divergence. generate_function emits an inline label +
+  entry-switch case per alias entry; generate_alias_group wrappers delegate
+  `if(cpu->pc==0)cpu->pc=alias; func_<host>(cpu)`.
+- `6004ced` mmio_write8 byte-lane timer support — unblocked the Whoopee-Camp
+  freeze (a guest `sb` to Timer 1 was fatal-on-unhandled-MMIO).
+
+Net: native overlay execution is stable end-to-end through boot; the boot reaches
+and plays the intro FMV with native overlays, no crash/hang.
+
+REMAINING (the FMV-100% goal): the FMV's hot driver `0x80083094` is classified
+`DISPATCH_INTERIOR` — the dirty-interp dispatches into it MID-FUNCTION, but its
+host function was never DISCOVERED, so it can't be compiled (overlay regions
+refuse to root orphan interiors — the mid-function-seed softlock guard). It's
+interp-only by design → FMV slow; cache warming cannot touch it. Likely also
+0x107250/0x10724C.
+
+NEXT (host recovery from an interior PC — the tractable fix): when the interp
+dispatches to an orphan overlay `DISPATCH_INTERIOR`, walk BACKWARD from that PC
+to recover the host start (MIPS is fixed-width: scan back to an `addiu sp,sp,-N`
+prologue not in a delay slot, or the instruction after a preceding `jr $ra` — the
+existing `_callable_legacy_seed` signature). Root the recovered host as a function
+so it compiles; the interior PC then becomes an alias-entry into it (handled by
+47f3f15). This converts the orphan-interior coverage gap into a discovery step.
 - The GP0 0xFE crash was NOT stale-provider execution (dispatch re-validates).
   It was either the stale/mixed cache (now wiped) or a real codegen divergence;
   P5 shadow-diff isolates it.
