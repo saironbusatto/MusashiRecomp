@@ -1028,18 +1028,17 @@ def generate_overlay_dispatch(all_virt_addrs: list) -> str:
 # DLL compilation
 # ---------------------------------------------------------------------------
 
-def write_overlay_ranges(src_path: str, out_path: str,
-                         data: bytes, load_addr: int, size: int) -> int:
-    """Filter the recompiler's _full.ranges manifest to in-overlay functions,
-    compute each function's AUTHORITATIVE code hash from the captured bytes (the
-    exact bytes the recompiler compiled from), and write {phys}_{crc}.ranges
-    beside the DLL. The loader marks a compiled entry callable iff live RAM
-    matches this hash — making per-entry validity timing-independent and
-    reload-on-return correct (design §8). Returns the number of functions written.
+def parse_overlay_func_ids(src_path: str, data: bytes, load_addr: int,
+                           size: int) -> list:
+    """Parse the recompiler's _full.ranges manifest and return the list of
+    in-overlay function identities as (ev, code_crc, ranges) tuples, where
+    ev = virtual entry, code_crc = AUTHORITATIVE hash of the captured code-range
+    bytes (the exact bytes the recompiler compiled from), and ranges is the
+    coalesced [(lo, len), ...] code-range list.
 
-    Manifest v2 line format:
-      F <entry_hex> <code_crc_hex>     one per function
-      R <lo_hex> <len_hex>             one per coalesced code range
+    This (entry, code_crc) pair is the per-function IDENTITY: the loader marks a
+    compiled entry callable iff live RAM matches code_crc, and overlay-cache v2
+    keys build/dedup decisions on this set rather than on the whole-region CRC.
 
     binascii.crc32 (zlib, poly 0xEDB88320, init/final 0xFFFFFFFF) is bit-identical
     to the runtime's crc32_compute, and `data` is the raw little-endian RAM image,
@@ -1076,8 +1075,7 @@ def write_overlay_ranges(src_path: str, out_path: str,
                     continue
                 cur[1].append((lo, length))
 
-    out_lines = ['# psxrecomp overlay code-range manifest v2 (entry+code_crc)\n']
-    n = 0
+    out = []
     for entry, ranges in funcs:
         if not ranges:
             continue
@@ -1092,13 +1090,63 @@ def write_overlay_ranges(src_path: str, out_path: str,
         if not ok:
             continue
         ev = (entry & 0x1FFFFFFF) | 0x80000000
+        out.append((ev, crc & 0xFFFFFFFF, ranges))
+    return out
+
+
+def write_overlay_ranges_from(func_ids: list, out_path: str) -> int:
+    """Write the {phys}_{key}.ranges manifest (v2) from a func-id list produced by
+    parse_overlay_func_ids. Returns the number of functions written.
+
+    Manifest v2 line format:
+      F <entry_hex> <code_crc_hex>     one per function
+      R <lo_hex> <len_hex>             one per coalesced code range"""
+    out_lines = ['# psxrecomp overlay code-range manifest v2 (entry+code_crc)\n']
+    for ev, crc, ranges in func_ids:
         out_lines.append(f'F {ev:08X} {crc & 0xFFFFFFFF:08X}\n')
         for lo, length in ranges:
             out_lines.append(f'R {(lo & 0x1FFFFFFF) | 0x80000000:08X} {length:X}\n')
-        n += 1
     with open(out_path, 'w') as f:
         f.writelines(out_lines)
-    return n
+    return len(func_ids)
+
+
+def write_overlay_ranges(src_path: str, out_path: str,
+                         data: bytes, load_addr: int, size: int) -> int:
+    """Back-compat wrapper: parse the recompiler manifest and write the v2 .ranges.
+    See parse_overlay_func_ids / write_overlay_ranges_from."""
+    return write_overlay_ranges_from(
+        parse_overlay_func_ids(src_path, data, load_addr, size), out_path)
+
+
+def load_region_coverage(cache_dir: str, phys_addr: int) -> set:
+    """Set of (ev, code_crc) function identities already provided by built DLLs
+    for this region_start. The loader content-matches per function across ALL
+    DLLs sharing a region_start, so a function is "covered" as soon as ANY
+    existing .ranges for that region_start lists it with a matching code_crc.
+    overlay-cache v2 uses this to skip the (expensive) gcc compile when a capture
+    would add no new function identity (the volatile-data redundant-build case)."""
+    covered = set()
+    prefix = f'{phys_addr:08X}_'
+    try:
+        names = os.listdir(cache_dir)
+    except OSError:
+        return covered
+    for name in names:
+        if not (name.startswith(prefix) and name.endswith('.ranges')):
+            continue
+        try:
+            with open(os.path.join(cache_dir, name)) as f:
+                for ln in f:
+                    p = ln.split()
+                    if len(p) >= 3 and p[0] == 'F':
+                        try:
+                            covered.add((int(p[1], 16), int(p[2], 16)))
+                        except ValueError:
+                            pass
+        except OSError:
+            pass
+    return covered
 
 
 def _toolchain_env(gcc: str):
@@ -1329,6 +1377,12 @@ def main():
     # B-2 static mode: accumulate all overlay C into one file
     static_parts = []   # list of (patched_src, func_virt_addrs)
 
+    # overlay-cache v2: per-region_start function-identity coverage, so a capture
+    # that adds no NEW (entry, code_crc) skips the gcc compile (volatile-data
+    # redundant-build elimination). Lazily loaded from existing .ranges, kept warm
+    # in-memory and updated as we build, so repeats within one run also dedup.
+    region_coverage_cache = {}   # phys_addr -> set((ev, code_crc))
+
     for cap in captures:
         load_addr = int(cap['load_addr'], 16)
         size      = int(cap['size'])
@@ -1479,6 +1533,34 @@ def main():
                 with open(patched_c, 'w') as f:
                     f.write(src)
 
+                # overlay-cache v2 dedup: compute this capture's per-function
+                # identity set BEFORE the (expensive) gcc compile. The loader
+                # content-matches each function by (entry, code_crc) across ALL
+                # DLLs at this region_start, so if every function we'd produce is
+                # already provided by an existing DLL, a new DLL adds nothing —
+                # skip the build. This is what stops volatile-data regions (a
+                # changing whole-region CRC over byte-identical code) from minting
+                # an endless pile of redundant DLLs.
+                ranges_src = None
+                for fn in os.listdir(out_dir_tmp):
+                    if fn.endswith('_full.ranges'):
+                        ranges_src = os.path.join(out_dir_tmp, fn)
+                        break
+                this_ids = (parse_overlay_func_ids(ranges_src, data, load_addr, size)
+                            if ranges_src else [])
+                this_set = {(ev, crc) for ev, crc, _ in this_ids}
+
+                covered = region_coverage_cache.get(phys_addr)
+                if covered is None:
+                    covered = load_region_coverage(cache_dir, phys_addr)
+                    region_coverage_cache[phys_addr] = covered
+
+                if this_set and this_set <= covered and not args.force:
+                    print(f'  SKIP: all {len(this_set)} function(s) already '
+                          f'covered by existing DLL(s) at this region — no new '
+                          f'native code to build\n')
+                    continue
+
                 # Compile to DLL
                 include_dirs = [args.runtime_include]
                 recomp_root = os.path.dirname(os.path.dirname(args.recompiler))
@@ -1491,20 +1573,17 @@ def main():
                                       gcc=args.gcc, flavor=args.flavor,
                                       compiler=args.compiler, tcc=args.tcc)
                 if success:
-                    # Emit the per-entry code-range manifest beside the DLL.
-                    # The loader keys it by the same filename stem with .ranges
-                    # (replacing .dll). Without it the loader leaves the region
-                    # to the interpreter (precision-first), so warn loudly.
-                    ranges_src = None
-                    for fn in os.listdir(out_dir_tmp):
-                        if fn.endswith('_full.ranges'):
-                            ranges_src = os.path.join(out_dir_tmp, fn)
-                            break
+                    # Emit the per-entry code-range manifest beside the DLL from
+                    # the same func-id list we keyed the dedup on. The loader keys
+                    # it by the same filename stem with .ranges (replacing .dll).
                     ranges_out = dll_path[:-4] + '.ranges'
-                    if ranges_src:
-                        nfn = write_overlay_ranges(ranges_src, ranges_out,
-                                                   data, load_addr, size)
+                    if this_ids:
+                        nfn = write_overlay_ranges_from(this_ids, ranges_out)
                         print(f'  ranges: {nfn} functions -> {ranges_out}')
+                        # New identities are now available for this region_start;
+                        # keep the warm coverage set current so later captures in
+                        # this same run dedup against them.
+                        covered |= this_set
                     else:
                         print('  WARNING: recompiler emitted no _full.ranges — '
                               'loader will leave this region to the interpreter')
