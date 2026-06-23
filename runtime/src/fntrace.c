@@ -71,6 +71,14 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
     if (!s_game_started && s_game_entry_phys != 0) {
         if ((target & 0x1FFFFFFFu) == s_game_entry_phys) {
             s_game_started = 1;
+            /* Establish the clean compiled-image baseline now: the boot EXE is fully
+             * loaded into the game-text region (== compiled image) and no gameplay
+             * overlay has run yet. The EXE load marked the whole text dirty (false
+             * positive); clearing it makes dirty_ram_is_dirty() true ONLY for pages a
+             * later overlay overwrites, so the dispatch runs clean text compiled and
+             * interprets only true overlays (Tomba 2 boot-text loader overlay). */
+            extern void dirty_ram_clear_image_baseline(void);
+            dirty_ram_clear_image_baseline();
             cdrom_notify_game_started();
             boot_state_trigger_capture(cpu);
         }

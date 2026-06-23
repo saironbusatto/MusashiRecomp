@@ -1790,7 +1790,10 @@ int psx_sljit_call(CPUState *cpu, uint32_t target, uint32_t return_pc,
                    int check_contract) {
     uint32_t site_sp = cpu->gpr[29];   /* sp at the call (after the delay slot) */
 #ifdef PSX_HAS_GAME_DISPATCH
-    {
+    /* Skip the compiled game function if its page is dirty (an overlay overwrote it
+     * after the game-start baseline -> compiled code is stale); fall through to the
+     * native/interp paths which run the live overlay. Clean pages run compiled. */
+    if (!dirty_ram_is_dirty(target & 0x1FFFFFFFu)) {
         extern int psx_dispatch_game_compiled(CPUState *cpu, uint32_t addr);
         cpu->pc = 0;
         if (psx_dispatch_game_compiled(cpu, target)) {
