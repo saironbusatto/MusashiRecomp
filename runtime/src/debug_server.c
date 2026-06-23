@@ -8904,6 +8904,86 @@ static void handle_insn_freeze_status(int id, const char *json)
              g_insn_log_frozen, (unsigned long long)g_dirty_ram_insn_log_seq);
 }
 
+/* insn_freeze_target <target>: freeze the insn ring the instant an interpreted
+ * instruction transfers to (or falls through to) <target>. Used to capture the
+ * Tomba2 worker wild-jump to 0x49422E54 with the offending jr's register
+ * snapshot as the ring tail. target=0 disarms. */
+static void handle_insn_freeze_target(int id, const char *json)
+{
+    extern uint32_t g_insn_freeze_on_target;
+    extern int g_insn_log_frozen, g_freeze_snap_valid;
+    char buf[32];
+    if (json_get_str(json, "target", buf, sizeof(buf)))
+        g_insn_freeze_on_target = hex_to_u32(buf);
+    g_insn_log_frozen   = 0;
+    g_freeze_snap_valid = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"freeze_on_target\":\"0x%08X\"}\n",
+             id, g_insn_freeze_on_target);
+}
+
+/* insn_freeze_snapshot: report the register file captured at the jr/jalr that
+ * hit the watched wild target (g_insn_freeze_on_target). Reveals the source
+ * register (scan for the reg whose value == the target) -> ra=stack/sp bug,
+ * t9/v0/v1=filename-ptr-as-fn-ptr, etc. */
+static void handle_insn_freeze_snapshot(int id, const char *json)
+{
+    (void)json;
+    extern int g_freeze_snap_valid;
+    extern uint32_t g_freeze_snap_pc, g_freeze_snap_insn, g_freeze_snap_tcb;
+    extern uint32_t g_freeze_snap_gpr[32];
+    extern uint32_t g_insn_freeze_on_target;
+    static const char *RN[32] = {
+        "zero","at","v0","v1","a0","a1","a2","a3","t0","t1","t2","t3",
+        "t4","t5","t6","t7","s0","s1","s2","s3","s4","s5","s6","s7",
+        "t8","t9","k0","k1","gp","sp","fp","ra" };
+    char buf[2048];
+    size_t pos = 0;
+    pos += snprintf(buf+pos, sizeof(buf)-pos,
+        "{\"id\":%d,\"ok\":true,\"valid\":%d,\"pc\":\"0x%08X\",\"insn\":\"0x%08X\","
+        "\"tcb\":\"0x%08X\",\"target\":\"0x%08X\",\"regs\":{",
+        id, g_freeze_snap_valid, g_freeze_snap_pc, g_freeze_snap_insn,
+        g_freeze_snap_tcb, g_insn_freeze_on_target);
+    for (int r = 0; r < 32; r++)
+        pos += snprintf(buf+pos, sizeof(buf)-pos, "%s\"%s\":\"0x%08X\"",
+                        r ? "," : "", RN[r], g_freeze_snap_gpr[r]);
+    pos += snprintf(buf+pos, sizeof(buf)-pos, "}}\n");
+    (void)pos;
+    send_fmt("%s", buf);
+}
+
+/* ra_load_watch <value>: arm/read capture of the instruction that sets $ra to
+ * <value> (the wild target). With no "value" arg, reports the captured snapshot:
+ * the loading pc/insn, the source stack address (for an lw), and the full GPR
+ * file. value=0 disarms+clears. */
+static void handle_ra_load_watch(int id, const char *json)
+{
+    extern uint32_t g_ra_load_watch, g_ra_load_snap_pc, g_ra_load_snap_insn;
+    extern uint32_t g_ra_load_snap_before_ra, g_ra_load_snap_srcaddr;
+    extern uint32_t g_ra_load_snap_gpr[32];
+    extern int g_ra_load_snap_valid;
+    char vbuf[32];
+    if (json_get_str(json, "value", vbuf, sizeof(vbuf))) {
+        g_ra_load_watch = hex_to_u32(vbuf);
+        g_ra_load_snap_valid = 0;
+    }
+    static const char *RN[32] = {
+        "zero","at","v0","v1","a0","a1","a2","a3","t0","t1","t2","t3",
+        "t4","t5","t6","t7","s0","s1","s2","s3","s4","s5","s6","s7",
+        "t8","t9","k0","k1","gp","sp","fp","ra" };
+    char buf[2048]; size_t pos = 0;
+    pos += snprintf(buf+pos, sizeof(buf)-pos,
+        "{\"id\":%d,\"ok\":true,\"watch\":\"0x%08X\",\"valid\":%d,\"load_pc\":\"0x%08X\","
+        "\"insn\":\"0x%08X\",\"before_ra\":\"0x%08X\",\"src_addr\":\"0x%08X\",\"regs\":{",
+        id, g_ra_load_watch, g_ra_load_snap_valid, g_ra_load_snap_pc,
+        g_ra_load_snap_insn, g_ra_load_snap_before_ra, g_ra_load_snap_srcaddr);
+    for (int r = 0; r < 32; r++)
+        pos += snprintf(buf+pos, sizeof(buf)-pos, "%s\"%s\":\"0x%08X\"",
+                        r ? "," : "", RN[r], g_ra_load_snap_gpr[r]);
+    pos += snprintf(buf+pos, sizeof(buf)-pos, "}}\n");
+    (void)pos;
+    send_fmt("%s", buf);
+}
+
 /* event_ring_dump: write the whole live event-timeline ring (IRQ deliver/gate,
  * I_STAT raises/changes, DMA kick/done, each tagged cycle/pc/func/mode/overlay)
  * to a JSON file for offline diffing of native-OFF vs native-ON runs. Optional
@@ -9641,6 +9721,9 @@ static const CmdEntry s_commands[] = {
     { "dirty_insn_gate",      handle_dirty_insn_gate },
     { "insn_freeze",          handle_insn_freeze },
     { "insn_freeze_status",   handle_insn_freeze_status },
+    { "insn_freeze_target",   handle_insn_freeze_target },
+    { "insn_freeze_snapshot", handle_insn_freeze_snapshot },
+    { "ra_load_watch",        handle_ra_load_watch },
     { "overlay_native_on",    handle_overlay_native_on },
     { "overlay_native_off",   handle_overlay_native_off },
     { "overlay_capture_dump", handle_overlay_capture_dump },

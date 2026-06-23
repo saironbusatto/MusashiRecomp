@@ -319,6 +319,16 @@ static void psx_thread_fiber_entry(void* param)
         psx_dispatch(cpu, target_pc);
     }
 
+    /* Tomba2 loader-thread diagnosis (Patch 1, trace-only): record the dispatch
+     * EXIT state for this thread's fiber. kind 13 = psx_dispatch returned with
+     * in_exception==0; kind 26 = with in_exception==1. target_pc field carries the
+     * FINAL cpu->pc the dispatch returned with (0 = sentinel/clean-exit path; any
+     * non-zero = a surfaced transfer). This is the decisive "exit reason" (vs the
+     * garbage ra): if the worker thread's dispatch returns with cpu->pc==0 / a
+     * surfaced transfer rather than a verified thread-close, closing the fiber here
+     * is wrong. */
+    debug_server_log_thread_event(psx_get_in_exception() ? 26u : 13u, cpu,
+                                  psx_current_tcb_ptr(cpu), slot->tcb, cpu->pc);
     debug_server_log_thread_event(11, cpu, psx_current_tcb_ptr(cpu), slot->tcb, target_pc);
     slot->closed = 1;
     /* Guest BIOS code owns the TCB state. A host fiber can finish because a
@@ -496,6 +506,16 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
 
         case 3: { /* ChangeThread / ReturnFromException */
             uint32_t target_tcb = cpu->gpr[5];
+            /* Tomba2 loader-thread diagnosis (Patch 1, trace-only): record every
+             * syscall-3 (ChangeThread/RFE) at its decision point. kind 20 = entered
+             * with in_exception==0 (eligible for psx_change_thread); kind 24 = entered
+             * with in_exception==1 (will be forced down the manual-RFE path, NOT a
+             * thread switch). target_tcb is the requested switch target; its state
+             * word is auto-captured as target_state. This tells us whether the loader
+             * ChangeThread is ever requested (Case A) and, if so, whether in_exception
+             * diverts it (Case B). */
+            debug_server_log_thread_event(psx_get_in_exception() ? 24u : 20u, cpu,
+                                          psx_current_tcb_ptr(cpu), target_tcb, cpu->pc);
             if (!psx_get_in_exception() && psx_change_thread(cpu, target_tcb)) {
                 /* Thread switched (and this thread has since been resumed): the
                  * fiber scheduler leaves cpu->pc == 0. Under CPS that must NOT

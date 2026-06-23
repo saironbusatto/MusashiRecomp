@@ -153,6 +153,30 @@ uint32_t g_insn_freeze_addr  = 0;  /* candidate phys entry to watch            *
 uint32_t g_insn_freeze_nth   = 0;  /* freeze before its Nth dispatch           */
 uint32_t g_insn_freeze_count = 0;
 int      g_insn_log_frozen   = 0;
+/* Tomba2 wild-jump capture (Confirm-(b)): freeze the insn ring the instant an
+ * interpreted instruction's transfer TARGET (or next_pc) equals this watched
+ * value, so the offending jr/jalr is preserved as the ring's last entry with its
+ * full register snapshot. Set via the `insn_freeze_target` debug command (0 =
+ * disabled). Matches on full 32-bit value (wild PCs are not phys-normalizable). */
+uint32_t g_insn_freeze_on_target = 0;
+/* Register snapshot captured at the instruction that hits g_insn_freeze_on_target
+ * (the offending jr/jalr). g_freeze_snap_valid latches 1; pc/insn identify the
+ * branch, gpr[] is the full guest register file at that moment (the source
+ * register still holds the wild target; scan for which reg == the target). */
+int      g_freeze_snap_valid = 0;
+uint32_t g_freeze_snap_pc    = 0;
+uint32_t g_freeze_snap_insn  = 0;
+uint32_t g_freeze_snap_tcb   = 0;
+uint32_t g_freeze_snap_gpr[32] = {0};
+/* ra-load watch (Confirm-(b)): capture the instruction that sets $ra to this
+ * value. 0 = disabled. */
+uint32_t g_ra_load_watch        = 0;
+int      g_ra_load_snap_valid   = 0;
+uint32_t g_ra_load_snap_pc      = 0;
+uint32_t g_ra_load_snap_insn    = 0;
+uint32_t g_ra_load_snap_before_ra = 0;
+uint32_t g_ra_load_snap_srcaddr = 0;
+uint32_t g_ra_load_snap_gpr[32] = {0};
 
 /* Overlay-region floor (phys) = the loaded game's main-EXE text end. Defaults to
  * the BIOS-only value; main.cpp pins it to (load_address + text_size) at game
@@ -245,6 +269,24 @@ static void dirty_ram_log_instruction(CPUState *cpu, uint32_t pc, uint32_t insn,
                                       uint32_t before_s0, uint32_t next_pc,
                                       uint32_t target, int transferred) {
     if (g_insn_log_frozen) return;
+    /* Freeze-on-target (Confirm-(b)): checked BEFORE the gate filter so it fires
+     * for ANY interpreted instruction transferring to the watched wild PC, even
+     * if that jr/jalr sits outside the recorded gate range. We do NOT record this
+     * out-of-gate entry (the gate still governs what's stored); we just stop the
+     * ring so the in-gate window leading up to the wild jump is preserved. */
+    if (g_insn_freeze_on_target != 0u &&
+        (target == g_insn_freeze_on_target || next_pc == g_insn_freeze_on_target)) {
+        if (!g_freeze_snap_valid) {
+            g_freeze_snap_pc   = pc;
+            g_freeze_snap_insn = insn;
+            uint32_t tcb_ptr = cpu->read_word(0x00000108u);
+            g_freeze_snap_tcb = tcb_ptr ? cpu->read_word(tcb_ptr) : 0;
+            for (int r = 0; r < 32; r++) g_freeze_snap_gpr[r] = cpu->gpr[r];
+            g_freeze_snap_valid = 1;
+        }
+        g_insn_log_frozen = 1;
+        return;
+    }
     uint32_t phys = pc & 0x1FFFFFFFu;
     if (!((g_insn_gate_hi != 0u && phys >= g_insn_gate_lo && phys < g_insn_gate_hi) ||
           (phys >= 0x000E0000u && phys < 0x000F0000u) ||
@@ -376,14 +418,29 @@ static int abort_unsupported(uint32_t pc, uint32_t insn, const char *reason) {
     return 1; /* signal "control transferred" so the caller stops */
 }
 
-/* Local-flow gate: overlay region ONLY, by design. Kernel-window code
- * (phys < DIRTY_RAM_KERNEL_WINDOW_END) keeps the verified per-block dispatch
- * cadence — it runs in exception context, where interrupt-check cadence and
- * EPC handling are delicate (see dirty_ram_interp.h window note). Kernel
- * native coverage comes from overlay_loader candidates, not interp chaining. */
+/* A dirty page that should run as a locally-chained overlay: anything ABOVE the
+ * kernel window. The kernel window [0, DIRTY_RAM_KERNEL_WINDOW_END) intentionally
+ * stays per-block (it runs in exception context, where interrupt-check cadence and
+ * EPC handling are delicate — see dirty_ram_interp.h window note; kernel native
+ * coverage comes from overlay_loader candidates, not interp chaining).
+ *
+ * NOTE this is the kernel-window end, NOT OVERLAY_REGION_FLOOR. The floor is the
+ * end of the boot-EXE text, and the original design assumed [0x10000, FLOOR) is
+ * immutable statically-recompiled text. That assumption is FALSE for games that
+ * discard their boot/init code and load gameplay overlays OVER the boot-text region
+ * (Tomba 2: a START.BIN-loader overlay at 0x8001Dxxx, well below its 0x38800 floor).
+ * Such a page is dirty (RAM != compiled image), so dispatching to it must interpret
+ * the live overlay and chain locally — exactly like the [FLOOR, RAM_SIZE) overlay
+ * region — NOT run the stale compiled image or route through the bail-prone
+ * non-local-call contract (the Whoopee-Camp splash wild-jr). dirty_ram_is_dirty()
+ * keeps clean boot text on the fast compiled path; only overwritten pages divert. */
+static inline int phys_is_overlay_flow_region(uint32_t phys) {
+    return phys >= DIRTY_RAM_KERNEL_WINDOW_END;
+}
+
 static int is_local_dirty_target(uint32_t target) {
     uint32_t phys = target & 0x1FFFFFFFu;
-    return phys >= OVERLAY_REGION_FLOOR && dirty_ram_is_dirty(phys);
+    return phys_is_overlay_flow_region(phys) && dirty_ram_is_dirty(phys);
 }
 
 /* Target the last interp run handed back to the dispatch loop (chained
@@ -1502,9 +1559,10 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 
     /* Reset soft-fail state at block entry. */
     g_unsupported_seen = 0;
-    /* Overlay region only — kernel window stays per-block (see
-     * is_local_dirty_target). */
-    int allow_local_dirty_flow = (phys >= OVERLAY_REGION_FLOOR);
+    /* Overlay flow above the kernel window — kernel window stays per-block (see
+     * is_local_dirty_target / phys_is_overlay_flow_region). Includes boot-text
+     * pages overwritten by a runtime overlay (Tomba 2), not just [FLOOR, RAM). */
+    int allow_local_dirty_flow = phys_is_overlay_flow_region(phys);
 
     /* Per-PC entry counter (visible via dirty_ram_stats). */
     DirtyRamPcEntry *pc_entry = pc_table_get_or_insert(phys);
@@ -1561,6 +1619,28 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         if (cpu->gpr[31] == 1u && before_ra != 1u) {
             extern void psx_ra_tripwire(CPUState *, uint32_t, uint32_t, uint32_t);
             psx_ra_tripwire(cpu, before_ra, pc, 0u /*INTERP*/);
+        }
+        /* Tomba2 ra-corruption pin (Confirm-(b)): capture the EXACT instruction
+         * that loads/sets $ra to the watched wild value (0x49422E54). For a
+         * `lw ra, off(sp)` this records the loading pc/insn + sp + the source
+         * stack address so we can see whether sp is wrong or the filename string
+         * was written onto the saved-ra slot. Latches g_ra_load_snap_valid. */
+        if (g_ra_load_watch != 0u && cpu->gpr[31] == g_ra_load_watch &&
+            before_ra != g_ra_load_watch && !g_ra_load_snap_valid) {
+            g_ra_load_snap_valid = 1;
+            g_ra_load_snap_pc    = pc;
+            g_ra_load_snap_insn  = insn;
+            g_ra_load_snap_before_ra = before_ra;
+            for (int r = 0; r < 32; r++) g_ra_load_snap_gpr[r] = cpu->gpr[r];
+            /* If it's a load (lw/lbu/...), decode base+imm to record the source addr. */
+            uint32_t op = insn >> 26;
+            if (op >= 0x20u && op <= 0x25u) { /* lb/lh/lwl/lw/lbu/lhu */
+                uint32_t base = cpu->gpr[(insn >> 21) & 0x1Fu];
+                int16_t  imm  = (int16_t)(insn & 0xFFFFu);
+                g_ra_load_snap_srcaddr = base + (int32_t)imm;
+            } else {
+                g_ra_load_snap_srcaddr = 0;
+            }
         }
 #ifdef PSX_ENABLE_BLOCK_CYCLES
         psx_advance_cycles(1u);
@@ -1640,7 +1720,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             uint32_t target_phys = target & 0x1FFFFFFFu;
             if (allow_local_dirty_flow && target != 0 &&
                 target != stop_addr &&
-                target_phys >= OVERLAY_REGION_FLOOR &&
+                phys_is_overlay_flow_region(target_phys) &&
                 dirty_ram_is_dirty(target_phys)) {
                 /* Capture freeze gates ONLY the ring write — never flow. */
                 if (!g_insn_log_frozen) {
