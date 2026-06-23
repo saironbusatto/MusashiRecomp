@@ -196,6 +196,9 @@ static uint32_t s_invalidations  = 0;   /* VALID -> INVALID transitions       */
 static uint32_t s_revalidations  = 0;   /* INVALID -> VALID (reload-on-return) */
 static uint32_t s_rehashes       = 0;   /* code-range hashes computed         */
 static uint32_t s_rehash_miss    = 0;   /* hashes that didn't match crc_code  */
+static uint64_t s_gen_fastpath   = 0;   /* dispatches that skipped the crc32   */
+                                        /* via the unchanged page-generation   */
+                                        /* fast path (overlay-cache v2 P2)      */
 static uint32_t s_last_crc       = 0;
 static uint32_t s_no_manifest    = 0;   /* exports skipped (no manifest range)*/
 static uint32_t s_selfmod        = 0;   /* entries blacklisted (self-mod)     */
@@ -1233,10 +1236,22 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
         int ci = overlay_find_by_range(phys);
         if (ci >= 0) {
             Candidate *c = &s_cand[ci];
-            uint32_t live = cand_crc(c);
-            s_rehashes++;
-            s_last_crc = live;
-            if (live == c->crc_code) {
+            /* Generation-gated validation (overlay-cache v2 P2) — same contract
+             * as the main chain: skip the crc32 when no watched code page changed
+             * since this entry was last confirmed VALID. */
+            uint32_t gen = cand_gensum(c);
+            int matched;
+            if (c->state == ENTRY_VALID && gen == c->val_gen) {
+                matched = 1;
+                s_gen_fastpath++;
+            } else {
+                uint32_t live = cand_crc(c);
+                s_rehashes++;
+                s_last_crc = live;
+                c->val_gen = gen;
+                matched = (live == c->crc_code);
+            }
+            if (matched) {
                 if (c->state != ENTRY_VALID) { c->state = ENTRY_VALID; s_valid_count++; }
                 if (c->device_touch)   { s_disp_interp++; return 0; }
                 if (!s_native_exec)    { s_would_run_native++; s_disp_interp++; return 0; }
@@ -1271,18 +1286,32 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
         Candidate *c = &s_cand[i];
         if (c->state == ENTRY_BLACKLIST) continue;
 
-        /* CORRECTNESS-FIRST — parity (native == interpreter) is not yet proven,
-         * so we verify the live code bytes match what we compiled on EVERY
-         * dispatch, immediately before running native. This is the safe stance
-         * AND the decisive test: if a stale-native blue screen still occurs when
-         * we PROVABLY only run native on byte-exact matches, the fault is the
-         * native translation itself (parity), not the validity tracking. The
-         * generation counter is retained only as a diagnostic (cand_gensum). */
-        uint32_t live = cand_crc(c);
-        s_rehashes++;
-        s_last_crc = live;
-        c->val_gen = cand_gensum(c);
-        if (live == c->crc_code) {
+        /* Generation-gated validation (overlay-cache v2 P2). The ONLY way this
+         * entry's compiled code bytes can change is a write to one of its watched
+         * code pages — and every CPU/DMA store funnels through the single store
+         * chokepoint, which bumps overlay_page_gen for watched pages (memory.c).
+         * So if the page-generation sum is unchanged since we last confirmed this
+         * entry VALID, the bytes are PROVABLY unchanged and we run native without
+         * re-hashing. We fall back to the full crc32 only when the generation
+         * moved (or the entry isn't known-valid) — which also covers
+         * reload-on-return: a write-away-then-back bumps the gen, forcing a
+         * re-hash that re-confirms the byte-exact match before any native call.
+         * This removes the per-dispatch crc32 of the whole function body from the
+         * hot path for stable code (the warm-cache common case). Correctness is
+         * identical to the old unconditional hash; only redundant hashing is cut. */
+        uint32_t gen = cand_gensum(c);
+        int matched;
+        if (c->state == ENTRY_VALID && gen == c->val_gen) {
+            matched = 1;                 /* no watched write since validation */
+            s_gen_fastpath++;
+        } else {
+            uint32_t live = cand_crc(c);
+            s_rehashes++;
+            s_last_crc = live;
+            c->val_gen = gen;
+            matched = (live == c->crc_code);
+        }
+        if (matched) {
             if (c->state != ENTRY_VALID) {
                 c->state = ENTRY_VALID;
                 s_revalidations++;              /* reload-on-return */
@@ -1449,6 +1478,11 @@ int overlay_loader_registered_count(void) { return s_valid_count; }
 
 /* sljit Tier-2 shards registered as candidates this session (diagnostics). */
 uint32_t overlay_loader_sljit_registered(void) { return s_sljit_registered; }
+
+/* Dispatches that ran native via the unchanged-page-generation fast path,
+ * i.e. skipped the per-dispatch code-range crc32 (overlay-cache v2 P2). High
+ * values relative to reval_attempts mean the warm-cache hot path is cheap. */
+uint64_t overlay_loader_gen_fastpath(void) { return s_gen_fastpath; }
 
 /* sljit shards superseded by a higher-priority gcc DLL (same content). */
 uint32_t overlay_loader_sljit_obsoleted(void) { return s_sljit_obsoleted; }

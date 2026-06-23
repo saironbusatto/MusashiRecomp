@@ -8727,8 +8727,10 @@ static void handle_overlay_loader_status(int id, const char *json)
         n += snprintf(buf + n, sizeof(buf) - n,
             ",\"r0_valid\":%d,\"r0_writes_since_invalid\":%u,"
             "\"r0_fn_lo\":\"0x%08X\",\"r0_fn_hi\":\"0x%08X\",\"r0_crc_live\":\"0x%08X\","
-            "\"reval_attempts\":%u,\"reval_crc_miss\":%u,\"last_reval_crc\":\"0x%08X\"",
-            r0v, r0w, r0lo, r0hi, r0crc, ratt, rmiss, rlast);
+            "\"reval_attempts\":%u,\"reval_crc_miss\":%u,\"last_reval_crc\":\"0x%08X\","
+            "\"gen_fastpath\":%llu",
+            r0v, r0w, r0lo, r0hi, r0crc, ratt, rmiss, rlast,
+            (unsigned long long)overlay_loader_gen_fastpath());
     }
     snprintf(buf + n, sizeof(buf) - n, "}\n");
     send_fmt("%s", buf);

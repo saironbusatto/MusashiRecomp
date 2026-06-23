@@ -88,6 +88,10 @@ void overlay_loader_get_reload_debug(int *r0_valid, uint32_t *r0_writes,
                                      uint32_t *reval_crc_miss,
                                      uint32_t *last_reval_crc);
 
+/* Dispatches that skipped the per-dispatch code-range crc32 via the unchanged
+ * page-generation fast path (overlay-cache v2 P2). */
+uint64_t overlay_loader_gen_fastpath(void);
+
 #ifdef __cplusplus
 }
 #endif
