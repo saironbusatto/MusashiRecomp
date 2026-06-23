@@ -236,3 +236,35 @@ exits early; a "load already done?" / state / event-flag check that's in the wro
 or a return value from the dir-read/open routine that differs. Find the routine that issued the LBA-373
 read (wtrace CD cmd reg from boot → PC/ra), disasm it live, and compare its post-read branch + the
 values it tests on recomp vs oracle.
+
+### Directory contents (recomp parsed it perfectly) + NEW audio-streaming clue
+The recomp's `0x104368` subdir (LBA 373) decodes to the full game file list — `A00.BIN`..`A0L.BIN`
+(level/scene overlays), `CRD.BIN`, `DEMO.BIN`, `GAME.BIN`, `OPN.BIN`, `SOP.BIN`, `START.BIN`, all with
+valid extents/sizes. So directory parsing is perfect; the recomp simply never LOADS the next file.
+(The big LBA-24 / `0x41800` 512KB load holds the splash code at `0x80050xxx`; the `0x107xxx` advance
+task is a SEPARATE file from this dir that never loads.)
+
+**NEW CLUE — recomp's CD-DA/XA audio streaming is failing.** The recomp's CD activity FROZE at
+~frame 1987 (now stuck at frame 4379, no CD since). cdrom_trace is 100% flooded with `dma` empty-read
+events (`val=0 addr=0`, `func=0x00000E10` = the EXCEPTION HANDLER chain-walk, `pc=0x8008B6F4`). Combined
+with: the recomp's CD dests are only `0x41800`/`0x104368` while the ORACLE hammers DMA3 to `0x1Axxxxx`
+(~1.1M MADR writes, game routine `0x8008DB88`) — the recomp is **NOT streaming the splash CD-DA/XA audio
+(the Whoopee-Camp jingle, multi-track TRACK 02 / XA), it's getting EMPTY reads in the CD interrupt
+handler.** Strong hypothesis: the splash→attract progression is gated on the audio stream (jingle end /
+stream-position / XA-sector event), and because the recomp's audio streaming returns empty, that
+gate never fires → the file-load that brings the `0x107xxx` advance task is never issued → state stuck 0.
+
+This ties the softlock to the **CD-DA/XA streaming path for the multi-track Tomba 2 disc**, executed
+from the CD/VBlank interrupt handler — i.e. likely the SAME interrupt/event neighborhood as frame-1997.
+
+### Blocking tooling (Rule 15 — fix next)
+`cdrom_trace_dump` ring is fully evicted by `dma` (empty-read 'D') events — can't see the CD commands.
+Edge-suppress the 'D'/dma empty-read events (the memory's documented fix) so the SetLoc/ReadN/Play
+commands + their PCs are visible. Also add `cd_read_log` + a CD-command trace to beetle for cross-diff.
+
+### Revised next steps
+1. Fix the cdrom_trace dma-flood (edge-suppress empty reads) → see the CD command sequence + PCs.
+2. Investigate the CD-DA/XA AUDIO streaming for the multi-track disc: does the recomp read TRACK 02 /
+   XA audio sectors at all, or return empty? Compare with the oracle's DMA3 stream to `0x1Axxxxx`.
+3. Determine whether the splash advance is gated on the audio stream; if so, fix the multi-track
+   CD-DA/XA read path (the empty reads from `pc=0x8008B6F4` in the exception handler are the thread to pull).
