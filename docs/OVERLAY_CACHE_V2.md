@@ -193,6 +193,23 @@ hot path). P3 backward host recovery as an OPPORTUNISTIC upgrade (accept a
 recovered host only if: candidate found + its CFG provably REACHES the interior PC
 + compiles in isolation + strict audit passes + runtime byte-hash matches; don't
 require a prologue; score candidates rather than pattern-match a single boundary).
+
+IMPLEMENTED 2026-06-23 (psxrecomp c5efd70) — P1+P2. compile_overlays.py runs a
+DECOUPLED post-loop fragment pass: for each region, the EXECUTED DISPATCH_INTERIOR
+PCs not covered by any built DLL get compiled, each via compile_interior_fragment
+(single `dispatch_root` seed → own <region>_<key>.dll). P1 is satisfied implicitly
+— fragments are separate compiles, so a fragment audit-failure drops that fragment
+alone and never touches the region's DLL; the pass runs even if the region's own
+compile audit-failed. VALIDATED: a probe produced a clean mid-entry island for
+0x80083094 (audit-clean, branches before the entry emitted as dispatcher exits); a
+full run built 34/47 executed orphans at 0x38000 (incl. 0x80083094) as isolated
+shards while that region's NORMAL compile audit-failed on a bad variant; a fresh
+runtime run loaded 20 DLLs / 264 native funcs / gen_fastpath 297k / crc_miss=0 —
+island fragments run native with NO divergence. The fragment infra is done and
+stable. OPEN: (a) clean good-variant warm to prove FMV/title speed end-to-end
+(region audit-fails on the messy accumulated captures, losing hot NORMAL funcs like
+0x50CE8); (b) extend isolated fragments to executed NORMAL funcs so a region
+audit-fail stops losing all its functions; (c) P3 host recovery (optional).
 - The GP0 0xFE crash was NOT stale-provider execution (dispatch re-validates).
   It was either the stale/mixed cache (now wiped) or a real codegen divergence;
   P5 shadow-diff isolates it.
