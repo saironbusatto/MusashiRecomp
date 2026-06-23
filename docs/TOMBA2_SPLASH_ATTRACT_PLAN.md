@@ -100,3 +100,36 @@ transition out of state 0** + the writer PC + the predicate loads right before i
   why the predicate differs. (TCP debug works fine; the browser flakiness is unrelated.)
 - Recomp runs STABLY stuck on the splash to frame 78k+ this run (the earlier ~17k death was
   not reproduced — likely the window was closed), so it is live-inspectable for the comparison.
+
+## ✅ ROOT CAUSE FOUND (2026-06-22 sess2) — missing splash-advance code at 0x80107xxx
+Ran the oracle reverse-writer-hunt (wtrace_arm on `[0x1F800190,0x1F8001A8]` from a fresh boot;
+TCP raw cmd since the client maps `wtrace_add` but the oracle wants `wtrace_arm`). The oracle's
+state byte `[0x1F80019C]` ping-pongs EVERY frame:
+- `PC 0x80107268` writes **state=2** (the advance trigger), then
+- `PC 0x80050DA8` (state-2 handler) writes **state=1**.
+So on HW, `0x80107268` runs every frame and drives the splash forward.
+
+**The recomp NEVER runs it because the code isn't there.** Disassembled `0x80107200..0x8010728C`:
+- ORACLE = the real splash-advance function (the `sb v0,412(v1)` state=2 write is at 0x80107268,
+  preceded by a counter `addiu s1,s1,-1` / `bne s1` loop + GPU/struct setup).
+- RECOMP = **ALL ZEROS (NOPs).** The function is simply not loaded.
+
+Memory map sampling `0x80100000..0x80110000` (recomp vs oracle): recomp has `0x80104368` and
+`0x8010A000` loaded (but with DIFFERENT content than the oracle) while `0x80107000`, `0x80110000`
+are ZERO in the recomp and real code on the oracle. So the recomp's high-RAM overlay
+(`0x80100000+`) is PARTIALLY loaded and DIVERGENT — a **load / relocation divergence during boot**:
+the recomp failed to bring the `0x80107xxx` overlay region into RAM (or loaded it elsewhere).
+
+This is the real softlock cause (NOT the JIT/cache — confirmed pure interp: overlay
+`dispatch_native=0`, `dispatch_interp_fallback=125778`, sljit `live=0/compiles=0`, autocompile off).
+
+### NEXT (loader hunt)
+Find how the oracle gets `0x80107xxx` into RAM and why the recomp doesn't. It loads EARLY (oracle
+has it by frame 630), so it's a boot/splash-setup load — a CD read OR a RAM→RAM memcpy/decompress.
+The cd_read_log ring (256 entries) has already evicted the early loads, so capture from boot:
+- Arm an always-on/early wtrace on `0x80107000..0x80108000` (writes that INSTALL the code) on BOTH
+  the oracle and the recomp; compare. The oracle's installer write (DMA or memcpy store) PC + source
+  tells us the load mechanism; the recomp either never does it (skipped load / wrong branch) or writes
+  it to a different address (relocation/base divergence).
+- Also dump the full early CD read log from boot (restart with cd logging) to see if a CD read to
+  0x107xxx happens on the oracle but not the recomp.
