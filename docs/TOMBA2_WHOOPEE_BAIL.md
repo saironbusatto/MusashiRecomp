@@ -79,6 +79,81 @@ restore the host call-contract frame on RFE. Validate against the oracle
 
 ---
 
+## ✅✅ CONFIRMED with live data (2026-06-22, session 2) — was inference, now proof
+
+Reproduced the frame-1997 exit (`PSX_EXIT_HALT=1`, halt-and-serve) and read the real
+state over TCP 4500. The prior section was an *inference from `last_store_pc`*; the
+following is *measured*:
+
+**1. The exit sequence (from the `PSX_FNTRACE_ARM=all` dispatch-tail ring):**
+```
+0x80085D1C  game VBlank entry (sp -> 0x800ABD30, game stack)
+0x000000B0  -> B0 vector, ra=0x80085F3C   = ReturnFromException (B0:0x17)
+0x80000048  RFE restored interrupted ctx (sp=0x801FFFB8 ra=0x80050CC8), pc=SENTINEL
+            -> psx_unknown_dispatch sentinel-longjmp gate FAILS -> pc=0 -> top exit
+```
+
+**2. `in_exception == 0` at the failing RFE — measured two independent ways:**
+- `freeze_check`: `in_exception=0`, `post_exception_cooldown=7`, `current_func=0x000000B0`,
+  `last_store_pc=0x80086208`.
+- The event ring's last entry is `IRQ_GATE detail=2` = `GATE_COOLDOWN`, which is only
+  set *after* `in_exception` is cleared. So the game's RFE ran in the post-exception
+  window, not inside our synthesized exception.
+
+**3. The TCB save area is the smoking gun.** `TCB ptr @0x108 = 0xA000E1EC` →
+save_area `0xA000E1FC`:
+```
+saved EPC (off 128) = 0x80000048   <-- OUR SENTINEL (the bug)
+saved SR  (off 140) = 0x40000404   (exception-pushed SR)
+saved ra  (off 124) = 0x80050CC8   (real interrupted ctx, correct)
+saved sp  (off 116) = 0x801FFFB8   (real interrupted ctx, correct)
+```
+The interrupted GPRs are saved correctly; only **EPC is the sentinel** instead of the
+real interrupted PC. `interrupts.c:362` writes the sentinel; the recompiled BIOS
+handler saves it to the TCB; `ReturnFromException` reads it back and RFEs to the
+sentinel.
+
+**4. The game handler is HookEntryInt-installed and self-RFEs (disasm of live RAM):**
+`0x80085D8C` walks a per-source handler table (`jalr ra,v0` loop `0x80085E2C–E78`) and
+ends with `jal 0x80086200`. `0x80086200 = addiu t2,0xB0; jr t2; addiu t1,0x17` =
+B0:0x17 ReturnFromException; `0x80086220` = B0:0x19 HookEntryInt (the install site is
+`0x80085D3C jal 0x80086220`). So Tomba 2 installs a full-takeover interrupt handler
+that drives `ReturnFromException` itself.
+
+**5. A precise guest resume PC EXISTS and is being discarded.** The interrupted code is
+dirty-interpreted (`event_ring` mode=INTERP, pc≈`0x80050CE8`). The dirty-interp pump
+(`dirty_ram_interp.c:1377`) commits `cpu->pc` (the next guest PC) **before** calling
+`psx_check_interrupts`. So at exception entry `cpu->pc` holds the real interrupted
+guest PC — but `psx_check_interrupts` ignores it and writes the sentinel into EPC.
+
+### Root cause (one line)
+Our exception model overloads COP0 EPC with the host sentinel `0x80000048`. Resume
+works only via the host-GPR-save/restore + `longjmp` hack, which is valid **only
+synchronously inside `psx_check_interrupts`**. Tomba 2's HookEntryInt handler calls
+`ReturnFromException` **asynchronously** (after our exception window has closed,
+`in_exception=0`); RFE reads `saved_epc=sentinel`, the longjmp gate fails, and the
+sentinel resolves to `pc=0` → "execution completed" abnormal exit.
+
+### Fix design (recommended — pending ChatGPT consult + oracle grounding)
+**Option A (scoped EPC de-overload — recommended):** when `psx_check_interrupts`
+delivers an interrupt while the interrupted context is dirty-interpreted (a valid
+guest resume PC is live in `cpu->pc`), set `EPC = cpu->pc` (real guest PC) instead of
+the sentinel. The TCB then saves the real PC; `ReturnFromException` — synchronous OR
+asynchronous — resumes at the real guest PC via the dispatch loop / dirty-interp
+re-entry. Keep the sentinel + host-restore path ONLY for compiled-interrupted
+contexts (where no precise guest PC exists; T1/MMX6/Ape gameplay handlers RFE
+synchronously and are unaffected). The host-GPR-save/restore interplay on the
+real-EPC path must be re-derived carefully.
+**Option B:** pin *why* our model runs the game handler with `in_exception=0` and make
+it run inside the exception (reuse the proven sync longjmp). Needs the deferral
+mechanism nailed first.
+**Gate:** this touches the shared interrupt path — re-regress Tomba 1 / MMX6 / Ape
+frame-by-frame vs the oracle before landing on master.
+
+Consult package for the Recomp GPT: `docs/TOMBA2_EXC_CONSULT.md`.
+
+---
+
 ### Original investigation (history — superseded by the RESOLVED section above)
 
 ## Symptom
