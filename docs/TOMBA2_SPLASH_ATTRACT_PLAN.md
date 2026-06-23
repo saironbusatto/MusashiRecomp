@@ -133,3 +133,28 @@ The cd_read_log ring (256 entries) has already evicted the early loads, so captu
   it to a different address (relocation/base divergence).
 - Also dump the full early CD read log from boot (restart with cd logging) to see if a CD read to
   0x107xxx happens on the oracle but not the recomp.
+
+## LOADER HUNT RESULT (2026-06-22 sess2) — it's a CD DMA load, late, that the recomp never gets
+Armed `wtrace 0x80107000..0x80108000` on a fresh oracle from frame 411. Findings:
+- The ONLY CPU-store writes caught to the region were the BIOS RAM-zeroing pass (PC `0xBFC0D864`,
+  ra `0xBFC06BBC`, writing 0x00000000 to `0xA0107C00+` at frame ~848). NOT the code install.
+- The real code at `0x80107268` is **still ZERO at oracle frame 2289**, but **present by frame 3960**
+  — and the wtrace caught **ZERO CPU stores** carrying those code bytes. ⇒ the splash-advance code
+  is installed by **CD DMA (channel 3, CD→RAM)**, not CPU stores. It loads LATE (≈frame 2289–3960),
+  i.e. DURING the splash, not at initial boot.
+- So **the CD is NOT fully ruled out** after all: the EARLY load (`0x41800+`, 250 sectors) works, but
+  this LATER DMA load of the `0x80107xxx` overlay is the one the recomp never receives (its region
+  stays zero even at frame 78k). cd_read_log cross-compare blocked by tooling (beetle has no
+  `cd_read_log`; recomp dump came back empty once — Rule 15 follow-up).
+
+### Refined model + next step
+Likely chicken-and-egg / CD-completion: the splash state-0 loop (both run) initiates or waits on a CD
+load that brings in the `0x80107xxx` advance task; on HW the DMA completes (~frame 3960) and the task
+then drives state 2↔1; on the recomp the load never lands so state stays 0. This points back at the
+**CD/DMA + completion-event path for a SECOND (mid-splash) load**, distinct from the working first load.
+NEXT: (1) fix/confirm cd_read_log on the recomp + add it to beetle (Rule 15) so we can diff CD reads;
+(2) restart the RECOMP with full from-boot CD logging and check whether it ever issues a read whose
+DMA dest covers `0x107xxx` — if NO, a code-path/branch divergence skips the load (the state-0 loop
+never reaches the load trigger); if YES-but-data-absent, a CD/DMA targeting or completion bug drops it.
+(3) On the oracle, trace what the state-0 loop does right before the load fires (the CD command +
+DeliverEvent/CdSync) and compare the recomp's same loop.
