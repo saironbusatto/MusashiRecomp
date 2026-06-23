@@ -1402,8 +1402,20 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
         if (gap >= 4096u) {
             s_last_pump_insns = now;
             g_dirty_pump_count++;
-            g_dirty_safe_resume_pc = cpu->pc;  /* committed guest PC -> real-EPC mode */
+            uint32_t committed = cpu->pc;      /* block already retired; this is next PC */
+            g_dirty_safe_resume_pc = committed;
             psx_check_interrupts(cpu);   /* may exception-enter / longjmp */
+            /* Frame-1997 fix: a game-driven ReturnFromException longjmp'd through the
+             * handler and left cpu->pc=0. Here (outer pump, the block already returned)
+             * that null PC would propagate up the trampoline to the OUTERMOST dispatch
+             * and be read as a clean "execution completed" exit. Restore the committed
+             * guest PC so the trampoline re-dispatches and the game resumes. (The
+             * local-flow internal pump resumes via its own loop, so this only matters at
+             * block-return pumps.) */
+            if (cpu->pc == 0u && committed != 0u) {
+                cpu->pc = committed;
+                g_async_rfe_fire_count++;
+            }
             g_dirty_safe_resume_pc = 0;
         }
     }
@@ -1691,9 +1703,18 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     cpu->pc = pc;
     if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
     g_dirty_interp_chain_target = pc;
-    g_dirty_safe_resume_pc = cpu->pc;  /* committed guest PC -> real-EPC mode */
-    psx_check_interrupts(cpu);
-    g_dirty_safe_resume_pc = 0;
+    {
+        uint32_t committed = cpu->pc;
+        g_dirty_safe_resume_pc = committed;
+        psx_check_interrupts(cpu);
+        /* Frame-1997 fix (see outer pump): restore the committed PC if a game RFE
+         * longjmp left cpu->pc=0, so the trampoline re-dispatches instead of exiting. */
+        if (cpu->pc == 0u && committed != 0u) {
+            cpu->pc = committed;
+            g_async_rfe_fire_count++;
+        }
+        g_dirty_safe_resume_pc = 0;
+    }
     OV_FPLOG_RET1();
 }
 #undef OV_FPLOG_RET1
