@@ -13,13 +13,30 @@ longjmp at a BLOCK-RETURN pump left `cpu->pc=0`, which unwinds to the outermost 
 and reads as a clean exit. Fix = restore the committed guest PC after the block-return
 pumps so the trampoline re-dispatches (details in the CORRECTION section below).
 
-**NEW FRONTIER — splash→attract divergence.** The recomp lingers on the splash with its
-**CD idle** (`reading=0`); the Beetle oracle on the same disc has moved on to the
-**attract/intro gameplay** (3D scene: Tomba on a grassy field). BOTH sit at the same idle
-PC `0x80050CE8` — so the recomp tracks the oracle's CODE but has diverged in game STATE:
-the oracle's splash logic triggered the attract-scene CD load, the recomp's did not.
-Likely a CD-streaming / scene-transition divergence (first-divergence work vs oracle @4380).
-This is the path to the user's "through to attract" goal.
+**NEW FRONTIER — splash→attract divergence (first-divergence, NOT a CD bug).** The recomp
+softlocks on the splash; the Beetle oracle on the same disc reaches the **attract/intro
+gameplay** (3D Tomba on a grassy field). BOTH sit at the same idle PC `0x80050CE8`, so the
+recomp tracks the oracle's CODE but has diverged in game STATE.
+
+Investigated 2026-06-22 sess2:
+- The splash main loop is at `0x80050C40+`; it pumps a 2-frame VBlank gate (counter
+  `0x800E809C` reset by `sh zero` @`0x80050C8C`, waited up to threshold byte `[0x1F800235]=2`
+  — works, reaches 2 between samples) and runs a state machine on `[0x1F8001A4]` (observed
+  stuck at 0). The state never advances to load/show the attract.
+- **CD RULED OUT.** The attract data DOES load correctly: consecutive CD-DMA dest addresses
+  (`0x80041800`, `0x80042000`, …) hold DIFFERENT, valid MIPS code, and `read_msf` advanced to
+  LBA 374. The `cd_read_log` "lba" field misleadingly logs the SetLoc target (24) for every
+  DMA read, not the per-sector read position — a TOOL bug to fix (Rule 15): it cost a wrong
+  "CD stuck at LBA 24" hypothesis. The CD streaming/advance is fine.
+- So the divergence is a true first-divergence in the splash state machine / scene-transition
+  decision, upstream of the common `0x80050CE8` loop. Next: oracle PC-trace from the splash
+  (psx-beetle @4380) to find the first divergent branch / state write that gates the attract.
+
+**SECONDARY: ~frame-17k crash.** With the frame-1997 fix the recomp runs ~16-17k frames on
+the splash (≈8e9 dirty insns; ~470k insns/frame — the splash spin is expensive) then dies
+silently (SEH; watchdog was off). Possible host-stack growth from the fix's re-dispatch on
+NESTED block-return-pump RFEs (the restore fires ~1/22 frames) — must check (also a
+regression-risk signal for the shared path). Re-run with watchdog + crash dumps armed.
 
 **PENDING GATES (before master-landing of the fix):** (1) T1/MMX6/Ape regression — the
 fix is in the SHARED dirty-pump path; argued low-risk (the restore only fires when a
