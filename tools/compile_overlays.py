@@ -1186,6 +1186,21 @@ def main():
                          '+ carry an entry-switch. Must match the runtime build.')
     args = ap.parse_args()
 
+    # Resolve the recompiler exe and runtime-include to absolute paths up front.
+    # game.toml's overlay_autocompile_cmd uses paths RELATIVE to the project root
+    # (the runtime spawns this script via cmd.exe with cwd = project root) so the
+    # shipped config is portable across machines — never bake absolute paths into
+    # game.toml. But two Windows quirks break relative paths once we hand them off:
+    #   1. subprocess/CreateProcess does NOT resolve a relative *executable*
+    #      against the child cwd (the recompiler spawn below, cwd=toml_dir), so a
+    #      relative --recompiler fails with WinError 2 and the cache never warms.
+    #   2. gcc launched from cmd.exe rejects relative forward-slash -I/-c/-o paths
+    #      (already handled inside compile_dll via os.path.abspath).
+    # Anchoring both here (against this process's cwd = project root, where the
+    # relative paths are meant to resolve) makes relative config work everywhere.
+    args.recompiler      = os.path.abspath(args.recompiler)
+    args.runtime_include = os.path.abspath(args.runtime_include)
+
     # Read game ID from game.toml (strip BOM if present)
     with open(args.game_toml, 'rb') as f:
         raw = f.read().lstrip(b'\xef\xbb\xbf')  # UTF-8 BOM
