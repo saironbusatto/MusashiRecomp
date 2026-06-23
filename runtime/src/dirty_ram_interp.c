@@ -48,6 +48,34 @@ uint64_t g_dirty_ram_guard_yields = 0;
 uint64_t g_dirty_pump_max_gap_insns = 0;
 uint64_t g_dirty_pump_count         = 0;
 
+/* EPC de-overload signal (Tomba 2 frame-1997 fix). Set to the committed guest PC
+ * immediately around a dirty-pump psx_check_interrupts() call, 0 otherwise. When
+ * non-zero at exception entry, the interrupt is delivered at a dirty-interp safe point
+ * with a precise guest resume PC, so psx_check_interrupts sets COP0_EPC to the REAL PC
+ * (architectural RFE resume) instead of the host sentinel 0x80000048. The TCB then
+ * saves the real PC, so a game-installed handler that drives ReturnFromException
+ * itself (sync OR async) resumes correctly. Compiled-code block-boundary pumps leave
+ * this 0 -> the sentinel + host-GPR-restore + longjmp path (unchanged: T1/MMX6/Ape). */
+uint32_t g_dirty_safe_resume_pc = 0;
+
+/* Persistent async-RFE resume PC (Tomba 2 frame-1997 fix). psx_check_interrupts latches
+ * this from g_dirty_safe_resume_pc at each dirty-safe-point exception entry, so it holds
+ * the real guest PC of the most recent dirty-interp interruption. When a game-installed
+ * handler drives ReturnFromException ASYNCHRONOUSLY (sentinel RFE with in_exception==0),
+ * the sentinel gates resume the guest here instead of resolving to pc=0 (abnormal exit).
+ * Unlike g_dirty_safe_resume_pc (transient, scoped to the pump call) this persists across
+ * the gap between the interrupt and the game's later ReturnFromException. */
+uint32_t g_async_rfe_resume_pc = 0;
+/* Diagnostics for the async-RFE fix: times the resume PC was latched at a dirty-safe
+ * exception entry, and times the sentinel gates actually redirected to it. */
+uint64_t g_async_rfe_set_count  = 0;
+uint64_t g_async_rfe_fire_count = 0;
+/* Reach diagnostics: which gate the sentinel dispatch lands in, and what
+ * g_async_rfe_resume_pc held there. */
+uint64_t g_sentinel_reach_dirty = 0;
+uint64_t g_sentinel_reach_traps = 0;
+uint32_t g_sentinel_reach_async = 0;
+
 /* Mid-block unsupported-opcode counters. Bumped instead of fprintf-spamming
  * stderr (CLAUDE.md §3). Read via dirty_ram_get_unsupported(). The "last_*"
  * fields capture the most recent occurrence so a TCP query can see what
@@ -1374,7 +1402,9 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
         if (gap >= 4096u) {
             s_last_pump_insns = now;
             g_dirty_pump_count++;
+            g_dirty_safe_resume_pc = cpu->pc;  /* committed guest PC -> real-EPC mode */
             psx_check_interrupts(cpu);   /* may exception-enter / longjmp */
+            g_dirty_safe_resume_pc = 0;
         }
     }
 
@@ -1386,9 +1416,20 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (addr == 0x80000048u) {
+        g_sentinel_reach_dirty++;
+        if (!psx_get_in_exception()) g_sentinel_reach_traps++; /* reuse: in_exc==0 dirty reaches */
+        g_sentinel_reach_async = g_async_rfe_resume_pc;
         cpu->pc = 0;
         if (psx_get_in_exception()) {
             psx_exception_longjmp(); /* does not return */
+        }
+        /* Async ReturnFromException (Tomba 2 frame-1997 fix): game-installed handler
+         * RFE'd outside our exception window. Resume at the latched real guest PC
+         * instead of returning pc=0 (which the top dispatch reads as a clean exit). */
+        if (g_async_rfe_resume_pc != 0u) {
+            g_async_rfe_fire_count++;
+            cpu->pc = g_async_rfe_resume_pc;
+            return 1;
         }
         return 1;
     }
@@ -1609,7 +1650,9 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 if ((insns_executed & 0xFFF) == 0) {
                     debug_server_poll();
                     debug_server_wait_if_paused();
+                    g_dirty_safe_resume_pc = cpu->pc;  /* committed (==target) -> real-EPC */
                     psx_check_interrupts(cpu);
+                    g_dirty_safe_resume_pc = 0;
                 }
                 continue;
             }
@@ -1648,7 +1691,9 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     cpu->pc = pc;
     if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
     g_dirty_interp_chain_target = pc;
+    g_dirty_safe_resume_pc = cpu->pc;  /* committed guest PC -> real-EPC mode */
     psx_check_interrupts(cpu);
+    g_dirty_safe_resume_pc = 0;
     OV_FPLOG_RET1();
 }
 #undef OV_FPLOG_RET1
