@@ -4,7 +4,27 @@ Frame-1997 is FIXED. Next: the recomp softlocks on the Whoopee-Camp splash; the 
 oracle reaches the attract. The splash state machine never advances. CD ruled out (attract
 data loads correctly). This is a first-divergence in the scene-transition logic.
 
-## ✅✅✅ CONFIRMED ROOT CAUSE (2026-06-22 sess2) — incomplete CD STREAMING path (first exercised by Tomba 2)
+## ⚠️ CORRECTION (2026-06-22 sess2, after fixing the CD trace flood) — CD streaming is NOT the immediate blocker
+After gating the per-word DMA 'D' trace off (commit 598d1aa) the CD COMMAND flow is finally readable, and it
+**refutes the "CD streaming is the root cause" conclusion below.** The game does the directory traversal via
+SINGLE-SECTOR DATA reads that WORK: `SetLoc`+`ReadN`+`Pause` per sector — PVD LBA16 → root LBA22 → subdir
+LBA373 (all delivered, INT1, parsed perfectly). After LBA 373 is delivered (frame 1986), the game issues
+**NO further CD command** and stalls (now `reading=0`, a half-state `pending Pause 0x09` phase=1). So the
+recomp never even REACHES the CD-audio/XA streaming — it stalls earlier, at the **post-directory FILE-LOAD
+DECISION**. The CD-audio streaming IS still missing (the oracle hammers DMA3 to `0x1Axxxxx` ~1.1M times; the
+recomp doesn't), but since the game issues no streaming command, that's downstream, not the gate.
+
+**Corrected blocker:** after a correct directory read, the game's code decides what/whether to load next, and
+the recomp's decision diverges (issues no SetLoc+ReadN for the next file). Same disc data + same game code +
+correct directory ⇒ a STATE the game tests after the dir read differs (candidate: an event/flag/return value,
+possibly from the interrupt/event model — the frame-1997 neighborhood). NEXT: find the code that runs right
+after the LBA-373 directory delivery (the CD-read completion at `pc≈0x8008ADE4` / `0x8008594C` returns into
+the file-open/dir-walk routine) and trace its branch + the state it tests on recomp vs oracle.
+
+---
+
+## (SUPERSEDED) CONFIRMED ROOT CAUSE — incomplete CD STREAMING path (first exercised by Tomba 2)
+NOTE: superseded by the CORRECTION above — streaming is real & missing but NOT the immediate gate.
 The splash softlock is the **CD streaming / XA / CD-DA + DMA-3 audio path being incomplete** — Tomba 2 is
 the FIRST title psxrecomp has run that actually drives it (Tomba 1 / MMX6 / Ape use SPU-voice/SEQ music on
 single-track data discs; none stream CD audio). Evidence chain (all measured):
