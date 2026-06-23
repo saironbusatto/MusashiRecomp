@@ -139,13 +139,29 @@ refuse to root orphan interiors — the mid-function-seed softlock guard). It's
 interp-only by design → FMV slow; cache warming cannot touch it. Likely also
 0x107250/0x10724C.
 
-NEXT (host recovery from an interior PC — the tractable fix): when the interp
-dispatches to an orphan overlay `DISPATCH_INTERIOR`, walk BACKWARD from that PC
-to recover the host start (MIPS is fixed-width: scan back to an `addiu sp,sp,-N`
-prologue not in a delay slot, or the instruction after a preceding `jr $ra` — the
-existing `_callable_legacy_seed` signature). Root the recovered host as a function
-so it compiles; the interior PC then becomes an alias-entry into it (handled by
-47f3f15). This converts the orphan-interior coverage gap into a discovery step.
+NEXT (host recovery from an interior PC): when the interp dispatches to an orphan
+overlay `DISPATCH_INTERIOR`, walk BACKWARD from that PC to recover the host start
+(MIPS is fixed-width: scan back to an `addiu sp,sp,-N` prologue not in a delay
+slot, or the instruction after a preceding `jr $ra` — the existing
+`_callable_legacy_seed` signature). Root the recovered host so it compiles; the
+interior PC then becomes an alias-entry into it (handled by 47f3f15).
+
+ATTEMPTED 2026-06-23 — REVERTED (regresses). Adding the recovered host as a root
+to the region's seed list (even gated to EXECUTED/resident orphans only) makes
+the recompiler walk from the recovered boundary and emit C that fails the strict
+generated-C audit (unknown jump targets / unsupported instructions walked from a
+not-quite-right start). Because ALL roots in a region compile into ONE shared C
+file / DLL, a single audit failure skips the WHOLE region's DLL → coverage gets
+WORSE (the previously-good 0x38000 region stopped compiling). The shared-region
+compile makes speculative roots fragile.
+
+ROBUST PATH (dedicated effort): isolate host recovery from the region compile.
+Either (A) compile each recovered host + its interior aliases as its OWN seed set
+→ its OWN DLL, so a bad recovery fails alone without poisoning the region (the
+loader already content-matches per function across DLLs at a region_start); or
+(B) validate each recovered host by compiling it in isolation and checking the
+audit BEFORE adding it to any seed set. (A) is preferred. Until then, the FMV
+driver's host stays interp-only.
 - The GP0 0xFE crash was NOT stale-provider execution (dispatch re-validates).
   It was either the stale/mixed cache (now wiped) or a real codegen divergence;
   P5 shadow-diff isolates it.
