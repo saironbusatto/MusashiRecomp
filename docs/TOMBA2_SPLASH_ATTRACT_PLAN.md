@@ -4,7 +4,34 @@ Frame-1997 is FIXED. Next: the recomp softlocks on the Whoopee-Camp splash; the 
 oracle reaches the attract. The splash state machine never advances. CD ruled out (attract
 data loads correctly). This is a first-divergence in the scene-transition logic.
 
-## Strategy — REVERSE WRITER HUNT (not a PC diff)
+## ✅✅✅ CONFIRMED ROOT CAUSE (2026-06-22 sess2) — incomplete CD STREAMING path (first exercised by Tomba 2)
+The splash softlock is the **CD streaming / XA / CD-DA + DMA-3 audio path being incomplete** — Tomba 2 is
+the FIRST title psxrecomp has run that actually drives it (Tomba 1 / MMX6 / Ape use SPU-voice/SEQ music on
+single-track data discs; none stream CD audio). Evidence chain (all measured):
+- Splash state machine `[0x80050D00]` stuck at state 0; advance writer `0x80107268` (sets state=2/frame)
+  is in a FILE that never loads (`0x80107xxx` = zeros in recomp, real code on oracle).
+- The recomp's directory read (LBA 373) is PERFECT (full file list A00-A0L/DEMO/GAME/OPN/SOP/START.BIN) —
+  not a CD-fidelity or game-code bug. It just never issues the next file load.
+- The recomp's CD froze ~frame 1987; its CD interrupt handler spins at `pc=0x8008B6F4` reading
+  `[0x800AC2C4]=0x1F8010B8` (**DMA-3/CDROM CHCR**) waiting for CHCR bit `0x01000000` (DMA start/busy) to
+  clear — the CD-streaming DMA-drain loop. The oracle hammers DMA-3 to `0x1Axxxxx` (~1.1M transfers via
+  game routine `0x8008DB88`); the recomp gets EMPTY reads → the stream never flows.
+- `cdrom.c` Play(0x03) handler comment: *"Red Book sample output is not yet decoded — silent for now —
+  but the flow no longer stalls."* XA decode fns exist but the continuous-stream delivery is not built.
+
+So: the splash sequence streams CD audio+data; the recomp's streaming doesn't deliver continuously, so
+the IRQ-handler DMA-wait never completes / the audio/stream sequence never progresses, so the game never
+loads the `0x107xxx` advance-task file → state stuck 0. **The fix is to BUILD the CD streaming path
+(Architecture-A hardware-sim, no stubs):** DMA-3 CD-streaming must deliver the game's requested sectors
+continuously (data sectors to the game's buffer; XA-audio sectors decoded to SPU; CD-DA Red Book output +
+position/end reporting for multi-track), so the IRQ DMA-wait completes and the stream advances. This is
+the STUBS_TO_FIX S3/S4/S5 (MDEC/SPU/DMA) streaming family, now actually exercised. NOTE: must not regress
+T1/MMX6/Ape (they don't stream, so the streaming additions should be inert for them) — but this is an
+isolated branch; Tomba 2 first, regression after.
+
+---
+
+## Strategy — REVERSE WRITER HUNT (not a PC diff)  [historical — how we got here]
 Both recomp and oracle reach the same idle PC `0x80050CE8`, so a raw PC-stream diff buries
 the signal (code reconverges, state diverged). Instead: make the ORACLE stop itself at the
 successful transition and dump the write history *before* it (the recomp never reaches that
