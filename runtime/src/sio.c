@@ -74,6 +74,18 @@ static uint8_t pad_current_cmd = 0;
  * reaches 0x42. (MMX6 ISSUES.md #2.) */
 static uint8_t pad_in_config[2] = { 0, 0 };
 
+/* Whether the pad on a slot is a config-capable DualShock (1) or a plain
+ * digital controller (0). A real SCPH-1080 digital pad (poll id 0x41) does NOT
+ * answer the config-mode commands (0x43/0x44/.../0x4F): it returns hi-z and the
+ * transaction ends. A game's pad driver that probes with 0x43 to detect a
+ * DualShock therefore classifies a digital pad as digital-only and just polls
+ * it with 0x42. Tomba 2's driver probes this way every frame; when the SM
+ * (wrongly) answered 0x43 for its digital pad it went down the DualShock config
+ * path and read the 0x00 config-response bytes as buttons -> phantom "all
+ * pressed" input. Default 1 keeps analog/hybrid pads unchanged; main.cpp sets 0
+ * for PAD_MODE_DIGITAL. */
+static uint8_t pad_supports_config[2] = { 1, 1 };
+
 /* Coherent-DualShock model (Tomba phantom-input fix). A real controller never
  * changes its reported type (0x41 digital <-> 0x73 analog) in the middle of a
  * transaction, nor while the host is mid config-handshake: the type only flips
@@ -567,6 +579,14 @@ void sio_set_pad_connected(int slot, int connected) {
     else           pad_connected &= (uint8_t)~(1 << slot);
 }
 
+void sio_set_pad_config_capable(int slot, int capable) {
+    if (slot < 0 || slot > 1) return;
+    pad_supports_config[slot] = capable ? 1 : 0;
+    /* A plain digital pad can never be in config mode; clear any stale latch so
+     * the next poll reports the digital id (0x41), not the config id (0xF3). */
+    if (!capable) pad_in_config[slot] = 0;
+}
+
 void sio_set_pad_state(uint16_t buttons) {
     pad_buttons[0] = buttons;
 }
@@ -718,6 +738,12 @@ static void pad_process_byte(uint8_t tx_byte) {
         {
         const uint8_t cur_id = pad_in_config[selected_slot] ? 0xF3
                                : (pad_analog[selected_slot] ? 0x73 : 0x41);
+        /* A plain digital controller (SCPH-1080) answers ONLY the 0x42 poll; it
+         * ignores every config-mode command (returns hi-z, no ACK). A driver
+         * that probes with 0x43 to detect a DualShock then classifies it as
+         * digital-only and just polls. Gate all config branches on this so a
+         * digital-mode pad behaves like real hardware (see pad_supports_config). */
+        const int ds = pad_supports_config[selected_slot];
         if (tx_byte == 0x42) {
             /* Read poll. Analog (or in-config) uses the 8-byte format with the
              * four stick axes; a plain digital pad uses the 4-byte format. */
@@ -738,7 +764,7 @@ static void pad_process_byte(uint8_t tx_byte) {
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;
-        } else if (tx_byte == 0x43) {
+        } else if (ds && tx_byte == 0x43) {
             /* Enter/exit config mode. The ID byte reflects the CURRENT mode; the
              * enter(0x01)/exit(0x00) flag is the second data byte, latched in
              * PAD_SEND_RESPONSE so it takes effect after this transaction.
@@ -753,7 +779,7 @@ static void pad_process_byte(uint8_t tx_byte) {
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;
-        } else if (g_pad_legacy_cfg &&
+        } else if (ds && g_pad_legacy_cfg &&
                    (tx_byte == 0x45 || tx_byte == 0x46 || tx_byte == 0x47 ||
                     tx_byte == 0x4C || tx_byte == 0x4D)) {
             /* LEGACY config answers (pre-98aa688): canned 0xF3 responses given
@@ -774,7 +800,7 @@ static void pad_process_byte(uint8_t tx_byte) {
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;
-        } else if (!g_pad_legacy_cfg && pad_in_config[selected_slot] &&
+        } else if (ds && !g_pad_legacy_cfg && pad_in_config[selected_slot] &&
                    (tx_byte == 0x44 || tx_byte == 0x45 || tx_byte == 0x46 ||
                     tx_byte == 0x47 || tx_byte == 0x4C || tx_byte == 0x4D ||
                     tx_byte == 0x4F)) {

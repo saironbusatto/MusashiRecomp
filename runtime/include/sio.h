@@ -80,6 +80,16 @@ void sio_request_pad_type(int slot, int analog);
 void sio_connect_pad(int slot);
 void sio_set_pad_connected(int slot, int connected);
 
+/* Declare whether the pad on a slot is a config-capable DualShock (1) or a
+ * plain digital controller (0). A real digital controller (SCPH-1080, poll id
+ * 0x41) does NOT answer the config-mode commands (0x43/0x44/0x45/0x46/0x47/
+ * 0x4C/0x4D/0x4F) — it returns hi-z / no ACK, so a game's pad driver classifies
+ * it as digital-only and just polls with 0x42. A DualShock answers them. Set
+ * from the per-player pad mode (DIGITAL => 0, ANALOG/HYBRID => 1) at boot/
+ * hotplug. Default is 1 (config-capable) so existing analog/hybrid behaviour is
+ * unchanged. */
+void sio_set_pad_config_capable(int slot, int capable);
+
 /* Return current pad button state (for debug server). _slot targets either. */
 uint16_t sio_get_pad_buttons(void);
 uint16_t sio_get_pad_buttons_slot(int slot);

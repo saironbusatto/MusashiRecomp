@@ -1037,6 +1037,11 @@ static void refresh_player_devices(void) {
         else open_player(p, g_players[s ^ 1]);
         sio_set_pad_connected(s, p.kind != 0 ? 1 : 0);
         sio_set_pad_analog(s, pad_mode_boot_analog(p.mode), 0x80, 0x80, 0x80, 0x80);
+        /* DIGITAL mode == a plain digital controller that ignores the DualShock
+         * config-mode commands (real SCPH-1080 behaviour); ANALOG/HYBRID == a
+         * config-capable DualShock. A digital pad that wrongly answered 0x43
+         * sent Tomba 2's pad driver down the config path -> phantom 0x00 reads. */
+        sio_set_pad_config_capable(s, p.mode != PSXRecompV4::PAD_MODE_DIGITAL);
     }
 }
 
