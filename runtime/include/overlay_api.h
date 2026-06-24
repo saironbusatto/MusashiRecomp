@@ -31,7 +31,10 @@
  *     DLLs (which lack both the emit and a host that supplies the callback). */
 /*   v5: psx_syscall callback return type void->int (CPS, RECURSION_BUG.md §25);
  *       overlays compiled under CPS emit `if (psx_syscall(...)) return;`. */
-#define PSX_OVERLAY_ABI_VERSION 6
+/*   v7: advance_cycles callback added; overlays now built with
+ *       PSX_ENABLE_BLOCK_CYCLES and charge the shared host cycle/timer timeline.
+ *       Bumping rejects stale DLLs that charged no cycles (Tomba2 Timer1 fork). */
+#define PSX_OVERLAY_ABI_VERSION 7
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -96,6 +99,11 @@ typedef struct {
     void (*dispatch_call)(CPUState *cpu, uint32_t addr, uint32_t ra);
     /* Interrupt check: called after every function return in overlay */
     void (*check_interrupts)(CPUState *cpu);
+    /* Guest-cycle accounting (ABI v7): block-cycle charge. Overlay code built
+     * with PSX_ENABLE_BLOCK_CYCLES must charge the SAME shared host cycle/timer
+     * timeline as the dirty-RAM interpreter and the BIOS, or timer-sensitive
+     * code reads different values per backend (Tomba2 logo Timer1 fork). */
+    void (*advance_cycles)(uint32_t cycles);
     /* GTE coprocessor 2 execution */
     void (*gte_execute)(CPUState *cpu, uint32_t cmd);
     /* MIPS syscall (break/syscall instructions). Returns 1 if control

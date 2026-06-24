@@ -125,6 +125,142 @@ static int    io_thread_main(void *arg);   /* defined near debug_server_poll    
  * ring-buffer entries with the current frame for cross-correlation. */
 uint64_t s_frame_count = 0;
 
+/* ---- Layer-1 first-divergence per-frame fingerprint ----------------------
+ * Cumulative, ORDER-DEPENDENT rolling hashes over MAIN-RAM guest writes.
+ * The point: native and dirty-interp are the SAME deterministic program run
+ * two ways; they must produce an identical sequence of (addr,val,store_pc)
+ * guest-RAM writes until a codegen/timing bug forks them. A guest RAM write
+ * (and the PC issuing it) is pure guest semantics — granularity-invariant
+ * across native vs interp (unlike host block/dispatch counts). We accumulate
+ * two rolling hashes and snapshot them once per guest frame. Diff two runs'
+ * per-frame columns: the FIRST frame whose hash differs is the first-divergence
+ * frame, found in O(1) instead of O(n) function guesses. wr_hash vs pc_hash
+ * classifies the fork: pc differs but wr matches => same writes via a different
+ * control path; wr differs => actual state divergence. Reusable for any title.
+ * Hashed over main RAM (phys < 0x200000) only — game state lives there; MMIO/
+ * scratchpad churn (device polling) would add benign cross-backend noise. */
+uint64_t g_fp_wr_hash    = 1469598103934665603ULL;  /* FNV-1a-style seed (main RAM) */
+uint64_t g_fp_pc_hash    = 1469598103934665603ULL;  /* store-PC path sig (main RAM)  */
+uint64_t g_fp_write_count = 0;
+uint64_t g_fp_mmio_hash  = 1469598103934665603ULL;  /* SEPARATE: device-register writes */
+uint64_t g_fp_mmio_count = 0;
+uint64_t g_fp_sp_hash    = 1469598103934665603ULL;  /* SEPARATE: scratchpad (0x1F8000xx) writes */
+uint64_t g_fp_sp_count   = 0;
+#define FP_RING_CAP 32768
+typedef struct { uint32_t frame; uint64_t wr_hash; uint64_t pc_hash; uint64_t wcount;
+                 uint64_t mmio_hash; uint64_t mmio_count;
+                 uint64_t sp_hash; uint64_t sp_count; uint64_t cyc; } FpEntry;
+static FpEntry  s_fp_ring[FP_RING_CAP];
+static uint32_t s_fp_head  = 0;
+static uint64_t s_fp_total = 0;
+
+/* Record a guest WRITE into the per-frame fingerprint. Main RAM (phys<0x200000)
+ * feeds the proven wr/pc hashes. Scratchpad (0x1F800000..0x1F8003FF) feeds a
+ * SEPARATE sp_hash — it was previously dropped entirely (the blind spot that
+ * hid a possible pre-1823 scratchpad-state fork), but folding it into wr_hash
+ * would pollute the main-RAM signal with benign device-poll churn, so it gets
+ * its own classified column instead. */
+static inline void fp_record_write(uint32_t phys, uint32_t val, uint32_t pc)
+{
+    if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {   /* scratchpad — separate hash */
+        uint64_t s = g_fp_sp_hash;
+        s = (s ^ (uint64_t)phys) * 1099511628211ULL;
+        s = (s ^ (uint64_t)val)  * 1099511628211ULL;
+        s = (s ^ (uint64_t)pc)   * 1099511628211ULL;
+        g_fp_sp_hash = s;
+        g_fp_sp_count++;
+        return;
+    }
+    if (phys >= 0x200000u) return;                  /* main RAM only */
+    uint64_t h = g_fp_wr_hash;
+    h = (h ^ (uint64_t)phys) * 1099511628211ULL;
+    h = (h ^ (uint64_t)val)  * 1099511628211ULL;
+    g_fp_wr_hash = h;
+    g_fp_pc_hash = (g_fp_pc_hash ^ (uint64_t)pc) * 1099511628211ULL;
+    g_fp_write_count++;
+}
+
+/* MMIO/device-register write signature — separate hash so the diff can tell a
+ * RAM-state fork from a device-interaction fork (CD command, IRQ ack/mask, GPU).
+ * This is the gap that hid the true first divergence: the main-RAM fingerprint
+ * only sees the RAM AFTERMATH of a CD/IRQ-register divergence. */
+static inline void fp_record_mmio(uint32_t addr, uint32_t val, uint32_t pc)
+{
+    uint64_t h = g_fp_mmio_hash;
+    h = (h ^ (uint64_t)addr) * 1099511628211ULL;
+    h = (h ^ (uint64_t)val)  * 1099511628211ULL;
+    h = (h ^ (uint64_t)pc)   * 1099511628211ULL;
+    g_fp_mmio_hash = h;
+    g_fp_mmio_count++;
+}
+
+static void fp_snapshot(uint32_t frame)
+{
+    FpEntry *e = &s_fp_ring[s_fp_head];
+    e->frame      = frame;
+    e->wr_hash    = g_fp_wr_hash;
+    e->pc_hash    = g_fp_pc_hash;
+    e->wcount     = g_fp_write_count;
+    e->mmio_hash  = g_fp_mmio_hash;
+    e->mmio_count = g_fp_mmio_count;
+    e->sp_hash    = g_fp_sp_hash;
+    e->sp_count   = g_fp_sp_count;
+    { extern uint64_t psx_get_cycle_count(void); e->cyc = psx_get_cycle_count(); }
+    s_fp_head  = (s_fp_head + 1) % FP_RING_CAP;
+    s_fp_total++;
+}
+
+/* ---- Layer-2 frame-gated ordered write recorder -------------------------
+ * Once Layer-1 names the first-divergence frame N, arm `record_frame N` to
+ * capture the full ORDERED list of main-RAM writes for that one frame in both
+ * runs. Bounded (one frame), so it dumps in clean pages with no eviction race.
+ * Diff the two ordered logs by index (longest common prefix) -> the first
+ * differing (addr,val,pc) is the exact instruction where execution forks. */
+/* UNIFIED ordered access recorder. One buffer, so the array index IS the true
+ * execution order across writes AND device reads — no separate-indices problem.
+ * Each entry carries `kind` so the diff can interleave and classify. Captures,
+ * in execution order for the one gated frame: main-RAM writes, scratchpad
+ * writes (previously the blind spot), MMIO writes, and MMIO reads. The literal
+ * first divergent ACCESS (read or write) is the first index whose tuple differs
+ * between two runs. */
+#define REC_CAP 400000
+#define REC_KIND_RAM_W   0   /* main-RAM write   */
+#define REC_KIND_SP_W    1   /* scratchpad write */
+#define REC_KIND_MMIO_W  2   /* device-register write */
+#define REC_KIND_MMIO_R  3   /* device-register read  */
+#define REC_KIND_RAM_R   4   /* main-RAM read (targeted watch range only) */
+typedef struct { uint8_t kind; uint32_t addr; uint32_t val; uint32_t pc; uint32_t ra; uint64_t cyc; } RecEntry;
+static RecEntry  s_rec_buf[REC_CAP];
+static uint32_t  s_rec_count = 0;
+static int64_t   s_rec_frame = -1;       /* target guest frame, -1 = off */
+static uint32_t  s_rec_overflow = 0;
+
+/* Targeted main-RAM READ watch. Main-RAM data loads are far too hot to trace
+ * wholesale, but a narrow watched range answers the decisive question for a
+ * value-fork-with-no-write-divergence: what value does each backend actually
+ * load from the suspect address, and does it even read that address (proving
+ * pointer/register equality)? Reads in [lo,hi) land in the unified buffer as
+ * REC_KIND_RAM_R, interleaved in execution order with the writes. The hot read
+ * path checks only the int flag g_ram_read_watch_active (0 = no cost). */
+int             g_ram_read_watch_active = 0;
+static uint32_t s_rwatch_lo = 0, s_rwatch_hi = 0;
+
+static inline void rec_event(uint8_t kind, uint32_t addr, uint32_t val,
+                             uint32_t pc, uint32_t ra)
+{
+    if (s_rec_frame < 0 || (int64_t)s_frame_count != s_rec_frame) return;
+    if (s_rec_count >= REC_CAP) { s_rec_overflow++; return; }
+    RecEntry *e = &s_rec_buf[s_rec_count++];
+    e->kind = kind; e->addr = addr; e->val = val; e->pc = pc; e->ra = ra;
+    { extern uint64_t psx_get_cycle_count(void); e->cyc = psx_get_cycle_count(); }
+}
+
+void debug_server_trace_ram_read_watch(uint32_t phys, uint32_t val)
+{
+    if (phys >= s_rwatch_lo && phys < s_rwatch_hi)
+        rec_event(REC_KIND_RAM_R, phys, val, 0, 0);
+}
+
 /* ---- CPU state pointer (set at init) ---- */
 static CPUState *s_cpu = NULL;
 
@@ -3688,6 +3824,145 @@ static void handle_frame(int id, const char *json)
              id, (unsigned long long)s_frame_count);
 }
 
+/* Layer-1 first-divergence: dump the per-frame write fingerprint ring.
+ * Params: count (default 1024), frame_lo / frame_hi (optional inclusive
+ * filter). Entries are oldest-first within the window. Diff the wr/pc columns
+ * of two runs (native vs interp/oracle): the first frame whose wr or pc differs
+ * is the first-divergence frame. Small integer fields only — no large/ragged
+ * payload, so it never trips the trace-dump JSON/eviction problems. */
+static void handle_frame_fingerprint(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 1024);
+    if (count < 1) count = 1;
+    if (count > FP_RING_CAP) count = FP_RING_CAP;
+    int flo = json_get_int(json, "frame_lo", -1);
+    int fhi = json_get_int(json, "frame_hi", -1);
+
+    uint32_t avail = (s_fp_total < FP_RING_CAP) ? (uint32_t)s_fp_total : FP_RING_CAP;
+    uint32_t start = (s_fp_total < FP_RING_CAP) ? 0 : s_fp_head;
+
+    size_t BUF = 512 + (size_t)count * 224;
+    char *out = (char *)malloc(BUF);
+    if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
+                    id, (unsigned long long)s_fp_total, avail);
+    int emitted = 0;
+    for (uint32_t i = 0; i < avail && emitted < count; i++) {
+        FpEntry *e = &s_fp_ring[(start + i) % FP_RING_CAP];
+        if (flo >= 0 && (int)e->frame < flo) continue;
+        if (fhi >= 0 && (int)e->frame > fhi) continue;
+        pos += snprintf(out + pos, BUF - pos,
+                        "%s{\"frame\":%u,\"wr\":\"0x%016llx\",\"pc\":\"0x%016llx\",\"wc\":%llu,"
+                        "\"mmio\":\"0x%016llx\",\"mc\":%llu,"
+                        "\"sp\":\"0x%016llx\",\"sc\":%llu,\"cyc\":%llu}",
+                        emitted ? "," : "", e->frame,
+                        (unsigned long long)e->wr_hash,
+                        (unsigned long long)e->pc_hash,
+                        (unsigned long long)e->wcount,
+                        (unsigned long long)e->mmio_hash,
+                        (unsigned long long)e->mmio_count,
+                        (unsigned long long)e->sp_hash,
+                        (unsigned long long)e->sp_count,
+                        (unsigned long long)e->cyc);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF - pos, "]}\n");
+    debug_server_send_line(out);
+    free(out);
+}
+
+/* Layer-2: arm the frame-gated write recorder for a guest frame. */
+static void handle_record_frame(int id, const char *json)
+{
+    int f = json_get_int(json, "frame", -1);
+    s_rec_count = 0; s_rec_overflow = 0;
+    s_rec_frame = (f < 0) ? -1 : (int64_t)f;
+    send_fmt("{\"id\":%d,\"ok\":true,\"armed_frame\":%lld,\"cur_frame\":%llu}",
+             id, (long long)s_rec_frame, (unsigned long long)s_frame_count);
+}
+
+static const char *rec_kind_str(uint8_t k)
+{
+    switch (k) {
+        case REC_KIND_RAM_W:  return "ramw";
+        case REC_KIND_SP_W:   return "spw";
+        case REC_KIND_MMIO_W: return "mmiow";
+        case REC_KIND_MMIO_R: return "mmior";
+        case REC_KIND_RAM_R:  return "ramr";
+        default:              return "?";
+    }
+}
+
+/* Layer-2: dump the recorded frame's UNIFIED ordered access log (paged). The
+ * array index `i` is the true execution order across writes and reads; `kind`
+ * classifies each. Optional "kind" param (0..3) filters to one class; default
+ * (omitted/-1) emits everything. Diff two runs by `i` — the first differing
+ * (kind,addr,val,pc) tuple is the literal first divergent access. */
+static void handle_record_frame_dump(int id, const char *json)
+{
+    int offset = json_get_int(json, "offset", 0);
+    int count  = json_get_int(json, "count", 1500);
+    int kfilt  = json_get_int(json, "kind", -1);
+    if (offset < 0) offset = 0;
+    if (count < 1) count = 1;
+    if (count > 4000) count = 4000;
+    size_t BUF = 512 + (size_t)count * 160;
+    char *out = (char *)malloc(BUF);
+    if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF - pos,
+        "{\"id\":%d,\"ok\":true,\"frame\":%lld,\"total\":%u,\"overflow\":%u,\"offset\":%d,\"entries\":[",
+        id, (long long)s_rec_frame, s_rec_count, s_rec_overflow, offset);
+    int emitted = 0;
+    for (int i = offset; i < (int)s_rec_count && emitted < count; i++) {
+        RecEntry *e = &s_rec_buf[i];
+        if (kfilt >= 0 && (int)e->kind != kfilt) continue;
+        pos += snprintf(out + pos, BUF - pos,
+            "%s{\"i\":%d,\"kind\":\"%s\",\"addr\":\"0x%08X\",\"val\":\"0x%08X\",\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"cyc\":%llu}",
+            emitted ? "," : "", i, rec_kind_str(e->kind), e->addr, e->val, e->pc, e->ra,
+            (unsigned long long)e->cyc);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF - pos, "]}\n");
+    debug_server_send_line(out);
+    free(out);
+}
+
+/* Layer-2 companion: dump only the device-register READS from the unified log,
+ * preserving their execution-order index `i`. (Thin wrapper over the unified
+ * buffer filtered to MMIO reads — retained for the existing read-diff tools.) */
+static void handle_record_reads_dump(int id, const char *json)
+{
+    int offset = json_get_int(json, "offset", 0);
+    int count  = json_get_int(json, "count", 1500);
+    if (offset < 0) offset = 0;
+    if (count < 1) count = 1;
+    if (count > 4000) count = 4000;
+    size_t BUF = 512 + (size_t)count * 112;
+    char *out = (char *)malloc(BUF);
+    if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF - pos,
+        "{\"id\":%d,\"ok\":true,\"frame\":%lld,\"total\":%u,\"offset\":%d,\"entries\":[",
+        id, (long long)s_rec_frame, s_rec_count, offset);
+    int emitted = 0;
+    int seen = 0;
+    for (int i = 0; i < (int)s_rec_count && emitted < count; i++) {
+        RecEntry *e = &s_rec_buf[i];
+        if (e->kind != REC_KIND_MMIO_R) continue;
+        if (seen++ < offset) continue;          /* page over reads only */
+        pos += snprintf(out + pos, BUF - pos,
+            "%s{\"i\":%d,\"addr\":\"0x%08X\",\"val\":\"0x%08X\",\"pc\":\"0x%08X\"}",
+            emitted ? "," : "", i, e->addr, e->val, e->pc);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF - pos, "]}\n");
+    debug_server_send_line(out);
+    free(out);
+}
+
 static void handle_get_registers(int id, const char *json)
 {
     (void)json;
@@ -6651,6 +6926,14 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     return;
 #endif
     if (is_card_critical_addr(phys)) card_trace_record(phys, old_val, new_val, width);
+    fp_record_write(phys, new_val, g_debug_last_store_pc);
+    {
+        uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
+        if (phys < 0x200000u)
+            rec_event(REC_KIND_RAM_W, phys, new_val, g_debug_last_store_pc, ra);
+        else if (phys >= 0x1F800000u && phys <= 0x1F8003FFu)
+            rec_event(REC_KIND_SP_W, phys, new_val, g_debug_last_store_pc, ra);
+    }
     wtrace_all_record(phys, new_val, width);
     wtrace_transition_record(phys, old_val, new_val, width);
     wtrace_boot_record(phys, old_val, new_val, width);
@@ -6670,6 +6953,10 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
     (void)addr; (void)val; (void)width;
     return;
 #endif
+    /* First-divergence fingerprint + frame recorder also see device writes. */
+    fp_record_mmio(addr, val, g_debug_last_store_pc);
+    rec_event(REC_KIND_MMIO_W, addr, val, g_debug_last_store_pc,
+              debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0);
     if (!s_mmio_trace) return;
     MmioTraceEntry *e = &s_mmio_trace[s_mmio_trace_head];
     e->seq       = s_mmio_trace_seq++;
@@ -6708,6 +6995,8 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
  * livelock that polls them. `val` is the value the CPU actually loaded. */
 void debug_server_trace_mmio_read(uint32_t addr, uint32_t val, uint8_t width)
 {
+    rec_event(REC_KIND_MMIO_R, addr, val, g_debug_last_store_pc,
+              debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0);
 #ifdef PSX_NO_DEBUG_TOOLS
     (void)addr; (void)val; (void)width;
     return;
@@ -9572,6 +9861,10 @@ static const CmdEntry s_commands[] = {
     { "xprobe_arm",        handle_xprobe_arm },
     { "ce_profile",        handle_ce_profile },
     { "frame",             handle_frame },
+    { "frame_fingerprint", handle_frame_fingerprint },
+    { "record_frame",      handle_record_frame },
+    { "record_frame_dump", handle_record_frame_dump },
+    { "record_reads_dump", handle_record_reads_dump },
     { "get_registers",     handle_get_registers },
     { "read_ram",          handle_read_ram },
     { "dump_ram",          handle_read_ram },   /* alias: one request, one response */
@@ -9833,6 +10126,33 @@ void debug_server_set_cpu(CPUState *cpu)
 void debug_server_init(int port)
 {
     if (port > 0) s_port = port;
+
+    /* Race-free recorder arming: PSX_RECORD_FRAME=<N> arms the unified ordered
+     * access recorder from boot (instruction 0), so it deterministically
+     * captures guest frame N no matter when a probe connects — the same
+     * always-on-from-boot model as PSX_NATIVE_BLOCK / PSX_OVERLAY_NATIVE_OFF.
+     * Never race a connect against the target frame; seed it and free-run. */
+    {
+        const char *rf = getenv("PSX_RECORD_FRAME");
+        if (rf && *rf) {
+            s_rec_frame = (int64_t)strtoll(rf, NULL, 0);
+            s_rec_count = 0; s_rec_overflow = 0;
+        }
+        /* PSX_READ_WATCH="<lo>,<hi>" arms the targeted main-RAM read watch from
+         * boot (phys range, hex/dec ok). Reads in [lo,hi) during the recorded
+         * frame land in the unified buffer as REC_KIND_RAM_R. */
+        const char *rw = getenv("PSX_READ_WATCH");
+        if (rw && *rw) {
+            char tmp[64]; snprintf(tmp, sizeof(tmp), "%s", rw);
+            char *comma = strchr(tmp, ',');
+            if (comma) {
+                *comma = '\0';
+                s_rwatch_lo = (uint32_t)strtoul(tmp, NULL, 0);
+                s_rwatch_hi = (uint32_t)strtoul(comma + 1, NULL, 0);
+                if (s_rwatch_hi > s_rwatch_lo) g_ram_read_watch_active = 1;
+            }
+        }
+    }
 
 #ifdef _WIN32
     WSADATA wsa;
@@ -10341,6 +10661,10 @@ void debug_server_record_frame(void)
 
     s_history_count = s_frame_count + 1;
     s_frame_count++;
+    /* Layer-1 first-divergence: snapshot the cumulative write fingerprint for
+     * the frame that just completed. Tagged with the new frame number so two
+     * runs line up by frame index. */
+    fp_snapshot((uint32_t)s_frame_count);
 
     /* step / run_to_frame post-frame hooks: removed with the rest of
      * pause/step machinery. s_step_count and s_run_to stay at zero. */

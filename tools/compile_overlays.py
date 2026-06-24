@@ -829,6 +829,9 @@ void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra) {
 void psx_check_interrupts(CPUState *cpu) {
     g_cbs.check_interrupts(cpu);
 }
+void psx_advance_cycles(uint32_t cycles) {
+    if (g_cbs.advance_cycles) g_cbs.advance_cycles(cycles);
+}
 void gte_execute(CPUState *cpu, uint32_t cmd) {
     g_cbs.gte_execute(cpu, cmd);
 }
@@ -1361,6 +1364,14 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
     cmd = [
         gcc, '-shared', *pic_flag, '-O2',
         '-DPSX_OVERLAY_DLL_BUILD',
+        # CYCLE MODEL UNIFICATION (Tomba2 logo Timer1 fork): compiled-overlay code
+        # MUST charge guest cycles exactly like the dirty-RAM interpreter and the
+        # BIOS (both built with PSX_ENABLE_BLOCK_CYCLES=1). Without this flag every
+        # psx_advance_cycles() in overlay code is #ifdef'd out, so a function run as
+        # a native overlay charges ~0 cycles while the same function run via the
+        # interp charges per-instruction -> timer-sensitive code (e.g. a Timer1
+        # debounce) reads different values per backend and the game forks.
+        '-DPSX_ENABLE_BLOCK_CYCLES=1',
         # Codegen-flavor tag baked into overlay_abi() (base=0). The loader
         # rejects DLLs whose flavor differs from the runtime's, so a widescreen
         # cache and a base cache can never cross-contaminate even if they share
