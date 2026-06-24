@@ -183,14 +183,121 @@ BISECTION RESULT — culprit is **func_80050B08's own native body**:
   jal return-continuations are present in the entry-switch (no missing/`default`
   fall-through-to-top). So it is NOT a wrong-target or missing-continuation bug.
 
-NARROWED to the main-loop region (block_80050C6C..0x50DE0, the part with real
-conditionals). STRONG SUSPECT: an INTERIOR ENTRY in a loop — `block_80050CE8` is an
-entry-switch case landing MID-BLOCK, immediately AFTER `0x50CE4: lhu v0,-32612(a0)`,
-so entering at 0x50CE8 uses a STALE v0 (skips the load) before the `sltu v0,v0,v1` +
-`bne` scan-loop test. This matches ChatGPT's #1 suspect (continuation/interior-entry
-handling, the 47f3f15 zone). Need to confirm what transfers control to 0x50CE8 (a
-jalr-return / jr-table / branch alias) and whether native lands there with wrong
-state vs interp.
+Additional rule-outs (Ghidra raw-RAM analysis):
+- 0x80050CE8 interior entry is SPURIOUS — Ghidra finds NO xrefs to it (over-detected
+  by the recompiler; only fall-through reaches it). Harmless red herring, not the bug.
+- No load-delay hazard in 0x50B08 (loads have compiler-scheduled nop delay slots).
+
+SMOKING-GUN TRANSITION (overlay_native_ring): the repeating cycle is
+0x89860 -> 0x89770 -> 0x50B08 -> 0x89788 -> [back to 0x89860]. After native 0x50B08's
+FIRST jal (to 0x89788) returns (ra=0x50B30), control should continue to 0x50B08's
+NEXT jal (0x85B20); instead it goes back to 0x89860 (InitHeap inside the 0x896E0
+bootstrap) — i.e. the BOOTSTRAP RE-RUNS. So the 0x89788 return / the 0x50B30 CPS
+continuation re-entry is mis-handled under native. This is consistent with why
+BLOCKING 0x50B08 fixes it: running 0x50B08 in the interp BYPASSES the native CPS
+continuation re-entry entirely (the interp runs jal callees as units and continues
+sequentially), so the broken re-entry never happens.
+
+REFINED HYPOTHESIS: the bug is in the CPS continuation RE-ENTRY for 0x50B08's interior
+PCs — the trampoline dispatching pc=0x50B30 (an interior continuation, head<0) through
+the g_psx_cps_mode path (overlay_loader.c ~line 1075: overlay_find_by_range +
+generation/crc validation + entry-switch) across the 23 resident variants of the
+0x38000 region. Either overlay_find_by_range picks the wrong variant for the interior
+PC, or the re-entry doesn't route to block_80050B30, so control escapes back to the
+bootstrap. This is a RUNTIME dispatch issue (overlay_loader.c), possibly compounded by
+the multi-variant region, NOT necessarily a code_generator.cpp per-instruction bug.
+NEXT: instrument the CPS continuation re-entry (which candidate/variant is chosen for
+pc=0x50B30, and where c->fn(cpu) lands) — add it to the always-on native ring, OR
+diff the interp's call-as-unit return vs native's trampoline re-entry at this exact
+site. The 0x89788->0x89860 transition is the window to query.
+
+GENERATED ENTRY-SWITCH CLEARED as the cause: checked all 5 resident _patched.c
+variants with func_80050B08 — ALL include `case 0x80050B30`. The only inter-variant
+diff is the SPURIOUS `0x80050CE8` case (present in 4, absent in 77548F26; harmless —
+0x50CE8 has no xrefs). So re-entry at 0x50B30 would land at block_80050B30 correctly
+IF the runtime dispatched pc=0x50B30 into func_80050B08. Since 0x85B20/0x50B30 never
+execute, the runtime is NOT re-entering func_80050B08 for pc=0x50B30 at all — the
+failure is in overlay_loader_dispatch's interior-continuation path (overlay_loader.c
+~1075: head<0 -> g_psx_cps_mode -> overlay_find_by_range(0x50B30) -> crc-validate ->
+cpu->pc=addr; c->fn). Across 43 resident 0x38000 variant DLLs, the candidate chosen
+for the interior PC 0x50B30 (or its crc validation) is wrong, so control escapes to
+the interp/bootstrap instead of block_80050B30. This is a RUNTIME dispatch bug
+(multi-variant interior-continuation re-entry), to confirm with live instrumentation
+of that exact path (log: for pc=0x50B30, the ci/variant overlay_find_by_range returns,
+crc match y/n, and the dispatch return value).
+
+KEY RING FACT: after 0x89788 returns (pc should be 0x50B30), NEITHER 0x50B30 (native
+re-entry) NOR 0x85B20 (0x50B30's jal, via interp) ever appears in the native ring —
+control goes straight to 0x89860 (bootstrap). So the trampoline neither native-re-
+enters func_80050B08 nor interp-runs 0x50B30; pc=0x50B30 is routed somewhere that
+lands back in the 0x896E0 bootstrap.
+
+overlay_find_by_range is FIRST-BY-RANGE: it returns the first s_cand (registration
+order) whose [range_lo, range_lo+range_len) contains phys, then crc-validates ONLY
+that one (no fallthrough to other range-containing candidates). With 43 resident
+0x38000 variant DLLs (+ interior-entry island fragments, c5efd70) all carrying
+func_80050B08-range entries, the candidate chosen for interior PC 0x50B30 can be the
+WRONG unit (a different variant or an island fragment whose range overlaps 0x50B30 but
+whose entry-switch lacks 0x50B30 -> default -> runs from ITS top = wrong code), or one
+whose crc fails -> return 0. Prime suspect for "control escapes to bootstrap."
+
+FIX DIRECTION (runtime, overlay_loader.c — to design after live confirmation): make
+interior-continuation re-entry select the candidate that genuinely OWNS the PC as a
+continuation (entry-switch/known-continuation membership, or nearest function-start
+<= phys whose body+crc covers phys), not merely first-by-range; and/or try all
+range-containing candidates until one validates AND owns the continuation. Until then
+the per-function native-disable (overlay_native_block) is the workaround.
+
+STATUS: localized to the runtime interior-continuation dispatch; exact fault to be
+confirmed by instrumenting the trampoline/overlay_find_by_range for pc=0x50B30.
+
+## ROOT CAUSE CONFIRMED (2026-06-23, session 3) — break fall-through pollutes function range
+
+Built a CPS-dispatch probe (overlay_cps_probe debug cmd: arm a watched interior PC,
+records what overlay_find_by_range + validation decide). Live result for the spin:
+
+  probe pc=0x89788: count=1021, chosen_addr=0x000896E0, ci=96, cands_in_range=6,
+                    crc_matched=1, outcome=2 (ran native)
+
+i.e. when func_80050B08 does `jal 0x89788` (its first subsystem-init call), the
+trampoline can't find 0x89788 as a registered entry (idx_head<0), so the CPS path
+runs overlay_find_by_range(0x89788). SIX loaded candidates have a range containing
+0x89788; it returns **func_800896E0** (the crt0 bootstrap, crc 0x1D663E23, whose range
+spans 0x896E0..past 0x89788). crc matches → it runs func_800896E0 with cpu->pc=0x89788.
+0x89770 IS a case in func_800896E0's entry-switch (so the 0x89770 dispatch works), but
+**0x89788 is NOT a case → default → func_800896E0 runs from its TOP** = the bootstrap
+re-init (zero BSS, InitHeap [the 0xA0 spin], call main 0x50B08 again...). Infinite
+re-loop → VBLANK stays masked → deadlock.
+
+WHY func_800896E0's range covers 0x89788: function_discovery.cpp:493-499 treats BREAK
+(and SYSCALL) as FALL-THROUGH ("BIOS uses these as in-line traps that return") and
+pushes addr+4 onto the discovery work-queue. The bootstrap has `jal 0x50B08; break`
+at 0x89780/0x89784 (break guards "main returned"). Discovery falls through the break
+at 0x89784 into 0x89788 — a SEPARATE function (the init-array, called directly by
+0x50B08) — absorbing it into func_800896E0's body/range. So 0x89788 is owned by
+func_800896E0 (no matching entry-switch case) instead of being its own dispatchable
+entry. The interp is immune: it executes 0x89788's bytes (init-array) directly, no
+range ownership.
+
+This is the SAME break-no-op flagged earlier; the damage is at COMPILE/DISCOVERY time
+(range pollution), not runtime execution of break — which is why it survived the
+"break isn't reached in the working path" rule-out.
+
+### Fix options (framework-wide; needs regression on Tomba1/MMX6/Ape)
+- A. BREAK terminates discovery (don't push addr+4). Clean root fix, matches
+  strict_translator/interp/HW. RISK: regresses div-by-zero break (PsyQ relies on the
+  break handler returning to EPC+4, i.e. fall-through) and any trap-that-returns.
+- B. Clip a function's discovered range at the next discovered function entry, so even
+  with break fall-through func_800896E0 stops at 0x89788. Preserves in-function
+  fall-through (div-by-zero) while preventing cross-function swallowing. Likely the
+  best fix; needs the next-entry set during range finalization.
+- C. Fall through past BREAK only if addr+4 is NOT a known function entry (terminate
+  when it would cross into another function). Targeted variant of A.
+- D. Runtime: overlay_find_by_range prefer the candidate whose c->addr is the nearest
+  start <= phys (most-specific entry) and whose crc matches, over first-by-range. Only
+  helps if a candidate with addr==0x89788 (func_80089788) is loaded + crc-matches.
+RECOMMEND B or C (don't change break execution semantics; stop the range from crossing
+a function boundary). Workaround meanwhile: overlay_native_block 0x80050B08.
 
 ## Next steps
 
