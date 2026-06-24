@@ -168,6 +168,39 @@ void overlay_loader_bad_entry_stats(uint32_t *owner, uint32_t *pc, uint64_t *cou
     if (pc)    *pc    = s_bad_entry_pc;
     if (count) *count = s_bad_entry_count;
 }
+
+/* Per-function native-disable (bisection). Functions whose ENTRY phys address is
+ * listed here are forced through the sanctioned dirty-RAM interpreter instead of
+ * their native shard — exactly as if s_native_exec were off, but for that one
+ * function only. This is a DIAGNOSTIC localization knob (not skip/stub/HLE): the
+ * function still runs, just via the interpreter. Used to binary-search which
+ * compiled overlay function's native execution causes a native-vs-interp
+ * divergence. Keyed by phys (addr & 0x1FFFFFFF) so KSEG bits don't matter. */
+#define NATIVE_BLOCK_CAP 64
+static uint32_t s_native_block[NATIVE_BLOCK_CAP];
+static int      s_native_block_n = 0;
+static uint64_t s_native_block_hits = 0;
+static int overlay_native_blocked(uint32_t addr) {
+    if (s_native_block_n == 0) return 0;
+    uint32_t p = addr & 0x1FFFFFFFu;
+    for (int i = 0; i < s_native_block_n; i++)
+        if (s_native_block[i] == p) { s_native_block_hits++; return 1; }
+    return 0;
+}
+int overlay_loader_native_block_add(uint32_t addr) {
+    uint32_t p = addr & 0x1FFFFFFFu;
+    for (int i = 0; i < s_native_block_n; i++) if (s_native_block[i] == p) return s_native_block_n;
+    if (s_native_block_n >= NATIVE_BLOCK_CAP) return -1;
+    s_native_block[s_native_block_n++] = p;
+    return s_native_block_n;
+}
+void overlay_loader_native_block_clear(void) { s_native_block_n = 0; s_native_block_hits = 0; }
+int  overlay_loader_native_block_list(uint32_t *out, int cap) {
+    int n = s_native_block_n < cap ? s_native_block_n : cap;
+    for (int i = 0; i < n; i++) out[i] = s_native_block[i];
+    return s_native_block_n;
+}
+uint64_t overlay_loader_native_block_hits(void) { return s_native_block_hits; }
 /* Address of the native overlay function currently executing (0 if none).
  * Used by the event-timeline ring to tag an event's execution mode. */
 uint32_t overlay_loader_get_inprogress(void) { return s_native_inprogress; }
@@ -1268,7 +1301,8 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
             if (matched) {
                 if (c->state != ENTRY_VALID) { c->state = ENTRY_VALID; s_valid_count++; }
                 if (c->device_touch)   { s_disp_interp++; return 0; }
-                if (!s_native_exec)    { s_would_run_native++; s_disp_interp++; return 0; }
+                if (!s_native_exec || overlay_native_blocked(c->addr))
+                                       { s_would_run_native++; s_disp_interp++; return 0; }
                 uint32_t slot = s_nring_pos++ & (NRING_CAP - 1u);
                 s_nring[slot].addr = addr;
                 s_nring[slot].crc  = c->crc_code;
@@ -1358,8 +1392,10 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
 
             /* A/B: prove whether native EXECUTION is the cause. When off, the
              * candidate matched (byte-exact) but we DON'T run native — interp
-             * handles it. */
-            if (!s_native_exec) { s_would_run_native++; s_disp_interp++; return 0; }
+             * handles it. The per-function blocklist forces the same interp
+             * routing for one function only (bisection localization). */
+            if (!s_native_exec || overlay_native_blocked(c->addr))
+                { s_would_run_native++; s_disp_interp++; return 0; }
 
             /* Record into the always-on ring BEFORE the call; mark in-progress
              * so a freeze inside this fn is visible at dump time. */

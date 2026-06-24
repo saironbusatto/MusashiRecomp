@@ -121,18 +121,100 @@ shared) ranked, for this static-MIPS CPS recompiler:
   interpreter. No load-delay hazard detection currently exists (only a branch-delay
   scanner, `tools/scan_branch_delay_hazards.py`).
 
+## Deeper investigation (2026-06-23, session 2) — codegen DOUBLY confirmed; red herrings ruled out
+
+Raw RAM dumped + loaded into Ghidra (MIPS:LE:32 @ 0x80000000). Dumps are now
+KEYED by resident-overlay identity (tools dump_ram.py writes
+`<name>_f<frame>_<variant-fingerprint>.bin` + a .json manifest of game/frame/
+resident-fn CRCs) — a bare RAM image is ambiguous because the same addresses
+hold different overlay variants per scene.
+
+Codegen-vs-race settled by TWO independent methods:
+1. Sandboxed `overlay_diff` shadow (identical state, no IRQ/timing) diverges.
+2. `overlay_irq_ratelimit n=4096` (coarse, interp-like IRQ cadence) set BEFORE
+   the freeze → STILL freezes at ~1826. Not IRQ-cadence/timing.
+=> CODEGEN, definitively not a race.
+
+Red herrings ruled OUT as the direct cause:
+- BREAK no-op: the spin-set's break is at 0x80089784. The dirty-RAM interpreter
+  (`dirty_ram_interp.c:1041`, the engine under overlay_native_off) routes break
+  to `psx_break` which CRASHES (traps.c:594 = trap_crash + exit(1)). Since
+  overlay_native_off PROGRESSES (no crash), 0x89784 is NEVER reached in the
+  working path => main (0x80050B08) does not return there normally. So the
+  recompiler's break-no-op (code_generator.cpp:973) is a real latent bug (should
+  fail-loud like strict_translator's `psx_break(...)`/the interp), but it is NOT
+  what breaks the FMV. It only matters once something upstream wrongly reaches it.
+- Load-delay: path clean (see above).
+
+Operative divergence (what actually happens): under native, control flow reaches
+the bootstrap re-loop — the native overlay ring shows a repeating cycle
+{0x89860 InitHeap-thunk → 0x89770 → 0x80050B08 "main" → 0x89788 init-array} with
+0x800896E0 (the crt0-style stack/heap/context init) re-entered each lap, calling
+InitHeap (→ A0 vector) every iteration — which is the `dispatch_tail` all-0xA0
+spin. Under interp this does not loop. i.e. native's 0x80050B08 ("main") RETURNS
+(native_ring returned:1) or the bootstrap otherwise re-enters, where interp keeps
+running. Root is a mis-emitted control transfer in the 0x80050B08 subtree (large
+fn, internal loops, many interior/alias entries) — NOT yet pinned to one insn.
+
+Shadow caveat (rule 15): `overlay_shadow_dump` reports 13 divergences; the seq-1
+(0x896E0 t0/t1) is suspect as a SYSCALL-BOUNDARY ARTIFACT — native continues
+through the A0 dispatch (t1=0x39<<2=0xE4, t0=A0_table[0x39]) while the interp
+shadow stops at the overlay→kernel(0xA0) boundary (t1=0x39). Later records have
+real RAM divergences (e.g. fn 0x85D70: RAM native=0 vs interp=0xBFC050A4, a BIOS
+ROM pointer) suggesting a systemic BIOS-interaction/return-path codegen issue,
+not one function. Need finer (instruction-level) isolation.
+
+## Session 3 (2026-06-23): per-function native-disable BUILT + bug localized to func_80050B08
+
+Built the per-function native-disable (the tool ChatGPT recommended): a phys-keyed
+blocklist in overlay_loader.c that forces a named overlay function through the
+sanctioned dirty-RAM interpreter (NOT skip/stub/HLE — it still runs), exposed as the
+`overlay_native_block` debug command ({"addr":"0x.."} add / {"clear":1} clear /
+{} report). Runtime-only change (overlay_loader.c + debug_server.c), no regen.
+
+BISECTION RESULT — culprit is **func_80050B08's own native body**:
+- `overlay_native_block addr=0x80050B08` set early → boot PASSES the freeze (frame
+  2306+), hits=1. Because the blocked function runs via interp while its CALLEES stay
+  native, this proves the bug is in 0x50B08's OWN compiled code, not a callee.
+- 0x80050B08 = the game main: a 33-`jal` subsystem-init sequence then an infinite main
+  loop (no `jr $ra`; loops via goto). It is entered ONCE (hits=1); native exec of it
+  causes the bootstrap re-loop / A0-spin; interp exec runs the game (frame advances).
+- Verified clean: all 33 CPS jal TARGETS match the RAM-decoded jal instructions; all
+  jal return-continuations are present in the entry-switch (no missing/`default`
+  fall-through-to-top). So it is NOT a wrong-target or missing-continuation bug.
+
+NARROWED to the main-loop region (block_80050C6C..0x50DE0, the part with real
+conditionals). STRONG SUSPECT: an INTERIOR ENTRY in a loop — `block_80050CE8` is an
+entry-switch case landing MID-BLOCK, immediately AFTER `0x50CE4: lhu v0,-32612(a0)`,
+so entering at 0x50CE8 uses a STALE v0 (skips the load) before the `sltu v0,v0,v1` +
+`bne` scan-loop test. This matches ChatGPT's #1 suspect (continuation/interior-entry
+handling, the 47f3f15 zone). Need to confirm what transfers control to 0x50CE8 (a
+jalr-return / jr-table / branch alias) and whether native lands there with wrong
+state vs interp.
+
 ## Next steps
 
-1. Drill to the exact diverging instruction inside the 0x800896E0 callee tree (it makes
-   an A0:0x39 call the interpreter doesn't — find the branch whose condition native
-   computes wrong). Disassemble 0x80089860 and the A0-call site; narrow with the diff
-   infra.
-2. Confer with ChatGPT on the disasm to confirm the codegen construct.
-3. Class-fix in `recompiler/src` (never generated C, never a Tomba 2 workaround).
-4. Verify: regen overlay cache, `overlay_diff` shows 0 divergences for 0x896E0, and a
-   live native run passes the freeze (frame > 2031) at 60fps with MDEC advancing.
-5. Adjudicate the exact divergent MIPS against the Beetle oracle + BIOS disasm + Ghidra;
+1. Build a PER-FUNCTION / per-entry-PC native-disable (ChatGPT's #1 tool; does not
+   exist yet — only the global overlay_native_off). It must route the disabled
+   HostUnit through the sanctioned dirty-RAM interpreter (NOT skip/stub/HLE). Then
+   bisect: start by disabling native for 0x80050B08, then its callees, to find the
+   single function whose native execution flips the freeze. This gives causal proof
+   where the shadow (function-granular, with syscall-boundary artifacts) cannot.
+2. With the culprit function isolated, instruction-diff native-vs-interp within it
+   (extend the shadow to record the first diverging guest PC, or step the dirty
+   interp and the native side from the same entry and compare per-block) to pin the
+   exact mis-emitted transfer.
+3. Confer with ChatGPT on that disasm to confirm the codegen construct (likely a
+   jr/jalr/branch continuation-PC or interior/alias-entry transfer in 0x50B08's tree).
+4. Class-fix in `recompiler/src` (never generated C, never a Tomba 2 workaround).
+5. Verify: regen overlay cache, `overlay_diff` shows 0 divergences, live native run
+   passes the freeze (frame > 2031) at 60fps with MDEC advancing.
+6. Adjudicate the exact divergent MIPS against the Beetle oracle + BIOS disasm + Ghidra;
    generated C is evidence only.
+
+Separately (independent class fixes, lower priority): emit BREAK as fail-loud/exception
+in code_generator.cpp (match strict_translator/interp), and model the R3000A
+load-delay slot.
 
 Diagnostic principle reminder: a shadow mismatch is "native differs from interp at
 fn X / insn Y", NOT automatically "native is wrong" — the interpreter can also be

@@ -9045,6 +9045,36 @@ static void handle_overlay_native_off(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"native_exec\":0}\n", id);
 }
 
+/* overlay_native_block: per-function native-disable for bisection. Forces the
+ * named overlay function(s) through the sanctioned dirty-RAM interpreter (the
+ * function still runs — NOT skipped/stubbed), so you can binary-search which
+ * compiled function's native execution causes a divergence without rebuilding.
+ *   {"cmd":"overlay_native_block","addr":"0x80050B08"}  -> add (keyed by phys)
+ *   {"cmd":"overlay_native_block","clear":1}            -> clear all
+ *   {"cmd":"overlay_native_block"}                      -> just report state */
+static void handle_overlay_native_block(int id, const char *json)
+{
+    extern int      overlay_loader_native_block_add(uint32_t addr);
+    extern void     overlay_loader_native_block_clear(void);
+    extern int      overlay_loader_native_block_list(uint32_t *out, int cap);
+    extern uint64_t overlay_loader_native_block_hits(void);
+    char abuf[32];
+    if (json_get_int(json, "clear", 0)) overlay_loader_native_block_clear();
+    if (json_get_str(json, "addr", abuf, sizeof(abuf)))
+        overlay_loader_native_block_add(hex_to_u32(abuf));
+    uint32_t list[64];
+    int n = overlay_loader_native_block_list(list, 64);
+    char buf[1200]; size_t pos = 0;
+    pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
+        "{\"id\":%d,\"ok\":true,\"count\":%d,\"hits\":%llu,\"blocked\":[",
+        id, n, (unsigned long long)overlay_loader_native_block_hits());
+    for (int i = 0; i < n && i < 64; i++)
+        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
+            "%s\"0x%08X\"", i ? "," : "", list[i]);
+    snprintf(buf + pos, sizeof(buf) - pos, "]}\n");
+    send_fmt("%s", buf);
+}
+
 /* overlay_dump: extract RAM regions that dirty_ram has marked executable
  * above a threshold physical address. Writes <crc32>.bin files to a
  * caller-supplied directory and returns a JSON manifest.
@@ -9728,6 +9758,7 @@ static const CmdEntry s_commands[] = {
     { "ra_load_watch",        handle_ra_load_watch },
     { "overlay_native_on",    handle_overlay_native_on },
     { "overlay_native_off",   handle_overlay_native_off },
+    { "overlay_native_block", handle_overlay_native_block },
     { "overlay_capture_dump", handle_overlay_capture_dump },
     { "cdrom_instant_rate",   handle_cdrom_instant_rate },
     { "cd_overwrite",         handle_cd_overwrite },
