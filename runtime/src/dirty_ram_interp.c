@@ -875,6 +875,16 @@ static void exec_delay_slot(CPUState *cpu, uint32_t pc) {
     uint32_t dummy_next = 0;
     (void)exec_one(cpu, pc, &dummy_next);
     g_dirty_ram_insns_run++;
+    /* CYCLE MODEL: the delay-slot instruction is a real retired R3000A
+     * instruction and costs its own cycle. The main interp loop charges 1 for
+     * the branch/jump itself; charge 1 here for the delay slot so a branch+slot
+     * pair costs 2 — matching the recompiler's block.instruction_count (which
+     * counts both) and hardware. Without this the dirty-interp under-charges 1
+     * cycle per taken branch vs compiled-overlay code, drifting the shared
+     * guest-cycle timeline and forking timer-sensitive code (Tomba2 logo). */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    psx_advance_cycles(1u);
+#endif
 }
 
 static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
