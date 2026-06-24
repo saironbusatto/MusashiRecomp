@@ -9075,6 +9075,27 @@ static void handle_overlay_native_block(int id, const char *json)
     send_fmt("%s", buf);
 }
 
+/* overlay_cps_probe: arm/dump the CPS interior-continuation dispatch probe.
+ *   {"cmd":"overlay_cps_probe","addr":"0x80050B30"} -> arm for that PC
+ *   {"cmd":"overlay_cps_probe"}                     -> dump last decision
+ * outcome: 0=find<0, 1=crc-miss->interp, 2=ran native, 3=device->interp, 4=blocked */
+static void handle_overlay_cps_probe(int id, const char *json)
+{
+    extern void overlay_loader_cps_probe_set(uint32_t pc);
+    extern void overlay_loader_cps_probe_get(uint32_t *pc, uint64_t *cnt,
+        uint32_t *found, int *ci, int *nrange, int *matched, int *outcome, int *ncand);
+    char abuf[32];
+    if (json_get_str(json, "addr", abuf, sizeof(abuf)))
+        overlay_loader_cps_probe_set(hex_to_u32(abuf));
+    uint32_t pc = 0, found = 0; uint64_t cnt = 0;
+    int ci = 0, nrange = 0, matched = 0, outcome = 0, ncand = 0;
+    overlay_loader_cps_probe_get(&pc, &cnt, &found, &ci, &nrange, &matched, &outcome, &ncand);
+    send_fmt("{\"id\":%d,\"ok\":true,\"probe_pc\":\"0x%08X\",\"count\":%llu,"
+             "\"chosen_addr\":\"0x%08X\",\"ci\":%d,\"chosen_nranges\":%d,"
+             "\"cands_in_range\":%d,\"crc_matched\":%d,\"outcome\":%d}\n",
+             id, pc, cnt, found, ci, nrange, ncand, matched, outcome);
+}
+
 /* overlay_dump: extract RAM regions that dirty_ram has marked executable
  * above a threshold physical address. Writes <crc32>.bin files to a
  * caller-supplied directory and returns a JSON manifest.
@@ -9759,6 +9780,7 @@ static const CmdEntry s_commands[] = {
     { "overlay_native_on",    handle_overlay_native_on },
     { "overlay_native_off",   handle_overlay_native_off },
     { "overlay_native_block", handle_overlay_native_block },
+    { "overlay_cps_probe",    handle_overlay_cps_probe },
     { "overlay_capture_dump", handle_overlay_capture_dump },
     { "cdrom_instant_rate",   handle_cdrom_instant_rate },
     { "cd_overwrite",         handle_cd_overwrite },

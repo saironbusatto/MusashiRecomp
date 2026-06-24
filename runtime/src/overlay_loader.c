@@ -201,6 +201,44 @@ int  overlay_loader_native_block_list(uint32_t *out, int cap) {
     return s_native_block_n;
 }
 uint64_t overlay_loader_native_block_hits(void) { return s_native_block_hits; }
+
+/* CPS interior-continuation dispatch probe (diagnostic, always-on when armed).
+ * Records, for a watched interior PC, what the CPS continuation re-entry path
+ * (overlay_find_by_range + validate) decides: chosen candidate entry, range
+ * count, crc match, and outcome. Used to confirm the wrong-candidate / escape
+ * hypothesis for the Tomba 2 FMV freeze (pc=0x50B30). */
+static uint32_t s_cps_probe_pc = 0;        /* phys, 0 = disarmed */
+static uint64_t s_cps_probe_count = 0;
+static uint32_t s_cps_probe_found = 0;     /* chosen c->addr (0 if none) */
+static int      s_cps_probe_ci = -2;       /* overlay_find_by_range result */
+static int      s_cps_probe_nrange = -1;
+static int      s_cps_probe_matched = -1;  /* crc match */
+static int      s_cps_probe_outcome = -1;  /* 0=find<0,1=crc-miss->interp,2=native,3=device,4=blocked */
+static int      s_cps_probe_ncand_inrange = 0; /* how many candidates' range contains the PC */
+void overlay_loader_cps_probe_set(uint32_t pc) {
+    s_cps_probe_pc = pc & 0x1FFFFFFFu; s_cps_probe_count = 0;
+    s_cps_probe_found = 0; s_cps_probe_ci = -2; s_cps_probe_nrange = -1;
+    s_cps_probe_matched = -1; s_cps_probe_outcome = -1; s_cps_probe_ncand_inrange = 0;
+}
+void overlay_loader_cps_probe_get(uint32_t *pc, uint64_t *cnt, uint32_t *found,
+                                  int *ci, int *nrange, int *matched, int *outcome,
+                                  int *ncand) {
+    if (pc) *pc = s_cps_probe_pc; if (cnt) *cnt = s_cps_probe_count;
+    if (found) *found = s_cps_probe_found; if (ci) *ci = s_cps_probe_ci;
+    if (nrange) *nrange = s_cps_probe_nrange; if (matched) *matched = s_cps_probe_matched;
+    if (outcome) *outcome = s_cps_probe_outcome; if (ncand) *ncand = s_cps_probe_ncand_inrange;
+}
+/* count how many live candidates have a range containing phys (multi-variant check) */
+static int overlay_count_by_range(uint32_t phys) {
+    int n = 0;
+    for (int i = 0; i < s_cand_n; i++) {
+        const Candidate *c = &s_cand[i];
+        if (c->state == ENTRY_BLACKLIST) continue;
+        for (int r = 0; r < c->nranges; r++)
+            if (phys >= c->range_lo[r] && phys < c->range_lo[r] + c->range_len[r]) { n++; break; }
+    }
+    return n;
+}
 /* Address of the native overlay function currently executing (0 if none).
  * Used by the event-timeline ring to tag an event's execution mode. */
 uint32_t overlay_loader_get_inprogress(void) { return s_native_inprogress; }
@@ -1281,6 +1319,16 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
      * so they run native directly here; device-touch funcs still go to interp. */
     if (head < 0 && g_psx_cps_mode) {
         int ci = overlay_find_by_range(phys);
+        int _probe = (s_cps_probe_pc && phys == s_cps_probe_pc);
+        if (_probe) {
+            s_cps_probe_count++;
+            s_cps_probe_ci = ci;
+            s_cps_probe_ncand_inrange = overlay_count_by_range(phys);
+            s_cps_probe_found = (ci >= 0) ? s_cand[ci].addr : 0;
+            s_cps_probe_nrange = (ci >= 0) ? s_cand[ci].nranges : -1;
+            s_cps_probe_matched = -1;
+            s_cps_probe_outcome = (ci < 0) ? 0 : -1;
+        }
         if (ci >= 0) {
             Candidate *c = &s_cand[ci];
             /* Generation-gated validation (overlay-cache v2 P2) — same contract
@@ -1298,11 +1346,13 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
                 c->val_gen = gen;
                 matched = (live == c->crc_code);
             }
+            if (_probe) s_cps_probe_matched = matched;
             if (matched) {
                 if (c->state != ENTRY_VALID) { c->state = ENTRY_VALID; s_valid_count++; }
-                if (c->device_touch)   { s_disp_interp++; return 0; }
+                if (c->device_touch)   { if (_probe) s_cps_probe_outcome = 3; s_disp_interp++; return 0; }
                 if (!s_native_exec || overlay_native_blocked(c->addr))
-                                       { s_would_run_native++; s_disp_interp++; return 0; }
+                                       { if (_probe) s_cps_probe_outcome = 4; s_would_run_native++; s_disp_interp++; return 0; }
+                if (_probe) s_cps_probe_outcome = 2;
                 uint32_t slot = s_nring_pos++ & (NRING_CAP - 1u);
                 s_nring[slot].addr = addr;
                 s_nring[slot].crc  = c->crc_code;
@@ -1326,6 +1376,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
                 }
                 return 1;
             }
+            if (_probe) s_cps_probe_outcome = 1;
             /* stale code bytes: fall through to the interpreter */
         }
     }
