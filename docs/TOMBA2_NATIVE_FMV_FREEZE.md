@@ -1,9 +1,42 @@
 # Tomba 2 — native-overlay FMV freeze (end of Whoopee Camp): root-cause findings
 
-Status: **ROOT CAUSE LOCALIZED** (2026-06-23). Deterministic codegen divergence
-in a native-compiled overlay function. NOT a timing/race. Exact diverging
-instruction inside the suspect call tree not yet pinned; recompiler class fix
-pending.
+Status: **FIXED + VERIFIED** (2026-06-23, wt/tomba2 bd60381). Was a deterministic
+overlay range-ownership / dispatch-legality bug (not a race). See "RESOLUTION" at
+the very bottom for the implemented fix and verification; the sections below are the
+investigation trail that led there.
+
+---
+
+## RESOLUTION (implemented + verified)
+
+Fix shipped: the fail-closed native entry guard (the runtime/dispatch-legality layer
+of the ChatGPT-validated plan; "ownership is not entry legality"). The generated CPS
+entry-switch for OVERLAY functions no longer falls through to the function top on an
+unknown interior PC — it restores the PC and calls psx_native_bad_entry, and the
+overlay dispatch routes that PC to the sanctioned dirty-RAM interpreter (the live
+bytes run correctly; NOT a stub/HLE). A true-prologue entry still runs from the top.
+Overlay-scoped via config_.overlay_mode (static BIOS/boot-EXE keep legacy behavior;
+their generated trampoline doesn't consume the signal and their ranges have no
+multi-variant ambiguity). Wired through OverlayCallbacks (ABI v5→v6 to reject stale
+caches), the DLL glue (compile_overlays.py), and the runtime (overlay_loader.c,
+cpu_state.h). Files: recompiler/src/code_generator.cpp, runtime/src/overlay_loader.c,
+runtime/include/{cpu_state.h,overlay_api.h}, tools/compile_overlays.py.
+
+VERIFIED (clean-warm native): boot passes the freeze — frame 1823 → 18001+ at
+emu_cpu 16.5ms / 60fps, i_mask=0x0D (VBLANK live), reval_crc_miss=0, invalidations=0,
+MDEC decoding; foreign-interior PCs (0x89788) fail closed to the interpreter
+(dispatch_interp_fallback; cheap flag-guarded init-array).
+
+REMAINING (optional completeness — ChatGPT's B/C "primary class fix"): clip overlay
+function ownership range at the next STRONG known function entry in the CAPTURE-DRIVEN
+overlay discovery path (compile_overlays.py + recompiler --overlay), so 0x89788 becomes
+a first-class native function and the interp fallbacks disappear. NOTE: the static
+two-phase FunctionDiscovery::discover already enforces hard_cap = next known entry via
+in_bounds (addr < hard_cap), so this is specifically an overlay-discovery-path gap, not
+a general one. Plus: NOT yet visually confirmed split-frame-free (user visual-verify).
+Framework-wide change — regression-test Tomba 1 / MMX6 / Ape before any master merge.
+
+---
 
 ## Symptom
 
@@ -298,6 +331,46 @@ This is the SAME break-no-op flagged earlier; the damage is at COMPILE/DISCOVERY
   helps if a candidate with addr==0x89788 (func_80089788) is loaded + crc-matches.
 RECOMMEND B or C (don't change break execution semantics; stop the range from crossing
 a function boundary). Workaround meanwhile: overlay_native_block 0x80050B08.
+
+### CHATGPT-VALIDATED FIX PLAN (2026-06-23, debug principles shared)
+Verdict: not a BREAK runtime-semantics bug — a discovery/range-ownership bug PLUS an
+unsafe runtime "contained range implies callable entry" assumption. Fix BOTH layers
+(defense-in-depth). Implement as a three-part class correction (all inside Arch A):
+
+1. DISCOVERY FINALIZATION (B, required): clip a function's ownership range at the next
+   STRONG known function entry:  owner_end = min(raw_end, next_strong_function_entry_after(start)).
+   STRONG = direct jal target, direct j/tailcall target, executed dispatch root,
+   game.toml symbol, manifest overlay entry. WEAK (do NOT clip on these) = linear-sweep
+   artifact, speculative recovered host, unvalidated jump-table target, range-derived
+   interior-only guess (e.g. the spurious 0x50CE8, which has no xrefs). 0x89788 is a
+   direct jal target = strong, so clipping func_800896E0 at 0x89788 is valid.
+   Compute next-entry from THAT candidate's OWN compile/discovery known-entry set —
+   NOT from the runtime list of simultaneously-loaded variants (that would mix variants;
+   overlapping scene variants each independently produce equivalent ownership).
+2. DISCOVERY TRAVERSAL (C, good): BREAK and SYSCALL are EXCEPTION EDGES, not ordinary
+   fall-through. Treat them the SAME (the distinction is NOT "syscall falls through /
+   break terminates"). Enqueue addr+4 as a trap-RESUME edge only if addr+4 is not a
+   strong known function entry. Neither may swallow a known function entry. (Preserves
+   div-by-zero break / returning-trap idioms; prevents cross-function absorption.)
+3. RUNTIME DISPATCH (D, required — fail-closed): add per-candidate LEGAL-ENTRY metadata
+   (the entry-switch case set / legal continuation PCs). overlay_find_by_range becomes:
+   (a) find candidates whose owner_range contains phys, (b) CRC/byte validate,
+   (c) REQUIRE candidate.legal_entries contains phys, (d) prefer most-specific owner if
+   several remain, (e) if none legally serves phys -> sanctioned dirty-RAM interpreter.
+   This does NOT violate Arch A (fallback is the sanctioned interp, not a stub/HLE).
+   Correct degradation = interp runs the exact live bytes at that PC.
+PLUS codegen: the generated entry-switch DEFAULT must NOT fall through to the top block.
+   Emit `default: return psx_native_bad_entry(cpu, unit_id, cpu->pc);` — dev/strict =
+   abort with ring context (matches "fully implemented or aborts"); normal runtime =
+   reject provider and fall to sanctioned dirty interp. It must NEVER run from the top.
+NUANCE: keep dispatch OwnerRange (for range-based containment) separate from
+   CRC CoveredRanges (bytes the native body may execute + validate). Don't conflate
+   "clipped ownership range" with "the only bytes this function may execute."
+
+INVARIANT (the takeaway): "containment is not ownership, and ownership is not entry
+legality." Expected post-fix: func_800896E0 owns [0x896E0,0x89788); 0x89788 either has
+its own native candidate with an exact legal entry or falls to dirty interp;
+overlay_find_by_range(0x89788) can neither choose func_800896E0 nor run it from the top.
 
 ## Next steps
 
