@@ -1728,7 +1728,32 @@ GeneratedFunction CodeGenerator::generate_function(
                     << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n", c, c);
             cps_continuation_owner_[c] = func.start_addr;
         }
-        body_ss << config_.indent << "        default: break;\n";
+        if (config_.overlay_mode) {
+            // Overlay functions: FAIL CLOSED on a foreign interior entry (the
+            // Tomba/Tomba2 native-overlay "blue screen" wedge). Entry at the true
+            // prologue (cpu->pc == start_addr) runs from the top. Any OTHER non-zero
+            // _cont is a foreign interior entry (a range-ownership mismatch routed a
+            // PC this function does not own into it). The old `default: break` ran
+            // the function FROM ITS TOP -- corrupting shared CPU/RAM state and
+            // wedging. Instead restore the requested PC and signal the overlay
+            // dispatch to route it to the sanctioned dirty-RAM interpreter
+            // (psx_native_bad_entry). NEVER run from the top.
+            if (seen.insert(func.start_addr).second) {
+                body_ss << config_.indent
+                        << fmt::format("        case 0x{:08X}u: break;  /* entry at prologue */\n",
+                                       func.start_addr);
+            }
+            body_ss << config_.indent
+                    << fmt::format("        default: cpu->pc = _cont; "
+                                   "psx_native_bad_entry(cpu, 0x{:08X}u, _cont); return;\n",
+                                   func.start_addr);
+        } else {
+            // Static (BIOS/boot-EXE) functions keep the legacy fall-through: the
+            // generated static trampoline does not consume the bad-entry signal,
+            // and static ranges are discovered once with no overlay multi-variant
+            // ownership ambiguity. (The fail-closed default is overlay-scoped.)
+            body_ss << config_.indent << "        default: break;\n";
+        }
         body_ss << config_.indent << "    }\n";
         body_ss << config_.indent << "}\n";
     }

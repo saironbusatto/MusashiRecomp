@@ -68,6 +68,11 @@ extern int psx_syscall(CPUState* cpu, uint32_t code);
 extern void psx_arith_overflow(CPUState* cpu);
 extern void psx_unaligned_access(CPUState* cpu, uint32_t addr, uint32_t pc);
 extern void psx_break(CPUState* cpu, uint32_t code, uint32_t pc);
+/* Fail-closed native entry guard: a function's CPS entry-switch calls this when
+ * dispatched at a PC that is not one of its legal entries (foreign interior PC
+ * from a range-ownership mismatch). The function returns without executing; the
+ * overlay dispatch then routes the PC to the sanctioned dirty-RAM interpreter. */
+extern void psx_native_bad_entry(CPUState* cpu, uint32_t owner, uint32_t pc);
 
 /* Dispatch — defined in generated/SCPH1001_dispatch.c */
 extern void psx_dispatch(CPUState* cpu, uint32_t target_addr);

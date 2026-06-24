@@ -31,7 +31,7 @@
  *     DLLs (which lack both the emit and a host that supplies the callback). */
 /*   v5: psx_syscall callback return type void->int (CPS, RECURSION_BUG.md §25);
  *       overlays compiled under CPS emit `if (psx_syscall(...)) return;`. */
-#define PSX_OVERLAY_ABI_VERSION 5
+#define PSX_OVERLAY_ABI_VERSION 6
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -136,6 +136,13 @@ typedef struct {
      * grows back-compatibly); may be NULL on a host that predates it — the DLL
      * glue falls back to orig. */
     uint32_t (*ws_backdrop_value)(uint32_t orig, int is_end, int window_cols);
+    /* Fail-closed native entry guard (ABI v6). The generated CPS entry-switch
+     * calls this when the function is dispatched at a PC that is not one of its
+     * legal entries (a foreign interior PC from a range-ownership mismatch); the
+     * function returns without executing and the runtime routes the PC to the
+     * sanctioned dirty-RAM interpreter. Appended LAST (struct grows back-
+     * compatibly); may be NULL on a host that predates it. */
+    void (*psx_native_bad_entry)(CPUState *cpu, uint32_t owner, uint32_t pc);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

@@ -142,6 +142,32 @@ static uint64_t s_would_run_native = 0;   /* matched but skipped (exec off)   */
 
 void overlay_loader_set_native_exec(int on) { s_native_exec = on ? 1 : 0; }
 int  overlay_loader_get_native_exec(void)   { return s_native_exec; }
+/* Fail-closed native entry guard (root-cause fix for the Tomba/Tomba2 native-
+ * overlay "blue screen" wedge). A native overlay function's generated CPS entry-
+ * switch calls psx_native_bad_entry when it is entered at a PC that is NOT one of
+ * its legal entries (true prologue or a known continuation) -- e.g. when range
+ * ownership wrongly resolved a foreign interior PC to this function. Instead of
+ * the old `default: break` (which fell through and ran the function from its
+ * TOP, corrupting shared CPU/RAM state -- the wedge), the function records the
+ * illegal entry and returns WITHOUT executing; overlay_loader_dispatch then
+ * routes the requested PC to the sanctioned dirty-RAM interpreter (the bytes at
+ * that PC run correctly). NOT a stub/HLE -- the code still runs, via interp. */
+int      g_native_bad_entry = 0;       /* set by psx_native_bad_entry, consumed by dispatch */
+static uint32_t s_bad_entry_owner = 0; /* the function unit that rejected the PC */
+static uint32_t s_bad_entry_pc = 0;    /* the illegal entry PC */
+static uint64_t s_bad_entry_count = 0;
+void psx_native_bad_entry(CPUState *cpu, uint32_t owner, uint32_t pc) {
+    (void)cpu;
+    g_native_bad_entry = 1;
+    s_bad_entry_owner = owner;
+    s_bad_entry_pc = pc;
+    s_bad_entry_count++;
+}
+void overlay_loader_bad_entry_stats(uint32_t *owner, uint32_t *pc, uint64_t *count) {
+    if (owner) *owner = s_bad_entry_owner;
+    if (pc)    *pc    = s_bad_entry_pc;
+    if (count) *count = s_bad_entry_count;
+}
 /* Address of the native overlay function currently executing (0 if none).
  * Used by the event-timeline ring to tag an event's execution mode. */
 uint32_t overlay_loader_get_inprogress(void) { return s_native_inprogress; }
@@ -836,6 +862,7 @@ static void init_callbacks(void) {
     s_callbacks.check_interrupts     = overlay_ci_wrapper;
     s_callbacks.gte_execute          = gte_execute;
     s_callbacks.psx_syscall          = psx_syscall;
+    s_callbacks.psx_native_bad_entry = psx_native_bad_entry;
     s_callbacks.psx_unknown_dispatch = psx_unknown_dispatch;
     s_callbacks.log_call_entry       = debug_server_log_call_entry;
     s_callbacks.psx_restore_state_escape = psx_restore_state_escape;
@@ -1229,6 +1256,11 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
                 if (s_active_depth > 0) s_active_depth--;
                 s_nring[slot].returned = 1;
                 s_native_inprogress = prev_inprogress;
+                if (g_native_bad_entry) {  /* foreign interior entry: fail closed to interp */
+                    g_native_bad_entry = 0;
+                    s_disp_native--; s_disp_interp++;
+                    return 0;            /* cpu->pc was restored to the requested PC */
+                }
                 return 1;
             }
             /* stale code bytes: fall through to the interpreter */
@@ -1311,6 +1343,11 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
 
             s_nring[slot].returned = 1;
             s_native_inprogress = prev_inprogress;   /* restore (nested calls) */
+            if (g_native_bad_entry) {  /* foreign interior entry: fail closed to interp */
+                g_native_bad_entry = 0;
+                s_disp_native--; s_disp_interp++;
+                return 0;            /* cpu->pc was restored to the requested PC */
+            }
             return 1;
         } else {
             s_rehash_miss++;

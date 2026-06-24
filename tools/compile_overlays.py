@@ -835,6 +835,9 @@ void gte_execute(CPUState *cpu, uint32_t cmd) {
 int psx_syscall(CPUState *cpu, uint32_t code) {
     return g_cbs.psx_syscall(cpu, code);
 }
+void psx_native_bad_entry(CPUState *cpu, uint32_t owner, uint32_t pc) {
+    if (g_cbs.psx_native_bad_entry) g_cbs.psx_native_bad_entry(cpu, owner, pc);
+}
 void psx_unknown_dispatch(CPUState *cpu, uint32_t addr, uint32_t phys) {
     g_cbs.psx_unknown_dispatch(cpu, addr, phys);
 }
