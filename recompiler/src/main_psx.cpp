@@ -448,16 +448,61 @@ int main(int argc, char** argv) {
         }
 
         std::vector<AliasEntry> alias_entries;
+        std::set<uint32_t> alias_seen;
         for (uint32_t a : interior) {
             const PSXRecomp::Function* host = containing(a);
             if (host && a == host->start_addr) continue;  // became a real entry
             if (host) {
-                alias_entries.push_back({a, host->start_addr, host->end_addr});
+                if (alias_seen.insert(a).second)
+                    alias_entries.push_back({a, host->start_addr, host->end_addr});
             } else {
                 fmt::print("  WARNING: interior seed 0x{:08X} has no host "
                            "function — left to the interpreter\n", a);
             }
         }
+
+        // Range-ownership completeness (B): a DIRECT CALL (jal) whose target
+        // lands strictly INSIDE an already-discovered function is a separate
+        // routine the host's discovered range absorbed (e.g. via a break/trap
+        // fall-through in discovery — the crt0 `jal main; break` that swallowed
+        // the next function, the Tomba 2 FMV-freeze root cause). Register every
+        // such target as an ALIAS entry so the host's entry-switch routes a
+        // dispatch of that PC to the correct interior block (running the absorbed
+        // routine natively) instead of failing closed to the interpreter. This is
+        // derived purely from static jal evidence in the discovered code, so it
+        // does not depend on the PC having been captured/executed. jal encodes a
+        // code target, so this never mints code from data.
+        size_t jal_alias_added = 0;
+        {
+            std::set<uint32_t> known_starts;
+            for (const auto& f : analysis_result.functions)
+                known_starts.insert(f.start_addr);
+            std::set<uint32_t> jal_targets;
+            for (const auto& f : analysis_result.functions) {
+                for (uint32_t a = f.start_addr; a + 4 <= f.end_addr; a += 4) {
+                    uint32_t w = read_w(a);
+                    if ((w >> 26) == 0x03u) {  // jal
+                        uint32_t tgt = (a & 0xF0000000u) | ((w & 0x03FFFFFFu) << 2);
+                        jal_targets.insert(tgt);
+                    }
+                }
+            }
+            for (uint32_t t : jal_targets) {
+                if (known_starts.count(t)) continue;          // already a real entry
+                if (!alias_seen.count(t)) {
+                    const PSXRecomp::Function* host = containing(t);
+                    if (host && t != host->start_addr) {
+                        alias_seen.insert(t);
+                        alias_entries.push_back({t, host->start_addr, host->end_addr});
+                        jal_alias_added++;
+                    }
+                }
+            }
+        }
+        if (jal_alias_added)
+            fmt::print("  +{} in-function jal-target alias entries "
+                       "(range-ownership completeness)\n", jal_alias_added);
+
         materialize_alias_groups(analysis_result, alias_entries);
         fmt::print("Overlay alias entries emitted: {}\n\n", alias_entries.size());
     } else {
