@@ -290,6 +290,9 @@ extern void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                            uint32_t new_val, uint8_t width);
 extern void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
 extern void debug_server_trace_mmio_read(uint32_t addr, uint32_t val, uint8_t width);
+/* Targeted main-RAM read watch (debug_server.c). Flag gates the hot read path. */
+extern int  g_ram_read_watch_active;
+extern void debug_server_trace_ram_read_watch(uint32_t phys, uint32_t val);
 extern void debug_server_trace_entryint_write(uint32_t phys, uint32_t old_val,
                                               uint32_t new_val, uint8_t width);
 extern CPUState *debug_cpu_ptr;
@@ -692,10 +695,14 @@ uint32_t psx_read_word(uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
-        return  (uint32_t)ram[phys]
+        uint32_t v = (uint32_t)ram[phys]
              | ((uint32_t)ram[phys + 1] << 8)
              | ((uint32_t)ram[phys + 2] << 16)
              | ((uint32_t)ram[phys + 3] << 24);
+        /* Targeted main-RAM read watch (debug). Flag is 0 in normal runs, so the
+         * hot read path pays only a predictable branch. */
+        if (g_ram_read_watch_active) debug_server_trace_ram_read_watch(phys, v);
+        return v;
     }
     /* Expansion 1: 0x1F000000..0x1F7FFFFF — no device, open bus */
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) {

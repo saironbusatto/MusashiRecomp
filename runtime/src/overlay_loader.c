@@ -964,6 +964,8 @@ static void init_callbacks(void) {
     extern void psx_restore_state_escape(void);
     s_callbacks.dispatch_call        = psx_dispatch_call;
     s_callbacks.check_interrupts     = overlay_ci_wrapper;
+    { extern void psx_advance_cycles(uint32_t cycles);
+      s_callbacks.advance_cycles     = psx_advance_cycles; }
     s_callbacks.gte_execute          = gte_execute;
     s_callbacks.psx_syscall          = psx_syscall;
     s_callbacks.psx_native_bad_entry = psx_native_bad_entry;
@@ -1112,6 +1114,37 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
          * publish + persist_sljit_shard are inert even if reached. gcc > interp. */
         s_sljit_persist = 0;
         loader_log("sljit tier DISABLED (emitter bug; gcc>interp). PSX_SLJIT_ENABLE=1 to re-enable");
+    }
+    /* Pre-seed native-block bisection list from PSX_NATIVE_BLOCK (comma/space
+     * separated hex addrs). Lets us route init-time overlay functions through the
+     * sanctioned dirty-RAM interpreter from the FIRST boot instruction — the
+     * runtime overlay_native_block cmd can only be set post-boot, too late for
+     * once-only init functions. Same diagnostic knob, just seedable at launch. */
+    {
+        const char *nb = getenv("PSX_NATIVE_BLOCK");
+        if (nb && *nb) {
+            const char *p = nb;
+            while (*p) {
+                while (*p == ' ' || *p == ',' || *p == '\t') p++;
+                if (!*p) break;
+                uint32_t a = (uint32_t)strtoul(p, NULL, 0);
+                if (a) overlay_loader_native_block_add(a);
+                while (*p && *p != ' ' && *p != ',' && *p != '\t') p++;
+            }
+            loader_log("PSX_NATIVE_BLOCK seeded %d native-block entr%s from '%s'",
+                       s_native_block_n, s_native_block_n == 1 ? "y" : "ies", nb);
+        }
+    }
+    /* Boot-time full-interp override (diagnostic): PSX_OVERLAY_NATIVE_OFF=1 forces
+     * native overlay execution off from the first instruction, so a pristine
+     * interpreter reference can be captured without racing post-boot cmds. Same
+     * effect as the overlay_native_off cmd, but seeded at launch. */
+    {
+        const char *no = getenv("PSX_OVERLAY_NATIVE_OFF");
+        if (no && *no && *no != '0') {
+            s_native_exec = 0;
+            loader_log("PSX_OVERLAY_NATIVE_OFF set: native overlay exec OFF from boot");
+        }
     }
     /* Live-mode policy is applied later via overlay_loader_apply_live_policy(),
      * AFTER code_provider_init resolves the backend (the default depends on it). */
