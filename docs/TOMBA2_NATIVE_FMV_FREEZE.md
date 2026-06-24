@@ -27,13 +27,23 @@ emu_cpu 16.5ms / 60fps, i_mask=0x0D (VBLANK live), reval_crc_miss=0, invalidatio
 MDEC decoding; foreign-interior PCs (0x89788) fail closed to the interpreter
 (dispatch_interp_fallback; cheap flag-guarded init-array).
 
-REMAINING (optional completeness — ChatGPT's B/C "primary class fix"): clip overlay
-function ownership range at the next STRONG known function entry in the CAPTURE-DRIVEN
-overlay discovery path (compile_overlays.py + recompiler --overlay), so 0x89788 becomes
-a first-class native function and the interp fallbacks disappear. NOTE: the static
-two-phase FunctionDiscovery::discover already enforces hard_cap = next known entry via
-in_bounds (addr < hard_cap), so this is specifically an overlay-discovery-path gap, not
-a general one. Plus: NOT yet visually confirmed split-frame-free (user visual-verify).
+DONE — B/C completeness (the discovery/ownership layer; recompiler main_psx.cpp overlay
+mode): in overlay discovery, after walking the seed roots, every DIRECT CALL (jal)
+target that lands strictly INSIDE an already-discovered function is registered as an
+ALIAS ENTRY of that host (the existing alias machinery — materialize_alias_groups), so
+the host's entry-switch routes a dispatch of that PC to the correct absorbed interior
+block (runs NATIVE), instead of relying on it having been captured/executed. This is
+derived purely from static jal evidence, so it does not depend on the capture. Why this
+over an explicit range-clip: the absorbed code IS the right code; it just needed a
+routable entry. VERIFIED: regenerated overlay cache (codegen hash cg4_42de29a8)
+func_800896E0 now emits `case 0x80089788u`; the cps_probe for 0x89788 drops from 1021
+hits (broken CPS find-by-range -> func_800896E0 default) to 0 (now a registered entry,
+main-chain native); freeze still gone, 60fps sustained to frame 6261+. The fail-closed
+default remains as the safety net for any genuinely-unrouted interior PC.
+NOTE: the static two-phase FunctionDiscovery::discover already enforces hard_cap = next
+known entry (in_bounds: addr < hard_cap), so only the overlay path needed this.
+
+STILL OPEN: NOT yet visually confirmed split-frame-free (user visual-verify).
 Framework-wide change — regression-test Tomba 1 / MMX6 / Ape before any master merge.
 
 ---
