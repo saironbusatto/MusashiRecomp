@@ -15,6 +15,7 @@
 #include "autocompile.h"
 #include "code_provider.h"
 #include "overlay_sljit.h"
+#include "overlay_backend.h"
 #include "gpu.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
@@ -1980,24 +1981,71 @@ int main(int argc, char** argv) {
                  * The background compile additionally needs a configured
                  * command; autocompile_request() no-ops without one. */
                 overlay_autocapture_set_enabled(1);
-                if (gc.runtime.has_overlay_autocompile_cmd) {
-                    autocompile_configure(
-                        gc.runtime.overlay_autocompile_cmd.c_str(),
-                        gc.project_root.string().c_str());
-                    std::fprintf(stdout,
-                        "psxrecomp: overlay autocompile enabled\n");
+                /* Resolve the overlay tier first so we wire the RIGHT compiler's
+                 * autocompile command. gcc is "available" only when a gcc cmd is
+                 * configured AND a gcc toolchain is actually reachable (a real
+                 * dev/production box). auto => gcc if so, else tcc; auto-no-gcc =>
+                 * tcc even with gcc present (simulate a toolchain-less user box).
+                 * env PSX_OVERLAY_BACKEND overrides. Tiers: static > gcc > tcc >
+                 * (sljit, deprecated/off) > interp. */
+                const char *cfg_backend = gc.runtime.overlay_backend.empty()
+                        ? nullptr : gc.runtime.overlay_backend.c_str();
+                int gcc_avail = gc.runtime.has_overlay_autocompile_cmd
+                                && autocompile_toolchain_available();
+                OverlayBackend eff = overlay_backend_resolve(cfg_backend, gcc_avail);
+                /* gcc and tcc run the IDENTICAL recompiler->C->DLL->load pipeline;
+                 * only the compiler binary differs. Wire the autocompile spawn with
+                 * the command for the resolved tier (tcc cmd for the tcc tier, gcc
+                 * cmd otherwise). gcc shards already on disk still LOAD either way
+                 * (the loader is compiler-blind), so a tcc box uses shipped gcc
+                 * shards first and fills the rest with tcc. */
+                std::string built_tcc_cmd;  /* runtime-constructed bundled tcc cmd */
+                const std::string *ac_cmd = nullptr;
+                if (eff == OVERLAY_BACKEND_TCC) {
+                    if (gc.runtime.has_overlay_autocompile_cmd_tcc) {
+                        ac_cmd = &gc.runtime.overlay_autocompile_cmd_tcc;  /* explicit override (dev) */
+                    } else {
+                        /* PRODUCTION: construct the tcc autocompile cmd from the
+                         * self-contained toolchain bundled beside the exe
+                         * (<exe>/overlay_toolchain/ = embedded python + tcc +
+                         * recompiler + compile_overlays.py + runtime headers). No
+                         * system python or gcc required. */
+                        extern int g_psx_cps_mode;
+                        std::filesystem::path xd = exe_dir_from_argv(argv[0]);
+                        std::filesystem::path tk = xd / "overlay_toolchain";
+                        std::filesystem::path py = tk / "python" / "python.exe";
+                        if (std::filesystem::exists(py)) {
+                            built_tcc_cmd =
+                                py.string() + " " + (tk / "compile_overlays.py").string() +
+                                " --captures " + (xd / "overlay_captures.json").string() +
+                                " --game-toml " + std::string(game_config_path ? game_config_path : "game.toml") +
+                                " --recompiler " + (tk / "psxrecomp-game.exe").string() +
+                                " --runtime-include " + (tk / "include").string() +
+                                " --out-dir " + (xd / "cache").string() +
+                                (g_psx_cps_mode ? " --cps" : "") +
+                                " --compiler tcc --tcc " + (tk / "tcc" / "tcc.exe").string();
+                            ac_cmd = &built_tcc_cmd;
+                            std::fprintf(stdout,
+                                "psxrecomp: tcc tier using bundled toolchain (%s)\n",
+                                tk.string().c_str());
+                        } else {
+                            std::fprintf(stdout,
+                                "psxrecomp: tcc tier active but no bundled toolchain at %s "
+                                "(overlay gaps -> interpreter)\n", tk.string().c_str());
+                        }
+                    }
+                } else {
+                    if (gc.runtime.has_overlay_autocompile_cmd)
+                        ac_cmd = &gc.runtime.overlay_autocompile_cmd;
                 }
-                /* Resolve the Tier-2 codegen backend now that we know whether a
-                 * compile command is wired. auto => gcc only when a C compiler is
-                 * ACTUALLY reachable (a real dev box — not merely a configured
-                 * command string, which the shipped game.toml always carries),
-                 * else sljit (toolchain-less production); env PSX_OVERLAY_BACKEND
-                 * overrides. The active provider is what the capture/dispatch
-                 * spine produces code through. */
-                code_provider_init(
-                    gc.runtime.overlay_backend.empty()
-                        ? nullptr : gc.runtime.overlay_backend.c_str(),
-                    autocompile_configured() && autocompile_toolchain_available());
+                if (ac_cmd) {
+                    autocompile_configure(ac_cmd->c_str(),
+                                          gc.project_root.string().c_str());
+                    std::fprintf(stdout,
+                        "psxrecomp: overlay autocompile enabled (%s)\n",
+                        overlay_backend_name(eff));
+                }
+                code_provider_init(cfg_backend, gcc_avail);
                 /* Now that the backend is resolved, apply the sljit live policy:
                  * a toolchain-less (sljit) machine runs validated shards live so
                  * it self-improves on the normal play path; PSX_OVERLAY_SLJIT_LIVE

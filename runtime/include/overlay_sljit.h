@@ -37,22 +37,9 @@ extern "C" {
 /* The native shard ABI — identical to overlay_loader's OverlayFn. */
 typedef void (*OverlaySljitFn)(CPUState *);
 
-/* Backend selection policy (config + PSX_OVERLAY_BACKEND env override). */
-typedef enum {
-    OVERLAY_BACKEND_AUTO  = 0, /* gcc if a toolchain is configured, else sljit */
-    OVERLAY_BACKEND_GCC   = 1, /* force the spawn-gcc->DLL producer (dev) */
-    OVERLAY_BACKEND_SLJIT = 2  /* force the in-process sljit producer       */
-} OverlayBackend;
-
-/* Resolve the active backend once at startup. autocompile_configured indicates
- * whether a gcc compile command is wired (game.toml overlay_autocompile_cmd).
- * Reads PSX_OVERLAY_BACKEND (auto|gcc|sljit) env; falls back to `cfg` (from
- * [runtime] overlay_backend) then AUTO. Result is logged and cached. */
-OverlayBackend overlay_backend_resolve(const char *cfg, int autocompile_configured);
-
-/* The cached resolution (OVERLAY_BACKEND_AUTO until resolve() runs). */
-OverlayBackend overlay_backend_active(void);
-const char    *overlay_backend_name(OverlayBackend b);
+/* Backend-selection policy (OverlayBackend enum + resolve/name/active) now lives
+ * in overlay_backend.h — it is compiler-neutral (gcc/tcc/sljit/auto) and not part
+ * of the sljit emitter. */
 
 /* sljit availability — always 1 once the lib is linked (no external dep). */
 int overlay_sljit_available(void);

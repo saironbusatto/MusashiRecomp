@@ -26,7 +26,6 @@
 #endif
 
 /* ---- counters ---------------------------------------------------------- */
-static OverlayBackend s_active   = OVERLAY_BACKEND_AUTO;
 /* RECURSION_BUG.md §25 — 1 when the build is continuation-passing (set by a
  * constructor in the generated CPS dispatch). Under CPS this JIT must emit the
  * tail-transfer contract: jr $ra publishes cpu->pc, and call-containing
@@ -34,7 +33,6 @@ static OverlayBackend s_active   = OVERLAY_BACKEND_AUTO;
  * nested psx_sljit_call. Defined in overlay_loader.c. */
 extern int g_psx_cps_mode;
 
-static int            s_resolved = 0;
 static int            s_selftest_ok = -1; /* -1 = not run */
 static uint64_t       s_compiles = 0;
 static uint64_t       s_declines = 0;
@@ -47,42 +45,8 @@ static void sljit_log(const char *fmt, ...) {
     va_end(ap);
 }
 
-/* ---- backend selection policy ----------------------------------------- */
-const char *overlay_backend_name(OverlayBackend b) {
-    switch (b) {
-        case OVERLAY_BACKEND_GCC:   return "gcc";
-        case OVERLAY_BACKEND_SLJIT: return "sljit";
-        default:                    return "auto";
-    }
-}
-
-static OverlayBackend parse_backend(const char *s, OverlayBackend dflt) {
-    if (!s || !*s) return dflt;
-    if (!strcmp(s, "gcc"))   return OVERLAY_BACKEND_GCC;
-    if (!strcmp(s, "sljit")) return OVERLAY_BACKEND_SLJIT;
-    if (!strcmp(s, "auto"))  return OVERLAY_BACKEND_AUTO;
-    return dflt;
-}
-
-OverlayBackend overlay_backend_resolve(const char *cfg, int autocompile_configured) {
-    /* Precedence: env PSX_OVERLAY_BACKEND > game.toml [runtime] overlay_backend
-     * (cfg) > AUTO. AUTO prefers gcc when a compile command is wired (a dev
-     * machine), else sljit (self-contained production / toolchain-less dev). */
-    OverlayBackend want = parse_backend(getenv("PSX_OVERLAY_BACKEND"),
-                                        parse_backend(cfg, OVERLAY_BACKEND_AUTO));
-    OverlayBackend eff = want;
-    if (want == OVERLAY_BACKEND_AUTO)
-        eff = autocompile_configured ? OVERLAY_BACKEND_GCC : OVERLAY_BACKEND_SLJIT;
-
-    s_active   = eff;
-    s_resolved = 1;
-    sljit_log("backend resolved: want=%s effective=%s (autocompile=%d)",
-              overlay_backend_name(want), overlay_backend_name(eff),
-              autocompile_configured);
-    return eff;
-}
-
-OverlayBackend overlay_backend_active(void) { return s_active; }
+/* Backend-selection policy moved to overlay_backend.{c,h} (it is compiler-
+ * neutral — gcc/tcc/sljit/auto — and does not belong in the sljit emitter). */
 
 int overlay_sljit_available(void) {
     /* Debug A/B knob: PSX_NO_SLJIT=1 makes sljit report unavailable, so the

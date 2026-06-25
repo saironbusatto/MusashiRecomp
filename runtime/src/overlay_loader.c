@@ -2,6 +2,7 @@
 #include "overlay_api.h"
 #include "code_provider.h"
 #include "overlay_sljit.h"
+#include "overlay_backend.h"
 #include "crc32.h"
 #include "dirty_ram_interp.h"
 #include "interrupts.h"
@@ -475,6 +476,19 @@ static int cache_idx_has_path(const char *path) {
     return 0;
 }
 
+/* Dedup by FILENAME (<addr8>_<crc8>.dll = region+crc). Used so a tcc/ shard for a
+ * region already covered by a gcc/ shard is skipped: scan_cache_dir scans gcc/
+ * FIRST, so gcc always wins the tie (tier order gcc > tcc). Also subsumes the
+ * per-path rescan-idempotence check (same dir => same filename). */
+static int cache_idx_has_basename(const char *fname) {
+    for (int i = 0; i < s_cache_idx_count; i++) {
+        const char *b = strrchr(s_cache_idx[i].path, '/');
+        b = b ? b + 1 : s_cache_idx[i].path;
+        if (strcmp(b, fname) == 0) return 1;
+    }
+    return 0;
+}
+
 /* Canonical cache arch-abi tag (see SLJIT.md §4 — caches are namespaced per
  * backend AND per target so a Windows-x64 gcc DLL and, later, a same-OS arm64
  * or an sljit blob for the same fragment never comingle). compile_overlays.py
@@ -525,7 +539,9 @@ static void scan_one_cache_dir(const char *dir) {
         if (s_cache_idx_count >= CACHE_IDX_CAP) break;
         char full[768];
         snprintf(full, sizeof(full), "%s/%s", dir, fd.cFileName);
-        if (cache_idx_has_path(full)) continue;  /* rescan idempotence */
+        /* skip if this region+crc is already indexed (rescan idempotence, AND a
+         * higher-priority namespace already covers it — gcc/ scanned before tcc/). */
+        if (cache_idx_has_basename(fd.cFileName)) continue;
         CacheEntry *e = &s_cache_idx[s_cache_idx_count++];
         e->region_start = addr;
         snprintf(e->path, sizeof(e->path), "%s", full);
@@ -544,7 +560,15 @@ static void scan_one_cache_dir(const char *dir) {
  * older flat / unversioned caches are simply ignored and regenerated.) */
 static void scan_cache_dir(void) {
     char dir[768];
+    /* Tier order: scan gcc/ FIRST (highest native priority — the dev/production
+     * shards), THEN tcc/ (the toolchain-free fallback). scan_one_cache_dir dedups
+     * by filename (region+crc), so a tcc shard for a region a gcc shard already
+     * covers is skipped — gcc always wins the tie. */
     snprintf(dir, sizeof(dir), "%s/%s/gcc/%s/cg%d_%08x",
+             s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
+             (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+    scan_one_cache_dir(dir);
+    snprintf(dir, sizeof(dir), "%s/%s/tcc/%s/cg%d_%08x",
              s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
              (unsigned)PSX_OVERLAY_CODEGEN_HASH);
     scan_one_cache_dir(dir);

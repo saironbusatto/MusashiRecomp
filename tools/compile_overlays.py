@@ -1116,14 +1116,64 @@ def _toolchain_env(gcc: str):
     return env, None
 
 
+# ---- TinyCC (tcc) overlay compile — toolchain-free user fallback -----------
+# tcc has its own built-in linker (no ld/collect2) and bundles its own headers,
+# so it is self-contained. The only friction is that tcc 0.9.27 does not skip a
+# UTF-8 BOM, and the recompiler's runtime headers carry one — so we feed tcc a
+# BOM-stripped copy of the include dirs (used ONLY for tcc's -I; the codegen hash
+# still derives from the real headers, so the cache dir matches the runtime).
+_TCC_BOMFREE_INC = {}   # orig include dir -> bom-stripped temp dir (memoized)
+
+def _bom_free_incdir(d: str) -> str:
+    d = os.path.abspath(d)
+    if d in _TCC_BOMFREE_INC:
+        return _TCC_BOMFREE_INC[d]
+    out = tempfile.mkdtemp(prefix='tcc_inc_')
+    for name in os.listdir(d):
+        if not name.endswith('.h'):
+            continue
+        with open(os.path.join(d, name), 'rb') as f:
+            data = f.read()
+        if data[:3] == b'\xef\xbb\xbf':
+            data = data[3:]
+        with open(os.path.join(out, name), 'wb') as f:
+            f.write(data)
+    _TCC_BOMFREE_INC[d] = out
+    return out
+
+def _compile_dll_tcc(c_path: str, out_dll: str, include_dirs, flavor: int,
+                     tcc: str) -> bool:
+    # strip a UTF-8 BOM off the overlay C itself (tcc 0.9.27 chokes on it)
+    with open(c_path, 'rb') as f:
+        data = f.read()
+    if data[:3] == b'\xef\xbb\xbf':
+        with open(c_path, 'wb') as f:
+            f.write(data[3:])
+    cmd = [tcc, '-shared',
+           '-DPSX_OVERLAY_DLL_BUILD',
+           f'-DPSX_OVERLAY_FLAVOR={int(flavor)}',
+           c_path, '-o', out_dll]
+    for d in include_dirs:
+        cmd.append('-I' + _bom_free_incdir(d))
+    print(f'  compile (tcc): {" ".join(cmd)}')
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f'  TCC COMPILE ERROR (exit {r.returncode}):\n{r.stderr or r.stdout}')
+        return False
+    return True
+
+
 def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
-                gcc: str = 'gcc', flavor: int = 0) -> bool:
+                gcc: str = 'gcc', flavor: int = 0,
+                compiler: str = 'gcc', tcc: str = 'tcc') -> bool:
     import platform
     # Absolute OS-native paths: gcc invoked from cmd.exe (the runtime's
     # autocompile spawn) silently fails (exit 1, no stderr) on relative
     # forward-slash paths; absolute backslash paths work in every context.
     c_path  = os.path.abspath(c_path)
     out_dll = os.path.abspath(out_dll)
+    if compiler == 'tcc':
+        return _compile_dll_tcc(c_path, out_dll, include_dirs, flavor, tcc)
     env, tc_dir = _toolchain_env(gcc)
     includes = [f'-I{os.path.abspath(d)}' for d in include_dirs]
     # On Windows, DLLs use PE relocations — -fPIC triggers GCC CRT init
@@ -1172,6 +1222,12 @@ def main():
                     help='cache root dir (default: build-dev/cache)')
     ap.add_argument('--gcc',             default='gcc',
                     help='GCC binary (default: gcc)')
+    ap.add_argument('--compiler',        choices=['gcc', 'tcc'], default='gcc',
+                    help='overlay shard compiler: gcc (default; dev/production, '
+                         'best-optimized) or tcc (bundled, toolchain-free user '
+                         'fallback). tcc shards land in the tcc/ cache namespace.')
+    ap.add_argument('--tcc',             default='tcc',
+                    help='TinyCC binary (used when --compiler tcc)')
     ap.add_argument('--force',           action='store_true',
                     help='recompile even if output already exists')
     ap.add_argument('--static',          action='store_true',
@@ -1221,7 +1277,7 @@ def main():
         # overlay_loader.c scan_cache_dir(). Pre-1.0: no legacy fallback.
         cg = codegen_ver(args.runtime_include)
         ch = codegen_hash(args.runtime_include)
-        cache_dir = os.path.join(args.out_dir, game_id, 'gcc', cache_arch_abi(),
+        cache_dir = os.path.join(args.out_dir, game_id, args.compiler, cache_arch_abi(),
                                  f'cg{cg}_{ch:08x}')
         os.makedirs(cache_dir, exist_ok=True)
         print(f'Cache dir: {cache_dir}  (codegen ver {cg}, hash {ch:08x})')
@@ -1393,7 +1449,8 @@ def main():
                         include_dirs.append(p)
 
                 success = compile_dll(patched_c, dll_path, include_dirs,
-                                      gcc=args.gcc, flavor=args.flavor)
+                                      gcc=args.gcc, flavor=args.flavor,
+                                      compiler=args.compiler, tcc=args.tcc)
                 if success:
                     # Emit the per-entry code-range manifest beside the DLL.
                     # The loader keys it by the same filename stem with .ranges

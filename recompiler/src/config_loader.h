@@ -98,12 +98,22 @@ struct RuntimeConfig {
     bool                  has_overlay_autocompile_cmd = false;
     std::string           overlay_autocompile_cmd;
 
-    // overlay_backend: Tier-2 codegen backend selection (SLJIT.md §1).
-    // "auto" (default, empty == auto) | "gcc" | "sljit". auto resolves to gcc
-    // when overlay_autocompile_cmd is configured (a dev machine with a
-    // toolchain), else sljit (self-contained / toolchain-less). The env var
-    // PSX_OVERLAY_BACKEND overrides this at runtime. gcc stays the default
-    // until the sljit emitter passes the same-state differential gate.
+    // overlay_autocompile_cmd_tcc: the SAME pipeline as overlay_autocompile_cmd
+    // but invoking the bundled, toolchain-free TinyCC compiler instead of gcc.
+    // The runtime spawns THIS command instead of the gcc one when the resolved
+    // backend is tcc (a machine without a gcc toolchain, or overlay_backend =
+    // "tcc"/"auto-no-gcc"). Lets gcc stay the dev/production path while tcc is
+    // the user fallback. When unset, a tcc-resolved backend has no compiler and
+    // overlay gaps fall to the interpreter.
+    bool                  has_overlay_autocompile_cmd_tcc = false;
+    std::string           overlay_autocompile_cmd_tcc;
+
+    // overlay_backend: overlay tier-selection (overlay_backend.h).
+    // "auto" (default, empty == auto) | "gcc" | "tcc" | "auto-no-gcc" | "sljit"
+    // (deprecated). auto resolves to gcc when a gcc TOOLCHAIN is present (a dev /
+    // production box), else tcc (bundled, toolchain-free). "auto-no-gcc" forces
+    // the tcc branch even with gcc present (simulate a toolchain-less user box;
+    // gcc shards still load). The env var PSX_OVERLAY_BACKEND overrides at runtime.
     std::string           overlay_backend;
 
     // ---- [video] block — visual enhancement options ----

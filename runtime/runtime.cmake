@@ -155,6 +155,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/overlay_loader.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_compile_worker.c
     ${PSXRECOMP_ROOT}/runtime/src/overlay_sljit.c
+    ${PSXRECOMP_ROOT}/runtime/src/overlay_backend.c
     ${PSXRECOMP_ROOT}/runtime/src/autocompile.c
     ${PSXRECOMP_ROOT}/runtime/src/code_provider.c
     ${PSXRECOMP_ROOT}/runtime/src/event_ring.c

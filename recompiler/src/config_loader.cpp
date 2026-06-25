@@ -140,6 +140,11 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             toml::find<std::string>(runtime, "overlay_autocompile_cmd");
         rt.has_overlay_autocompile_cmd = !rt.overlay_autocompile_cmd.empty();
     }
+    if (runtime.contains("overlay_autocompile_cmd_tcc")) {
+        rt.overlay_autocompile_cmd_tcc =
+            toml::find<std::string>(runtime, "overlay_autocompile_cmd_tcc");
+        rt.has_overlay_autocompile_cmd_tcc = !rt.overlay_autocompile_cmd_tcc.empty();
+    }
     if (runtime.contains("overlay_backend")) {
         rt.overlay_backend = toml::find<std::string>(runtime, "overlay_backend");
     }

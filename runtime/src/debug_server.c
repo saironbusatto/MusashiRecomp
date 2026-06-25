@@ -21,6 +21,7 @@
 #include "overlay_capture.h"
 #include "code_provider.h"
 #include "overlay_sljit.h"
+#include "overlay_backend.h"
 #include "overlay_compile_worker.h"
 #include "cpu_state.h"
 #include "dma.h"

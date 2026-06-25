@@ -10,6 +10,7 @@
 #include "code_provider.h"
 #include "autocompile.h"
 #include "overlay_sljit.h"
+#include "overlay_backend.h"
 
 /* ---- gcc provider: pass-through to the validated spawn->DLL->rescan path --- */
 /* The hook signatures match autocompile_* exactly, so we point straight at
@@ -68,6 +69,11 @@ void code_provider_init(const char *cfg_backend, int gcc_configured) {
      * AUTO, so this maps cleanly to one of the two providers. It also logs the
      * decision (surfaced via the sljit_status debug command). */
     OverlayBackend b = overlay_backend_resolve(cfg_backend, gcc_configured);
+    /* The "gcc" provider is really the spawn-a-compiler->DLL->rescan path; it is
+     * compiler-agnostic (the actual compiler is whatever overlay_autocompile_cmd
+     * runs — gcc OR tcc, selected in main.cpp by the resolved backend). So BOTH
+     * gcc and tcc map to it. Only the deprecated in-process sljit producer is
+     * separate. */
     s_active = (b == OVERLAY_BACKEND_SLJIT) ? &s_sljit : &s_gcc;
 }
 

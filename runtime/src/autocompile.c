@@ -14,7 +14,8 @@
 
 extern void overlay_loader_rescan(void);
 
-static char s_cmd[1024];
+static char s_cmd[4096];   /* large: the runtime-constructed bundled tcc cmd has
+                            * many absolute paths (python+script+recompiler+tcc+...) */
 static char s_cwd[512];
 
 enum { AC_IDLE = 0, AC_RUNNING = 1, AC_DONE = 2 };
@@ -134,7 +135,7 @@ int autocompile_request(void) {
 
     /* cmd.exe /C resolves the command via PATH and supports the relative
      * paths in the configured line (cwd = project root). */
-    char full[1200];
+    char full[4200];
     snprintf(full, sizeof(full), "cmd.exe /C %s", s_cmd);
 
     STARTUPINFOA si;
