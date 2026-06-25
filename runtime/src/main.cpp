@@ -2429,6 +2429,12 @@ int main(int argc, char** argv) {
      * as a game controller rather than a raw HID device. */
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
+    /* ...but HIDAPI's Xbox sub-driver is OFF by default on Windows (Xbox pads are
+     * normally RAWINPUT/XInput there). With RAWINPUT disabled above, a PHYSICAL
+     * Xbox One/Series controller would be claimed by nobody -> not a GameController
+     * -> zero input (PS5 DualSense works regardless: its HIDAPI driver is on by
+     * default). Enable the HIDAPI Xbox driver so HIDAPI handles Xbox pads too. */
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
