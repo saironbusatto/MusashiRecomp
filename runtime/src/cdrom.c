@@ -1649,3 +1649,56 @@ int cdrom_load_in_progress(void) {
     }
     return 0;
 }
+
+/* ---- boot snapshot: complete CD-ROM controller FSM (see boot_state.h) ---- */
+/* Every functional controller/drive/FIFO/IRQ-latch/XA-decode/timing global is
+ * listed here exactly once. The X-macro guarantees bytes()/write()/read() can
+ * never drift: they all expand the same field list. Pure diagnostics (trace
+ * ring, command/sector history rings, the load-burst ring, response-overwrite
+ * counters) and the host-only iso_handle pointer are intentionally excluded.
+ * PendingCmd / QueuedCmd are plain pointer-free structs, so raw copy is sound. */
+#define CDROM_SNAP_FIELDS(X) \
+    /* index-banked controller registers + IRQ latch */ \
+    X(index_reg) X(stat_reg) X(request_reg) X(irq_enable) X(irq_flag) \
+    /* CPS single-outstanding INTC latch + presentation delay */ \
+    X(cdrom_intc_request_latched) X(cdrom_irq_generation) \
+    X(cdrom_intc_latched_generation) X(cdrom_irq_present_delay) \
+    /* parameter FIFO */ \
+    X(param_fifo) X(param_count) \
+    /* response FIFO */ \
+    X(response_fifo) X(response_read) X(response_count) \
+    /* current sector buffer */ \
+    X(sector_buffer) X(sector_read_pos) X(sector_available) X(sector_size) \
+    /* last-delivered sector (GetlocL/GetlocP + in-flight re-delivery) */ \
+    X(last_sector_buffer) X(last_sector_lba) X(last_sector_size) \
+    X(last_sector_frame) X(last_sector_mode) X(last_sector_have_raw) \
+    X(last_sector_raw_mode) X(last_sector_xa_file) X(last_sector_xa_channel) \
+    X(last_sector_xa_submode) X(last_sector_xa_coding) \
+    /* seek target */ \
+    X(seek_min) X(seek_sec) X(seek_sect) X(s_setloc_lba) \
+    /* read stream state */ \
+    X(reading) X(read_min) X(read_sec) X(read_sect) X(mode_reg) \
+    X(read_cmd) X(read_delay) X(filter_file) X(filter_channel) X(cd_muted) \
+    /* XA ADPCM decode + active-stream identity */ \
+    X(xa_hist_l) X(xa_hist_r) X(xa_stream_file) X(xa_stream_channel) \
+    X(xa_stream_coding) X(xa_stream_active) \
+    /* disc-speed timing model */ \
+    X(g_disc_speed_divisor) X(g_game_divisor) X(g_instant_max_per_frame) \
+    /* pending (delayed second response) + queued command */ \
+    X(pending) X(queued_cmd)
+
+uint32_t cdrom_snapshot_bytes(void){ uint32_t n=0;
+#define X(f) n += (uint32_t)sizeof(f);
+    CDROM_SNAP_FIELDS(X)
+#undef X
+    return n; }
+void cdrom_snapshot_write(uint8_t *p){
+#define X(f) memcpy(p,&(f),sizeof(f)); p+=sizeof(f);
+    CDROM_SNAP_FIELDS(X)
+#undef X
+}
+int cdrom_snapshot_read(const uint8_t *p, uint32_t len){ if(len!=cdrom_snapshot_bytes()) return 0;
+#define X(f) memcpy(&(f),p,sizeof(f)); p+=sizeof(f);
+    CDROM_SNAP_FIELDS(X)
+#undef X
+    return 1; }

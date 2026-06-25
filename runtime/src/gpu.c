@@ -3073,3 +3073,43 @@ void gpu_write_gp1(uint32_t val) {
         }
     }
 }
+
+/* ---- boot snapshot: complete GPU register state (see boot_state.h) ---- */
+#define GPU_SNAP_FIELDS(X) \
+    X(texpage_x) X(texpage_y) X(semi_transparency) X(texpage_colors) \
+    X(dither_enabled) X(draw_to_display) X(texture_disable) X(texture_window_value) \
+    X(set_mask_bit) X(check_mask_bit) \
+    X(interlace_field) X(reverse_flag) \
+    X(draw_area_left) X(draw_area_top) X(draw_area_right) X(draw_area_bottom) \
+    X(draw_offset_x) X(draw_offset_y) \
+    X(hres1) X(hres2) X(vres) X(video_mode) X(display_depth) X(vertical_interlace) \
+    X(display_disabled) X(irq1_flag) X(dma_direction) X(lcf) \
+    X(display_area_x) X(display_area_y) \
+    X(h_display_x1) X(h_display_x2) X(v_display_y1) X(v_display_y2) \
+    X(gpuread_latch) \
+    X(gp0_state) \
+    X(gp0_cmd_buf) X(gp0_words_collected) X(gp0_words_needed) \
+    X(gp0_next_source_addr) X(gp0_cmd_source_addr) \
+    X(polyline_color) X(polyline_prev_x) X(polyline_prev_y) X(polyline_prev_c) \
+    X(polyline_semi_trans) X(polyline_has_prev) \
+    X(vram_write_x) X(vram_write_y) X(vram_write_w) X(vram_write_h) \
+    X(vram_write_col) X(vram_write_row) X(vram_write_remaining) \
+    X(vram_read_active) X(vram_read_x) X(vram_read_y) X(vram_read_w) X(vram_read_h) \
+    X(vram_read_col) X(vram_read_row)
+uint32_t gpu_snapshot_bytes(void){ uint32_t n=0;
+#define X(f) n += (uint32_t)sizeof(f);
+    GPU_SNAP_FIELDS(X)
+#undef X
+    return n; }
+void gpu_snapshot_write(uint8_t *p){
+#define X(f) memcpy(p,&(f),sizeof(f)); p+=sizeof(f);
+    GPU_SNAP_FIELDS(X)
+#undef X
+}
+int gpu_snapshot_read(const uint8_t *p, uint32_t len){ if(len!=gpu_snapshot_bytes()) return 0;
+#define X(f) memcpy(&(f),p,sizeof(f)); p+=sizeof(f);
+    GPU_SNAP_FIELDS(X)
+#undef X
+    return 1; }
+uint16_t* gpu_get_vram_ptr(void){ return vram; }
+uint32_t  gpu_get_vram_bytes(void){ return (uint32_t)sizeof(vram); }

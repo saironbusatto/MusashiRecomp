@@ -999,3 +999,26 @@ void dma_debug_get_state(DMADebugState* out) {
             delayed_complete[i].cycles_remaining;
     }
 }
+
+/* ---- boot snapshot: complete DMA hardware state (see boot_state.h) ---- */
+#define DMA_SNAP_FIELDS(X) \
+    X(channels) X(dpcr) X(dicr) X(mdec_async) X(cdrom_async) X(delayed_complete)
+uint32_t dma_snapshot_bytes(void) {
+    uint32_t n = 0;
+#define X(f) n += (uint32_t)sizeof(f);
+    DMA_SNAP_FIELDS(X)
+#undef X
+    return n;
+}
+void dma_snapshot_write(uint8_t *p) {
+#define X(f) memcpy(p, &(f), sizeof(f)); p += sizeof(f);
+    DMA_SNAP_FIELDS(X)
+#undef X
+}
+int dma_snapshot_read(const uint8_t *p, uint32_t len) {
+    if (len != dma_snapshot_bytes()) return 0;
+#define X(f) memcpy(&(f), p, sizeof(f)); p += sizeof(f);
+    DMA_SNAP_FIELDS(X)
+#undef X
+    return 1;
+}

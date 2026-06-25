@@ -2000,3 +2000,72 @@ void sio_get_pace_state(uint64_t out[16]) {
     for (int i = 0; i < 16; i++) out[i] = 0;
 #endif
 }
+
+/* ---- boot snapshot: complete SIO hardware/FSM state (see boot_state.h) ----
+ *
+ * Serializes ALL functional SIO state needed to faithfully resume a transfer
+ * mid-flight: the six SIO registers, the pad-config FSM (incl. per-slot config
+ * latches + pending type requests + the in-flight response buffer), the working
+ * memcard FSM vars AND the authoritative per-slot mc_slots[] (the working vars
+ * are saved back into mc_slots[] and zeroed whenever the bus switches device or
+ * SELECT drops, so a card transfer suspended on a deselected slot lives ONLY in
+ * mc_slots[]), the active-device selector, the cycle-paced shifter/buffer/ACK
+ * scheduler state, the g_sio_timing_active scheduler gate, and the access-paced
+ * pending-IRQ context. Pure diagnostics (trace/txn/irq rings, probe/abort/arm/
+ * burst/pace counters, host-resampled pad_buttons/pad_stick) are NOT serialized.
+ *
+ * The cycle-paced fields and g_sio_timing_active are guarded by
+ * SIO_MODEL_CYCLE_PACED so the serialized byte count matches the build that
+ * wrote it; a snapshot written by one model can never load into the other
+ * because boot_state's integrity key (codegen hash/ABI/ver) rejects it first,
+ * and sio_snapshot_read additionally length-checks. */
+#if SIO_MODEL_CYCLE_PACED
+#define SIO_SNAP_PACED_FIELDS(X) \
+    X(g_sio_timing_active) \
+    X(sio_shift_active) X(sio_shift_byte) X(sio_shift_remaining) \
+    X(sio_tx_buffered) X(sio_tx_buffer) \
+    X(sio_shift_ack_irq_en) X(sio_tx_buffer_ack_irq_en) \
+    X(sio_pending_ack) X(sio_ack_remaining) X(sio_pending_ack_irq_en) \
+    X(sio_bus_owner) X(sio_bus_byte_index)
+#else
+#define SIO_SNAP_PACED_FIELDS(X)
+#endif
+
+#define SIO_SNAP_FIELDS(X) \
+    /* SIO registers */ \
+    X(sio_tx_data) X(sio_rx_data) X(sio_stat) X(sio_mode) X(sio_ctrl) X(sio_baud) \
+    /* pad-config FSM */ \
+    X(pad_analog) X(pad_connected) X(pad_state) X(selected_slot) \
+    X(pad_response) X(pad_response_len) X(pad_response_idx) X(pad_current_cmd) \
+    X(pad_in_config) X(pad_type_req) \
+    /* memcard working FSM vars */ \
+    X(mc_state) X(mc_slot) X(mc_cmd) X(mc_sector) X(mc_sector_msb) X(mc_sector_lsb) \
+    X(mc_data) X(mc_data_idx) X(mc_checksum) X(mc_flag) \
+    /* memcard authoritative per-slot state */ \
+    X(mc_slots) \
+    /* active device selector */ \
+    X(active_device) \
+    /* cycle-paced shifter/buffer/ACK scheduler (model-gated) */ \
+    SIO_SNAP_PACED_FIELDS(X) \
+    /* access-paced pending-IRQ context */ \
+    X(sio_irq_pending) X(sio_irq_countdown) X(sio_ack_visible_reads) \
+    X(sio_irq_pending_source) X(sio_irq_pending_slot) X(sio_irq_pending_delay) \
+    X(sio_irq_pending_mc_state) X(sio_irq_pending_byte_seq)
+
+uint32_t sio_snapshot_bytes(void){ uint32_t n=0;
+#define X(f) n += (uint32_t)sizeof(f);
+    SIO_SNAP_FIELDS(X)
+#undef X
+    return n; }
+
+void sio_snapshot_write(uint8_t *p){
+#define X(f) memcpy(p,(const void*)&(f),sizeof(f)); p+=sizeof(f);  /* cast: some fields are volatile */
+    SIO_SNAP_FIELDS(X)
+#undef X
+}
+
+int sio_snapshot_read(const uint8_t *p, uint32_t len){ if(len!=sio_snapshot_bytes()) return 0;
+#define X(f) memcpy((void*)&(f),p,sizeof(f)); p+=sizeof(f);  /* cast: some fields are volatile */
+    SIO_SNAP_FIELDS(X)
+#undef X
+    return 1; }

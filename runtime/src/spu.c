@@ -774,3 +774,25 @@ void spu_event_reset(void) {
     s_event_seq = 0;
     memset(s_events, 0, sizeof(s_events));
 }
+
+/* ---- boot snapshot: complete SPU register + voice state (see boot_state.h) ---- */
+#define SPU_SNAP_FIELDS(X) \
+    X(spu_regs) X(voices) X(transfer_addr) X(key_on_count) \
+    X(endx_latch) X(kon_latch) X(koff_latch)
+uint32_t spu_snapshot_bytes(void){ uint32_t n=0;
+#define X(f) n += (uint32_t)sizeof(f);
+    SPU_SNAP_FIELDS(X)
+#undef X
+    return n; }
+void spu_snapshot_write(uint8_t *p){
+#define X(f) memcpy(p,&(f),sizeof(f)); p+=sizeof(f);
+    SPU_SNAP_FIELDS(X)
+#undef X
+}
+int spu_snapshot_read(const uint8_t *p, uint32_t len){ if(len!=spu_snapshot_bytes()) return 0;
+#define X(f) memcpy(&(f),p,sizeof(f)); p+=sizeof(f);
+    SPU_SNAP_FIELDS(X)
+#undef X
+    return 1; }
+uint8_t*  spu_get_ram_ptr(void){ return spu_ram; }
+uint32_t  spu_get_ram_bytes(void){ return (uint32_t)sizeof(spu_ram); }
