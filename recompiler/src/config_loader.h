@@ -445,6 +445,7 @@ struct UserSettings {
     // (the per-game game.toml value seeds the launcher toggle; user choice in
     // settings.toml overrides it).
     bool has_turbo_loads    = false; bool turbo_loads    = true;
+    bool has_fast_boot      = false; bool fast_boot      = false;
     // [video] fullscreen: launch the game window in desktop fullscreen (the
     // launcher's "Fullscreen on launch" toggle; the in-game F11 / Alt+Enter
     // hotkey still toggles it live). false => windowed (default).

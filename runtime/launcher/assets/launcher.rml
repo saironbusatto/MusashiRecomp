@@ -357,6 +357,9 @@ button:hover { background-color: #232d3c; }
 				<div class="set-row"><span class="set-lbl">Turbo loads</span><span class="set-ctl">
 					<button class="toggle" data-event-click="toggle_turbo_loads"><span class="value" data-if="turbo_loads">On</span><span class="value" data-if="turbo_loads == false">Off</span></button>
 					</span></div>
+				<div class="set-row"><span class="set-lbl">Skip PSX BIOS</span><span class="set-ctl">
+					<button class="toggle" data-event-click="toggle_fast_boot"><span class="value" data-if="fast_boot">On</span><span class="value" data-if="fast_boot == false">Off</span></button>
+					<span class="ws-hint" data-if="fast_boot">first boot still loads to build the cache &#8212; instant after</span></span></div>
 				<div class="set-row"><span class="set-lbl">Fullscreen on launch</span><span class="set-ctl">
 					<button class="toggle" data-event-click="toggle_fullscreen"><span class="value" data-if="fullscreen">On</span><span class="value" data-if="fullscreen == false">Off</span></button></span></div>
 			<div class="set-row" data-if="ws_eligible"><span class="set-lbl">Widescreen <span class="exp-tag">EXPERIMENTAL</span></span><span class="set-ctl">
