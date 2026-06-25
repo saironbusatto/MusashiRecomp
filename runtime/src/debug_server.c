@@ -9044,10 +9044,15 @@ static void handle_overlay_native_ring(int id, const char *json)
 {
     (void)json;
     extern int overlay_loader_dump_native_ring(char *out, int cap);
-    static char rbuf[16384];
+    static char rbuf[2 * 1024 * 1024];
     int len = overlay_loader_dump_native_ring(rbuf, (int)sizeof(rbuf));
     if (len < 0) len = 0;
-    send_fmt("{\"id\":%d,\"ok\":true,\"ring\":%s}\n", id, rbuf);
+    int cap = len + 128;
+    char *out = (char *)malloc((size_t)cap);
+    if (!out) { send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"oom\"}\n", id); return; }
+    snprintf(out, (size_t)cap, "{\"id\":%d,\"ok\":true,\"ring\":%s}", id, rbuf);
+    debug_server_send_line(out);
+    free(out);
 }
 
 /* overlay_diff_on/off: same-state native↔interp differential. With it on, each

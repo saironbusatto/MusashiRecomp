@@ -116,6 +116,12 @@ struct RuntimeConfig {
     // gcc shards still load). The env var PSX_OVERLAY_BACKEND overrides at runtime.
     std::string           overlay_backend;
 
+    // overlay_native_block: per-game overlay function entries that must stay on
+    // the dirty-RAM interpreter even when a matching native DLL exists. Intended
+    // for small timing-sensitive setup/task routines while the rest of the
+    // overlay runs native.
+    std::vector<uint32_t> overlay_native_block;
+
     // ---- [video] block — visual enhancement options ----
     // supersampling: internal-resolution SSAA factor (per axis). 1 = native
     // (default, behaves exactly as before). 2..4 render geometry/shading into

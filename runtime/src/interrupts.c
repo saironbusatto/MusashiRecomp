@@ -143,6 +143,12 @@ void* g_exception_owner_fiber = NULL;
 int   g_pending_exception_longjmp = 0;
 extern int g_psx_dispatch_depth;
 
+/* Set by psx_check_interrupts_at while a compiled block-leader interrupt check
+ * is in progress. If the delivered handler later RFEs to the sentinel outside
+ * the synchronous host window, dirty_ram_dispatch can resume at this guest PC
+ * instead of treating the sentinel as pc=0 termination. */
+static uint32_t s_compiled_interrupt_resume_pc = 0;
+
 int psx_get_in_exception(void) { return in_exception; }
 
 void psx_get_freeze_diag(uint64_t *out_total_checks,
@@ -382,6 +388,9 @@ void psx_check_interrupts(CPUState* cpu) {
     extern uint64_t g_async_rfe_set_count;
     {
         uint32_t safe_pc = g_dirty_safe_resume_pc;
+        if (safe_pc == 0u) {
+            safe_pc = s_compiled_interrupt_resume_pc;
+        }
         if (safe_pc != 0u && (safe_pc & 0x3u) == 0u &&
             (safe_pc & 0x1FFFFFFFu) < 0x00200000u) {
             g_async_rfe_resume_pc = safe_pc;
@@ -553,6 +562,8 @@ void psx_check_interrupts(CPUState* cpu) {
  * here gives the mmx6 baseline interrupt behavior — sufficient to build+run the
  * current generated code on the good baseline for instrumented comparison. */
 void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
-    (void)resume_pc;
+    uint32_t prev = s_compiled_interrupt_resume_pc;
+    s_compiled_interrupt_resume_pc = resume_pc;
     psx_check_interrupts(cpu);
+    s_compiled_interrupt_resume_pc = prev;
 }
