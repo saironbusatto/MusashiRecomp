@@ -2033,6 +2033,7 @@ int main(int argc, char** argv) {
         if (us.has_screen_kind)    g_video_screen    = us.screen_kind;
         if (us.has_auto_skip_fmv)  g_auto_skip_fmv   = us.auto_skip_fmv ? 1 : 0;
         if (us.has_turbo_loads)    g_turbo_loads_enabled = us.turbo_loads ? 1 : 0;
+        if (us.has_fast_boot)      fast_boot = us.fast_boot;
         if (us.has_fullscreen)     g_fullscreen      = us.fullscreen ? 1 : 0;
         if (us.has_aspect_ratio) {
             g_video_aspect_num = us.aspect_num;
@@ -2131,6 +2132,7 @@ int main(int argc, char** argv) {
             seed.screen_kind = g_video_screen;            seed.has_screen_kind = true;
             seed.auto_skip_fmv = (g_auto_skip_fmv != 0);  seed.has_auto_skip_fmv = true;
             seed.turbo_loads = (g_turbo_loads_enabled != 0); seed.has_turbo_loads = true;
+            seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
             seed.fullscreen = (g_fullscreen != 0);        seed.has_fullscreen = true;
             seed.aspect_num = g_video_aspect_num;
             seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
@@ -2201,6 +2203,7 @@ int main(int argc, char** argv) {
                 g_video_screen    = seed.screen_kind;
                 g_auto_skip_fmv   = seed.auto_skip_fmv ? 1 : 0;
                 g_turbo_loads_enabled = seed.turbo_loads ? 1 : 0;
+                fast_boot = seed.fast_boot;
                 g_fullscreen      = seed.fullscreen ? 1 : 0;
                 g_video_aspect_num = seed.aspect_num;
                 g_video_aspect_den = seed.aspect_den;

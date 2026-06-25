@@ -817,6 +817,9 @@ UserSettings load_user_settings(const fs::path& path) {
         if (v.contains("turbo_loads")) try_get([&]{
             s.turbo_loads = toml::find<bool>(v, "turbo_loads"); s.has_turbo_loads = true;
         });
+        if (v.contains("fast_boot")) try_get([&]{
+            s.fast_boot = toml::find<bool>(v, "fast_boot"); s.has_fast_boot = true;
+        });
         if (v.contains("fullscreen")) try_get([&]{
             s.fullscreen = toml::find<bool>(v, "fullscreen"); s.has_fullscreen = true;
         });
@@ -965,6 +968,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "auto_skip_fmv     = " << (s.auto_skip_fmv ? "true" : "false") << "\n";
     if (s.has_turbo_loads)
         f << "turbo_loads       = " << (s.turbo_loads ? "true" : "false") << "\n";
+    if (s.has_fast_boot)
+        f << "fast_boot         = " << (s.fast_boot ? "true" : "false") << "\n";
     if (s.has_fullscreen)
         f << "fullscreen        = " << (s.fullscreen ? "true" : "false") << "\n";
     if (s.has_low_latency_input)
