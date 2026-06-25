@@ -21,6 +21,7 @@
 #include "overlay_capture.h"
 #include "code_provider.h"
 #include "overlay_sljit.h"
+#include "overlay_compile_worker.h"
 #include "cpu_state.h"
 #include "dma.h"
 #include "gpu.h"
@@ -8539,6 +8540,56 @@ static void handle_sljit_status(int id, const char *json)
              overlay_loader_sljit_persist_dbg());
 }
 
+/* sljit_async: off-thread compile-worker telemetry. Reports the always-on
+ * counters (enqueued/compiled/failed/queued_now), last/worst off-thread compile
+ * time, the resolved on-disk shard dir, and the recent-compile ring. This is the
+ * ring-buffer proof that the worker actually does work: a rising `compiled` with
+ * a populated `recent[]` (each with a phys/crc/code_len/ms) while the dispatch
+ * thread's ce_profile stays flat == JIT moved off the hot path. */
+static void handle_sljit_async(int id, const char *json)
+{
+    extern void overlay_loader_sljit_cache_dir(char *buf, int n);
+    extern int  overlay_loader_sljit_async_on(void);
+    extern int  overlay_loader_sljit_tier_enabled(void);
+    (void)json;
+    uint64_t enq = 0, done = 0, failed = 0;
+    uint32_t queued = 0, last_ms = 0, max_ms = 0;
+    overlay_compile_worker_stats(&enq, &done, &failed, &queued);
+    overlay_compile_worker_timing(&last_ms, &max_ms);
+    char dir[768] = {0};
+    overlay_loader_sljit_cache_dir(dir, (int)sizeof(dir));
+    /* escape backslashes in the Windows path for valid JSON */
+    char dir_esc[1536]; int di = 0;
+    for (int i = 0; dir[i] && di < (int)sizeof(dir_esc) - 2; i++) {
+        if (dir[i] == '\\') dir_esc[di++] = '\\';
+        dir_esc[di++] = dir[i];
+    }
+    dir_esc[di] = '\0';
+
+    OverlayCompileEvent evs[64];
+    int ne = overlay_compile_worker_recent(evs, 64);
+
+    char out[16384];
+    int n = snprintf(out, sizeof(out),
+        "{\"id\":%d,\"ok\":true,\"tier_enabled\":%d,\"worker_running\":%d,\"async_on\":%d,"
+        "\"enqueued\":%llu,\"compiled\":%llu,\"failed\":%llu,\"queued_now\":%u,"
+        "\"last_compile_ms\":%u,\"max_compile_ms\":%u,\"cache_dir\":\"%s\","
+        "\"recent\":[",
+        id, overlay_loader_sljit_tier_enabled(),
+        overlay_compile_worker_running(), overlay_loader_sljit_async_on(),
+        (unsigned long long)enq, (unsigned long long)done,
+        (unsigned long long)failed, queued, last_ms, max_ms, dir_esc);
+    for (int i = 0; i < ne && n < (int)sizeof(out) - 160; i++) {
+        n += snprintf(out + n, sizeof(out) - n,
+            "%s{\"vaddr\":\"0x%08X\",\"phys\":\"0x%08X\",\"crc\":\"0x%08X\","
+            "\"code_lo\":\"0x%08X\",\"code_len\":%u,\"ms\":%u,\"ok\":%d}",
+            i ? "," : "", evs[i].vaddr, evs[i].phys, evs[i].crc,
+            evs[i].code_lo, evs[i].code_len, evs[i].compile_ms, evs[i].ok);
+    }
+    n += snprintf(out + n, sizeof(out) - n, "]}\n");
+    send_fmt("%s", out);
+}
+
 /* sljit_try <hex_addr>: force a one-shot JIT of the leaf function at a phys
  * address from live RAM (bypasses the diff gate — a probe) and report whether
  * the emitter accepted it. Lets the leaf emitter be exercised against a known
@@ -9578,6 +9629,7 @@ static const CmdEntry s_commands[] = {
     { "turbo_loads",          handle_turbo_loads },
     { "autocompile_status",   handle_autocompile_status },
     { "sljit_status",         handle_sljit_status },
+    { "sljit_async",          handle_sljit_async },
     { "sljit_try",            handle_sljit_try },
     { "autocompile_run",      handle_autocompile_run },
     { "overlay_rescan",       handle_overlay_rescan },

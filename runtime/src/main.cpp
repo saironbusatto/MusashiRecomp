@@ -580,7 +580,9 @@ static std::filesystem::path default_memcard_dir(const char* argv0) {
 
 static void close_controller(void);
 
+extern "C" void overlay_compile_worker_stop(void);
 static void shutdown_runtime(void) {
+    overlay_compile_worker_stop();   /* signal + join the off-thread sljit worker */
     memcard_flush_all();
     overlay_capture_write_json();
     if (sdl_audio_device) {

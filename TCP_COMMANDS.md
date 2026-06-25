@@ -47,6 +47,7 @@ Columns: **N** = native, **D** = DuckStation oracle.
 | `dma_state` | ✓ | ✓ | — | DPCR, DICR, all 7 channel states (madr/bcr/chcr) |
 | `event_state` |   | ✓ | — | EvCB table summary (stub on DS — events are BIOS-level) |
 | `overlay_state` |   | ✓ | — | Current overlay info |
+| `sljit_async` | ✓ |   | — | Off-thread sljit compile-worker telemetry: `worker_running`, `async_on`, always-on counters (`enqueued`/`compiled`/`failed`/`queued_now`), `last_compile_ms`/`max_compile_ms` (off-thread compile time), resolved `cache_dir`, and a `recent[]` ring of the last 64 compiles (per-shard `phys`/`crc`/`code_len`/`ms`/`ok`). Query it to prove the worker compiles off the dispatch thread without a frame hitch |
 | `cdrom_sector_dump` | ✓ |   | `offset`, `len` | Dump bytes from the last CD-ROM sector observed by the controller, including LBA/mode metadata |
 | `cdrom_sector_history` | ✓ |   | `count`, optional `lba` | Dump newest CD-ROM sector history entries, including raw XA subheader fields, CPU/audio delivery flags, and the first 128 bytes |
 | `cdrom_sector_history_clear` | ✓ |   | — | Reset the CD-ROM sector history ring |
