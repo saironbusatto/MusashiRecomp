@@ -7,6 +7,7 @@
 #include "dirty_ram_interp.h"
 #include "interrupts.h"
 #include "debug_server.h"
+#include "psx_cycles.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -125,13 +126,14 @@ static int s_active_depth = 0;
  * interest — never "arm a trace then hope". s_native_inprogress holds the entry
  * currently executing (nonzero at dump => a native fn was entered and never
  * returned: a freeze INSIDE native code, the strongest single suspect). */
-#define NRING_CAP 1024
-typedef struct { uint32_t addr; uint32_t crc; uint64_t seq; int returned; } NRingEnt;
+#define NRING_CAP 16384
+typedef struct { uint32_t addr; uint32_t crc; uint32_t frame; uint64_t seq; int returned; } NRingEnt;
 static NRingEnt s_nring[NRING_CAP];
 static uint32_t s_nring_pos = 0;
 static uint64_t s_nring_seq = 0;
 static uint32_t s_native_inprogress = 0;   /* addr of fn currently in native, 0 = none */
 static uint64_t s_native_calls_total = 0;
+extern uint64_t s_frame_count;
 
 /* Runtime A/B: when 0, candidates are still hashed/validated and recorded, but
  * NEVER executed native — execution falls to the interpreter. Lets us prove
@@ -912,6 +914,7 @@ int overlay_loader_has_cached_crc(uint32_t region_start, uint32_t crc) {
 
 extern void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra);
 extern void psx_check_interrupts(CPUState *cpu);
+extern void psx_check_interrupts_at(CPUState *cpu, uint32_t resume_pc);
 extern void gte_execute(CPUState *cpu, uint32_t cmd);
 extern int psx_syscall(CPUState *cpu, uint32_t code);
 extern void psx_unknown_dispatch(CPUState *cpu, uint32_t addr, uint32_t phys);
@@ -937,6 +940,14 @@ static int      s_suppress_irq = 0;
 static uint32_t s_irq_ratelimit = 0;   /* 0 = full suppress; N = every Nth call */
 static uint32_t s_irq_callcount = 0;
 static uint64_t s_irq_suppressed = 0;
+static uint32_t s_irq_budget_cycles = 0; /* 0 = off; otherwise guest cycles/check */
+static uint64_t s_irq_last_check_cycle = UINT64_MAX;
+static int      s_irq_suppress_cdrom_only = 0;
+static int      s_irq_post_dispatch_pump = 0;
+static int      s_irq_defer_cdrom = 0;
+
+extern uint32_t i_stat;
+extern uint32_t i_mask;
 
 void overlay_loader_set_irq_suppress(int mode, uint32_t ratelimit) {
     s_suppress_irq  = mode ? 1 : 0;
@@ -952,18 +963,78 @@ void overlay_loader_get_irq_suppress(int *mode, uint32_t *rl, uint64_t *supp) {
     if (supp) *supp = s_irq_suppressed;
 }
 
-static void overlay_ci_wrapper(CPUState *cpu) {
+static int overlay_irq_suppressed_now(void) {
     if (s_suppress_irq) {
-        if (s_irq_ratelimit == 0) { s_irq_suppressed++; return; }
-        if ((++s_irq_callcount % s_irq_ratelimit) != 0) { s_irq_suppressed++; return; }
+        if (s_irq_ratelimit == 0) { s_irq_suppressed++; return 1; }
+        if ((++s_irq_callcount % s_irq_ratelimit) != 0) { s_irq_suppressed++; return 1; }
+    }
+    if (s_irq_suppress_cdrom_only) {
+        uint32_t pending = i_stat & i_mask;
+        if (pending == (1u << IRQ_CDROM)) {
+            s_irq_suppressed++;
+            return 1;
+        }
+    }
+    if (s_irq_budget_cycles != 0) {
+        uint64_t now = psx_get_cycle_count();
+        if (s_irq_last_check_cycle != UINT64_MAX &&
+            now - s_irq_last_check_cycle < (uint64_t)s_irq_budget_cycles) {
+            s_irq_suppressed++;
+            return 1;
+        }
+        s_irq_last_check_cycle = now;
+    }
+    return 0;
+}
+
+static void overlay_ci_wrapper(CPUState *cpu) {
+    if (overlay_irq_suppressed_now()) return;
+    if (s_irq_defer_cdrom && (i_stat & (1u << IRQ_CDROM))) {
+        uint32_t saved_cd = i_stat & (1u << IRQ_CDROM);
+        i_stat &= ~(1u << IRQ_CDROM);
+        psx_check_interrupts(cpu);
+        i_stat |= saved_cd;
+        return;
     }
     psx_check_interrupts(cpu);
+}
+
+static void overlay_ci_at_wrapper(CPUState *cpu, uint32_t resume_pc) {
+    if (overlay_irq_suppressed_now()) return;
+    if (s_irq_defer_cdrom && (i_stat & (1u << IRQ_CDROM))) {
+        uint32_t saved_cd = i_stat & (1u << IRQ_CDROM);
+        i_stat &= ~(1u << IRQ_CDROM);
+        psx_check_interrupts_at(cpu, resume_pc);
+        i_stat |= saved_cd;
+        return;
+    }
+    psx_check_interrupts_at(cpu, resume_pc);
+}
+
+static int overlay_irq_budget_blocks_now(void) {
+    if (s_irq_budget_cycles == 0) return 0;
+    uint64_t now = psx_get_cycle_count();
+    if (s_irq_last_check_cycle != UINT64_MAX &&
+        now - s_irq_last_check_cycle < (uint64_t)s_irq_budget_cycles) {
+        s_irq_suppressed++;
+        return 1;
+    }
+    s_irq_last_check_cycle = now;
+    return 0;
+}
+
+static void overlay_post_dispatch_irq_pump(CPUState *cpu) {
+    if (!s_irq_post_dispatch_pump) return;
+    if (overlay_irq_budget_blocks_now()) return;
+    if (cpu->pc != 0u) psx_check_interrupts_at(cpu, cpu->pc);
+    else psx_check_interrupts(cpu);
 }
 
 static void init_callbacks(void) {
     extern void psx_restore_state_escape(void);
     s_callbacks.dispatch_call        = psx_dispatch_call;
     s_callbacks.check_interrupts     = overlay_ci_wrapper;
+    s_callbacks.check_interrupts_at  = overlay_ci_at_wrapper;
     { extern void psx_advance_cycles(uint32_t cycles);
       s_callbacks.advance_cycles     = psx_advance_cycles; }
     s_callbacks.gte_execute          = gte_execute;
@@ -1144,6 +1215,57 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
         if (no && *no && *no != '0') {
             s_native_exec = 0;
             loader_log("PSX_OVERLAY_NATIVE_OFF set: native overlay exec OFF from boot");
+        }
+    }
+    {
+        const char *sup = getenv("PSX_OVERLAY_IRQ_SUPPRESS");
+        const char *rl  = getenv("PSX_OVERLAY_IRQ_RATELIMIT");
+        if (sup && *sup && *sup != '0') {
+            overlay_loader_set_irq_suppress(1, 0);
+            loader_log("PSX_OVERLAY_IRQ_SUPPRESS set: native overlay IRQ checks suppressed from boot");
+        } else if (rl && *rl) {
+            uint32_t n = (uint32_t)strtoul(rl, NULL, 0);
+            if (n == 0) n = 1;
+            overlay_loader_set_irq_suppress(1, n);
+            loader_log("PSX_OVERLAY_IRQ_RATELIMIT set: native overlay IRQ checks every %u call(s)", n);
+        }
+    }
+    {
+        const char *budget = getenv("PSX_OVERLAY_IRQ_BUDGET");
+        if (budget && *budget) {
+            uint32_t n = (uint32_t)strtoul(budget, NULL, 0);
+            s_irq_budget_cycles = n;
+            s_irq_last_check_cycle = UINT64_MAX;
+            loader_log("PSX_OVERLAY_IRQ_BUDGET set: native overlay IRQ checks every %u guest cycle(s)", n);
+        }
+    }
+    {
+        const char *no_cd = getenv("PSX_OVERLAY_IRQ_NO_CDROM");
+        if (no_cd && *no_cd && *no_cd != '0') {
+            s_irq_suppress_cdrom_only = 1;
+            loader_log("PSX_OVERLAY_IRQ_NO_CDROM set: native overlay CDROM-only IRQ checks suppressed");
+        }
+    }
+    {
+        const char *defer_cd = getenv("PSX_OVERLAY_IRQ_DEFER_CDROM");
+        if (defer_cd && *defer_cd && *defer_cd != '0') {
+            s_irq_defer_cdrom = 1;
+            loader_log("PSX_OVERLAY_IRQ_DEFER_CDROM set: native overlay CDROM IRQ delivery deferred");
+        }
+    }
+    {
+        const char *post = getenv("PSX_OVERLAY_IRQ_POST_PUMP");
+        if (post && *post && *post != '0') {
+            s_irq_post_dispatch_pump = 1;
+            s_irq_last_check_cycle = UINT64_MAX;
+            loader_log("PSX_OVERLAY_IRQ_POST_PUMP set: native overlay dispatch-return IRQ pump enabled");
+        }
+    }
+    {
+        const char *diff = getenv("PSX_OVERLAY_DIFF");
+        if (diff && *diff && *diff != '0') {
+            s_diff_mode = 1;
+            loader_log("PSX_OVERLAY_DIFF set: native/interp shadow diff ON from boot");
         }
     }
     /* Live-mode policy is applied later via overlay_loader_apply_live_policy(),
@@ -1413,12 +1535,13 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
             if (matched) {
                 if (c->state != ENTRY_VALID) { c->state = ENTRY_VALID; s_valid_count++; }
                 if (c->device_touch)   { if (_probe) s_cps_probe_outcome = 3; s_disp_interp++; return 0; }
-                if (!s_native_exec || overlay_native_blocked(c->addr))
+                if (!s_native_exec || overlay_native_blocked(c->addr) || overlay_native_blocked(addr))
                                        { if (_probe) s_cps_probe_outcome = 4; s_would_run_native++; s_disp_interp++; return 0; }
                 if (_probe) s_cps_probe_outcome = 2;
                 uint32_t slot = s_nring_pos++ & (NRING_CAP - 1u);
                 s_nring[slot].addr = addr;
                 s_nring[slot].crc  = c->crc_code;
+                s_nring[slot].frame = (uint32_t)s_frame_count;
                 s_nring[slot].seq  = ++s_nring_seq;
                 s_nring[slot].returned = 0;
                 uint32_t prev_inprogress = s_native_inprogress;
@@ -1429,6 +1552,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
                 s_disp_native++;
                 cpu->pc = addr;          /* route the func's entry-switch to the block */
                 c->fn(cpu);
+                overlay_post_dispatch_irq_pump(cpu);
                 if (s_active_depth > 0) s_active_depth--;
                 s_nring[slot].returned = 1;
                 s_native_inprogress = prev_inprogress;
@@ -1516,6 +1640,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
             uint32_t slot = s_nring_pos++ & (NRING_CAP - 1u);
             s_nring[slot].addr = c->addr;
             s_nring[slot].crc  = c->crc_code;
+            s_nring[slot].frame = (uint32_t)s_frame_count;
             s_nring[slot].seq  = ++s_nring_seq;
             s_nring[slot].returned = 0;
             uint32_t prev_inprogress = s_native_inprogress;
@@ -1531,6 +1656,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
             uint32_t mtag = (uint32_t)s_nring[slot].seq;  /* stable across nesting */
             dirty_ram_log_marker(c->addr, mtag, 0);
             c->fn(cpu);
+            overlay_post_dispatch_irq_pump(cpu);
             dirty_ram_log_marker(c->addr, mtag, 1);
             if (s_active_depth > 0) s_active_depth--;
 
@@ -1740,6 +1866,7 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     extern uint8_t *memory_get_ram_ptr(void);
     extern uint8_t *memory_get_scratchpad_ptr(void);
     extern int dirty_ram_dispatch(CPUState *cpu, uint32_t addr, uint32_t stop_addr);
+    extern void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t return_addr);
     extern int      g_shadow_mmio_watch;   /* memory.c — device-access detector */
     extern uint64_t g_shadow_mmio_hits;
     uint8_t *ram  = memory_get_ram_ptr();
@@ -1801,16 +1928,18 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
 
     uint32_t stop_ra = cpu->gpr[31];   /* entry $ra = the function's return point */
     c->fn(cpu);
-    /* A shard that ends in a computed `jr rX` (jump table) exits with cpu->pc =
-     * target rather than running to the return; chain through tail-transfers to
-     * the same stop the interp used, so we compare FULL native vs FULL interp. */
+    /* CPS shards exit with cpu->pc set to the next tail target. Chain through
+     * the normal dispatcher to the original caller return, with s_native_exec=0
+     * above so nested overlay calls still run through the interpreter on both
+     * passes. dirty_ram_dispatch alone cannot follow clean/static BIOS targets
+     * and creates false shadow divergences for tail-transfer-heavy functions. */
     {
         int guard = 0;
         while (cpu->pc != 0 && !g_psx_call_bail && guard++ < 8192) {
             uint32_t tv = cpu->pc;
             if ((tv & 0x1FFFFFFFu) == (stop_ra & 0x1FFFFFFFu)) break;  /* returned */
             cpu->pc = 0;
-            if (!dirty_ram_dispatch(cpu, tv, stop_ra)) { cpu->pc = tv; break; }
+            psx_dispatch_call(cpu, tv, stop_ra);
         }
     }
     CPUState cpuN = *cpu;
@@ -2115,14 +2244,14 @@ int overlay_loader_dump_native_ring(char *out, int cap) {
         "\"in_progress\":\"0x%08X\",\"recent\":[",
         s_native_exec, (unsigned long long)s_native_calls_total,
         (unsigned long long)s_would_run_native, s_native_inprogress);
-    /* Walk backward from the most recent up to 64 entries. */
+    /* Walk backward from the most recent entries kept in the diagnostic ring. */
     int shown = 0;
-    for (uint32_t k = 0; k < NRING_CAP && shown < 64 && n < cap - 120; k++) {
+    for (uint32_t k = 0; k < NRING_CAP && n < cap - 140; k++) {
         uint32_t idx = (s_nring_pos - 1u - k) & (NRING_CAP - 1u);
         if (s_nring[idx].seq == 0) break;
         n += snprintf(out + n, cap - n,
-            "%s{\"addr\":\"0x%08X\",\"crc\":\"0x%08X\",\"seq\":%llu,\"returned\":%d}",
-            shown ? "," : "", s_nring[idx].addr, s_nring[idx].crc,
+            "%s{\"addr\":\"0x%08X\",\"crc\":\"0x%08X\",\"frame\":%u,\"seq\":%llu,\"returned\":%d}",
+            shown ? "," : "", s_nring[idx].addr, s_nring[idx].crc, s_nring[idx].frame,
             (unsigned long long)s_nring[idx].seq, s_nring[idx].returned);
         shown++;
     }

@@ -28,7 +28,8 @@ void interrupts_init(void);
  * Fires vblank on schedule, checks (i_stat & i_mask), and if
  * pending + COP0 allows, dispatches the exception handler. */
 void psx_check_interrupts(struct CPUState* cpu);
-/* Compat shim for ape-flavored generated code (forwards to psx_check_interrupts). */
+/* Interrupt check with the compiled guest PC to resume if a game-installed
+ * handler later RFEs to the sentinel outside the synchronous host window. */
 void psx_check_interrupts_at(struct CPUState* cpu, uint32_t resume_pc);
 
 /* Accumulate emitted PSX cycles toward the next VBlank trigger.

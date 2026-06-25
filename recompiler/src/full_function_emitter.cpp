@@ -105,6 +105,13 @@ bool FullFunctionEmitter::emit_function(
         const char* e = std::getenv("PSX_CPS");
         return e == nullptr || e[0] != '0';
     }();
+    auto emit_irq_check = [](uint32_t resume_pc, const std::string& indent = "    ") {
+        return indent + fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc);
+    };
+    auto emit_irq_check_expr = [](const std::string& resume_pc_expr,
+                                  const std::string& indent = "    ") {
+        return indent + fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+    };
 
     // Build sorted instruction list and a set for O(1) membership test.
     // sfr.instructions is already sorted by address.
@@ -369,7 +376,6 @@ bool FullFunctionEmitter::emit_function(
                 out += fmt::format("    psx_advance_cycles({}u);\n", bcyc);
                 out += "#endif\n";
             }
-            out += "    psx_check_interrupts(cpu);\n";
             if (should_probe_pc(addr)) {
                 out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n", addr);
             }
@@ -427,12 +433,16 @@ bool FullFunctionEmitter::emit_function(
                         uint8_t rs = (pb.raw >> 21) & 0x1F;
                         if (rs == 31) {
                             if (ra_loaded_from_non_sp)
-                                out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
+                                out += emit_irq_check_expr("cpu->gpr[31]") +
+                                       "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
                             else if (cps)
-                                out += "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra */\n";
+                                out += emit_irq_check_expr("cpu->gpr[31]") +
+                                       "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra */\n";
                             else
-                                out += "    return;\n";
+                                out += emit_irq_check_expr("cpu->gpr[31]") +
+                                       "    return;\n";
                         } else {
+                            out += emit_irq_check_expr(fmt::format("cpu->gpr[{}]", static_cast<int>(rs)));
                             out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
                                                static_cast<int>(rs));
                         }
@@ -466,12 +476,16 @@ bool FullFunctionEmitter::emit_function(
                     uint8_t rs = (raw >> 21) & 0x1F;
                     if (rs == 31) {
                         if (ra_loaded_from_non_sp)
-                            out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
+                            out += emit_irq_check_expr("cpu->gpr[31]") +
+                                   "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
                         else if (cps)
-                            out += "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra */\n";
+                            out += emit_irq_check_expr("cpu->gpr[31]") +
+                                   "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra */\n";
                         else
-                            out += "    return;\n";
+                            out += emit_irq_check_expr("cpu->gpr[31]") +
+                                   "    return;\n";
                     } else {
+                        out += emit_irq_check_expr(fmt::format("cpu->gpr[{}]", static_cast<int>(rs)));
                         out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
                                            static_cast<int>(rs));
                     }
@@ -494,14 +508,17 @@ bool FullFunctionEmitter::emit_function(
                     // Resolve branch.  Target was decoded as absolute virtual addr.
                     uint32_t target = tr.terminator_target;
                     register_cross_function_target(target);
-                    out += fmt::format("    if (psx_taken_{:08X}) {{ cpu->pc = 0x{:08X}u; return; }}\n",
-                                       addr, target);
+                    out += fmt::format("    if (psx_taken_{:08X}) {{\n", addr);
+                    out += emit_irq_check(target, "        ");
+                    out += fmt::format("        cpu->pc = 0x{:08X}u; return;\n", target);
+                    out += "    }\n";
                     // Not-taken: dispatch to delay-slot address (next function's entry).
                     // The next function's prologue will re-execute the delay slot — that's
                     // a duplicate side effect we accept for correctness on the not-taken
                     // path. (For unconditional branches like beq $zero,$zero this path
                     // is structurally dead.)
                     register_cross_function_target(ds_addr);
+                    out += emit_irq_check(ds_addr);
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", ds_addr);
                 } else if (kind == "j") {
                     // Inline orphaned delay slot, then unconditional jump.
@@ -521,6 +538,7 @@ bool FullFunctionEmitter::emit_function(
                     }
                     uint32_t target = relocate_j_target(addr, tr.terminator_target);
                     register_cross_function_target(target);
+                    out += emit_irq_check(target);
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", target);
                 } else if (kind == "jal") {
                     // Inline orphaned delay slot, set $ra, dispatch to target.
@@ -549,10 +567,12 @@ bool FullFunctionEmitter::emit_function(
                             register_cross_function_target(addr + 8);
                         }
                         out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
+                        out += emit_irq_check(target);
                         out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", target);
                     } else {
                         out += "    { uint32_t _csp = cpu->gpr[29];\n";
                         out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
+                        out += emit_irq_check(target);
                         out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
                         out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
                                            return_addr);
@@ -590,6 +610,7 @@ bool FullFunctionEmitter::emit_function(
                             out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
                                                static_cast<int>(rd), return_addr);
                         }
+                        out += emit_irq_check_expr("_t");
                         out += "    cpu->pc = _t; return; }\n";
                     } else {
                         out += "    { uint32_t _csp = cpu->gpr[29];\n";
@@ -597,6 +618,7 @@ bool FullFunctionEmitter::emit_function(
                             out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
                                                static_cast<int>(rd), return_addr);
                         }
+                        out += emit_irq_check_expr(fmt::format("cpu->gpr[{}]", static_cast<int>(rs)));
                         out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
                                            static_cast<int>(rs));
                         if (rd == 31) {
@@ -666,9 +688,10 @@ bool FullFunctionEmitter::emit_function(
                 "     * After the stub's jalr returns, ra=RAM 0x{:08X} routes\n"
                 "     * back here as a registered continuation target. */\n"
                 "    if (cpu->read_word(0x{:08X}u) != 0u) {{\n"
+                "        psx_check_interrupts_at(cpu, 0x{:08X}u);\n"
                 "        cpu->pc = 0x{:08X}u; return;\n"
                 "    }}\n",
-                addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc);
+                addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc, ram_pc);
         }
 
         // Non-terminator: emit normally.
@@ -685,27 +708,35 @@ bool FullFunctionEmitter::emit_function(
             if (is_branch_kind(kind.c_str())) {
                 // Conditional branch resolution.
                 uint32_t target = pb.target;
+                uint32_t fallthrough = pb.terminator_addr + 8;
                 bool target_in_function = addr_to_raw.count(target) != 0;
                 if (target_in_function) {
-                    out += fmt::format("    if (psx_taken_{:08X}) goto label_{:08X};\n",
-                                       pb.terminator_addr, target);
+                    out += fmt::format("    if (psx_taken_{:08X}) {{\n", pb.terminator_addr);
+                    out += emit_irq_check(target, "        ");
+                    out += fmt::format("        goto label_{:08X};\n", target);
+                    out += "    }\n";
                 } else {
                     // Tail call: set cpu->pc and return; dispatch loop re-dispatches.
                     // Register the cross-function target as a continuation so
                     // the dispatch table can route to it (otherwise mid-function
                     // targets miss the table — root cause of card-read failure).
                     register_cross_function_target(target);
-                    out += fmt::format("    if (psx_taken_{:08X}) {{ cpu->pc = 0x{:08X}u; return; }}\n",
-                                       pb.terminator_addr, target);
+                    out += fmt::format("    if (psx_taken_{:08X}) {{\n", pb.terminator_addr);
+                    out += emit_irq_check(target, "        ");
+                    out += fmt::format("        cpu->pc = 0x{:08X}u; return;\n", target);
+                    out += "    }\n";
                 }
+                out += emit_irq_check(fallthrough);
             } else if (kind == "j") {
                 uint32_t target = pb.target;
                 bool target_in_function = addr_to_raw.count(target) != 0;
                 if (target_in_function) {
+                    out += emit_irq_check(target);
                     out += fmt::format("    goto label_{:08X};\n", target);
                 } else {
                     // Tail call: set cpu->pc and return; dispatch loop re-dispatches.
                     register_cross_function_target(target);
+                    out += emit_irq_check(target);
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", target);
                 }
             } else if (kind == "jal") {
@@ -734,6 +765,7 @@ bool FullFunctionEmitter::emit_function(
                                            pb.terminator_addr);
                     }
                     out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
+                    out += emit_irq_check(target);
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", target);
                 } else {
                     out += "    { uint32_t _csp = cpu->gpr[29];\n";
@@ -743,6 +775,7 @@ bool FullFunctionEmitter::emit_function(
                         out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
                                            pb.terminator_addr);
                     }
+                    out += emit_irq_check(target);
                     out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
                     if (target == 0x00006380u) {
                         out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
@@ -778,6 +811,7 @@ bool FullFunctionEmitter::emit_function(
                         out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
                                            static_cast<int>(rd), return_addr);
                     }
+                    out += emit_irq_check_expr("_t");
                     out += "    cpu->pc = _t; return; }\n";
                 } else {
                     out += "    { uint32_t _csp = cpu->gpr[29];\n";
@@ -785,6 +819,7 @@ bool FullFunctionEmitter::emit_function(
                         out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
                                            static_cast<int>(rd), return_addr);
                     }
+                    out += emit_irq_check_expr(fmt::format("cpu->gpr[{}]", static_cast<int>(rs)));
                     out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
                                        static_cast<int>(rs));
                     if (rd == 31) {
@@ -803,11 +838,14 @@ bool FullFunctionEmitter::emit_function(
                 uint8_t rs = (pb.raw >> 21) & 0x1F;
                 if (rs == 31) {
                     if (ra_loaded_from_non_sp)
-                        out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
+                        out += emit_irq_check_expr("cpu->gpr[31]") +
+                               "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
                     else if (cps)
-                        out += "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra for trampoline dispatch */\n";
+                        out += emit_irq_check_expr("cpu->gpr[31]") +
+                               "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra for trampoline dispatch */\n";
                     else
-                        out += "    return;\n";
+                        out += emit_irq_check_expr("cpu->gpr[31]") +
+                               "    return;\n";
                 } else {
                     // Attempt jump table resolution: scan backward from the
                     // jr instruction to find SLTIU/SLL/LUI/ADDU/LW pattern.
@@ -884,10 +922,14 @@ bool FullFunctionEmitter::emit_function(
                                 out += fmt::format("    switch (cpu->gpr[{}]) {{\n",
                                                    static_cast<int>(jr_rs));
                                 for (auto& [rt, rom_t] : targets) {
-                                    out += fmt::format("        case 0x{:08X}u: goto label_{:08X};\n",
-                                                       rt, rom_t);
+                                    out += fmt::format("        case 0x{:08X}u:\n", rt);
+                                    out += emit_irq_check(rom_t, "            ");
+                                    out += fmt::format("            goto label_{:08X};\n", rom_t);
                                 }
-                                out += fmt::format("        default: cpu->pc = cpu->gpr[{}]; return;\n",
+                                out += "        default:\n";
+                                out += emit_irq_check_expr(fmt::format("cpu->gpr[{}]", static_cast<int>(jr_rs)),
+                                                           "            ");
+                                out += fmt::format("            cpu->pc = cpu->gpr[{}]; return;\n",
                                                    static_cast<int>(jr_rs));
                                 out += "    }\n";
                                 emitted_switch = true;
@@ -896,6 +938,7 @@ bool FullFunctionEmitter::emit_function(
                     }
                     if (!emitted_switch) {
                         // Tail call: set cpu->pc and return; dispatch loop re-dispatches.
+                        out += emit_irq_check_expr(fmt::format("cpu->gpr[{}]", static_cast<int>(rs)));
                         out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
                                            static_cast<int>(rs));
                     }
@@ -933,6 +976,7 @@ bool FullFunctionEmitter::emit_function(
         if (!has_control_flow) {
             // Fallthrough tail call: set cpu->pc and return; dispatch loop re-dispatches.
             uint32_t next_addr = last_addr + 4;
+            out += emit_irq_check(next_addr);
             out += fmt::format("    cpu->pc = 0x{:08X}u; return;  /* fallthrough */\n", next_addr);
         }
     }
@@ -1041,6 +1085,7 @@ void FullFunctionEmitter::emit_dispatch(
     // Extern declarations for runtime-provided functions.
     out += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
     out += "extern void psx_check_interrupts(CPUState* cpu);\n";
+    out += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     out += "extern void psx_restore_state_escape(void);\n";
     out += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     out += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
@@ -1416,6 +1461,7 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void psx_dispatch(CPUState* cpu, uint32_t addr);\n";
     full_c += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
     full_c += "extern void psx_check_interrupts(CPUState* cpu);\n";
+    full_c += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     full_c += "extern void psx_restore_state_escape(void);\n";
     full_c += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     full_c += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";

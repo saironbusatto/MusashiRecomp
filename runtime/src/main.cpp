@@ -1996,6 +1996,15 @@ int main(int argc, char** argv) {
                 overlay_capture_set_out_dir(exe_dir.string().c_str());
                 overlay_capture_set_enabled(1);
                 overlay_loader_init(cache_dir.c_str(), game_id.c_str());
+                for (uint32_t addr : gc.runtime.overlay_native_block) {
+                    overlay_loader_native_block_add(addr);
+                }
+                if (!gc.runtime.overlay_native_block.empty()) {
+                    std::fprintf(stdout,
+                        "psxrecomp: overlay native blocklist seeded with %zu entr%s\n",
+                        gc.runtime.overlay_native_block.size(),
+                        gc.runtime.overlay_native_block.size() == 1 ? "y" : "ies");
+                }
                 /* Step 2.8 variant-capture automation. Autocapture is ON
                  * whenever the cache is on: it writes the player-shareable
                  * overlay_captures.json (the contribution file the README

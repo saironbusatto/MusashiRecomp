@@ -13,6 +13,11 @@
 
 namespace PSXRecomp {
 
+static bool codegen_cycle_per_insn() {
+    const char* e = std::getenv("PSX_CODEGEN_CYCLE_PER_INSN");
+    return e != nullptr && e[0] != '\0' && e[0] != '0';
+}
+
 /*
  * Translate a runtime RAM address to an address that exe_.read_word() can
  * resolve.
@@ -54,6 +59,55 @@ CodeGenerator::CodeGenerator(const PS1Executable& exe, const CodeGenConfig& conf
     // via PSX_CPS so legacy codegen stays byte-identical when unset.
     // CPS is the DEFAULT (RECURSION_BUG.md §25). Opt out (legacy) with PSX_CPS=0.
     { const char* e = std::getenv("PSX_CPS"); cps_enabled_ = (e == nullptr || e[0] != '0'); }
+}
+
+uint32_t CodeGenerator::partial_block_cycle_count(uint32_t addr,
+                                                  const ControlFlowGraph& cfg) const {
+    if (cfg.blocks.count(addr)) {
+        return 0;
+    }
+
+    for (const auto& [block_addr, block] : cfg.blocks) {
+        (void)block_addr;
+        if (addr <= block.start_addr || addr > block.end_addr) {
+            continue;
+        }
+        if (((addr - block.start_addr) & 3u) != 0) {
+            continue;
+        }
+        return ((block.end_addr - addr) / 4u) + 1u;
+    }
+
+    return 0;
+}
+
+std::string CodeGenerator::emit_mid_block_cycle_charge(uint32_t addr,
+                                                       const ControlFlowGraph& cfg,
+                                                       const std::string& indent) const {
+    if (codegen_cycle_per_insn()) {
+        return "";
+    }
+
+    uint32_t cycles = partial_block_cycle_count(addr, cfg);
+    if (cycles == 0) {
+        return "";
+    }
+
+    std::stringstream ss;
+    ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+    ss << indent << fmt::format("psx_advance_cycles({}u);\n", cycles);
+    ss << "#endif\n";
+    return ss.str();
+}
+
+std::string CodeGenerator::emit_interrupt_check(uint32_t resume_pc,
+                                                const std::string& indent) const {
+    return indent + fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc);
+}
+
+std::string CodeGenerator::emit_interrupt_check_expr(const std::string& resume_pc_expr,
+                                                     const std::string& indent) const {
+    return indent + fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
 }
 
 std::string CodeGenerator::reg_name(int reg_num) {
@@ -1123,13 +1177,18 @@ std::string CodeGenerator::translate_basic_block(
 
     // Block label
     ss << fmt::format("block_{:08X}:\n", block.start_addr);
-    if (block.instruction_count > 0) {
+    const bool cycle_per_insn = codegen_cycle_per_insn();
+    auto emit_one_cycle = [&](const std::string& indent) {
+        ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+        ss << indent << "psx_advance_cycles(1u);\n";
+        ss << "#endif\n";
+    };
+    if (!cycle_per_insn && block.instruction_count > 0) {
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
         ss << config_.indent << fmt::format("psx_advance_cycles({}u);\n",
                                             static_cast<uint32_t>(block.instruction_count));
         ss << "#endif\n";
     }
-    ss << config_.indent << "psx_check_interrupts(cpu);\n";
 
     // Translate each instruction in the block
     uint32_t addr = block.start_addr;
@@ -1183,6 +1242,9 @@ std::string CodeGenerator::translate_basic_block(
 
         if (!is_cf) {
             ss << translate_instruction(addr, instr) << "\n";
+            if (cycle_per_insn) {
+                emit_one_cycle(config_.indent);
+            }
         } else {
             // Control flow is handled at block exit
             if (addr == exit_branch_addr) {
@@ -1215,8 +1277,15 @@ std::string CodeGenerator::translate_basic_block(
                             }
                             ss << config_.indent << "/* delay slot (always executes) */\n";
                             ss << translate_instruction(delay_slot_addr, delay_instr) << "\n";
+                            if (cycle_per_insn) {
+                                emit_one_cycle(config_.indent);
+                            }
                         }
                     }
+                }
+
+                if (cycle_per_insn) {
+                    emit_one_cycle(config_.indent);
                 }
 
                 // Now emit the branch/jump
@@ -1242,9 +1311,11 @@ std::string CodeGenerator::translate_basic_block(
                         : delay_saved_cond;
                     if (block.successors.size() == 2) {
                         ss << config_.indent << "if (" << condition << ") {\n";
+                        ss << emit_interrupt_check(block.successors[0], config_.indent + config_.indent);
                         ss << config_.indent << config_.indent
                            << fmt::format("goto block_{:08X};  /* taken */\n", block.successors[0]);
                         ss << config_.indent << "} else {\n";
+                        ss << emit_interrupt_check(block.successors[1], config_.indent + config_.indent);
                         ss << config_.indent << config_.indent
                            << fmt::format("goto block_{:08X};  /* not taken */\n", block.successors[1]);
                         ss << config_.indent << "}\n";
@@ -1259,29 +1330,37 @@ std::string CodeGenerator::translate_basic_block(
 
                         ss << config_.indent << "if (" << condition << ") {\n";
                         if (target_in) {
+                            ss << emit_interrupt_check(branch_target, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
                                << fmt::format("goto block_{:08X};  /* taken */\n", branch_target);
                         } else if (cps_enabled_) {
+                            ss << emit_interrupt_check(branch_target, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
                                << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS taken: split */\n", branch_target);
                         } else if (known_functions_.count(branch_target)) {
+                            ss << emit_interrupt_check(branch_target, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
                                << fmt::format("func_{:08X}(cpu); return;  /* taken: split piece */\n", branch_target);
                         } else {
+                            ss << emit_interrupt_check(branch_target, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
                                << fmt::format("call_by_address(cpu, 0x{:08X}u); return;  /* taken: split (mid-func) */\n", branch_target);
                         }
                         ss << config_.indent << "} else {\n";
                         if (fallthru_in) {
+                            ss << emit_interrupt_check(fall_through_addr, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
                                << fmt::format("goto block_{:08X};  /* not taken */\n", fall_through_addr);
                         } else if (cps_enabled_) {
+                            ss << emit_interrupt_check(fall_through_addr, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
                                << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS not taken: split */\n", fall_through_addr);
                         } else if (known_functions_.count(fall_through_addr)) {
+                            ss << emit_interrupt_check(fall_through_addr, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
                                << fmt::format("func_{:08X}(cpu); return;  /* not taken: split piece */\n", fall_through_addr);
                         } else {
+                            ss << emit_interrupt_check(fall_through_addr, config_.indent + config_.indent);
                             ss << config_.indent << config_.indent
                                << fmt::format("call_by_address(cpu, 0x{:08X}u); return;  /* not taken: split (mid-func) */\n", fall_through_addr);
                         }
@@ -1290,21 +1369,25 @@ std::string CodeGenerator::translate_basic_block(
                 } else if (block.exit_instr.type == ControlFlowType::Jump) {
                     // Unconditional jump
                     if (!block.successors.empty()) {
+                        ss << emit_interrupt_check(block.successors[0], config_.indent);
                         ss << config_.indent
                            << fmt::format("goto block_{:08X};  /* j */\n", block.successors[0]);
                     } else if (cps_enabled_ && block.exit_instr.target != 0) {
                         // CPS: out-of-function jump target — tail-transfer (the
                         // flat trampoline dispatches the split piece / mid-func).
+                        ss << emit_interrupt_check(block.exit_instr.target, config_.indent);
                         ss << config_.indent
                            << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS j: split */\n",
                                           block.exit_instr.target);
                     } else if (block.exit_instr.target != 0 && known_functions_.count(block.exit_instr.target)) {
                         // Jump target is out-of-function and is a known function start
+                        ss << emit_interrupt_check(block.exit_instr.target, config_.indent);
                         ss << config_.indent
                            << fmt::format("func_{:08X}(cpu); return;  /* j to split piece */\n",
                                           block.exit_instr.target);
                     } else if (block.exit_instr.target != 0) {
                         // Jump target is a mid-function address — dispatch dynamically
+                        ss << emit_interrupt_check(block.exit_instr.target, config_.indent);
                         ss << config_.indent
                            << fmt::format("call_by_address(cpu, 0x{:08X}u); return;  /* j to split (mid-func) */\n",
                                           block.exit_instr.target);
@@ -1341,15 +1424,18 @@ std::string CodeGenerator::translate_basic_block(
                            << "gte_ws_set_suppress(0);  /* widescreen: end far-backdrop un-squash (8C) */\n";
                     }
                     if (ra_loaded_from_non_sp) {
+                        ss << emit_interrupt_check_expr("cpu->gpr[31]", config_.indent);
                         ss << config_.indent
                            << "cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;"
                            << "  /* jr $ra — longjmp-return (ra loaded from non-sp) */\n";
                     } else if (cps_enabled_) {
                         // CPS: publish $ra so the flat trampoline dispatches the
                         // caller's continuation (no host C-return to nest).
+                        ss << emit_interrupt_check_expr("cpu->gpr[31]", config_.indent);
                         ss << config_.indent
                            << "cpu->pc = cpu->gpr[31]; return;  /* CPS: jr $ra */\n";
                     } else {
+                        ss << emit_interrupt_check_expr("cpu->gpr[31]", config_.indent);
                         ss << config_.indent << "return;  /* jr $ra */\n";
                     }
                 } else if (block.exit_instr.type == ControlFlowType::JumpRegister) {
@@ -1470,13 +1556,26 @@ std::string CodeGenerator::translate_basic_block(
                                                                 table_base, rom_table_base, table_count);
                             ss << config_.indent << fmt::format("switch ({}) {{\n", reg_name(jr_rs));
                             for (auto& [rt, rom] : targets) {
-                                ss << config_.indent << fmt::format("    case 0x{:08X}u: goto block_{:08X};\n", rt, rom);
+                                if (partial_block_cycle_count(rom, cfg) != 0) {
+                                    ss << config_.indent << fmt::format("    case 0x{:08X}u:\n", rt);
+                                    ss << emit_interrupt_check(rom, config_.indent + "        ");
+                                    ss << emit_mid_block_cycle_charge(rom, cfg, config_.indent + "        ");
+                                    ss << config_.indent << fmt::format("        goto block_{:08X};\n", rom);
+                                } else {
+                                    ss << config_.indent << fmt::format("    case 0x{:08X}u:\n", rt);
+                                    ss << emit_interrupt_check(rom, config_.indent + "        ");
+                                    ss << config_.indent << fmt::format("        goto block_{:08X};\n", rom);
+                                }
                             }
                             if (cps_enabled_) {
-                                ss << config_.indent << "    default: cpu->pc = " << reg_name(jr_rs)
+                                ss << config_.indent << "    default:\n";
+                                ss << emit_interrupt_check_expr(reg_name(jr_rs), config_.indent + "        ");
+                                ss << config_.indent << "        cpu->pc = " << reg_name(jr_rs)
                                    << "; return;  /* CPS: jr table miss — tail-transfer */\n";
                             } else {
-                                ss << config_.indent << "    default: call_by_address(cpu, " << reg_name(jr_rs) << "); return;\n";
+                                ss << config_.indent << "    default:\n";
+                                ss << emit_interrupt_check_expr(reg_name(jr_rs), config_.indent + "        ");
+                                ss << config_.indent << "        call_by_address(cpu, " << reg_name(jr_rs) << "); return;\n";
                             }
                             ss << config_.indent << "}\n";
                             emitted_switch = true;
@@ -1486,10 +1585,12 @@ std::string CodeGenerator::translate_basic_block(
                         if (cps_enabled_) {
                             // CPS: indirect jump / BIOS-call gate — tail-transfer
                             // to the target (the flat trampoline dispatches it).
+                            ss << emit_interrupt_check_expr(reg_name(jr_rs), config_.indent);
                             ss << config_.indent << fmt::format("cpu->pc = {}; return;  /* CPS: jr {} */\n",
                                                                 reg_name(jr_rs), reg_name(jr_rs));
                         } else {
                             // BIOS call or unrecognised indirect jump
+                            ss << emit_interrupt_check_expr(reg_name(jr_rs), config_.indent);
                             ss << config_.indent << fmt::format("call_by_address(cpu, {});  /* jr {} */\n",
                                                                 reg_name(jr_rs), reg_name(jr_rs));
                             ss << config_.indent << "return;\n";
@@ -1509,6 +1610,7 @@ std::string CodeGenerator::translate_basic_block(
                         }
                         ss << config_.indent
                            << fmt::format("cpu->gpr[31] = 0x{:08X}u;  /* CPS jal return addr */\n", cont_addr);
+                        ss << emit_interrupt_check(target, config_.indent);
                         ss << config_.indent
                            << fmt::format("cpu->pc = 0x{:08X}u; return;  /* CPS jal -> 0x{:08X} */\n",
                                           target, target);
@@ -1518,6 +1620,7 @@ std::string CodeGenerator::translate_basic_block(
                     // actually returned here with the caller's $sp.
                     ss << config_.indent << "{ uint32_t _csp = cpu->gpr[29];\n";
                     ss << config_.indent << "cpu->gpr[31] = " << fmt::format("0x{:08X};  /* return address */\n", addr + 8);
+                    ss << emit_interrupt_check(target, config_.indent);
                     if (known_functions_.count(target) > 0) {
                         ss << config_.indent << fmt::format("func_{:08X}(cpu);  /* jal */\n", target);
                         ss << config_.indent << fmt::format("if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n", addr + 8);
@@ -1561,6 +1664,7 @@ std::string CodeGenerator::translate_basic_block(
                             ss << config_.indent << fmt::format("    {} = 0x{:08X};  /* CPS jalr return addr */\n",
                                                                 reg_name(rd), cont_addr);
                         }
+                        ss << emit_interrupt_check_expr("_t", config_.indent + "    ");
                         ss << config_.indent << "cpu->pc = _t; return; }  /* CPS jalr */\n";
                     } else {
                     // Set link register to return address (PC + 8, past delay slot)
@@ -1568,6 +1672,7 @@ std::string CodeGenerator::translate_basic_block(
                                                         reg_name(rd), addr + 8);
 
                     // Dispatch indirect call — target is a runtime register value
+                    ss << emit_interrupt_check_expr(reg_name(rs), config_.indent);
                     ss << config_.indent << fmt::format("call_by_address(cpu, {});  /* jalr {} */\n",
                                                         reg_name(rs), reg_name(rs));
                     /* psx_dispatch_call validated the (ra, sp) contract;
@@ -1602,10 +1707,12 @@ std::string CodeGenerator::translate_basic_block(
     // function, tail-call that split piece so the physical fall-through is
     // preserved.
     if (block.exit_instr.type == ControlFlowType::None && !block.successors.empty()) {
+        ss << emit_interrupt_check(block.successors[0], config_.indent);
         ss << config_.indent << fmt::format("/* fall through to block_{:08X} */\n",
                                            block.successors[0]);
     } else if (block.exit_instr.type == ControlFlowType::None) {
         uint32_t next_addr = block.end_addr + 4;
+        ss << emit_interrupt_check(next_addr, config_.indent);
         if (known_functions_.count(next_addr) > 0) {
             ss << config_.indent
                << fmt::format("func_{:08X}(cpu); return;  /* fallthrough to split piece */\n",
@@ -1724,8 +1831,14 @@ GeneratedFunction CodeGenerator::generate_function(
         body_ss << config_.indent << "    switch (_cont) {\n";
         for (uint32_t c : cps_cur_continuations_) {
             if (!seen.insert(c).second) continue;
-            body_ss << config_.indent
-                    << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n", c, c);
+            if (partial_block_cycle_count(c, cfg) != 0) {
+                body_ss << config_.indent << fmt::format("        case 0x{:08X}u:\n", c);
+                body_ss << emit_mid_block_cycle_charge(c, cfg, config_.indent + "            ");
+                body_ss << config_.indent << fmt::format("            goto block_{:08X};\n", c);
+            } else {
+                body_ss << config_.indent
+                        << fmt::format("        case 0x{:08X}u: goto block_{:08X};\n", c, c);
+            }
             cps_continuation_owner_[c] = func.start_addr;
         }
         if (config_.overlay_mode) {

@@ -829,6 +829,10 @@ void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra) {
 void psx_check_interrupts(CPUState *cpu) {
     g_cbs.check_interrupts(cpu);
 }
+void psx_check_interrupts_at(CPUState *cpu, uint32_t resume_pc) {
+    if (g_cbs.check_interrupts_at) g_cbs.check_interrupts_at(cpu, resume_pc);
+    else g_cbs.check_interrupts(cpu);
+}
 void psx_advance_cycles(uint32_t cycles) {
     if (g_cbs.advance_cycles) g_cbs.advance_cycles(cycles);
 }

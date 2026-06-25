@@ -34,7 +34,9 @@
 /*   v7: advance_cycles callback added; overlays now built with
  *       PSX_ENABLE_BLOCK_CYCLES and charge the shared host cycle/timer timeline.
  *       Bumping rejects stale DLLs that charged no cycles (Tomba2 Timer1 fork). */
-#define PSX_OVERLAY_ABI_VERSION 7
+/*   v8: check_interrupts_at callback added so generated native overlay block
+ *       checks can provide the real guest resume PC for async RFE recovery. */
+#define PSX_OVERLAY_ABI_VERSION 8
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -99,6 +101,9 @@ typedef struct {
     void (*dispatch_call)(CPUState *cpu, uint32_t addr, uint32_t ra);
     /* Interrupt check: called after every function return in overlay */
     void (*check_interrupts)(CPUState *cpu);
+    /* Interrupt check with the guest PC that should resume if a game-installed
+     * handler later RFEs to the sentinel outside the synchronous host window. */
+    void (*check_interrupts_at)(CPUState *cpu, uint32_t resume_pc);
     /* Guest-cycle accounting (ABI v7): block-cycle charge. Overlay code built
      * with PSX_ENABLE_BLOCK_CYCLES must charge the SAME shared host cycle/timer
      * timeline as the dirty-RAM interpreter and the BIOS, or timer-sensitive
