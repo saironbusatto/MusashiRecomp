@@ -270,6 +270,21 @@ function(psxrecomp_add_runtime_target target)
     endif()
     add_dependencies(${target} psxrecomp_codegen_hash)
 
+    # Force the cg-tag CONSUMERS to recompile whenever overlay_codegen_hash.h
+    # changes. overlay_api.h pulls that header via __has_include, which the
+    # compiler depfile does NOT record when the header is absent at first compile —
+    # so a later hash change left a STALE baked-in PSX_OVERLAY_CODEGEN_HASH in the
+    # binary, making the LOADER read cg<old> while autocompile WROTE cg<new> (the
+    # read≠write overlay lag/wedge class — the runtime silently ignored the freshly
+    # compiled shards). An explicit OBJECT_DEPENDS makes the dependency
+    # unconditional, so the runtime's cg tag can never drift from the headers /
+    # autocompile again. (add_dependencies above only orders header generation; it
+    # does not force object recompiles on content change.)
+    set_source_files_properties(
+        ${PSXRECOMP_ROOT}/runtime/src/overlay_loader.c
+        ${PSXRECOMP_ROOT}/runtime/src/boot_state.c
+        PROPERTIES OBJECT_DEPENDS ${_codegen_hash_hdr})
+
     target_include_directories(${target} PRIVATE
         ${PSXRECOMP_RUNTIME_INCLUDE_DIRS}
         ${SDL2_INCLUDE_DIRS}
