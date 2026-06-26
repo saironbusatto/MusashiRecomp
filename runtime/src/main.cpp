@@ -2039,11 +2039,21 @@ int main(int argc, char** argv) {
                         ac_cmd = &gc.runtime.overlay_autocompile_cmd;
                 }
                 if (ac_cmd) {
+                    /* Pin the compile's WRITE cache + READ captures to the SAME
+                     * canonical locations the loader uses (cache_dir = <exe>/cache,
+                     * <exe>/overlay_captures.json — set above). The framework owns
+                     * the cache location; no game.toml --out-dir/--captures can make
+                     * the write drift from the read. Single source of truth, all
+                     * games, dev or prod. */
+                    std::string captures_path =
+                        (exe_dir / "overlay_captures.json").string();
+                    autocompile_set_cache_paths(cache_dir.c_str(),
+                                                captures_path.c_str());
                     autocompile_configure(ac_cmd->c_str(),
                                           gc.project_root.string().c_str());
                     std::fprintf(stdout,
-                        "psxrecomp: overlay autocompile enabled (%s)\n",
-                        overlay_backend_name(eff));
+                        "psxrecomp: overlay autocompile enabled (%s); cache=%s\n",
+                        overlay_backend_name(eff), cache_dir.c_str());
                 }
                 code_provider_init(cfg_backend, gcc_avail);
                 /* Now that the backend is resolved, apply the sljit live policy:

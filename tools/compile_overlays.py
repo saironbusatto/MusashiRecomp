@@ -853,6 +853,18 @@ int psx_ws_backdrop_x(int x) {
 int psx_ws_x_margin(void) {
     return g_cbs.ws_x_margin ? g_cbs.ws_x_margin() : 0;
 }
+/* Shared render-funnel screen-X cull widening ([widescreen.cull] auto_screen_x).
+ * The recompiler emits `rt = psx_ws_cull_sltiu(sx, imm)` at every width-compare
+ * cull site, INCLUDING in overlay-resident code, so the overlay DLL must define
+ * it or it fails to link (undefined reference) -> no native shard -> that overlay
+ * variant runs interpreted forever (the dwarf-village-style lag). Self-contained:
+ * depends only on psx_ws_x_margin() above. Identity at 4:3 (margin 0). MUST stay
+ * byte-for-byte identical to gpu.c psx_ws_cull_sltiu. */
+int psx_ws_cull_sltiu(uint32_t sx, uint32_t imm) {
+    int m = psx_ws_x_margin();
+    return ((uint32_t)((int32_t)(int16_t)(uint16_t)sx + m)
+            < (uint32_t)((int32_t)imm + 2 * m)) ? 1 : 0;
+}
 void psx_ws_sprite_tag(CPUState *cpu) {
     if (g_cbs.ws_sprite_tag) g_cbs.ws_sprite_tag(cpu);
 }
@@ -1210,8 +1222,11 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--captures',        required=True,
-                    help='overlay_captures.json from the runtime')
+    ap.add_argument('--captures',        default=None,
+                    help='overlay_captures.json from the runtime. Optional: the '
+                         'runtime injects PSX_OVERLAY_CAPTURES (the canonical '
+                         '<exe>/overlay_captures.json), which wins. Required only '
+                         'for manual/offline invocation.')
     ap.add_argument('--game-toml',       required=True,
                     help='game.toml (for game_id)')
     ap.add_argument('--recompiler',      required=True,
@@ -1241,6 +1256,27 @@ def main():
                          'when invoking the recompiler so overlay funcs tail-transfer '
                          '+ carry an entry-switch. Must match the runtime build.')
     args = ap.parse_args()
+
+    # ---- Framework-injected cache location wins over CLI flags ----------------
+    # The runtime (autocompile.c) exports PSX_OVERLAY_CACHE_DIR / PSX_OVERLAY_CAPTURES
+    # set to the loader's CANONICAL <exe>/cache and <exe>/overlay_captures.json. We
+    # honor those above --out-dir/--captures so the WRITE cache and READ captures
+    # are always exactly where the loader reads — no per-game config, no drift
+    # between dev and prod (the read/write-location divergence bug). The CLI flags
+    # remain the fallback for manual/offline invocation (no env set).
+    _env_out = os.environ.get('PSX_OVERLAY_CACHE_DIR')
+    if _env_out:
+        if _env_out != args.out_dir:
+            print(f'[cache] PSX_OVERLAY_CACHE_DIR overrides --out-dir: {_env_out}')
+        args.out_dir = _env_out
+    _env_cap = os.environ.get('PSX_OVERLAY_CAPTURES')
+    if _env_cap:
+        if _env_cap != args.captures:
+            print(f'[cache] PSX_OVERLAY_CAPTURES overrides --captures: {_env_cap}')
+        args.captures = _env_cap
+    if not args.captures:
+        ap.error('no captures file: set PSX_OVERLAY_CAPTURES (runtime injects it) '
+                 'or pass --captures for manual/offline use')
 
     # Resolve the recompiler exe and runtime-include to absolute paths up front.
     # game.toml's overlay_autocompile_cmd uses paths RELATIVE to the project root

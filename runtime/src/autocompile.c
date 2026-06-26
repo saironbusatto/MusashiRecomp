@@ -17,6 +17,11 @@ extern void overlay_loader_rescan(void);
 static char s_cmd[4096];   /* large: the runtime-constructed bundled tcc cmd has
                             * many absolute paths (python+script+recompiler+tcc+...) */
 static char s_cwd[512];
+/* Canonical loader cache dir + captures file (see autocompile_set_cache_paths).
+ * Injected into the compile child's environment so its WRITE location is exactly
+ * the loader's READ location, regardless of what the configured command says. */
+static char s_cache_dir[512];
+static char s_captures[512];
 
 enum { AC_IDLE = 0, AC_RUNNING = 1, AC_DONE = 2 };
 static volatile int s_state     = AC_IDLE;
@@ -84,6 +89,11 @@ void autocompile_configure(const char *cmd, const char *cwd) {
 #endif
 }
 
+void autocompile_set_cache_paths(const char *cache_dir, const char *captures) {
+    snprintf(s_cache_dir, sizeof(s_cache_dir), "%s", cache_dir ? cache_dir : "");
+    snprintf(s_captures,  sizeof(s_captures),  "%s", captures  ? captures  : "");
+}
+
 int autocompile_configured(void) { return s_cmd[0] != '\0'; }
 int autocompile_busy(void)       { return s_state == AC_RUNNING; }
 
@@ -132,6 +142,14 @@ int autocompile_request(void) {
     HANDLE rd = NULL, wr = NULL;
     if (!CreatePipe(&rd, &wr, &sa, 0)) return 0;
     SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+    /* Pin the WRITE cache + READ captures to the loader's canonical locations.
+     * Set on the PARENT env so the child (CreateProcessA lpEnvironment=NULL =>
+     * inherit) sees them; compile_overlays.py / coverage_vault.py prefer these
+     * over any CLI --out-dir/--captures, so the cache can never drift from where
+     * the loader reads. This is THE fix for the read/write-location divergence. */
+    if (s_cache_dir[0]) SetEnvironmentVariableA("PSX_OVERLAY_CACHE_DIR", s_cache_dir);
+    if (s_captures[0])  SetEnvironmentVariableA("PSX_OVERLAY_CAPTURES",  s_captures);
 
     /* cmd.exe /C resolves the command via PATH and supports the relative
      * paths in the configured line (cwd = project root). */
