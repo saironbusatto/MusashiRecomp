@@ -80,6 +80,60 @@ recomputes pending IRQ before the next instruction.
   committed block-exit check is fine only as the fast path's own edge check;
   correctness comes from the leader slice-guard + precise mode.
 
+## Task #3 implementation notes (architecture mapped 2026-06-26)
+
+- `psx_dispatch_impl` (generated SCPH1001_dispatch.c — DO NOT edit) is a tail-call
+  trampoline; `psx_check_interrupts` runs only when the OUTERMOST dispatch returns.
+- `dirty_ram_dispatch` / `_inner` (hand-written, editable) interpret a block via a
+  loop over `exec_one()`, but for CLEAN game-text pages `_inner` routes back to
+  `psx_dispatch_game_compiled` (compiled). Interrupts are pumped only every ~4096
+  insns (outer pump + local-flow inner pump). So this path is NOT per-instruction
+  precise — it's 4096-insn granular. The "interp reference" matching HW well enough
+  to reach the FMV is that 4096-granularity landing somewhere in the tight debounce
+  loop; Beetle/HW take at the EXACT instruction. Precise-mode must be FINER than the
+  existing interp: check the deliverable-IRQ condition after EACH instruction inside
+  the slice window (the window is short, bounded by cycles_to_next_event, so the
+  per-insn cost is paid only when an event is imminent).
+- `exec_one()` is the reusable per-instruction primitive AND it nests jal/jalr inline
+  via `psx_dispatch_call` (runs the callee COMPILED). 
+
+### Design decision — RESOLVED via ChatGPT: option (b)
+Precise-mode CONTINUES THROUGH statically-compiled callees, owned by the event
+deadline, NOT the call boundary. Option (a) [surface at the call, re-arm at the
+callee's first leader] was REJECTED: if the IRQ is actually due deeper inside the
+callee, taking it at the callee's first block leader is a FAKE take-point. Hard
+invariant: "native compiled code is never entered recursively from precise mode —
+while precise mode is active, it IGNORES native availability."
+
+Clean implementation (maps onto the existing interp with minimal change):
+- A global `g_precise_mode`. While set, `interp_enter_compiled()` (dirty_ram_interp.c)
+  RETURNS 0 (declines) — the existing jal/jalr handler already treats 0 as "interpret
+  locally," so calls step INTO the callee per-instruction instead of running it
+  compiled. This realizes "ignore native availability" with no new call machinery.
+- Precise loop = exec_one() + psx_advance_cycles(1) + a PER-INSTRUCTION deliverable-IRQ
+  check (FINER than the existing interp's ~4096-insn pump, which is only a parity
+  comparator, not HW-precise). On a deliverable IRQ: set g_dirty_safe_resume_pc to the
+  committed next PC and call psx_check_interrupts (takes at the exact instruction).
+- EXIT not at "event fired" but when: IRQ taken (pc now in the handler/vector), OR the
+  deadline passed AND no IRQ is pending+enabled at the next instruction boundary, OR a
+  safe dispatch boundary where the next compiled block is provably fast-safe. Then set
+  cpu->pc to the resume PC and return to the trampoline (which tail-dispatches compiled).
+- Re-entrancy is structurally impossible: precise-mode never enters compiled, so the
+  emitted block-leader guard is never re-hit during a slice window.
+
+### Emitter hook
+At each block leader, BEFORE psx_advance_cycles(bcyc), emit (full_function_emitter.cpp):
+    if (psx_block_needs_slice(bcyc, <side_effect_flag>)) { cpu->pc = <block_addr>; return; }
+`psx_block_needs_slice` (runtime): returns (cycles_to_next_event() <= bcyc) ||
+side_effect_flag || <irq already visible>. On true, the compiled block returns with
+cpu->pc=block_addr and a global `g_psx_slice_request=1`; the dispatch path runs
+precise-mode from block_addr instead of re-dispatching compiled (else infinite loop
+re-hitting the same leader). The cleanest seam that avoids editing generated
+dispatch: have `psx_block_needs_slice` itself run precise-mode inline and set cpu->pc
+to the safe resume PC, then the block `return`s and the trampoline tail-dispatches
+the safe PC compiled. (Decide seam during impl; keep generated-code change to the
+single emitted guard line.)
+
 ## Validation  [Task #5]
 - Beetle exc_ring oracle: native exception-entry record (cycle, last/next PC,
   EPC, BD, Status/Cause, I_STAT/I_MASK, pending-load) must match interp + Beetle
