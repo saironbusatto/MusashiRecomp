@@ -48,6 +48,12 @@ extern uint64_t g_dirty_ram_insns_run;
 extern uint32_t g_present_slow_count;
 extern int      g_present_vsync_disabled;
 
+/* CPU register file + scratchpad — captured into the heartbeat so a logical
+ * hang's exact wedged state survives in the small, user-uploadable file.
+ * debug_cpu_ptr (CPUState*) is declared in debug_server.h; CPUState layout
+ * (gpr[32], pc) in cpu_state.h — both already included above. */
+extern uint8_t *memory_get_scratchpad_ptr(void);   /* memory.c */
+
 static int s_started = 0;
 static char s_backend[32] = "psx-runtime";
 
@@ -83,6 +89,15 @@ static int    s_sym_initialized = 0;
  *      outside the simulation (observed: NVIDIA GL SwapBuffers
  *      blocking ~1.5s per present, dump 1781045865). Multi-sample
  *      stack capture attributes the wait.
+ *   D. SPIN freeze (logical hang) — frames advance at a HEALTHY rate
+ *      (the IRQ/VSync/render loop keeps running) but the GAME logic is
+ *      wedged: current_func and last_store_pc are pinned and no new
+ *      dirty-RAM (interpreted) instructions retire. The classic shape
+ *      is a guest poll loop spinning on a kernel call / event flag that
+ *      never flips (Tomba dwarf-village dialogue freeze, issue #1:
+ *      ~51 fps, exc_re ~1.6K/frame — UNDER every threshold above, so
+ *      A/B/C all miss it). Detected by cur_fn + store_pc + dirty_insns
+ *      all stable across the window while frame_delta is healthy.
  *
  * Window = 20 ticks = 2.0 sec. Long enough that legitimate startup
  * activity (boot, FMV decode, save load) doesn't trip it; short enough
@@ -273,6 +288,49 @@ static void freeze_dump_main_stack_samples_json(FILE *f, int n) {
  * in wins; the loser skips (same rings either way). */
 static volatile long s_dump_in_progress = 0;
 
+/* Format the CPU register file (pc + all 32 GPRs) and the full 1 KB
+ * scratchpad as JSON into `out`. Returns bytes written (NUL-terminated,
+ * clamped to cap). Shared by the small per-tick heartbeat and the big
+ * auto-dump so both carry identical state.
+ *
+ * Why this is the decisive observability for a logical hang: the scratchpad
+ * (0x1F800000..0x1F8003FF) is the R3000A's only fast working RAM, and PSX
+ * engines keep per-frame command/entity-list state there. A spin-freeze
+ * leaves its cause in those words (Tomba's dwarf-village dialogue processor
+ * at 0x8010D464 gates its entire loop on scratchpad 0x19E/0x1FC/0x250/0x260/
+ * 0x3C4). The register file pins down the poll site, and $t1 (gpr[9]) holds
+ * the BIOS A0/B0/C0 function index while the guest is parked in a kernel-call
+ * poll — i.e. "which B0 function is it waiting on" with no extra plumbing.
+ * Emitting the GPRs in the same shape as psx_last_run_report.json's "cpu"
+ * means existing analysis tooling reads it unchanged. */
+static int hb_format_cpu_scratchpad(char *out, size_t cap) {
+    if (cap < 64) { if (cap) out[0] = 0; return 0; }
+    const CPUState *cpu = debug_cpu_ptr;
+    int n = snprintf(out, cap, "  \"cpu\":{\"pc\":\"0x%08X\",\"gpr\":[",
+                     cpu ? cpu->pc : 0u);
+    for (int i = 0; i < 32 && n > 0 && (size_t)n < cap; i++) {
+        int m = snprintf(out + n, cap - (size_t)n, "%s\"0x%08X\"",
+                         i ? "," : "", cpu ? cpu->gpr[i] : 0u);
+        if (m <= 0) break;
+        n += m;
+    }
+    if (n > 0 && (size_t)n < cap) {
+        int m = snprintf(out + n, cap - (size_t)n, "]},\n  \"scratchpad\":\"");
+        if (m > 0) n += m;
+    }
+    const uint8_t *sp = memory_get_scratchpad_ptr();
+    if (sp) {
+        static const char hexd[] = "0123456789abcdef";
+        for (int i = 0; i < 1024 && (size_t)(n + 3) < cap; i++) {
+            out[n++] = hexd[(sp[i] >> 4) & 0xF];
+            out[n++] = hexd[sp[i] & 0xF];
+        }
+    }
+    if ((size_t)(n + 2) < cap) out[n++] = '"';
+    out[n] = 0;
+    return n;
+}
+
 static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
                               uint64_t exc_reentry, uint32_t cur_fn,
                               uint32_t last_store, uint32_t i_stat_v,
@@ -366,7 +424,8 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         (wedge_kind == 1) ? "hard_freeze" :
         (wedge_kind == 2) ? "reentry_storm" :
         (wedge_kind == 3) ? "slow_frames" :
-        (wedge_kind == 4) ? "fatal" : "unknown",
+        (wedge_kind == 4) ? "fatal" :
+        (wedge_kind == 5) ? "spin_freeze" : "unknown",
         (unsigned)DUMP_CAP_WTRACE_ALL,
         (unsigned)DUMP_CAP_WTRACE,
         (unsigned)DUMP_CAP_FRAME_HISTORY,
@@ -446,7 +505,7 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         fputs("[]", f);
     }
     fputs(",\n  \"main_stack_samples\":", f);
-    if (wedge_kind == 2 || wedge_kind == 3) {
+    if (wedge_kind == 2 || wedge_kind == 3 || wedge_kind == 5) {
         freeze_dump_main_stack_samples_json(f, 8);
     } else {
         fputs("[]", f);
@@ -455,6 +514,14 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
 #else
     fputs("  \"main_stack\":[]\n", f);
 #endif
+
+    {
+        static char cs_buf[4096];
+        hb_format_cpu_scratchpad(cs_buf, sizeof(cs_buf));
+        fputs(",\n", f);
+        fputs(cs_buf, f);
+        fputs("\n", f);
+    }
 
     fputs("}\n", f);
     fclose(f);
@@ -577,12 +644,26 @@ static void heartbeat_write(void) {
         uint64_t excre_delta = (newest_excre >= oldest_excre)
                                ? (newest_excre - oldest_excre) : 0;
 
+        /* Logical-hang (kind D) signature: the executing function, the last
+         * store PC, and the retired dirty-RAM instruction count are all
+         * unchanged across the whole window. Requiring all three pinned makes
+         * this specific to a guest spin loop — a legitimate long native
+         * compute would still move last_store_pc, and any interpreted/overlay
+         * work would advance dirty_insns. Checked only when frames are
+         * advancing healthily (kinds 1/2/3 take precedence below). */
+        int logic_pinned =
+            (s_ring[newest_idx].current_func    == s_ring[oldest_idx].current_func) &&
+            (s_ring[newest_idx].last_store_pc   == s_ring[oldest_idx].last_store_pc) &&
+            (s_ring[newest_idx].dirty_ram_insns == s_ring[oldest_idx].dirty_ram_insns);
+
         if (frame_delta == 0)
             wedge_kind = 1;
         else if (excre_delta / frame_delta > WEDGE_EXC_REENTRY_PER_FRAME_THRESHOLD)
             wedge_kind = 2;
         else if (frame_delta < WEDGE_SLOW_FRAMES_MAX_DELTA)
             wedge_kind = 3;
+        else if (logic_pinned)
+            wedge_kind = 5;  /* spin freeze: game wedged while frames advance */
     }
 
     if (wedge_kind != 0) {
@@ -705,7 +786,16 @@ static void heartbeat_write(void) {
         if (m <= 0 || (size_t)(n + m) >= sizeof(buf)) break;
         n += m;
     }
-    m = snprintf(buf + n, sizeof(buf) - (size_t)n, "  ]\n}\n");
+    m = snprintf(buf + n, sizeof(buf) - (size_t)n, "  ],\n");
+    if (m > 0) n += m;
+
+    /* CPU register file + full scratchpad: the wedged state of a logical
+     * hang, present every tick so it survives even a plain force-close
+     * (no auto-dump needed). See hb_format_cpu_scratchpad. */
+    m = hb_format_cpu_scratchpad(buf + n, sizeof(buf) - (size_t)n);
+    if (m > 0) n += m;
+
+    m = snprintf(buf + n, sizeof(buf) - (size_t)n, "\n}\n");
     if (m > 0) n += m;
 
     /* Atomic overwrite via .tmp + rename. Avoids a reader catching a
