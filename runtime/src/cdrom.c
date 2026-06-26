@@ -1517,6 +1517,29 @@ void cdrom_write(uint32_t addr, uint32_t value) {
     }
 }
 
+/* Cycle-budgeted precise event slicing: guest CPU cycles until the CD-ROM
+ * raises a DELIVERABLE IRQ (bit2 unmasked in i_mask). UINT32_MAX if none.
+ * Conservative under-estimate (smaller => slice more => safe): returns the
+ * nearest in-flight countdown that leads to an i_stat bit2 raise — the
+ * presentation delay of an already-armed response, a pending second response,
+ * or the next sector data-ready. See PRECISE_IRQ_SLICE.md. */
+uint32_t cdrom_cycles_to_irq(uint32_t i_mask) {
+    if (!(i_mask & (1u << 2))) return 0xFFFFFFFFu;   /* IRQ_CDROM masked */
+    uint32_t best = 0xFFFFFFFFu;
+    /* Armed response awaiting presentation (will raise bit2 when delay hits 0). */
+    if (irq_flag && (irq_enable & (1u << (irq_flag - 1)))) {
+        uint32_t d = cdrom_irq_present_delay > 0 ? (uint32_t)cdrom_irq_present_delay : 0u;
+        if (d < best) best = d;
+    }
+    /* Pending second response: fires set_irq in pending.delay cycles. */
+    if (pending.pending && pending.delay > 0 && (uint32_t)pending.delay < best)
+        best = (uint32_t)pending.delay;
+    /* Active sector read: next data-ready in read_delay cycles. */
+    if (reading && read_delay > 0 && (uint32_t)read_delay < best)
+        best = (uint32_t)read_delay;
+    return best;
+}
+
 void cdrom_advance(uint32_t cycles) {
     /* Age the response presentation latency. Once it elapses, the following
      * refresh_cdrom_irq_line() presents the held response to INTC — at this

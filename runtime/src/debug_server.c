@@ -4129,6 +4129,26 @@ static void handle_mem_words(int id, const char *json)
     free(buf);
 }
 
+/* Precise-event-slicing validation: report the cycle distance to the next
+ * deliverable interrupt, broken down per source. Compare against the live timer
+ * counters / VBLANK pacing (timers_state, freeze_check) to validate
+ * cycles_to_next_event before wiring it into the two-tier executor. UINT32_MAX
+ * (4294967295) for a source means "no deliverable IRQ scheduled". */
+static void handle_cycles_to_next_event(int id, const char *json)
+{
+    (void)json;
+    uint32_t agg = cycles_to_next_event();
+    uint32_t t = timers_cycles_to_irq(i_mask);
+    uint32_t c = cdrom_cycles_to_irq(i_mask);
+    uint32_t d = dma_cycles_to_irq(i_mask);
+    uint32_t s = sio_cycles_to_irq(i_mask);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
+             "\"cycles_to_next_event\":%u,"
+             "\"timers\":%u,\"cdrom\":%u,\"dma\":%u,\"sio\":%u}",
+             id, i_stat, i_mask, agg, t, c, d, s);
+}
+
 static void handle_irq_state(int id, const char *json)
 {
     (void)json;
@@ -9894,6 +9914,7 @@ static const CmdEntry s_commands[] = {
     { "gl_fbo_peek",       handle_gl_fbo_peek },
     { "gl_vram_diff",      handle_gl_vram_diff },
     { "irq_state",         handle_irq_state },
+    { "cycles_to_next_event", handle_cycles_to_next_event },
     { "timers_state",      handle_timers_state },
     { "cdrom_state",       handle_cdrom_state },
     { "cdrom_sector_dump", handle_cdrom_sector_dump },

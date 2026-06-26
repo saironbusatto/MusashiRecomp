@@ -568,6 +568,26 @@ void sio_init(void) {
      * transactions. Boot path zero-inits them via BSS. */
 }
 
+/* Cycle-budgeted precise event slicing: guest CPU cycles until SIO raises a
+ * DELIVERABLE IRQ (bit7 unmasked in i_mask). UINT32_MAX if none. Returns the
+ * nearest armed countdown: shift-complete, pending ack, or the pad/card IRQ
+ * delivery countdown. See PRECISE_IRQ_SLICE.md. */
+uint32_t sio_cycles_to_irq(uint32_t i_mask) {
+    if (!(i_mask & (1u << 7))) return 0xFFFFFFFFu;   /* IRQ_SIO0 masked */
+    uint32_t best = 0xFFFFFFFFu;
+    if (sio_irq_pending && sio_irq_countdown > 0 && (uint32_t)sio_irq_countdown < best)
+        best = (uint32_t)sio_irq_countdown;
+#if SIO_MODEL_CYCLE_PACED
+    if (g_sio_timing_active) {
+        if (sio_pending_ack && sio_ack_remaining > 0 && (uint32_t)sio_ack_remaining < best)
+            best = (uint32_t)sio_ack_remaining;
+        if (sio_shift_active && sio_shift_remaining > 0 && (uint32_t)sio_shift_remaining < best)
+            best = (uint32_t)sio_shift_remaining;
+    }
+#endif
+    return best;
+}
+
 void sio_connect_pad(int slot) {
     if (slot >= 0 && slot <= 1)
         pad_connected |= (1 << slot);
