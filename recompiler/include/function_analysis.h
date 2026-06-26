@@ -36,9 +36,7 @@ struct FunctionAnalysisResult {
     int prologue_count;
     int call_discovered_count = 0; // Functions found via JAL call-target following
     int strong_prologue_count = 0; // Functions found from prologues with saved $ra
-    int bios_thunk_count = 0; // Packed A0/B0/C0 BIOS dispatch thunks
     int state_continuation_count = 0; // Split entries after calls to SaveState-style helpers
-    int pointer_table_entry_count = 0; // Function entries found from executable pointer tables
 };
 
 class FunctionAnalyzer {
@@ -82,12 +80,6 @@ private:
 
     // Find function start by scanning backward from jr $ra
     uint32_t find_function_start(uint32_t return_addr);
-
-    // Detect PSY-Q style BIOS dispatch thunks:
-    //   addiu/ori rN, $zero, {0xA0,0xB0,0xC0}
-    //   jr        rN
-    //   addiu/ori $t1, $zero, function_index
-    bool is_bios_dispatch_thunk(uint32_t addr, uint32_t& jr_addr_out) const;
 
     // Detect if a region is likely a data section masquerading as code
     bool is_likely_data_section(uint32_t start_addr, uint32_t end_addr) const;
