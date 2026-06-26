@@ -204,36 +204,6 @@ int  overlay_loader_native_block_list(uint32_t *out, int cap) {
 }
 uint64_t overlay_loader_native_block_hits(void) { return s_native_block_hits; }
 
-/* Fail-closed native entry guard (overlay-cache v2, root-cause fix for the
- * Tomba 2 FMV freeze). A native overlay function's generated entry-switch calls
- * psx_native_bad_entry when it is entered at a PC that is NOT one of its legal
- * entries (true prologue or a known continuation/alias) -- e.g. when range
- * ownership wrongly resolved a foreign interior PC to this function. Instead of
- * the old `default: break` (which fell through and ran the function from its
- * TOP -- the bug), the function records the illegal entry and returns WITHOUT
- * executing; overlay_loader_dispatch then routes the requested PC to the
- * sanctioned dirty-RAM interpreter (the bytes at that PC run correctly). This is
- * NOT a stub/HLE -- the code still runs, via the sanctioned interpreter. */
-int      g_native_bad_entry = 0;       /* set by psx_native_bad_entry, consumed by dispatch */
-static uint32_t s_bad_entry_owner = 0; /* the function unit that rejected the PC */
-static uint32_t s_bad_entry_pc = 0;    /* the illegal entry PC */
-static uint64_t s_bad_entry_count = 0;
-void psx_native_bad_entry(CPUState *cpu, uint32_t owner, uint32_t pc) {
-    (void)cpu;
-    g_native_bad_entry = 1;
-    s_bad_entry_owner = owner;
-    s_bad_entry_pc = pc;
-    s_bad_entry_count++;
-    /* Fail-closed: the dispatch loop sees g_native_bad_entry and falls to the
-     * sanctioned dirty-RAM interpreter. (A dev-strict abort mode could be gated
-     * here; default runtime behavior is to degrade to the interpreter.) */
-}
-void overlay_loader_bad_entry_stats(uint32_t *owner, uint32_t *pc, uint64_t *count) {
-    if (owner) *owner = s_bad_entry_owner;
-    if (pc)    *pc    = s_bad_entry_pc;
-    if (count) *count = s_bad_entry_count;
-}
-
 /* CPS interior-continuation dispatch probe (diagnostic, always-on when armed).
  * Records, for a watched interior PC, what the CPS continuation re-entry path
  * (overlay_find_by_range + validate) decides: chosen candidate entry, range

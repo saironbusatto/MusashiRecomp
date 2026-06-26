@@ -794,6 +794,31 @@ int dma_cdrom_transfer_active(void) {
            ((channels[3].chcr & 1u) == 0);
 }
 
+/* Cycle-budgeted precise event slicing: guest CPU cycles until DMA raises a
+ * DELIVERABLE IRQ (bit3 unmasked in i_mask). UINT32_MAX if none. Conservative
+ * under-estimate: for async channels uses a 1-cycle/word floor minus cycles
+ * already accumulated (always <= the true remaining, since per-word cost >= 1),
+ * and the exact countdown for delayed-complete channels. Over-slicing on a
+ * channel whose DICR completion is masked is safe. See PRECISE_IRQ_SLICE.md. */
+uint32_t dma_cycles_to_irq(uint32_t i_mask) {
+    if (!(i_mask & (1u << 3))) return 0xFFFFFFFFu;   /* IRQ_DMA masked */
+    uint32_t best = 0xFFFFFFFFu;
+    const DMAAsyncChannel *async_ch[3] = { &mdec_async[0], &mdec_async[1], &cdrom_async };
+    for (int i = 0; i < 3; i++) {
+        const DMAAsyncChannel *a = async_ch[i];
+        if (!a->active || a->remaining_words == 0) continue;
+        /* floor: rw*per_word - accum >= rw - accum (per_word >= 1). Clamp >=0. */
+        uint32_t est = a->remaining_words > a->cycles_accum
+                         ? (a->remaining_words - a->cycles_accum) : 0u;
+        if (est < best) best = est;
+    }
+    for (int ch = 0; ch < 7; ch++) {
+        if (delayed_complete[ch].active && delayed_complete[ch].cycles_remaining < best)
+            best = delayed_complete[ch].cycles_remaining;
+    }
+    return best;
+}
+
 void dma_advance(uint32_t cycles) {
     if (cycles == 0) return;
     advance_mdec_channel(0, cycles);

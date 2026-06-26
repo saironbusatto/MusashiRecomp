@@ -39,6 +39,12 @@ void psx_check_interrupts_at(struct CPUState* cpu, uint32_t resume_pc);
  * real). One real-PSX VBlank = 564480 cycles (33.8688 MHz / 60). */
 void interrupts_advance_cycles(uint32_t cycles);
 
+/* Cycle-budgeted precise event slicing: minimum guest-CPU-cycle distance to the
+ * next DELIVERABLE hardware interrupt (source raises its I_STAT bit AND that bit
+ * is unmasked in i_mask). UINT32_MAX if none scheduled. Single source of truth
+ * for the two-tier block executor's fast/slice decision. See PRECISE_IRQ_SLICE.md. */
+uint32_t cycles_to_next_event(void);
+
 /* Query whether we are currently inside an exception handler dispatch. */
 int psx_get_in_exception(void);
 

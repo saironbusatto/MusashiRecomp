@@ -30,6 +30,7 @@
 #include "timers.h"
 #include "gpu.h"
 #include "cdrom.h"
+#include "dma.h"
 #include "cpu_state.h"
 #include "debug_server.h"
 #include "event_ring.h"
@@ -47,13 +48,20 @@ extern int g_dirty_interp_active;
  * edge-suppressed (they repeat every block while blocked); DELIVER is always
  * recorded (once per interrupt); the not-pending (idle) case emits nothing but
  * still updates the edge key so the next gate/deliver is captured. */
-static void irq_record_outcome(uint8_t kind, uint8_t detail) {
+static void irq_record_outcome(uint8_t kind, uint8_t detail, uint32_t aux) {
     static uint16_t s_last = 0xFFFFu;
     uint16_t key = ((uint16_t)kind << 8) | detail;
     int repeat = (key == s_last);
     s_last = key;
     if (kind == EV_NONE) return;                 /* idle: update key only */
-    if (kind == EV_IRQ_DELIVER) { event_ring_record(EV_IRQ_DELIVER, detail); return; }
+    /* IRQ_DELIVER: aux carries the architectural TAKE-PC (the resume PC), so the
+     * interrupt-take point can be compared across backends at the SAME guest
+     * cycle — native takes the IRQ at a basic-block boundary, the dirty-interp
+     * per-instruction. A take-PC that diverges at identical cycle is the
+     * take-point-granularity signature (PRINCIPLES "Control Flow Semantics":
+     * model the interrupt frame explicitly; the class fix is precise event
+     * slicing). The independent Beetle oracle records the same field. */
+    if (kind == EV_IRQ_DELIVER) { event_ring_record_aux(EV_IRQ_DELIVER, detail, aux); return; }
     if (!repeat) event_ring_record(kind, detail);/* GATE: edge only */
 }
 
@@ -220,6 +228,37 @@ void psx_restore_state_escape(void) {
     /* Not in exception context — return normally, let caller's `return;` handle it. */
 }
 
+/* Cycle-budgeted precise event slicing — single source of truth.
+ *
+ * Returns the minimum guest-CPU-cycle distance to the next DELIVERABLE hardware
+ * interrupt: a source raises its I_STAT bit AND that bit is unmasked in i_mask
+ * (CPU-side SR/IE gating is checked separately at take time). UINT32_MAX means
+ * no maskable hardware event is currently scheduled.
+ *
+ * The two-tier block executor uses this at each block leader: if a whole block
+ * fits inside this distance (and the block has no IRQ-visibility side effects),
+ * it runs as fast compiled C; otherwise it runs through the per-instruction
+ * interpreter so the interrupt is taken at its exact architectural cycle (see
+ * PRECISE_IRQ_SLICE.md). Each peripheral owns its own next-IRQ query; this just
+ * takes the min. Every query is a conservative UNDER-estimate (smaller distance
+ * => slice more => never run past an event), so this is too. */
+uint32_t cycles_to_next_event(void) {
+    uint32_t best = 0xFFFFFFFFu;
+    /* VBLANK is paced here (interrupts.c owns cycles_since_vblank). The deferred
+     * card-SIO case only pushes VBlank LATER, so this estimate stays a safe
+     * under-estimate. */
+    if (i_mask & (1u << IRQ_VBLANK)) {
+        uint32_t d = (cycles_since_vblank >= VBLANK_CYCLES)
+                       ? 0u : (VBLANK_CYCLES - cycles_since_vblank);
+        if (d < best) best = d;
+    }
+    uint32_t t = timers_cycles_to_irq(i_mask); if (t < best) best = t;
+    uint32_t c = cdrom_cycles_to_irq(i_mask);  if (c < best) best = c;
+    uint32_t d = dma_cycles_to_irq(i_mask);    if (d < best) best = d;
+    uint32_t s = sio_cycles_to_irq(i_mask);    if (s < best) best = s;
+    return best;
+}
+
 void psx_check_interrupts(CPUState* cpu) {
     total_checks++;
     if ((total_checks & 0x3FFFu) == 0) {
@@ -325,26 +364,36 @@ void psx_check_interrupts(CPUState* cpu) {
     }
 
     /* Check if any interrupts are pending. */
-    if ((i_stat & i_mask) == 0) { irq_record_outcome(EV_NONE, 0); return; }
+    if ((i_stat & i_mask) == 0) { irq_record_outcome(EV_NONE, 0, 0); return; }
     if (in_exception) {
         exception_reentry_blocks++;
-        irq_record_outcome(EV_IRQ_GATE, GATE_IN_EXCEPTION);
+        irq_record_outcome(EV_IRQ_GATE, GATE_IN_EXCEPTION, 0);
         return;
     }
 
     /* Post-exception cooldown: let at least one block execute after RFE. */
     if (post_exception_cooldown > 0) {
         post_exception_cooldown--;
-        irq_record_outcome(EV_IRQ_GATE, GATE_COOLDOWN);
+        irq_record_outcome(EV_IRQ_GATE, GATE_COOLDOWN, 0);
         return;
     }
 
     /* Check COP0 SR: IEc (bit 0) must be set, and IM2 (bit 10) must be set. */
     uint32_t sr = cpu->cop0[COP0_SR];
-    if (!(sr & 0x01)) { irq_record_outcome(EV_IRQ_GATE, GATE_SR_IE); return; }   /* Interrupts globally disabled */
-    if (!(sr & (1 << 10))) { irq_record_outcome(EV_IRQ_GATE, GATE_SR_IM2); return; } /* Hardware interrupt bit not enabled */
+    if (!(sr & 0x01)) { irq_record_outcome(EV_IRQ_GATE, GATE_SR_IE, 0); return; }   /* Interrupts globally disabled */
+    if (!(sr & (1 << 10))) { irq_record_outcome(EV_IRQ_GATE, GATE_SR_IM2, 0); return; } /* Hardware interrupt bit not enabled */
 
-    irq_record_outcome(EV_IRQ_DELIVER, 0);
+    /* Architectural take-PC = the resume PC (same selection the async-RFE block
+     * below uses): the dirty-interp commits the exact interrupted instruction in
+     * g_dirty_safe_resume_pc; compiled code passes its block-entry PC via
+     * psx_check_interrupts_at -> s_compiled_interrupt_resume_pc. Combined with the
+     * event's `mode`, this is the take-point for the cross-backend diff. */
+    {
+        extern uint32_t g_dirty_safe_resume_pc;
+        uint32_t take_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
+                                                  : s_compiled_interrupt_resume_pc;
+        irq_record_outcome(EV_IRQ_DELIVER, 0, take_pc);
+    }
     g_irq_deliver_count++;
     if ((i_stat & i_mask) & (1u << IRQ_VBLANK)) g_vblank_deliver_count++;
     in_exception = 1;

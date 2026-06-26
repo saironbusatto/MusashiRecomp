@@ -49,6 +49,10 @@ extern volatile int g_sio_timing_active;
  * g_sio_timing_active is 0. */
 void sio_advance(uint32_t cycles);
 
+/* Cycle-budgeted precise event slicing: guest CPU cycles until a DELIVERABLE
+ * SIO IRQ (bit7 unmasked in i_mask). UINT32_MAX if none. */
+uint32_t sio_cycles_to_irq(uint32_t i_mask);
+
 /* Telemetry counters for sio_advance. */
 uint64_t sio_get_advance_called(void);
 uint64_t sio_get_advance_with_work(void);
