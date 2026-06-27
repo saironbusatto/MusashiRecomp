@@ -162,11 +162,18 @@ First concrete target: make the 0x80017FC4 inter-hit Δ 46 -> 91 (== Beetle).
   regression). Closed ~10/45. Approximation: no scratchpad-free / region / load-delay
   ABSORB yet — those are refinements (absorb would LOWER native, so it's not the
   remaining 35; the remaining gap is other components below).
-- REMAINING ~35 cyc on that region: attribute faithfully before stacking guesses —
-  the within-burst region's instruction mix is unknown. Either disassemble it (count
-  mult/div, MMIO reads, GTE) OR validate the model on a KNOWN small region. Likely
-  candidates: a mult/div in the region (div ~36 ≈ the whole gap), or non-RAM/MMIO
-  reads (bigger region wait-state than +2). Do NOT blind-stack; confirm composition.
+- REMAINING ~35 cyc: DISASSEMBLED func_80017FC4 — it is only loads/stores/ALU/branches
+  + a countdown delay loop; NO mult/div/GTE/MMIO. So the gap is NOT those, for this fn.
+  BUT func_80017FC4 exits via a CPS TAIL-CALL to 0x8001EFFC (no normal return), so the
+  single-anchor entry-to-next-entry window SPANS MULTIPLE functions (80017FC4 ->
+  8001EFFC -> ... -> re-call). => single-anchor Δ is TOO COARSE for per-component
+  attribution; the 56/91 covers code we haven't disassembled.
+- TOOLING NEXT (before more cost components): add a TWO-ANCHOR region mode to cyc_watch
+  (capture cycles at region START anchor A and END anchor B; report Δ(B−A) per pass) on
+  BOTH backends. Then validate the cost model on a KNOWN, fully-disassembled single
+  code path (no calls/loops crossing out) — e.g. a leaf function entry→its terminator.
+  That gives rigorous per-component attribution instead of an opaque multi-fn window.
+  Only then resume adding components (fetch / mult-div-stall / GTE / load-absorb).
 
 ### Components to transcribe (from in-tree Beetle + psx-spx; verify each by Δ)
 The ~2x gap is dominated by what 1/insn ignores. Implement one at a time, re-measure Δ:
