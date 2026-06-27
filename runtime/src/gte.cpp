@@ -883,6 +883,14 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
 
     for (int i = 0; i < 32; i++) cpu->gte_data[i] = gte_mfc2(&gte, i);
     for (int i = 0; i < 32; i++) cpu->gte_ctrl[i] = gte_cfc2(&gte, i);
+
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    /* Faithful GTE command completion-stall: arm the per-command deadline
+     * (serializing back-to-back ops). Any later COP2 register access stalls to
+     * it. Single shared site for BOTH backends (compiled + dirty interp both
+     * route GTE commands through gte_execute). */
+    psx_gte_set(cpu, psx_gte_cmd_latency(cmd));
+#endif
 }
 
 /* C-callable wrappers for GTE register transfers */

@@ -1335,21 +1335,35 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     }
     case 0x12: { /* COP2 / GTE */
         uint32_t cop_op = rs;
+        /* Faithful GTE: any COP2 register access stalls to the pending command
+         * completion deadline (gte_execute armed it via psx_gte_set). */
         if (cop_op == 0x00) { /* MFC2 */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_gte_stall(cpu);
+#endif
             cpu->gpr[rt] = gte_read_data(cpu, (uint8_t)rd);
             cpu->gpr[0] = 0;
             return 0;
         }
         if (cop_op == 0x02) { /* CFC2 */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_gte_stall(cpu);
+#endif
             cpu->gpr[rt] = gte_read_ctrl(cpu, (uint8_t)rd);
             cpu->gpr[0] = 0;
             return 0;
         }
         if (cop_op == 0x04) { /* MTC2 */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_gte_stall(cpu);
+#endif
             gte_write_data(cpu, (uint8_t)rd, cpu->gpr[rt]);
             return 0;
         }
         if (cop_op == 0x06) { /* CTC2 */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_gte_stall(cpu);
+#endif
             gte_write_ctrl(cpu, (uint8_t)rd, cpu->gpr[rt]);
             return 0;
         }
@@ -1436,11 +1450,17 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     }
     case 0x32: { /* LWC2 */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+        psx_gte_stall(cpu);   /* COP2 reg write stalls to GTE completion */
+#endif
         gte_write_data(cpu, (uint8_t)rt, cpu->read_word(addr));
         return 0;
     }
     case 0x3A: { /* SWC2 */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+        psx_gte_stall(cpu);   /* COP2 reg read stalls to GTE completion */
+#endif
         cpu->write_word(addr, gte_read_data(cpu, (uint8_t)rt));
         return 0;
     }

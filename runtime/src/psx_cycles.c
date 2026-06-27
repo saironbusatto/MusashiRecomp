@@ -112,3 +112,63 @@ void psx_muldiv_stall(CPUState* cpu) {
         psx_advance_cycles((uint32_t)(cpu->muldiv_ts_done - psx_cycle_count));
     }
 }
+
+/* ---- GTE (COP2) per-command completion-stall timing ----
+ *
+ * Faithful R3000A/GTE model (Beetle cpu.cpp:1410-1412 + gte.cpp GTE_Instruction
+ * return(ret-1)). Each GTE command takes `cost` cycles (gte.cpp per-op returns,
+ * verified from source); the COP2 instruction's own +1 base is charged
+ * separately by per-instruction charging, so the *added* deadline latency is
+ * cost-1. A later COP2 register access (MFC2/CFC2/MTC2/CTC2/LWC2/SWC2) stalls
+ * until the deadline. Back-to-back commands serialize: psx_gte_set stalls to the
+ * prior deadline before arming the next (Beetle stalls timestamp to gte_ts_done
+ * at the command site before computing the new gte_ts_done).
+ *
+ * Cost table = (cost-1), indexed by the 6-bit GTE command (instr & 0x3F).
+ * cost values transcribed + verified from beetle-psx/mednafen/psx/gte.cpp op
+ * returns: RTPS15 RTPT23 MVMVA8 SQR5 OP6 AVSZ3/4=5 NCLIP8 NCDS19 NCDT44 NCCS17
+ * NCCT39 NCS14 NCT30 CC11 CDP13 DPCS8 DPCT17 DCPL8 INTPL8 GPF5 GPL5. Unknown/
+ * undefined commands = 1 cycle (Beetle default ret=1) -> 0 added. */
+static const uint8_t PSX_GTE_LAT_M1[64] = {
+    [0x00] = 14, [0x01] = 14,            /* RTPS  */
+    [0x06] = 7,                          /* NCLIP */
+    [0x0C] = 5,                          /* OP    */
+    [0x10] = 7,                          /* DPCS  */
+    [0x11] = 7,                          /* INTPL */
+    [0x12] = 7,                          /* MVMVA */
+    [0x13] = 18,                         /* NCDS  */
+    [0x14] = 12,                         /* CDP   */
+    [0x16] = 43,                         /* NCDT  */
+    [0x1A] = 7,                          /* DCPL (alt of 0x29) */
+    [0x1B] = 16,                         /* NCCS  */
+    [0x1C] = 10,                         /* CC    */
+    [0x1E] = 13,                         /* NCS   */
+    [0x20] = 29,                         /* NCT   */
+    [0x28] = 4,                          /* SQR   */
+    [0x29] = 7,                          /* DCPL  */
+    [0x2A] = 16,                         /* DPCT  */
+    [0x2D] = 4,                          /* AVSZ3 */
+    [0x2E] = 4,                          /* AVSZ4 */
+    [0x30] = 22,                         /* RTPT  */
+    [0x3D] = 4,                          /* GPF   */
+    [0x3E] = 4,                          /* GPL   */
+    [0x3F] = 38,                         /* NCCT  */
+};
+
+uint32_t psx_gte_cmd_latency(uint32_t cmd) {
+    return (uint32_t)PSX_GTE_LAT_M1[cmd & 0x3Fu];
+}
+
+void psx_gte_set(CPUState* cpu, uint32_t latency) {
+    /* Back-to-back GTE ops serialize: finish the prior op first. */
+    if (cpu->gte_ts_done > psx_cycle_count) {
+        psx_advance_cycles((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
+    }
+    cpu->gte_ts_done = psx_cycle_count + (uint64_t)latency;
+}
+
+void psx_gte_stall(CPUState* cpu) {
+    if (cpu->gte_ts_done > psx_cycle_count) {
+        psx_advance_cycles((uint32_t)(cpu->gte_ts_done - psx_cycle_count));
+    }
+}

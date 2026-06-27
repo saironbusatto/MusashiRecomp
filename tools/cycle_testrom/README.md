@@ -25,6 +25,8 @@ Loops (each adds ONLY its op(s) over the shared loop overhead):
 - `div`        — + divu, mflo (div latency + stall-on-read, worst case)
 - `div_spaced` — + divu, 2 filler addu, mflo (stall partly absorbed)
 - `mult`       — + multu, mflo (mult latency)
+- `gte_rtps`   — + RTPS cmd, mfc2 (GTE per-command stall; cost 15)
+- `gte_nclip`  — + NCLIP cmd, mfc2 (GTE per-command stall; cost 8)
 
 **Isolation by baseline subtraction:** (component_per_iter − baseline_per_iter)
 = the component's cost; loop overhead AND instruction fetch (both fully
@@ -91,6 +93,14 @@ Per-iteration cycle delta, and component cost (minus baseline=3):
 | div         | 41       | +38       | divu+mflo base 2 + ~36 div stall |
 | div_spaced  | 41       | +38       | divu+2addu+mflo — fillers ABSORBED by stall |
 | mult        | 18       | +15       | multu+mflo base 2 + ~13 mult stall |
+| gte_rtps    | 18       | +15       | RTPS cmd + mfc2 stall (gte.cpp RTPS=15) |
+| gte_nclip   | 11       | +8        | NCLIP cmd + mfc2 stall (gte.cpp NCLIP=8) |
+
+**GTE per-command stall — VALIDATED EXACT 2026-06-27:** native (compiled path)
+gte_rtps +15 == Beetle +15, gte_nclip +8 == Beetle +8. Modeled via
+`psx_gte_set`/`psx_gte_stall` (cpu->gte_ts_done), cost table in `psx_cycles.c`
+(verified from gte.cpp op returns). All other components unchanged (load2 +10 vs
+Beetle +11 = the remaining ReadFudge gap).
 
 Key targets for the native cost model: **div stall ~36, mult stall ~13** (native
 charges 0). Load ~5/6 (native memory.c flat +6 — close). **`div_spaced`==`div`

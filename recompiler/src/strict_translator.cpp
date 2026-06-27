@@ -1242,15 +1242,20 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         const uint8_t rt = (d.raw >> 16) & 0x1F;
         const uint8_t rd = (d.raw >> 11) & 0x1F;
 
+        // Faithful GTE: any COP2 register access stalls to the pending command
+        // completion deadline (gte_execute arms it). Cost-free unless in flight.
+        const std::string gte_stall =
+            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
+
         if (cop_op == 0x00) { // MFC2 — move from COP2 data register
             r.supported = true;
             // Computed/sign-extended data registers must route through the
             // helper instead of reading the backing array directly.
             if ((rd >= 8 && rd <= 11) || rd == 15 || rd == 28 || rd == 29 || rd == 31) {
-                r.c_code = emit_gpr_write(rt,
+                r.c_code = gte_stall + emit_gpr_write(rt,
                     fmt::format("gte_read_data(cpu, {})", static_cast<int>(rd)));
             } else {
-                r.c_code = emit_gpr_write(rt,
+                r.c_code = gte_stall + emit_gpr_write(rt,
                     fmt::format("cpu->gte_data[{}]", static_cast<int>(rd)));
             }
             r.comment = fmt::format("mfc2 {}, gte_data[{}]", gpr_name(rt), rd);
@@ -1258,7 +1263,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         }
         if (cop_op == 0x02) { // CFC2 — move from COP2 control register
             r.supported = true;
-            r.c_code = emit_gpr_write(rt,
+            r.c_code = gte_stall + emit_gpr_write(rt,
                 fmt::format("cpu->gte_ctrl[{}]", static_cast<int>(rd)));
             r.comment = fmt::format("cfc2 {}, gte_ctrl[{}]", gpr_name(rt), rd);
             return r;
@@ -1268,11 +1273,11 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
             // Route registers with side effects or canonical masking through
             // gte_write_data(): OTZ/IR/SXY2/SXYP/IRGB/LZCS.
             if (rd == 7 || (rd >= 8 && rd <= 11) || rd == 14 || rd == 15 || rd == 28 || rd == 30) {
-                r.c_code = fmt::format(
+                r.c_code = gte_stall + fmt::format(
                     "gte_write_data(cpu, {}, cpu->gpr[{}]);",
                     static_cast<int>(rd), static_cast<int>(rt));
             } else {
-                r.c_code = fmt::format(
+                r.c_code = gte_stall + fmt::format(
                     "cpu->gte_data[{}] = cpu->gpr[{}];",
                     static_cast<int>(rd), static_cast<int>(rt));
             }
@@ -1281,7 +1286,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         }
         if (cop_op == 0x06) { // CTC2 — move to COP2 control register
             r.supported = true;
-            r.c_code = fmt::format(
+            r.c_code = gte_stall + fmt::format(
                 "cpu->gte_ctrl[{}] = cpu->gpr[{}];",
                 static_cast<int>(rd), static_cast<int>(rt));
             r.comment = fmt::format("ctc2 {}, gte_ctrl[{}]", gpr_name(rt), rd);
@@ -1307,20 +1312,23 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         const uint8_t rt = (d.raw >> 16) & 0x1F;
         const int16_t offset = static_cast<int16_t>(d.raw & 0xFFFF);
         r.supported = true;
+        // Faithful GTE: COP2 reg write stalls to the command deadline.
+        const std::string gte_stall =
+            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
         bool special = (rt == 7 || (rt >= 8 && rt <= 11) || rt == 14 || rt == 15 || rt == 28 || rt == 30);
         if (special) {
             std::string addr = offset == 0
                 ? fmt::format("cpu->gpr[{}]", static_cast<int>(rs))
                 : fmt::format("(uint32_t)((int32_t)cpu->gpr[{}] + ({}))", static_cast<int>(rs), static_cast<int>(offset));
-            r.c_code = fmt::format(
+            r.c_code = gte_stall + fmt::format(
                 "gte_write_data(cpu, {}, cpu->read_word({}));",
                 static_cast<int>(rt), addr);
         } else if (offset == 0) {
-            r.c_code = fmt::format(
+            r.c_code = gte_stall + fmt::format(
                 "cpu->gte_data[{}] = cpu->read_word(cpu->gpr[{}]);",
                 static_cast<int>(rt), static_cast<int>(rs));
         } else {
-            r.c_code = fmt::format(
+            r.c_code = gte_stall + fmt::format(
                 "cpu->gte_data[{}] = cpu->read_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})));",
                 static_cast<int>(rt), static_cast<int>(rs), static_cast<int>(offset));
         }
@@ -1335,16 +1343,19 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         const uint8_t rt = (d.raw >> 16) & 0x1F;
         const int16_t offset = static_cast<int16_t>(d.raw & 0xFFFF);
         r.supported = true;
+        // Faithful GTE: COP2 reg read stalls to the command deadline.
+        const std::string gte_stall =
+            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
         std::string value = ((rt >= 8 && rt <= 11) || rt == 15 || rt == 28 || rt == 29 || rt == 31)
             ? fmt::format("gte_read_data(cpu, {})", static_cast<int>(rt))
             : fmt::format("cpu->gte_data[{}]", static_cast<int>(rt));
         if (offset == 0) {
-            r.c_code = fmt::format(
+            r.c_code = gte_stall + fmt::format(
                 "g_debug_last_store_pc = 0x{:08X}u; "
                 "cpu->write_word(cpu->gpr[{}], {});",
                 d.address, static_cast<int>(rs), value);
         } else {
-            r.c_code = fmt::format(
+            r.c_code = gte_stall + fmt::format(
                 "g_debug_last_store_pc = 0x{:08X}u; "
                 "cpu->write_word((uint32_t)((int32_t)cpu->gpr[{}] + ({})), {});",
                 d.address, static_cast<int>(rs), static_cast<int>(offset), value);
