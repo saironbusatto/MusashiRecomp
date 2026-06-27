@@ -213,6 +213,22 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-27 (dirty-interp mult/div completion-stall — backend parity):**
+  Completed the mult/div stall to the SECOND backend. The dirty-RAM interpreter
+  (Tomba2 overlays) charged 0 for mult/div while the compiled emitters already
+  set `muldiv_ts_done` + stall MFHI/MFLO — an inter-backend cost inconsistency
+  that drifts the shared guest-cycle timeline. `dirty_ram_interp.c` now mirrors
+  the compiled emitter exactly via the shared helpers (MULT→`psx_mult_latency_s`,
+  MULTU→`_u`, DIV/DIVU→37, MFHI/MFLO→`psx_muldiv_stall`), under
+  `PSX_ENABLE_BLOCK_CYCLES`. The interp charges base after exec_one (vs compiled
+  "+1 at top") but the set/stall offset cancels (verified algebraically). The
+  latency VALUES are already oracle-EXACT on rulers #1/#2 (compiled path); this
+  makes the interp apply the identical model. Validated: Tomba2 boots to FMV,
+  no regression. Caveat: validation is by-construction + no-regression, NOT a
+  direct interp Δ — interp emits no cyc_observe and the testrom isn't an overlay,
+  so a true interp-path ruler (interp cyc_observe + force-interp routing) is
+  future tooling. Commit 75d5d1a, runtime-only, no regen, UNPUSHED.
+
 - **2026-06-27 (load=4 boot wedge RESOLVED — faithful guest-cycle pad ACK):**
   The oracle-accurate load wait-state (=4) had deterministically wedged Tomba 2
   boot in the BIOS shell (handle s1=104 → 1672-stride table index → wild ptr
