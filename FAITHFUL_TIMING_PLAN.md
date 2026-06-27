@@ -213,6 +213,17 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-27 (GTE per-command completion-stall — VALIDATED EXACT):** Modeled
+  GTE (COP2) command latency + stall-on-COP2-access. New CPUState.gte_ts_done;
+  a GTE command arms it (now + cost-1, serializing back-to-back ops); any COP2
+  reg access (MFC2/CFC2/MTC2/CTC2/LWC2/SWC2) stalls to it. Cost table
+  (psx_cycles.c) transcribed+verified from beetle gte.cpp op returns (note
+  AVSZ4=5 not the psx-spx-doc's 6). Set armed in the shared gte_execute (both
+  backends); stall emitted at every COP2 reg-access site in both emitters + the
+  interp (offset cancels like muldiv). Added gte_rtps/gte_nclip loops to ruler
+  #2: native +15/+8 == Beetle +15/+8 EXACT; all other components unchanged;
+  Tomba2 boots to FMV no-regression. Commit ec1fd76. Required regen. UNPUSHED.
+
 - **2026-06-27 (dirty-interp mult/div completion-stall — backend parity):**
   Completed the mult/div stall to the SECOND backend. The dirty-RAM interpreter
   (Tomba2 overlays) charged 0 for mult/div while the compiled emitters already
