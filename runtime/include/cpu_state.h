@@ -61,6 +61,15 @@ typedef struct CPUState {
      * cycles) until this deadline — faithful R3000A behavior (Beetle
      * muldiv_ts_done). Appended at END so prior field offsets are unchanged. */
     uint64_t muldiv_ts_done;
+
+    /* GTE (COP2) command completion deadline (absolute guest cycle). A GTE
+     * command sets this to psx_cycle_count()+(cost-1) (cost from gte.cpp per-op
+     * returns; -1 because the COP2 instruction's own +1 base is charged
+     * separately). Back-to-back commands serialize (set stalls to the prior
+     * deadline first); any COP2 register access (MFC2/CFC2/MTC2/CTC2/LWC2/SWC2)
+     * stalls until it — faithful R3000A behavior (Beetle gte_ts_done).
+     * Appended at END so prior field offsets are unchanged. */
+    uint64_t gte_ts_done;
 } CPUState;
 
 /* Trap trampolines — defined in runtime/src/traps.c */
@@ -81,6 +90,16 @@ extern void     psx_muldiv_set(CPUState* cpu, uint32_t latency);
 extern void     psx_muldiv_stall(CPUState* cpu);
 extern uint32_t psx_mult_latency_s(uint32_t rs);   /* MULT  (signed)   */
 extern uint32_t psx_mult_latency_u(uint32_t rs);   /* MULTU (unsigned) */
+
+/* GTE (COP2) per-command completion-stall timing (psx_cycles.c). gte_execute()
+ * calls psx_gte_set with the command's added latency (cost-1, from
+ * psx_gte_cmd_latency); it serializes back-to-back ops by stalling to the prior
+ * deadline first. Every COP2 register access calls psx_gte_stall, which advances
+ * guest cycles to the deadline if the op is still in flight. Faithful only with
+ * per-instruction cycle charging. */
+extern void     psx_gte_set(CPUState* cpu, uint32_t latency);
+extern void     psx_gte_stall(CPUState* cpu);
+extern uint32_t psx_gte_cmd_latency(uint32_t cmd);  /* cost-1 for the 6-bit op  */
 
 extern void psx_unaligned_access(CPUState* cpu, uint32_t addr, uint32_t pc);
 extern void psx_break(CPUState* cpu, uint32_t code, uint32_t pc);

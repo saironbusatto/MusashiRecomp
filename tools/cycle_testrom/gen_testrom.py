@@ -64,6 +64,8 @@ def mflo(rd):            return R(0x12, 0, 0, rd)
 def mfhi(rd):            return R(0x10, 0, 0, rd)
 def lw(rt, off, base):   return I(0x23, base, rt, off)
 def sw(rt, off, base):   return I(0x2B, base, rt, off)
+def cop2cmd(cmd):        return (0x12 << 26) | (1 << 25) | (cmd & 0x1FFFFFF)  # GTE command
+def mfc2(rt, rd):        return (0x12 << 26) | (0x00 << 21) | (_r(rt) << 16) | ((rd & 0x1F) << 11)  # MFC2 rt,gte[rd]
 def bne(rs, rt, off):    return I(0x05, rs, rt, off)   # off in words, signed
 def beq(rs, rt, off):    return I(0x04, rs, rt, off)
 def jr(rs):              return R(0x08, rs)
@@ -160,6 +162,12 @@ def build():
                               mflo("$t4")])
     # mult: multu + mflo (isolates mult latency)
     inner_loop("mult", [multu("$t2", "$t3"), mflo("$t4")])
+    # gte_rtps: GTE RTPS command (0x01) + mfc2 result read. Isolates the GTE
+    # per-command completion-stall: the COP2 read stalls to the command deadline.
+    # Cost is operand-independent (gte.cpp RTPS returns 15), so delta == 15.
+    inner_loop("gte_rtps", [cop2cmd(0x01), mfc2("$t4", 14)])
+    # gte_nclip: NCLIP command (0x06, cost 8) + mfc2 MAC0 (reg 24) read.
+    inner_loop("gte_nclip", [cop2cmd(0x06), mfc2("$t4", 24)])
 
     # loop outer forever
     o = a.labels["outer"]
