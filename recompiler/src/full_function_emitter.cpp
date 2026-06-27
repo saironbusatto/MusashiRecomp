@@ -371,6 +371,19 @@ bool FullFunctionEmitter::emit_function(
         // can service vblank and other hardware interrupts.
         if (block_leaders.count(addr)) {
             out += fmt::format("label_{:08X}:\n", addr);
+            // Per-block-leader cycle observe (cyc_watch ruler). Sampled BEFORE
+            // this block's cycle advance, so it reports cumulative cycles for
+            // all PRIOR blocks — matching Beetle's before-instruction sample
+            // and the cycle_compare.py anchor semantics. Debug-only: prod
+            // (PSX_NO_DEBUG_TOOLS) emits nothing → zero overhead.
+            out += "#ifndef PSX_NO_DEBUG_TOOLS\n";
+            // Use the NORMALIZED (runtime) phys so anchors match the address
+            // space the entry hook + cyc_watch use — relocated kernel funcs
+            // (ROM 0x1FC10000+) run at RAM 0x500+, so the raw ROM addr would
+            // never match a RAM anchor.
+            out += fmt::format("    debug_server_cyc_observe(0x{:08X}u);\n",
+                               normalize_address(addr));
+            out += "#endif\n";
             // Phase 1.0e-d: advance guest cycles for this block. Macro-
             // gated; when off, generated code matches pre-1.0e-d output.
             uint32_t bcyc = 0;
@@ -1473,6 +1486,9 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
     full_c += "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
     full_c += "extern void debug_server_log_probe(uint32_t pc, CPUState *cpu);\n";
+    full_c += "#ifndef PSX_NO_DEBUG_TOOLS\n";
+    full_c += "extern void debug_server_cyc_observe(uint32_t block_leader_phys);\n";
+    full_c += "#endif\n";
     full_c += "extern uint32_t g_debug_last_store_pc;\n";
     full_c += "/* Phase 1.0e-d: per-block guest cycle accounting.\n";
     full_c += " * Compile generated code with -DPSX_ENABLE_BLOCK_CYCLES=1 to\n";

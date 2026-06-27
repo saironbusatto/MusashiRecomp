@@ -36,27 +36,27 @@ extern "C" {
  * each component verified against Beetle via the cyc_watch DELTA gate
  * (FAITHFUL_TIMING_PLAN.md §3c). Both backends consume this one function.
  *
- * STAGE 2 component #1 — data-memory access (the dominant ~2x gap):
- *   Beetle PS_CPU::ReadMemory: a normal CPU load adds `lts += 2` (LWC loads +1);
- *   stores are POSTED (WriteMemory adds no CPU stall); scratchpad reads add 0.
- *   So: load opcode = 1 (execute) + 2 (data access) = 3; LWC2 = 2; store/other = 1.
- * NOT YET MODELED (later Δ-gated components, will adjust here / in the mem path):
- *   - scratchpad-vs-RAM region (scratchpad load should be 1, not 3),
- *   - the read-after-load "fudge" (+0/2) and load-delay ABSORB (next-insn discount),
- *   - I-cache instruction-fetch timing, mult/div latency, GTE per-command costs.
- *   This RAM-load base is an upper bound on the load component (no absorb yet); the
- *   Δ gate shows whether we under/overshoot and what to add next. */
+ * DATA-MEMORY ACCESS IS *NOT* CHARGED HERE — it lives in the memory path.
+ *   The runtime already owns the load/store data-access cost address-keyed in
+ *   runtime/src/memory.c (charge_main_ram_read → psx_guest_read_*: +6 cyc per
+ *   main-RAM read wait-state, scratchpad/MMIO/ROM excluded), exactly like Beetle
+ *   charges it in PS_CPU::ReadMemory (region wait + completion), NOT in the
+ *   opcode dispatch. The opcode word alone cannot know the target region
+ *   (RAM vs scratchpad vs MMIO), so a per-opcode load surcharge here is wrong by
+ *   construction and DOUBLE-COUNTS what memory.c already charges.
+ *
+ *   HISTORY: Stage-2 #1a (commit 2ef47bd) returned 3 for loads / 2 for LWC2
+ *   ("1 execute + 2 data-access"). The BIOS-kernel cycle ruler (region
+ *   [0x80001C5C→0x80001CA4]) proved this double-counts: native charged the 2
+ *   loads +2 each HERE *and* +6 each in memory.c (8 over base), reconciling the
+ *   opaque 0x80017FC4 window only because that over-charge masked the entirely-
+ *   unmodeled divu→mflo stall. Reverted to pure execute base (this header's own
+ *   stated contract). The real Stage-2 components are EXECUTE-pipeline latencies
+ *   (mult/div stall, GTE per-command) added here, and CALIBRATING the memory-path
+ *   wait-state (memory.c) per Beetle region — each Δ-gated on the ruler. */
 static inline uint32_t psx_instr_base_cycles(uint32_t insn) {
-    uint32_t op = insn >> 26;
-    switch (op) {
-        case 0x20: case 0x21: case 0x22: case 0x23:   /* LB  LH  LWL LW  */
-        case 0x24: case 0x25: case 0x26:              /* LBU LHU LWR     */
-            return 3u;                                /* 1 execute + 2 data-access */
-        case 0x32:                                    /* LWC2 (GTE load): +1 */
-            return 2u;
-        default:
-            return 1u;
-    }
+    (void)insn;
+    return 1u;   /* pure CPU execute base; data access charged in memory.c */
 }
 
 #ifdef __cplusplus

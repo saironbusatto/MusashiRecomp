@@ -213,6 +213,50 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-26 (RULER #1 BUILT + load double-count bug found & fixed):** Built the
+  game-independent BIOS-kernel cycle ruler the §3c "TOOLING NEXT" called for, and
+  it immediately paid off. Details:
+  - **New oracle-model doc `CYCLE_MODEL_BEETLE.md`** — transcribed the full R3000A
+    cycle model verbatim from in-tree Beetle cpu.cpp (base +1/insn minus load-delay
+    absorb; I-cache fetch +0 hit / +4 KSEG1 / +3+refill miss; ReadMemory loads
+    scratchpad=0/region-wait+2, posted stores; mult 6-13 / div 36 stall-on-MFHI/LO;
+    GTE per-command table). This is the calibration ground truth.
+  - **cyc_watch double-fire FIXED** (debug_server.c): observe was called from BOTH
+    the dispatcher (trace_dispatch) AND the function prologue (log_call_entry) at the
+    same cycle → every dispatched entry double-recorded. Added (phys,cycle) dedupe.
+    Real tooling bug (Rule 15); native deltas were corrupted before this.
+  - **Per-block-leader cycle observe ADDED** (full_function_emitter.cpp →
+    debug_server_cyc_observe, #ifndef PSX_NO_DEBUG_TOOLS so prod = zero overhead).
+    Native previously observed only at FUNCTION ENTRIES; now it samples at EVERY
+    compiled block leader, matching Beetle's before-every-instruction sample. This
+    lets cyc_watch anchor ANY block-leader PC (interior loop tops, prologue exits) →
+    a clean KNOWN-instruction region on both backends. Emitted at normalize_address()
+    (runtime phys) so relocated-kernel anchors match.
+  - **THE RULER:** BIOS kernel EvCB-search fn at guest 0x80001C5C (relocated ROM,
+    identical in every PSX title). Region [0x80001C5C→0x80001CA4] (18-insn prologue,
+    contains divu+mflo + 2 RAM loads, no MMIO/GTE). Both backends now record it.
+  - **BUG FOUND — loads double-counted.** Native [c5c→ca4] = 34, fully decomposed:
+    block c5c advance 20 (=14×1 + **2 loads×3**) + block c9c 2 + **memory.c +6×2 = 12**
+    = 34. The Stage-2 #1a commit (2ef47bd) made psx_instr_base_cycles return 3 for
+    loads (+2 data-access) WHILE memory.c's charge_main_ram_read already charged +6
+    per main-RAM read — the load data-access cost was counted TWICE. The opaque
+    0x80017FC4 window hid this because the load over-charge masked the entirely-
+    unmodeled divu→mflo stall (~30 cyc Beetle, 0 native). **FIX:** reverted
+    psx_instr_base_cycles to pure execute base (loads=1), per the header's own stated
+    "data access charged separately in the memory path" contract. memory.c is the
+    single address-keyed owner (like Beetle's ReadMemory). Regen BIOS+game, rebuild.
+  - **RESULT:** native [c5c→ca4] 34→**30** (exact: 16+2+12), dead stable. Beetle 56
+    steady (84 cold = I-cache line refill). FMV still streams (i_stat 0x8D, no
+    regression). The remaining −26 gap is now HONEST and decomposed: native is
+    missing the divu→mflo execute stall, and memory.c's flat +6/load needs Beetle
+    calibration. NEXT: isolate those two components — the BIOS prologue combines
+    div+loads in one block (leader anchors can't split them), so the principled next
+    step is **ruler #2 (HW test ROM, Amidog)** for hand-crafted single-component
+    isolation loops (div-only, load-only), per the user's "do both rulers /
+    completeness not convenience" directive. Then Δ-gate each EXECUTE-latency
+    component (mult/div, GTE) into psx_instr_base_cycles and CALIBRATE memory.c's
+    wait-state per region. All on wt/tomba2-cycle-audit, uncommitted.
+
 - **2026-06-26 (measure: Beetle cycle clock BUILT + VALIDATED):** Added absolute
   guest-cycle exposure to the Beetle oracle (MAIN checkout, additive diagnostic):
   beetle-psx/libretro.cpp accumulates per-frame `timestamp` (CPU->Run slice) into

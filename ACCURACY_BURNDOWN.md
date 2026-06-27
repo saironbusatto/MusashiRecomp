@@ -84,14 +84,27 @@ Status: STRONG (recompiler core; proven byte-identical to interp on many funcs).
 ## Axis 2 — Cycle/timing  ← ACTIVE (see FAITHFUL_TIMING_PLAN.md)
 
 Status: Stage-1 (1 cycle/insn, single-source seam in place); Stage-2 in progress.
+Oracle model fully transcribed in `CYCLE_MODEL_BEETLE.md`. Game-independent
+BIOS-kernel ruler BUILT (region [0x80001C5C→0x80001CA4]); per-block-leader cycle
+observe added to the recompiler so ANY block leader is anchorable on both backends.
 - [x] Single-source `psx_instr_base_cycles` seam (identity), both backends.
-- [ ] Mult/div latency — Beetle cpu.cpp MULT_Tab/muldiv; psx-spx.
+- [x] cyc_watch dispatcher+prologue double-fire dedupe (was corrupting native Δ).
+- [x] Per-block-leader observe (native now samples like Beetle, not only fn-entry).
+- [x] **Load double-count FIXED**: Stage-2 #1a put +2 data-access in
+  psx_instr_base_cycles while memory.c already charged +6/main-RAM-load → counted
+  twice. Reverted opcode fn to pure execute base; memory.c is the single address-
+  keyed owner. Ruler [c5c→ca4]: native 34→30 (exact), no FMV regression.
+- [ ] Memory wait-state CALIBRATION: memory.c flat +6/RAM-read vs Beetle ReadMemory
+  (region wait + completion +2/+1 − load-delay absorb; scratchpad=0). Δ-gate.
+- [ ] Mult/div latency — Beetle cpu.cpp MULT_Tab/muldiv; psx-spx. (Ruler shows the
+  unmodeled divu→mflo stall is the dominant remaining −26 in [c5c→ca4].)
 - [ ] GTE per-command cycles — Beetle gte.cpp GTE_Instruction; DuckStation; psx-spx.
-- [ ] Memory wait-states by region (RAM/BIOS-ROM/scratchpad/MMIO) — Beetle
-  ReadMemory/PSX_MemRead timing; psx-spx "Memory Control".
-- [ ] Instruction-fetch / I-cache timing — Beetle ReadInstruction; psx-spx.
-- [ ] Validation: native cumulative cycles == Beetle at convergence (needs the
-  comparator above).
+- [ ] Instruction-fetch / I-cache timing — Beetle ReadInstruction (+0 hit / +4 KSEG1
+  / +3+refill miss). Ruler's 56→84 cold spread is the I-cache line-refill transient.
+- [ ] **HW test-ROM ruler (#2)** — Amidog CPU/GTE timing ROMs for hand-crafted
+  single-COMPONENT isolation (div-only, load-only loops) that organic BIOS code
+  can't give (the prologue combines div+loads in one block). Strongest validator.
+- [ ] Validation: native cumulative cycles == Beetle == analytic on the rulers.
 
 ## Axis 3 — Interrupt / event timing
 

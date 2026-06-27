@@ -2077,22 +2077,40 @@ static uint64_t s_cyc_watch_region_start = 0;
  * (debug_server_trace_dispatch), the universal function-entry hook
  * (debug_server_log_call_entry), and the dirty-RAM path
  * (debug_server_dirty_break_maybe_pause). `block_leader_phys` is physical. */
+/* Dedupe state for the dispatch+prologue double-fire (see below). */
+static uint32_t s_cyc_watch_last_phys  = 0xFFFFFFFFu;
+static uint64_t s_cyc_watch_last_cycle = 0xFFFFFFFFFFFFFFFFull;
+
 static inline void cyc_watch_observe(uint32_t block_leader_phys)
 {
     if (!s_cyc_watch_armed) return;                 /* disarmed: no cost */
 
+    /* DEDUPE the double-fire: a block reached via the dispatcher is observed
+     * BOTH by debug_server_trace_dispatch (routing) AND by the function's own
+     * debug_server_log_call_entry (prologue) — same phys, same cycle, 0 cycles
+     * apart. That double-records every dispatched entry (a function reached by a
+     * direct jal fires only the prologue, so it looked like alternating pairs in
+     * the ring). A genuine re-entry of the same PC is always ≥1 cycle later, so
+     * keying on (phys,cycle) drops ONLY the spurious double, never a real hit. */
+    uint64_t cyc_now = psx_get_cycle_count();
+    if (block_leader_phys == s_cyc_watch_last_phys &&
+        cyc_now           == s_cyc_watch_last_cycle) {
+        return;
+    }
+    s_cyc_watch_last_phys  = block_leader_phys;
+    s_cyc_watch_last_cycle = cyc_now;
+
     if (s_cyc_watch_end_phys != 0u) {               /* ── REGION mode (A..B Δ) ── */
         if (!s_cyc_watch_in_region) {
             if (block_leader_phys == s_cyc_watch_anchor_phys) {
-                s_cyc_watch_region_start = psx_get_cycle_count();
+                s_cyc_watch_region_start = cyc_now;
                 s_cyc_watch_in_region = 1;
             }
         } else if (block_leader_phys == s_cyc_watch_end_phys) {
-            uint64_t now = psx_get_cycle_count();
             CycWatchEntry *e = &s_cyc_watch_ring[s_cyc_watch_hits];
             e->hit_index       = s_cyc_watch_hits;
             e->pc              = block_leader_phys;
-            e->psx_cycle_count = now - s_cyc_watch_region_start;  /* Δ(B-A) */
+            e->psx_cycle_count = cyc_now - s_cyc_watch_region_start;  /* Δ(B-A) */
             s_cyc_watch_hits++;
             s_cyc_watch_in_region = 0;
             if (s_cyc_watch_hits >= s_cyc_watch_max_hits) s_cyc_watch_armed = 0;
@@ -2108,9 +2126,25 @@ static inline void cyc_watch_observe(uint32_t block_leader_phys)
     CycWatchEntry *e = &s_cyc_watch_ring[s_cyc_watch_hits];
     e->hit_index       = s_cyc_watch_hits;
     e->pc              = block_leader_phys;
-    e->psx_cycle_count = psx_get_cycle_count();
+    e->psx_cycle_count = cyc_now;
     s_cyc_watch_hits++;
     if (s_cyc_watch_hits >= s_cyc_watch_max_hits) s_cyc_watch_armed = 0;
+}
+
+/* Exported per-basic-block-leader cycle observer. Emitted by the recompiler at
+ * EVERY compiled block leader (under #ifndef PSX_NO_DEBUG_TOOLS, so prod builds
+ * emit nothing — zero overhead) so native's cycle observation matches Beetle's
+ * (which samples before every instruction). This lets cyc_watch anchor ANY
+ * block-leader PC — interior loop tops, prologue exits — not just function
+ * entries, which is required for a clean, KNOWN-instruction-sequence ruler.
+ * Disarmed cost = one volatile load + return (see cyc_watch_observe). */
+void debug_server_cyc_observe(uint32_t block_leader_phys) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)block_leader_phys;
+    return;
+#else
+    cyc_watch_observe(block_leader_phys & 0x1FFFFFFFu);
+#endif
 }
 
 void debug_server_trace_dispatch(uint32_t func_addr) {
@@ -7266,6 +7300,8 @@ static void handle_cyc_watch(int id, const char *json)
     s_cyc_watch_region_start= 0;
     s_cyc_watch_max_hits    = (uint32_t)n;
     s_cyc_watch_hits        = 0;
+    s_cyc_watch_last_phys   = 0xFFFFFFFFu;   /* reset dedupe state per arm */
+    s_cyc_watch_last_cycle  = 0xFFFFFFFFFFFFFFFFull;
     memset(s_cyc_watch_ring, 0, sizeof(s_cyc_watch_ring));
     s_cyc_watch_armed = 1;
 
