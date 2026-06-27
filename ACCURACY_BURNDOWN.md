@@ -96,11 +96,15 @@ observe added to the recompiler so ANY block leader is anchorable on both backen
   keyed owner. Ruler [c5c→ca4]: native 34→30 (exact), no FMV regression.
 - [ ] Memory wait-state CALIBRATION: memory.c flat +6/RAM-read vs Beetle ReadMemory
   (region wait + completion +2/+1 − load-delay absorb; scratchpad=0). Δ-gate.
-- [x] **Mult/div completion-stall — DONE, validated EXACT** (commit a3e8f28).
-  CPUState.muldiv_ts_done set by MULT/MULTU/DIV/DIVU, MFLO/MFHI stall to it
-  (psx_cycles.c). Needs per-instruction charging (now default on this branch).
-  Ruler #2: native div +38, div_spaced +38 (absorb), mult +15 — ALL == Beetle.
-  Still TODO in BIOS emitter (block-mode) → ruler #1 not yet moved.
+- [x] **Mult/div completion-stall — DONE, validated EXACT in BOTH emitters**
+  (commits a3e8f28 game, 180b821 BIOS). CPUState.muldiv_ts_done set by
+  MULT/MULTU/DIV/DIVU, MFLO/MFHI stall to it (psx_cycles.c). Per-instruction
+  charging default on this branch (both emitters). Ruler #2 (game): div +38,
+  div_spaced +38 (absorb), mult +15 — ALL == Beetle. Ruler #1 (BIOS kernel):
+  [c5c→ca4] native 30→56 == Beetle 56, STEADY DELTA 0 EXACT. FMV no regression.
+- [ ] **Instruction-fetch / I-cache** — ruler #1 shows the residual: Beetle 84 on
+  cold-line hits (I-cache refill) vs native flat 56. Next component. Beetle
+  ReadInstruction (+0 hit / +4 KSEG1 / +3+refill miss).
 - [ ] GTE per-command cycles — Beetle gte.cpp GTE_Instruction; DuckStation; psx-spx.
 - [ ] Instruction-fetch / I-cache timing — Beetle ReadInstruction (+0 hit / +4 KSEG1
   / +3+refill miss). Ruler's 56→84 cold spread is the I-cache line-refill transient.

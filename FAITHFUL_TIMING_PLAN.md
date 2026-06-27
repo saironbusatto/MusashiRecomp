@@ -213,6 +213,19 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-27 (BIOS emitter muldiv stall — ruler #1 now EXACT):** Applied
+  per-instruction cycle charging + the mult/div completion-stall to the BIOS
+  emitter (full_function_emitter.cpp: +1 at the top of every in-function
+  instruction + the 4 inlined orphaned-delay-slot sites; block-up-front charge
+  off in per-insn mode) and StrictTranslator (MULTU/DIV/DIVU → psx_muldiv_set,
+  MFHI/MFLO → psx_muldiv_stall). RESULT: ruler #1 [0x80001C5C→0x80001CA4] native
+  30→56 == Beetle 56, STEADY DELTA 0 — EXACT. Both rulers now match the oracle for
+  mult/div (ruler #2 game-side already exact). FMV no regression (i_stat 0x8D,
+  full frame). Commit 180b821. The +1-at-top convention cancels the divu-set /
+  mflo-stall offset identically to the game emitter (both exact). NEXT: I-cache
+  fetch (ruler #1 residual = Beetle's 84-on-cold-hit refill spikes vs native flat
+  56); then load wait-state calibration (memory.c +6 → ReadFudge model); then GTE.
+
 - **2026-06-27 (RULER #2 closed + mult/div completion-stall VALIDATED EXACT):**
   Built the full cycle micro-benchmark harness (ruler #2) and used it to land the
   biggest Stage-2 component.
