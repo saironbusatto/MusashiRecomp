@@ -2645,6 +2645,7 @@ int main(int argc, char** argv) {
     /* R3000A load-delay interlock init (Beetle: BACKED_LDWhich=0x20 = no pending
      * load; ReadFudge=0 so the first load gets no fudge). Rest is correctly 0. */
     cpu.ld_which_t = 0x20;
+    psx_icache_reset();   /* all I-cache lines cold at reset */
 
     /* Wire memory function pointers. Guest data loads now route their CPU cycle
      * cost through the faithful load-delay interlock (psx_cyc_load_* in memory.c),
