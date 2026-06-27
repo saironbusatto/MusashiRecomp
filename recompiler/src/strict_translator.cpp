@@ -1225,8 +1225,11 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
 
         if (rs == 0x00) { // MFC0 rt, rd  -- gpr[rt] = cop0[rd]
             r.supported = true;
-            r.c_code = emit_gpr_write(rt,
-                fmt::format("cpu->cop0[{}]", static_cast<int>(rd)));
+            // MFC0 is a delayed load (Beetle: LDAbsorb=0, LDWhich=rt): no give-back
+            // cycles, but sets ReadFudge=rt so a load in the next slot gets no fudge.
+            r.c_code = emit_gpr_write(rt, fmt::format("cpu->cop0[{}]", static_cast<int>(rd)))
+                + fmt::format("\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    cpu->ld_absorb = 0u; cpu->ld_which_t = {}u;\n#endif",
+                              static_cast<int>(rt));
             r.comment = fmt::format("mfc0 {}, cop0[{}]", gpr_name(rt), rd);
             return r;
         }
@@ -1255,16 +1258,22 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         // completion deadline (gte_execute arms it). Cost-free unless in flight.
         const std::string gte_stall =
             "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
+        // MFC2/CFC2 (GPR-dest reads): stall to the GTE deadline AND hand the stall
+        // amount to the next instruction(s) as a load-delay give-back (Beetle
+        // MFC2/CFC2: LDAbsorb=gte_ts_done-ts, LDWhich=rt). §1+DO_LDS ran in the
+        // function's per-instruction psx_cyc_step (COP2 is non-load).
+        const std::string gte_read = fmt::format(
+            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_read(cpu, {});\n#endif\n    ", static_cast<int>(rt));
 
         if (cop_op == 0x00) { // MFC2 — move from COP2 data register
             r.supported = true;
             // Computed/sign-extended data registers must route through the
             // helper instead of reading the backing array directly.
             if ((rd >= 8 && rd <= 11) || rd == 15 || rd == 28 || rd == 29 || rd == 31) {
-                r.c_code = gte_stall + emit_gpr_write(rt,
+                r.c_code = gte_read + emit_gpr_write(rt,
                     fmt::format("gte_read_data(cpu, {})", static_cast<int>(rd)));
             } else {
-                r.c_code = gte_stall + emit_gpr_write(rt,
+                r.c_code = gte_read + emit_gpr_write(rt,
                     fmt::format("cpu->gte_data[{}]", static_cast<int>(rd)));
             }
             r.comment = fmt::format("mfc2 {}, gte_data[{}]", gpr_name(rt), rd);
@@ -1272,7 +1281,7 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         }
         if (cop_op == 0x02) { // CFC2 — move from COP2 control register
             r.supported = true;
-            r.c_code = gte_stall + emit_gpr_write(rt,
+            r.c_code = gte_read + emit_gpr_write(rt,
                 fmt::format("cpu->gte_ctrl[{}]", static_cast<int>(rd)));
             r.comment = fmt::format("cfc2 {}, gte_ctrl[{}]", gpr_name(rt), rd);
             return r;

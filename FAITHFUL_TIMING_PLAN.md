@@ -213,6 +213,22 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-27 (GTE-read + MFC0 + muldiv give-back — IMPLEMENTED + VALIDATED, ruler #2 100%):**
+  Closed the last steady-state divergences. KEY METHODOLOGY FINDING (Rule 15): Beetle's
+  cyc_watch must be sampled at STEADY STATE — its boot/warm-up window reports the
+  no-give-back value, which is why earlier sessions mis-recorded gte_rtps as "+15 EXACT"
+  (true steady = +11). Added ruler #2 probes (load_use, gte_read_use, ld_div) to Δ-gate it.
+  Shipped: `psx_gte_read` (MFC2/CFC2: stall to gte_ts_done AND arm ld_absorb=stall/
+  ld_which_t=rt give-back; MTC2/CTC2 keep stall-only `psx_gte_stall`); MFC0 arms
+  ld_absorb=0/ld_which_t=rt (suppresses a following load's fudge); `psx_muldiv_stall` now
+  CONSUMES read_absorb during the MFLO/MFHI stall + the muldiv_ts_done-1 off-by-one — all
+  transcribed from Beetle cpu.cpp:1332-1341/1723-1736, in both emitters + the interp.
+  **All 12 ruler #2 loops == Beetle at steady state** (gte_rtps 18→14, gte_nclip 11→7,
+  gte_read_use 19→14, ld_div 45→49 fixed; the 8 CPU-load/alu/div/mult loops held); ruler #1
+  delta 0; Tomba 2 FMV plays (no regression). The R3000A load-delay + GTE/muldiv interlock
+  is now hardware-faithful across every micro-benchmark. NEXT axis: I-cache fetch (ruler #1
+  84/77 cold-refill spikes). Commits on wt/tomba2-load-accuracy (unpushed).
+
 - **2026-06-27 (load ReadFudge/LDAbsorb — IMPLEMENTED + VALIDATED, both rulers exact):**
   Shipped the shared per-instruction R3000A load-delay interlock. New `runtime/include/
   psx_cyc.h`: §1 base + GPR_DEPRES + DO_LDS (`psx_cyc_step`) as static-inline helpers over

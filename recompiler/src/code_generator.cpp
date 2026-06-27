@@ -1074,7 +1074,14 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     uint32_t rt = get_rt(instr);
                     uint32_t rd = get_rd(instr);
                     if (cop_op == 0x00) { // MFC0 - move from COP0
-                        code = fmt::format("{} = cpu->cop0[{}];  /* mfc0 */", reg_name(rt), rd);
+                        // MFC0 is a delayed load (Beetle: LDAbsorb=0, LDWhich=rt) — no
+                        // give-back cycles, but it sets ReadFudge=rt so a load in the next
+                        // slot gets no fudge. §1+DO_LDS ran in the block's psx_cyc_step.
+                        code = fmt::format(
+                            "{} = cpu->cop0[{}];"
+                            "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    cpu->ld_absorb = 0u; cpu->ld_which_t = {}u;\n#endif"
+                            "  /* mfc0 (delayed load) */",
+                            reg_name(rt), rd, rt);
                     } else if (cop_op == 0x04) { // MTC0 - move to COP0
                         code = fmt::format("cpu->cop0[{}] = {};  /* mtc0 */", rd, reg_name(rt));
                     } else if (cop_op == 0x10 && (instr & 0x3F) == 0x10) { // RFE
@@ -1096,14 +1103,20 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     // before the access; cost-free unless an op is still in flight.
                     const char* gte_stall =
                         "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
+                    // MFC2/CFC2 (GPR-dest reads): stall to the GTE deadline AND hand the
+                    // stall amount to the next instruction(s) as a load-delay give-back
+                    // (Beetle MFC2/CFC2: LDAbsorb=gte_ts_done-ts, LDWhich=rt). §1+DO_LDS
+                    // ran in the block's psx_cyc_step (COP2 is non-load).
+                    const std::string gte_read = fmt::format(
+                        "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_read(cpu, {});\n#endif\n    ", rt);
                     if (cop_op == 0x00) { // MFC2 - move from COP2 data
                         if ((rd >= 8 && rd <= 11) || rd == 15 || rd == 28 || rd == 29 || rd == 31) {
-                            code = gte_stall + fmt::format("{} = gte_read_data(cpu, {});  /* mfc2 */", reg_name(rt), rd);
+                            code = gte_read + fmt::format("{} = gte_read_data(cpu, {});  /* mfc2 */", reg_name(rt), rd);
                         } else {
-                            code = gte_stall + fmt::format("{} = cpu->gte_data[{}];  /* mfc2 */", reg_name(rt), rd);
+                            code = gte_read + fmt::format("{} = cpu->gte_data[{}];  /* mfc2 */", reg_name(rt), rd);
                         }
                     } else if (cop_op == 0x02) { // CFC2 - move from COP2 control
-                        code = gte_stall + fmt::format("{} = cpu->gte_ctrl[{}];  /* cfc2 */", reg_name(rt), rd);
+                        code = gte_read + fmt::format("{} = cpu->gte_ctrl[{}];  /* cfc2 */", reg_name(rt), rd);
                     } else if (cop_op == 0x04) { // MTC2 - move to COP2 data
                         if (rd == 7 || (rd >= 8 && rd <= 11) || rd == 14 || rd == 15 || rd == 28 || rd == 30) {
                             code = gte_stall + fmt::format("gte_write_data(cpu, {}, {});  /* mtc2 */", rd, reg_name(rt));

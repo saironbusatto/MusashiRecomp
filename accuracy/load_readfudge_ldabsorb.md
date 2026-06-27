@@ -14,9 +14,19 @@ unchanged + matching); ruler #1 [0x80001C5C→0x80001CA4] 54 → **56** == Beetl
 intro FMV (no regression). The `(ReadFudge>>4)&2` fudge, the region(RAM +3)+completion(+2)
 LDAbsorb give-back, and scratchpad +0 are all modeled per below.
 
-FOLLOW-UP (CONFIRMED divergences — ACCURACY axis-2): GTE-read (MFC2/CFC2) + MFC0 LDAbsorb
-give-back arming, and the muldiv-stall give-back consumption / off-by-one (Beetle
-cpu.cpp:1332-1338 / 1723-1736). **NOW Δ-GATED** by new ruler #2 probe loops, measured at
+FOLLOW-UP — **DONE + VALIDATED (2026-06-27, same session).** GTE-read (MFC2/CFC2) +
+MFC0 LDAbsorb give-back arming, and the muldiv-stall give-back consumption / off-by-one
+(Beetle cpu.cpp:1332-1341 / 1723-1736). Shipped: `psx_gte_read` (stall + arm give-back) for
+MFC2/CFC2 in both emitters + interp (MTC2/CTC2 stay `psx_gte_stall`); MFC0 arms
+ld_absorb=0/ld_which_t=rt; `psx_muldiv_stall` now consumes read_absorb during the stall +
+the muldiv_ts_done-1 off-by-one. **All 12 ruler #2 loops now == Beetle at steady state**:
+the 4 divergences closed (gte_rtps 18→14, gte_nclip 11→7, gte_read_use 19→14, ld_div 45→49)
+and the 8 prior matches held; ruler #1 delta 0; Tomba 2 FMV plays (jungle scene, no
+regression). The original FOLLOW-UP text + the Δ-gate table below is retained for the record.
+
+Original FOLLOW-UP note (CONFIRMED divergences — ACCURACY axis-2): GTE-read (MFC2/CFC2) +
+MFC0 LDAbsorb give-back arming, and the muldiv-stall give-back consumption / off-by-one
+(Beetle cpu.cpp:1332-1338 / 1723-1736). **Δ-GATED** by new ruler #2 probe loops, measured at
 STEADY STATE (Beetle must run long enough — its warm-up window reports the no-give-back
 value, which is why the handoff mis-recorded gte_rtps as "+15 EXACT"; the true steady
 Beetle value is +11). Steady-state native(no give-back) vs Beetle(give-back):
