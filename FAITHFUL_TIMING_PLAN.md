@@ -213,6 +213,26 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-27 (I-cache fetch — MODEL built + interp-validated EXACT; Stage 1 of 2):**
+  New runtime/src/psx_icache.c: faithful direct-mapped (4 KB / 256-line) instruction-cache
+  fetch cost, transcribed from Beetle PS_CPU::ReadInstruction — HIT +0 (no give-back clear),
+  KSEG1/uncached +4, cached miss +3 + refill from the missing word to the line end (earlier
+  words stay invalid), miss clears the load give-back. Mirrors only the per-word TV tag array.
+  Wired into the dirty-RAM interp (exec_one) per instruction, charged BEFORE §1 (Beetle order).
+  New ruler #2 loop `icache_miss` (loop top + victim 0x1000 apart alias the same line → refill
+  miss every iteration). VALIDATED interp vs Beetle (PSX_FORCE_INTERP=1 PSX_ICACHE=1):
+  icache_miss native +14 == Beetle +14; the other 12 loops unchanged at +0 fetch. So the
+  hit AND refill-miss costs are MEASURED equal to the oracle on the interp path. Opt-in via
+  PSX_ICACHE=1 (default OFF) — charging fetch in only one backend would fork mixed
+  compiled/interp timing. Default-off → no production change (Tomba 2 FMV/logo verified
+  byte-identical). Commit 958a928.
+  STAGE 2 (pending): emit psx_icache_fetch at each cache-line leader in BOTH static emitters
+  (code_generator + full_function_emitter), using the RUNTIME address (handle ROM->RAM
+  relocated shell code); flip PSX_ICACHE default on so both backends charge it; validate
+  ruler #1's cold first-hit spike (Beetle 84/77 vs steady 56) reproduces on the compiled
+  path. RISK: the compiled cache state must match Beetle cycle-for-cycle across the whole
+  boot to reproduce the cold spike — a careful cache-state-fidelity validation.
+
 - **2026-06-27 (interp-path Δ-ruler — INTERP == Beetle EXACT on all 12 components):**
   Closed the last validation gap: the dirty-RAM INTERPRETER is now MEASURED equal to the
   oracle, not just shared-by-construction. New tooling: `PSX_FORCE_INTERP=1` makes
