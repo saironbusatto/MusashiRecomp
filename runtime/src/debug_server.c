@@ -1931,6 +1931,7 @@ static int psx_synth_recurse(volatile int n) {
 void debug_server_synth_recurse_arm(void) { s_synth_recurse_armed = 1; }
 #endif
 
+static inline void cyc_watch_observe(uint32_t block_leader_phys);  /* defined below; used at fn-entry */
 void debug_server_log_call_entry(uint32_t func_addr) {
 #ifdef PSX_STACK_GUARD
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
@@ -1938,6 +1939,12 @@ void debug_server_log_call_entry(uint32_t func_addr) {
 #endif
 #ifndef PSX_NO_DEBUG_TOOLS
     if (s_synth_recurse_armed) { s_synth_recurse_armed = 0; psx_synth_recurse(0); }
+    /* cyc_watch: universal compiled-function-entry hook (game AND BIOS, incl.
+     * relocated BIOS-shell funcs which dispatch oddly but still log their entry
+     * here). Sampled at function entry, before the body runs — matches the
+     * Beetle side (PC==anchor, before execute). Covers the game-dispatch path
+     * that debug_server_trace_dispatch misses. */
+    cyc_watch_observe(func_addr & 0x1FFFFFFFu);
 #endif
 #ifdef PSX_NO_DEBUG_TOOLS
     /* Hottest call site in the binary — called at the top of every
@@ -2012,11 +2019,78 @@ void psx_bioscall_record(uint32_t table_base, uint32_t index, uint32_t func_ptr,
     }
 }
 
+/* ---- cyc_watch: native↔Beetle per-anchor cycle comparator ----
+ *
+ * Arms a single guest-PC anchor and records, into an always-on ring, the
+ * tuple (hit_index, psx_cycle_count, pc) the first N times the guest's
+ * executing block leader equals that anchor.  The companion tool
+ * tools/cycle_compare.py arms the SAME anchor on psx-beetle (matching
+ * command, added parent-side) and diffs elapsed cycles per hit_index to
+ * localize fine per-instruction cycle drift (e.g. the -8 class) that the
+ * gross per-frame rate already hides.
+ *
+ * CAPTURE SEMANTICS (the Beetle side must match EXACTLY):
+ *   - The anchor is sampled at BLOCK ENTRY, BEFORE the anchor instruction
+ *     (the block leader at the anchor PC) executes.
+ *   - psx_cycle_count at that instant = absolute guest cycles charged for
+ *     ALL prior blocks, NOT including any cycle of the anchor block.
+ *   - The anchor matches a basic-block *leader* PC (the address handed to
+ *     the dispatcher). A PC that is only ever reached mid-block (never a
+ *     dispatch/interp block leader) will not fire — anchor on a function
+ *     entry or branch target.
+ *
+ * ANCHOR NORMALIZATION: the armed PC is masked to a physical address
+ * (pc & 0x1FFFFFFF) and compared against the physical block leader on both
+ * the compiled-dispatch path (already-physical `phys`) and the dirty-RAM
+ * interpreter path (`target & 0x1FFFFFFF`). Caveat: BIOS-shell functions
+ * relocated into RAM 0x30000-0x5AFFF are dispatched at physical 0x1FC18xxx;
+ * to anchor one of those, arm its relocated physical PC. Game/BIOS-ROM
+ * anchors are a plain mask and need no special handling.
+ *
+ * Default-off, additive: when g_cyc_watch_armed == 0 the observe hook is a
+ * single load + compare and records nothing — zero behavior change. */
+#define CYC_WATCH_RING_CAP 1024
+typedef struct {
+    uint32_t hit_index;       /* 0-based ordinal of this anchor hit */
+    uint32_t pc;              /* matched physical block-leader PC */
+    uint64_t psx_cycle_count; /* absolute guest cycles at block entry */
+} CycWatchEntry;
+static CycWatchEntry s_cyc_watch_ring[CYC_WATCH_RING_CAP];
+static volatile int s_cyc_watch_armed = 0; /* 1 = recording active */
+static uint32_t s_cyc_watch_anchor_phys = 0; /* armed anchor, masked to phys */
+static uint32_t s_cyc_watch_anchor_raw = 0;  /* armed anchor as supplied (for echo) */
+static uint32_t s_cyc_watch_max_hits = 16;   /* stop after this many hits */
+static uint32_t s_cyc_watch_hits = 0;        /* hits recorded so far */
+
+/* Hot-path block-entry observer. Called from BOTH the compiled-dispatch
+ * path (debug_server_trace_dispatch, arg already physical) and the
+ * dirty-RAM interpreter path (debug_server_dirty_break_maybe_pause, arg
+ * virtual). `block_leader_phys` must be the physical block-leader PC. */
+static inline void cyc_watch_observe(uint32_t block_leader_phys)
+{
+    if (!s_cyc_watch_armed) return;                 /* disarmed: no cost */
+    if (block_leader_phys != s_cyc_watch_anchor_phys) return;
+    if (s_cyc_watch_hits >= s_cyc_watch_max_hits) {
+        s_cyc_watch_armed = 0;                      /* full: stop sampling */
+        return;
+    }
+    CycWatchEntry *e = &s_cyc_watch_ring[s_cyc_watch_hits];
+    e->hit_index       = s_cyc_watch_hits;
+    e->pc              = block_leader_phys;
+    e->psx_cycle_count = psx_get_cycle_count();
+    s_cyc_watch_hits++;
+    if (s_cyc_watch_hits >= s_cyc_watch_max_hits) s_cyc_watch_armed = 0;
+}
+
 void debug_server_trace_dispatch(uint32_t func_addr) {
 #ifdef PSX_NO_DEBUG_TOOLS
     (void)func_addr;
     return;
 #endif
+    /* cyc_watch: compiled-dispatch path. func_addr is already the physical
+     * (normalized) block leader. Sampled before the block runs. */
+    cyc_watch_observe(func_addr & 0x1FFFFFFFu);
+
     card_mgr_trace_record(func_addr, 1);
 
     {
@@ -3770,6 +3844,13 @@ void debug_server_send_fmt(const char *fmt, ...)
 
 int debug_server_dirty_break_maybe_pause(uint32_t target, CPUState *cpu)
 {
+    /* cyc_watch: dirty-RAM interpreter path. `target` is the virtual block
+     * leader about to be interpreted; mask to physical and sample before
+     * the block runs (same instant as the compiled path). This hook is
+     * invoked unconditionally at every interp block entry, so the anchor
+     * is observed even when no dirty-break range is set. */
+    cyc_watch_observe(target & 0x1FFFFFFFu);
+
     if (!s_dirty_break_active) return 0;
     if (target < s_dirty_break_lo || target >= s_dirty_break_hi) return 0;
 
@@ -7124,6 +7205,75 @@ static void handle_wtrace_ranges(int id, const char *json)
     free(buf);
 }
 
+/* ---- cyc_watch command handlers (see cyc_watch_observe above) ---- */
+
+/* cyc_watch — arm an anchor PC. {"pc":"0x...","n":16}. Clears the ring,
+ * masks the anchor to physical, and starts recording. The Beetle side
+ * (psx-beetle, added parent-side) implements the SAME command/spec. */
+static void handle_cyc_watch(int id, const char *json)
+{
+    char pcbuf[64];
+    if (!json_get_str(json, "pc", pcbuf, sizeof(pcbuf))) {
+        send_err(id, "cyc_watch requires pc");
+        return;
+    }
+    uint32_t raw = hex_to_u32(pcbuf);
+    int n = json_get_int(json, "n", 16);
+    if (n < 1) n = 1;
+    if (n > CYC_WATCH_RING_CAP) n = CYC_WATCH_RING_CAP;
+
+    /* Disarm first so the hot path can't sample mid-reset. */
+    s_cyc_watch_armed = 0;
+    s_cyc_watch_anchor_raw  = raw;
+    s_cyc_watch_anchor_phys = raw & 0x1FFFFFFFu;
+    s_cyc_watch_max_hits    = (uint32_t)n;
+    s_cyc_watch_hits        = 0;
+    memset(s_cyc_watch_ring, 0, sizeof(s_cyc_watch_ring));
+    s_cyc_watch_armed = 1;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"anchor\":\"0x%08X\","
+             "\"anchor_phys\":\"0x%08X\",\"max_hits\":%u}",
+             id, s_cyc_watch_anchor_raw, s_cyc_watch_anchor_phys,
+             s_cyc_watch_max_hits);
+}
+
+/* cyc_watch_dump — return the recorded ring as JSON. */
+static void handle_cyc_watch_dump(int id, const char *json)
+{
+    (void)json;
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "{\"id\":%d,\"ok\":true,\"anchor\":\"0x%08X\","
+             "\"anchor_phys\":\"0x%08X\",\"armed\":%d,\"max_hits\":%u,"
+             "\"hits\":%u,\"entries\":[",
+             id, s_cyc_watch_anchor_raw, s_cyc_watch_anchor_phys,
+             s_cyc_watch_armed ? 1 : 0, s_cyc_watch_max_hits,
+             s_cyc_watch_hits);
+    send_line(buf);
+    for (uint32_t i = 0; i < s_cyc_watch_hits; i++) {
+        CycWatchEntry *e = &s_cyc_watch_ring[i];
+        snprintf(buf, sizeof(buf),
+                 "%s{\"hit_index\":%u,\"pc\":\"0x%08X\",\"cycles\":%llu}",
+                 (i == 0) ? "" : ",",
+                 e->hit_index, e->pc,
+                 (unsigned long long)e->psx_cycle_count);
+        send_line(buf);
+    }
+    send_line("]}");
+}
+
+/* cyc_watch_clear — disarm and zero the ring. */
+static void handle_cyc_watch_clear(int id, const char *json)
+{
+    (void)json;
+    s_cyc_watch_armed = 0;
+    s_cyc_watch_hits  = 0;
+    s_cyc_watch_anchor_phys = 0;
+    s_cyc_watch_anchor_raw  = 0;
+    memset(s_cyc_watch_ring, 0, sizeof(s_cyc_watch_ring));
+    send_ok(id);
+}
+
 /* Liveness/freeze diagnostic: returns a single snapshot of every counter
  * that distinguishes "stuck in a tight handler loop" from "just slow" or
  * "starved on TCP poll".  Pass {"window":N} (default 256) to also include
@@ -10040,6 +10190,9 @@ static const CmdEntry s_commands[] = {
     { "wtrace_del",          handle_wtrace_del },
     { "wtrace_clear",        handle_wtrace_clear },
     { "freeze_check",      handle_freeze_check },
+    { "cyc_watch",         handle_cyc_watch },
+    { "cyc_watch_dump",    handle_cyc_watch_dump },
+    { "cyc_watch_clear",   handle_cyc_watch_clear },
     { "mmio_dump",         handle_mmio_dump },
     { "mmio_clear",        handle_mmio_clear },
     { "rtrace_dump",       handle_rtrace_dump },
