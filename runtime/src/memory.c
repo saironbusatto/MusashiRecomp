@@ -106,8 +106,22 @@ void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
     }
 }
 
+/* Force-interp mode (tooling): PSX_FORCE_INTERP=1 makes ALL RAM above the kernel
+ * window report dirty, so every dispatch into game/overlay text routes to the
+ * dirty-RAM interpreter (the SAME path overlays take) instead of the compiled
+ * image. Interp-path Δ-ruler enabler: lets the cyctest isolation loops be measured
+ * native-INTERP vs Beetle. Consulted by every routing site that already calls
+ * dirty_ram_is_dirty (top dispatch, dirty_ram_dispatch_inner gates, the
+ * psx_dispatch_game_compiled gates) — no emitter/dispatch change needed. */
+static int dirty_ram_force_interp(void) {
+    static int s = -1;
+    if (s < 0) { const char* e = getenv("PSX_FORCE_INTERP"); s = (e && e[0] && e[0] != '0'); }
+    return s;
+}
+
 int dirty_ram_is_dirty(uint32_t phys) {
     if (phys >= RAM_SIZE) return 0;
+    if (dirty_ram_force_interp() && phys >= DIRTY_RAM_KERNEL_TRACK_BYTES) return 1;
     uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
     return (dirty_ram_bitmap[page >> 5] >> (page & 31u)) & 1u;
 }
