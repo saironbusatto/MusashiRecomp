@@ -245,7 +245,8 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
 
             case 0x10: { // MFHI rd
                 r.supported = true;
-                r.c_code = emit_gpr_write(rd, "cpu->hi");
+                r.c_code = emit_gpr_write(rd, "cpu->hi")
+                    + "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_stall(cpu);\n#endif";
                 r.comment = fmt::format("mfhi {}", gpr_name(rd));
                 return r;
             }
@@ -260,7 +261,8 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
 
             case 0x12: { // MFLO rd
                 r.supported = true;
-                r.c_code = emit_gpr_write(rd, "cpu->lo");
+                r.c_code = emit_gpr_write(rd, "cpu->lo")
+                    + "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_stall(cpu);\n#endif";
                 r.comment = fmt::format("mflo {}", gpr_name(rd));
                 return r;
             }
@@ -278,8 +280,9 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
                 r.c_code = fmt::format(
                     "{{ uint64_t psx_p = (uint64_t)cpu->gpr[{}] * (uint64_t)cpu->gpr[{}]; "
                     "cpu->lo = (uint32_t)(psx_p & 0xFFFFFFFFu); "
-                    "cpu->hi = (uint32_t)(psx_p >> 32); }}",
-                    static_cast<int>(rs), static_cast<int>(rt));
+                    "cpu->hi = (uint32_t)(psx_p >> 32); }}"
+                    "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, psx_mult_latency_u(cpu->gpr[{}]));\n#endif",
+                    static_cast<int>(rs), static_cast<int>(rt), static_cast<int>(rs));
                 r.comment = fmt::format("multu {}, {}", gpr_name(rs), gpr_name(rt));
                 return r;
             }
@@ -312,7 +315,8 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
                     "int32_t psx_r = psx_n - (psx_q * psx_d); "
                     "cpu->lo = (uint32_t)psx_q; "
                     "cpu->hi = (uint32_t)psx_r; "
-                    "}} }}",
+                    "}} }}"
+                    "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, 37u);\n#endif",
                     static_cast<int>(rs), static_cast<int>(rt));
                 r.comment = fmt::format("div {}, {}", gpr_name(rs), gpr_name(rt));
                 return r;
@@ -337,7 +341,8 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
                     "uint32_t psx_r = psx_n - (psx_q * psx_d); "
                     "cpu->lo = psx_q; "
                     "cpu->hi = psx_r; "
-                    "}} }}",
+                    "}} }}"
+                    "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, 37u);\n#endif",
                     static_cast<int>(rs), static_cast<int>(rt));
                 r.comment = fmt::format("divu {}, {}", gpr_name(rs), gpr_name(rt));
                 return r;
