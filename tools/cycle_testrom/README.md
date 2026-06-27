@@ -73,12 +73,41 @@ tracked, so each developer reproduces the disc from a disc they own.
 ## Measure
 
 ```bash
-# both backends boot the same disc/cyctest.cue:
+# both backends boot the same disc/cyctest.cue (psx-cyctest = the native test-runtime, port 4600):
 #   beetle: psx-beetle <bios> --disc disc/cyctest.cue --port 4382
-#   native: <test-runtime> ... --disc disc/cyctest.cue   (TODO: test-runtime)
+#   native: psx-cyctest --no-launcher --game game.toml --bios <bios> --disc disc/cyctest.cue
 python measure.py --port 4382      # Beetle oracle: per-iter + per-component delta
-python measure.py --port 4500      # native cost model (once the test-runtime exists)
+python measure.py --port 4600      # native cost model (compiled backend)
 ```
+
+IMPORTANT: launch psx-cyctest via PowerShell `Start-Process` (a bash `&` launch
+fails to boot — pc=0). cyc_watch / freeze_check sampling must be done AT STEADY
+STATE: query AFTER the BIOS has booted to the EXE and the loops are running
+(`measure.py`'s own wait handles this) — an early sample reports warm-up values
+(Beetle's boot window) or, for the interp path, dirty_ram_insns=0 because the
+EXE entry hasn't been reached yet.
+
+## Interp-path measurement (PSX_FORCE_INTERP)
+
+Both backends share one cost model (`psx_cyc_*`, psx_cyc.h), but `measure.py
+--port 4600` above measures the COMPILED backend. To measure the dirty-RAM
+INTERPRETER on the same loops (isolated interp-vs-Beetle Δ — not by-construction),
+launch psx-cyctest with `PSX_FORCE_INTERP=1`:
+
+```powershell
+$env:PSX_FORCE_INTERP='1'; Start-Process psx-cyctest.exe -ArgumentList ...
+```
+
+`PSX_FORCE_INTERP=1` makes `dirty_ram_is_dirty()` (runtime/src/memory.c) report all
+RAM above the kernel window as dirty, so the dispatcher routes the test ROM through
+the dirty-RAM interpreter (the SAME path overlays take) instead of the compiled
+image — no emitter/dispatch change. Confirm it engaged via freeze_check
+`dirty_ram_insns` climbing (hundreds of millions during a measure run).
+
+**Interp == Beetle EXACT on all 12 components (2026-06-27):** baseline/alu/load/
+load2/load_use/div/div_spaced/mult/gte_rtps/gte_nclip/gte_read_use/ld_div all match
+the oracle, so the interpreter's per-instruction interlock model is MEASURED equal
+to the compiled backend and to Beetle, not merely shared-by-construction.
 
 ## Beetle ORACLE results (2026-06-26 — the HW cost targets)
 
