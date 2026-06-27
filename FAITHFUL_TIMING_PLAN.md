@@ -153,6 +153,28 @@ cycle number CREATES divergence, so verify, don't rush.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-26 (P3 step 1 DONE — single-source cost seam, identity):** Created
+  runtime/include/psx_instr_cost.h `psx_instr_base_cycles(insn)` (identity, 1/insn).
+  Routed BOTH backends through it: interp (exec_delay_slot, dirty-dispatch loop,
+  precise-slice) + recompiler (code_generator.cpp sums it per block + outside
+  delay-slot clone, folding into the compile-time block charge). PROVEN behavior-
+  preserving: regen byte-identical (full.c + dispatch.c diff = empty) and Tomba 2
+  still streams the FMV (i_stat 0x8D). Commit b00b81f. Stage-2 now edits ONLY this
+  one function. ACCURACY_BURNDOWN.md added (all-axes burndown; axis-5 peripherals,
+  esp. SIO/controller hybrid-pad bug, flagged weakest), 09a5d45.
+  NEXT (measure before Stage-2 costs — don't guess): build the native↔Beetle cycle
+  comparator. Feasibility CONFIRMED: beetle_debug_server.c (in worktree) already
+  exposes beetle_get_frame_count via the beetle glue — add a parallel
+  beetle_get_guest_cycles. Sub-steps: (1) find mednafen's running master-cycle
+  timestamp in beetle-psx/mednafen/psx (psx.cpp PSX_Update / the CPU
+  pscpu_timestamp_t accumulator — note it's slice-relative, must accumulate to an
+  absolute guest-cycle count); (2) add a C accessor through beetle_libretro.cpp +
+  a `guest_cycles` debug command; (3) rebuild Beetle static lib + psx-beetle
+  (slow: `cd beetle-psx && make platform=mingw_x86_64 STATIC_LINKING=1
+  HAVE_LIGHTREC=0 -j8`); (4) comparator: native psx_cycle_count (already in
+  freeze_check) vs Beetle guest_cycles at same-PC convergence. THEN transcribe
+  Stage-2 costs (mult/div, GTE table, mem wait-states) one at a time, each verified
+  by this comparator. Native cycle side already exists; Beetle side is the gap.
 - **2026-06-26 (holistic cycle-model audit, post-P2):** Audited ALL cycle-charging
   sites for the dominant class (delay-slot undercount) + cost-model consistency:
   - GAME + OVERLAY emitter (code_generator.cpp `translate_basic_block`): FIXED in
