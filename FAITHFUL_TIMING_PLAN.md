@@ -140,6 +140,47 @@ Build order for the model (P3 → Stage-2):
 DO each transcription with the Beetle source open + a runtime cross-check; a wrong
 cycle number CREATES divergence, so verify, don't rush.
 
+## 3c. STAGE 2 — full hardware cycle accuracy (the goal; -8 is DONE/past)
+
+The -8 was backend-disagreement (native vs our interp); FIXED (FMV reached). Stage 2
+makes the cycle model match REAL R3000A timing, validated against Beetle. We are NOT
+hardware-cycle-accurate yet: model is ~1 cycle/instruction; Beetle charges ~2x.
+
+### The validation breakthrough: DELTA comparison (offset-independent)
+Absolute-cycle comparison through boot is meaningless (native is ~121M cycles off
+Beetle due to turbo-loads/overlay load-model differences). BUT the cyc_watch
+comparator's per-hit DELTAS cancel that offset: between two consecutive hits of the
+same anchor (one iteration of identical code), native charged 46 cycles vs Beetle 91
+(@0x80017FC4). That ~2x gap IS the cycle-model inaccuracy, measured cleanly. So:
+  VALIDATE STAGE 2 BY MATCHING native Δcycles == Beetle Δcycles over identical
+  regions (consecutive same-anchor hits, or entry/exit anchor pairs), NOT absolute.
+First concrete target: make the 0x80017FC4 inter-hit Δ 46 -> 91 (== Beetle).
+
+### Components to transcribe (from in-tree Beetle + psx-spx; verify each by Δ)
+The ~2x gap is dominated by what 1/insn ignores. Implement one at a time, re-measure Δ:
+1. **Memory access wait-states (biggest lever).** Real loads/stores cost >1 cycle by
+   region (RAM/BIOS-ROM/scratchpad/MMIO). Beetle: cpu.cpp ReadMemory `lts` delta +
+   LDAbsorb (load-delay). Charge in the load/store path: interp exec_one's mem ops AND
+   the recompiler-emitted cpu->read/write (or a per-load/store charge). Region table.
+2. **Instruction fetch / I-cache timing.** Beetle ReadInstruction (+1 hit / +fill on
+   miss). For the recompiler, fold a per-block fetch-cost constant.
+3. **Mult/Div latency.** Beetle MULT_Tab/muldiv_ts_done: mult ~6-13, div ~36, stall on
+   HI/LO read. Encode in psx_instr_base_cycles (+ optional stall-on-read).
+4. **GTE/COP2 per-command.** Beetle gte.cpp GTE_Instruction table (RTPS=15, NCDS=19,
+   NCDT=44, ...). Encode in psx_instr_base_cycles for COP2 ops.
+All land in the single-source psx_instr_base_cycles (opcode costs) + a memory-path
+wait-state charger (address-dependent). Both backends consume the same model (seam
+already in place). Each component: transcribe -> regen/build -> Δ-compare vs Beetle
+on a fixed region -> next.
+
+### Caveats
+- Δ-region must be IDENTICAL code on both (a tight loop body, or a pure-compute
+  function). Avoid regions that cross turbo-load / overlay / dirty boundaries.
+- Relocated BIOS-shell funcs (phys 0x30000-0x5AFFF) dispatch at a different native
+  phys — anchor on game-text / BIOS-ROM, or the relocated phys.
+- This is a multi-component effort; do it methodically, one validated component at a
+  time. The comparator (cyc_watch + cycle_compare.py) is the validation backbone.
+
 ## 4. Tooling / oracle
 - Runtime TCP port 4500; Beetle oracle 4382. Always-on rings: `event_ring`,
   `wtrace_all` (write trace; `newest=1`). `freeze_check` has slice-trace + cycle
