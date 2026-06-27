@@ -70,6 +70,20 @@ typedef struct CPUState {
      * stalls until it — faithful R3000A behavior (Beetle gte_ts_done).
      * Appended at END so prior field offsets are unchanged. */
     uint64_t gte_ts_done;
+
+    /* ---- R3000A load-delay pipeline interlock (Beetle ReadAbsorb/ReadFudge/
+     * LDAbsorb/LDWhich) — TIMING ONLY; the load VALUE delay is handled by the
+     * existing load-delay correctness path. See psx_cyc.h + accuracy/
+     * load_readfudge_ldabsorb.md. Models: a load's data-access cost becomes a
+     * per-register "give-back" (read_absorb) that following instructions consume
+     * instead of charging their own +1 base; plus the +2 "fudge" charged on a
+     * load whose predecessor committed no load. Appended at END so prior field
+     * offsets are unchanged (precompiled overlay DLLs bake offsets). */
+    uint8_t  read_absorb[33];   /* ReadAbsorb[0..31] + [32]=0x20 DO_LDS dummy slot */
+    uint8_t  read_absorb_which; /* ReadAbsorbWhich: GPR the last committed load wrote */
+    uint8_t  read_fudge;        /* ReadFudge: last committed load's dest reg, or 0x20 = none */
+    uint8_t  ld_which_t;        /* LDWhich (timing): pending load dest reg, 0x20 = none */
+    uint32_t ld_absorb;         /* LDAbsorb: pending load's give-back (region+completion) */
 } CPUState;
 
 /* Trap trampolines — defined in runtime/src/traps.c */
@@ -224,5 +238,11 @@ static inline int psx_call_contract(CPUState* cpu, uint32_t site_ra,
 #ifdef __cplusplus
 }
 #endif
+
+/* R3000A load-delay interlock helpers (psx_cyc.h). Included LAST so CPUState is
+ * fully defined first; psx_cyc.h's own #include "cpu_state.h" is a guarded no-op.
+ * This makes the per-instruction timing API visible to EVERY generated file and
+ * runtime TU that includes cpu_state.h. */
+#include "psx_cyc.h"
 
 #endif /* PSXRECOMP_CPU_STATE_H */

@@ -2642,13 +2642,19 @@ int main(int argc, char** argv) {
     /* Initialize CPU state. */
     CPUState cpu;
     std::memset(&cpu, 0, sizeof(cpu));
+    /* R3000A load-delay interlock init (Beetle: BACKED_LDWhich=0x20 = no pending
+     * load; ReadFudge=0 so the first load gets no fudge). Rest is correctly 0. */
+    cpu.ld_which_t = 0x20;
 
-    /* Wire memory function pointers. */
-    cpu.read_word  = psx_guest_read_word;  /* +6cyc main-RAM read wait states */
+    /* Wire memory function pointers. Guest data loads now route their CPU cycle
+     * cost through the faithful load-delay interlock (psx_cyc_load_* in memory.c),
+     * so these VALUE accessors are the UNCHARGED psx_read_* — the data-access
+     * wait-state is charged once, inside the interlock, never here. */
+    cpu.read_word  = psx_read_word;
     cpu.write_word = psx_write_word;
-    cpu.read_half  = psx_guest_read_half;
+    cpu.read_half  = psx_read_half;
     cpu.write_half = psx_write_half;
-    cpu.read_byte  = psx_guest_read_byte;
+    cpu.read_byte  = psx_read_byte;
     cpu.write_byte = psx_write_byte;
     /* Wire the sljit JIT host-helper table (cpu-relative => position-independent
      * shards; prerequisite for the persisted sljit shard cache). Harmless when

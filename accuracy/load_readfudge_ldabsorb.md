@@ -1,6 +1,28 @@
 # Load ReadFudge / LDAbsorb — empirically-derived model + implementation spec
 
-Status: **MODEL NAILED (empirically, 2026-06-27), implementation PENDING.** This is
+Status: **IMPLEMENTED + VALIDATED (2026-06-27).** Shipped as the shared per-instruction
+R3000A load-delay interlock in `runtime/include/psx_cyc.h` (§1 base + GPR_DEPRES + DO_LDS,
++ `psx_cyc_load_*`/`psx_cyc_lwc2_read` in `memory.c`), driven by `psx_cyc_dep_res_mask`
+(`runtime/include/psx_instr_cost.h`, transcribed from Beetle's per-opcode GPR_DEP/RES).
+Wired into the dirty interp (`dirty_ram_interp.c`) and BOTH static emitters
+(`code_generator.cpp` game path; `full_function_emitter.cpp`+`strict_translator.cpp` BIOS
+path). Loads route value reads through the UNCHARGED `psx_read_*` (cpu->read_* rewired in
+main.cpp); the data-access cost is charged once, inside the interlock. VALIDATED against the
+Beetle oracle: ruler #2 `load2` native +10 → **+11** == Beetle (all other components
+unchanged + matching); ruler #1 [0x80001C5C→0x80001CA4] 54 → **56** == Beetle steady-state
+(residual 84/77 spikes = I-cache cold refill, the separate P2 axis); Tomba 2 boots to the
+intro FMV (no regression). The `(ReadFudge>>4)&2` fudge, the region(RAM +3)+completion(+2)
+LDAbsorb give-back, and scratchpad +0 are all modeled per below.
+
+FOLLOW-UP (not in this commit; ACCURACY axis-2): GTE-read (MFC2/CFC2) + MFC0 LDAbsorb
+give-back arming, and the muldiv-stall give-back consumption / off-by-one (Beetle
+cpu.cpp:1332-1338 / 1723-1736). These don't affect the rulers (no CPU-load give-back in the
+div/mult/gte loops) but are needed for full faithfulness in mixed game/FMV code.
+
+---
+ORIGINAL SPEC (model derivation) follows.
+
+This is
 the last unmodeled piece of the load path — the residual on BOTH rulers
 (ruler #1 native 54 vs Beetle 56; ruler #2 `load2` native +10 vs Beetle +11). It
 is the R3000A load-delay pipeline interlock (Beetle `ReadFudge`/`ReadAbsorb[]`/

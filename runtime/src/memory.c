@@ -853,49 +853,94 @@ uint8_t psx_read_byte(uint32_t addr) {
     return 0;
 }
 
-/* ---- CPU guest-side data reads: model PS1 main-RAM read latency ----
- * The R3000A has no usable D-cache (its data cache is repurposed as the 1 KB
- * scratchpad), so every CPU data read from main DRAM costs the base opcode cycle
- * plus a data-access wait-state. The base opcode cycle is charged per instruction
- * by the emitter/interp (psx_instr_base_cycles); here we add ONLY the data-access
- * wait-state, and only for main-RAM targets — scratchpad, MMIO, BIOS ROM and
- * open-bus are excluded (they have their own access timing). Keyed on the runtime
- * effective physical address (all of KUSEG/KSEG0/KSEG1 alias the same DRAM), NOT
- * the code region, so relocated kernel code is timed correctly.
+/* ---- CPU guest-side data loads: faithful R3000A load-delay pipeline interlock ----
+ * The R3000A has no usable D-cache (it is repurposed as the 1 KB scratchpad), so a
+ * CPU data load from main DRAM stalls the pipeline. Beetle (cpu.cpp ReadMemory,
+ * 364-451) models this as: a +2 "fudge" iff the predecessor committed no load, the
+ * region wait (main RAM = +3, libretro.cpp:884), and a completion cost (+2 CPU /
+ * +1 LWC2); the (region+completion) becomes a per-register LDAbsorb "give-back" that
+ * following instructions consume instead of their own +1 base (pipeline write-back
+ * overlap). The §1 base + GPR_DEPRES + DO_LDS that bracket this run in psx_cyc.h.
  *
- * VALUE = 4, the Beetle ORACLE-accurate cost (the cycle test ROM load-isolation
- * loop measures a main-RAM load at +5 over baseline = base 1 + 4; Beetle ReadMemory
- * = fudge(0/2) + region wait(0 RAM) + completion(+2), netting 4 in the common fudged
- * case). The old 6 came from DuckStation (RAM_READ_TICKS), which our oracle
- * contradicts. Ruler #2 load == Beetle EXACTLY at 4.
+ * These functions own the WHOLE per-instruction interlock for a CPU load (they call
+ * psx_cyc_base/deps/lds), so the emitters/interp invoke them in place of the prior
+ * cpu->read_* call and emit NO separate psx_cyc_step for the load. They return the
+ * raw value via the UNCHARGED psx_read_* (cpu->read_* is now uncharged too — the
+ * data-access cost is charged exactly once, here). Keyed on the runtime effective
+ * physical address (KUSEG/KSEG0/KSEG1 alias the same DRAM).
  *
- * ⚠ KNOWN ISSUE this value CAUSES (under active root-cause on branch
- *   wt/tomba2-load-accuracy): lowering 6→4 DETERMINISTICALLY WEDGES Tomba 2's
- *   BIOS-shell boot — pc=0/exception at shell pc 0xBFC2CE64 (epc 0x80000048),
- *   reproducible at identical total_checks across restarts. The faster-but-accurate
- *   load cost makes the CPU outrun a shell loop's timing assumption, exposing a
- *   downstream bug (likely incomplete device/loop timing). We deliberately KEEP the
- *   accurate value and fix the real cause rather than mask it with a wrong cost —
- *   faithful core (CLAUDE.md Rule -1). Until the wedge is fixed, Tomba 2 will not
- *   reach the FMV on this branch; ruler #2 (its own boot disc) is unaffected.
- *
- * RESIDUAL beyond the constant (stateful, future): Beetle's per-load ReadFudge
- * variation (back-to-back loads differ ~1; ruler load2 was 10 vs 11) and LDAbsorb
- * give-back (a load whose result is read by the next instruction is absorbed).
- *
- * These wrappers are wired to cpu->read_* (see main.cpp), so the penalty applies
- * to BOTH statically-recompiled and dirty-RAM-interpreted guest loads, but NOT to
- * debug-server / device reads that call psx_read_* directly. */
-#define PSX_RAM_READ_WAIT_CYCLES 4u   /* oracle-accurate; ⚠ causes Tomba 2 boot wedge @0xBFC2CE64 — root-cause in progress */
+ * Region residual: only main-RAM (+3) and scratchpad (+0) region waits are modeled;
+ * MMIO/BIOS-ROM device read waits (e.g. SPU +36) remain a separate unmodeled axis —
+ * those loads still get the +2 completion (faithful) but region 0. */
 extern void psx_advance_cycles(uint32_t cycles);
 
-static inline void charge_main_ram_read(uint32_t addr) {
-    if ((addr & 0x1FFFFFFFu) < RAM_SIZE) psx_advance_cycles(PSX_RAM_READ_WAIT_CYCLES);
+/* Beetle ReadMemory data-access timing (cpu.cpp:369-448), after §1/deps/DO_LDS.
+ * compl_cost = 2 (CPU load) / 1 (LWC2); arm_rt = GPR to arm as pending load, or
+ * 0x20 = none (LWC2, dest is a GTE reg). */
+static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys,
+                                   uint32_t compl_cost, uint32_t arm_rt) {
+    /* ReadMemory start (369-370): clear the current give-back slot. */
+    cpu->read_absorb[cpu->read_absorb_which] = 0u;
+    cpu->read_absorb_which = 0u;
+    /* Scratchpad (the D-cache): no wait, no give-back (414-422). */
+    if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
+        cpu->ld_absorb = 0u;
+        cpu->ld_which_t = (uint8_t)arm_rt;
+        return;
+    }
+    /* fudge (424): +2 iff the predecessor committed no load (read_fudge==0x20). */
+    psx_advance_cycles((uint32_t)((cpu->read_fudge >> 4) & 2u));
+    uint32_t region = (phys < RAM_SIZE) ? 3u : 0u;   /* main RAM +3; others: separate axis */
+    uint32_t cost = region + compl_cost;             /* LDAbsorb = region + completion */
+    cpu->ld_absorb = cost;
+    psx_advance_cycles(cost);
+    cpu->ld_which_t = (uint8_t)arm_rt;
 }
 
-uint32_t psx_guest_read_word(uint32_t addr) { charge_main_ram_read(addr); return psx_read_word(addr); }
-uint16_t psx_guest_read_half(uint32_t addr) { charge_main_ram_read(addr); return psx_read_half(addr); }
-uint8_t  psx_guest_read_byte(uint32_t addr) { charge_main_ram_read(addr); return psx_read_byte(addr); }
+/* The interlock half of a load (§1+deps+(cancel)+DO_LDS+ReadMemory). Gated on
+ * PSX_ENABLE_BLOCK_CYCLES so the Beetle-oracle build (cycles off) does a plain read. */
+static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr,
+                                       uint32_t rt, uint32_t reg_mask) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    psx_cyc_base(cpu);
+    psx_cyc_deps(cpu, reg_mask);
+    if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;   /* cancel pending load to same dest */
+    psx_cyc_lds(cpu);
+    psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, 2u, rt);
+#else
+    (void)cpu; (void)addr; (void)rt; (void)reg_mask;
+#endif
+}
+
+uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    psx_cyc_load_timing(cpu, addr, rt, reg_mask);
+    return psx_read_word(addr);
+}
+uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    psx_cyc_load_timing(cpu, addr, rt, reg_mask);
+    return psx_read_half(addr);
+}
+uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    psx_cyc_load_timing(cpu, addr, rt, reg_mask);
+    return psx_read_byte(addr);
+}
+
+/* LWC2 (GTE load): §1/DO_LDS done by psx_cyc_step(cpu,0); the GTE deadline stall by
+ * psx_gte_stall — both emitted before this call. Completion +1, no LDWhich arm. */
+uint32_t psx_cyc_lwc2_read(CPUState* cpu, uint32_t addr) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, 1u, 0x20u);
+#else
+    (void)cpu;
+#endif
+    return psx_read_word(addr);
+}
+
+/* Deprecated uncharged passthroughs (the +4 flat wait-state model is gone; load
+ * timing now lives in psx_cyc_load_*). Kept so any stray reference stays valid. */
+uint32_t psx_guest_read_word(uint32_t addr) { return psx_read_word(addr); }
+uint16_t psx_guest_read_half(uint32_t addr) { return psx_read_half(addr); }
+uint8_t  psx_guest_read_byte(uint32_t addr) { return psx_read_byte(addr); }
 
 void psx_write_byte(uint32_t addr, uint8_t val) {
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;

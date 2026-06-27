@@ -160,17 +160,16 @@ std::string CodeGenerator::translate_lw(uint32_t instr) {
     uint32_t rs = get_rs(instr);
     uint32_t rt = get_rt(instr);
     int16_t offset = get_imm16(instr);
+    std::string addr = (offset == 0) ? reg_name(rs)
+                                     : fmt::format("{} + {}", reg_name(rs), offset);
+    uint32_t mask = 1u << rs;   /* GPR_DEP rs (load: dest rt armed via LDWhich) */
 
     if (config_.optimize_zero_reg && rt == 0) {
-        return "/* nop: load to $zero */";
+        /* load to $zero: no GPR write, but the data access + R3000A interlock still run */
+        return fmt::format("(void)psx_cyc_load_word(cpu, {}, 0, 0x{:X}u);", addr, mask);
     }
-
-    if (offset == 0) {
-        return fmt::format("{} = cpu->read_word({});", reg_name(rt), reg_name(rs));
-    } else {
-        return fmt::format("{} = cpu->read_word({} + {});",
-                          reg_name(rt), reg_name(rs), offset);
-    }
+    return fmt::format("{} = psx_cyc_load_word(cpu, {}, {}, 0x{:X}u);",
+                       reg_name(rt), addr, rt, mask);
 }
 
 std::string CodeGenerator::translate_sw(uint32_t instr) {
@@ -323,68 +322,60 @@ std::string CodeGenerator::translate_lb(uint32_t instr) {
     uint32_t rs = get_rs(instr);
     uint32_t rt = get_rt(instr);
     int16_t offset = get_imm16(instr);
+    std::string addr = (offset == 0) ? reg_name(rs)
+                                     : fmt::format("{} + {}", reg_name(rs), offset);
+    uint32_t mask = 1u << rs;
 
     if (config_.optimize_zero_reg && rt == 0) {
-        return "/* nop: load to $zero */";
+        return fmt::format("(void)psx_cyc_load_byte(cpu, {}, 0, 0x{:X}u);", addr, mask);
     }
-
-    if (offset == 0) {
-        return fmt::format("{} = (int32_t)(int8_t)cpu->read_byte({});", reg_name(rt), reg_name(rs));
-    } else {
-        return fmt::format("{} = (int32_t)(int8_t)cpu->read_byte({} + {});",
-                          reg_name(rt), reg_name(rs), offset);
-    }
+    return fmt::format("{} = (int32_t)(int8_t)psx_cyc_load_byte(cpu, {}, {}, 0x{:X}u);",
+                       reg_name(rt), addr, rt, mask);
 }
 
 std::string CodeGenerator::translate_lbu(uint32_t instr) {
     uint32_t rs = get_rs(instr);
     uint32_t rt = get_rt(instr);
     int16_t offset = get_imm16(instr);
+    std::string addr = (offset == 0) ? reg_name(rs)
+                                     : fmt::format("{} + {}", reg_name(rs), offset);
+    uint32_t mask = 1u << rs;
 
     if (config_.optimize_zero_reg && rt == 0) {
-        return "/* nop: load to $zero */";
+        return fmt::format("(void)psx_cyc_load_byte(cpu, {}, 0, 0x{:X}u);", addr, mask);
     }
-
-    if (offset == 0) {
-        return fmt::format("{} = cpu->read_byte({});", reg_name(rt), reg_name(rs));
-    } else {
-        return fmt::format("{} = cpu->read_byte({} + {});",
-                          reg_name(rt), reg_name(rs), offset);
-    }
+    return fmt::format("{} = psx_cyc_load_byte(cpu, {}, {}, 0x{:X}u);",
+                       reg_name(rt), addr, rt, mask);
 }
 
 std::string CodeGenerator::translate_lh(uint32_t instr) {
     uint32_t rs = get_rs(instr);
     uint32_t rt = get_rt(instr);
     int16_t offset = get_imm16(instr);
+    std::string addr = (offset == 0) ? reg_name(rs)
+                                     : fmt::format("{} + {}", reg_name(rs), offset);
+    uint32_t mask = 1u << rs;
 
     if (config_.optimize_zero_reg && rt == 0) {
-        return "/* nop: load to $zero */";
+        return fmt::format("(void)psx_cyc_load_half(cpu, {}, 0, 0x{:X}u);", addr, mask);
     }
-
-    if (offset == 0) {
-        return fmt::format("{} = (int32_t)(int16_t)cpu->read_half({});", reg_name(rt), reg_name(rs));
-    } else {
-        return fmt::format("{} = (int32_t)(int16_t)cpu->read_half({} + {});",
-                          reg_name(rt), reg_name(rs), offset);
-    }
+    return fmt::format("{} = (int32_t)(int16_t)psx_cyc_load_half(cpu, {}, {}, 0x{:X}u);",
+                       reg_name(rt), addr, rt, mask);
 }
 
 std::string CodeGenerator::translate_lhu(uint32_t instr) {
     uint32_t rs = get_rs(instr);
     uint32_t rt = get_rt(instr);
     int16_t offset = get_imm16(instr);
+    std::string addr = (offset == 0) ? reg_name(rs)
+                                     : fmt::format("{} + {}", reg_name(rs), offset);
+    uint32_t mask = 1u << rs;
 
     if (config_.optimize_zero_reg && rt == 0) {
-        return "/* nop: load to $zero */";
+        return fmt::format("(void)psx_cyc_load_half(cpu, {}, 0, 0x{:X}u);", addr, mask);
     }
-
-    if (offset == 0) {
-        return fmt::format("{} = cpu->read_half({});", reg_name(rt), reg_name(rs));
-    } else {
-        return fmt::format("{} = cpu->read_half({} + {});",
-                          reg_name(rt), reg_name(rs), offset);
-    }
+    return fmt::format("{} = psx_cyc_load_half(cpu, {}, {}, 0x{:X}u);",
+                       reg_name(rt), addr, rt, mask);
 }
 
 std::string CodeGenerator::translate_lwl(uint32_t instr) {
@@ -396,16 +387,17 @@ std::string CodeGenerator::translate_lwl(uint32_t instr) {
         return "/* nop: load to $zero */";
     }
 
-    // LWL: Load Word Left - loads bytes into the most-significant portion of rt
-    // addr = rs + offset; byte_pos = addr & 3
-    // Result merges high bytes from aligned word with low bytes from current rt value
-    // Generate a helper call: cpu->rt = psx_lwl(cpu, addr, cpu->rt)
-    if (offset == 0) {
-        return fmt::format("{} = psx_lwl(cpu, {}, {});", reg_name(rt), reg_name(rs), reg_name(rt));
-    } else {
-        return fmt::format("{} = psx_lwl(cpu, {} + {}, {});",
-                          reg_name(rt), reg_name(rs), (int32_t)offset, reg_name(rt));
+    // LWL: Load Word Left - merges high bytes from the aligned word into rt.
+    // psx_lwl runs the full R3000A load interlock on the aligned address (GPR_DEP rs,
+    // arm LDWhich=rt) and returns the merged value.
+    std::string addr = (offset == 0) ? reg_name(rs)
+                                     : fmt::format("{} + {}", reg_name(rs), (int32_t)offset);
+    uint32_t mask = 1u << rs;
+    if (config_.optimize_zero_reg && rt == 0) {
+        return fmt::format("(void)psx_lwl(cpu, {}, {}, 0, 0x{:X}u);", addr, reg_name(rt), mask);
     }
+    return fmt::format("{} = psx_lwl(cpu, {}, {}, {}, 0x{:X}u);",
+                       reg_name(rt), addr, reg_name(rt), rt, mask);
 }
 
 std::string CodeGenerator::translate_lwr(uint32_t instr) {
@@ -417,16 +409,15 @@ std::string CodeGenerator::translate_lwr(uint32_t instr) {
         return "/* nop: load to $zero */";
     }
 
-    // LWR: Load Word Right - loads bytes into the least-significant portion of rt
-    // addr = rs + offset; byte_pos = addr & 3
-    // Result merges low bytes from aligned word with high bytes from current rt value
-    // Generate a helper call: cpu->rt = psx_lwr(cpu, addr, cpu->rt)
-    if (offset == 0) {
-        return fmt::format("{} = psx_lwr(cpu, {}, {});", reg_name(rt), reg_name(rs), reg_name(rt));
-    } else {
-        return fmt::format("{} = psx_lwr(cpu, {} + {}, {});",
-                          reg_name(rt), reg_name(rs), (int32_t)offset, reg_name(rt));
+    // LWR: Load Word Right - merges low bytes from the aligned word into rt.
+    std::string addr = (offset == 0) ? reg_name(rs)
+                                     : fmt::format("{} + {}", reg_name(rs), (int32_t)offset);
+    uint32_t mask = 1u << rs;
+    if (config_.optimize_zero_reg && rt == 0) {
+        return fmt::format("(void)psx_lwr(cpu, {}, {}, 0, 0x{:X}u);", addr, reg_name(rt), mask);
     }
+    return fmt::format("{} = psx_lwr(cpu, {}, {}, {}, 0x{:X}u);",
+                       reg_name(rt), addr, reg_name(rt), rt, mask);
 }
 
 std::string CodeGenerator::translate_swl(uint32_t instr) {
@@ -1153,19 +1144,20 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     // Faithful GTE: COP2 reg write stalls to the command deadline.
                     const char* gte_stall =
                         "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_gte_stall(cpu);\n#endif\n    ";
+                    // LWC2 load timing: §1+DO_LDS via the block's psx_cyc_step(cpu,0)
+                    // (op 0x32 is non-load), the GTE deadline stall via psx_gte_stall,
+                    // then psx_cyc_lwc2_read does the ReadMemory timing (completion +1,
+                    // no LDWhich arm — the dest is a GTE register).
+                    std::string addr = (offset == 0)
+                        ? reg_name(rs)
+                        : fmt::format("{} + {}", reg_name(rs), offset);
                     bool special = (rt == 7 || (rt >= 8 && rt <= 11) || rt == 14 || rt == 15 || rt == 28 || rt == 30);
                     if (special) {
-                        std::string addr = (offset == 0)
-                            ? reg_name(rs)
-                            : fmt::format("{} + {}", reg_name(rs), offset);
-                        code = gte_stall + fmt::format("gte_write_data(cpu, {}, cpu->read_word({}));  /* lwc2 gte[{}] */",
+                        code = gte_stall + fmt::format("gte_write_data(cpu, {}, psx_cyc_lwc2_read(cpu, {}));  /* lwc2 gte[{}] */",
                                            rt, addr, rt);
-                    } else if (offset == 0) {
-                        code = gte_stall + fmt::format("cpu->gte_data[{}] = cpu->read_word({});  /* lwc2 gte[{}], ({}) */",
-                                          rt, reg_name(rs), rt, reg_name(rs));
                     } else {
-                        code = gte_stall + fmt::format("cpu->gte_data[{}] = cpu->read_word({} + {});  /* lwc2 gte[{}], {}({}) */",
-                                          rt, reg_name(rs), offset, rt, offset, reg_name(rs));
+                        code = gte_stall + fmt::format("cpu->gte_data[{}] = psx_cyc_lwc2_read(cpu, {});  /* lwc2 gte[{}], ({}) */",
+                                          rt, addr, rt, addr);
                     }
                 }
                 break;
@@ -1289,9 +1281,18 @@ std::string CodeGenerator::translate_basic_block(
     }
 
     const bool cycle_per_insn = codegen_cycle_per_insn();
-    auto emit_one_cycle = [&](const std::string& indent) {
+    // Per-instruction R3000A load-delay interlock (cycle_per_insn mode): §1 base +
+    // GPR_DEPRES + DO_LDS, emitted BEFORE the instruction body so §1 precedes any
+    // muldiv/GTE deadline stall the body applies (Beetle order). CPU loads (op
+    // 0x20-0x26) are SKIPPED here — psx_cyc_load_* runs their full interlock inside
+    // the body (and arms LDWhich=rt). The dep/res mask is a gen-time literal. This
+    // replaces the old flat per-instruction psx_advance_cycles(1u).
+    auto emit_pre_timing = [&](uint32_t in, const std::string& indent) {
+        uint32_t op = in >> 26;
+        if (op >= 0x20u && op <= 0x26u) return;   // CPU load: interlock inside psx_cyc_load_*
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-        ss << indent << "psx_advance_cycles(1u);\n";
+        ss << indent << fmt::format("psx_cyc_step(cpu, 0x{:X}u);\n",
+                                    psx_cyc_dep_res_mask(in));
         ss << "#endif\n";
     };
     if (!cycle_per_insn && block_exec_cycles > 0) {
@@ -1352,13 +1353,18 @@ std::string CodeGenerator::translate_basic_block(
         }
 
         if (!is_cf) {
+            if (cycle_per_insn) emit_pre_timing(instr, config_.indent);
             ss << translate_instruction(addr, instr) << "\n";
-            if (cycle_per_insn) {
-                emit_one_cycle(config_.indent);
-            }
         } else {
             // Control flow is handled at block exit
             if (addr == exit_branch_addr) {
+                // Per-instruction interlock ORDER (Beetle): the branch's §1+deps+DO_LDS
+                // runs at the branch PC, THEN the delay slot's at PC+4. Emit the branch
+                // step FIRST (it is pure timing — does not touch GPR values, so it is
+                // safe before the branch-condition capture below).
+                if (cycle_per_insn)
+                    emit_pre_timing(block.exit_instr.instruction, config_.indent);
+
                 // MIPS delay slot handling: emit delay slot instruction BEFORE branch/jump
                 std::string delay_saved_cond;  // non-empty if condition was pre-captured
                 if (block.exit_instr.has_delay_slot) {
@@ -1387,16 +1393,11 @@ std::string CodeGenerator::translate_basic_block(
                                                   delay_saved_cond, cond);
                             }
                             ss << config_.indent << "/* delay slot (always executes) */\n";
+                            // Delay slot's own §1+deps+DO_LDS, before its body (skipped if a load).
+                            if (cycle_per_insn) emit_pre_timing(delay_instr, config_.indent);
                             ss << translate_instruction(delay_slot_addr, delay_instr) << "\n";
-                            if (cycle_per_insn) {
-                                emit_one_cycle(config_.indent);
-                            }
                         }
                     }
-                }
-
-                if (cycle_per_insn) {
-                    emit_one_cycle(config_.indent);
                 }
 
                 // Now emit the branch/jump
@@ -2392,8 +2393,8 @@ std::string CodeGenerator::generate_file(
     ss << " * addr is the effective (possibly unaligned) address.\n";
     ss << " * rt_value is the current value of the destination register.\n";
     ss << " */\n";
-    ss << "static uint32_t psx_lwl(CPUState* cpu, uint32_t addr, uint32_t rt_value) {\n";
-    ss << "    uint32_t word = cpu->read_word(addr & ~3u);\n";
+    ss << "static uint32_t psx_lwl(CPUState* cpu, uint32_t addr, uint32_t rt_value, uint32_t rt, uint32_t reg_mask) {\n";
+    ss << "    uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, reg_mask);  /* full load interlock */\n";
     ss << "    switch (addr & 3u) {\n";
     ss << "        case 0: return (rt_value & 0x00FFFFFFu) | (word << 24);\n";
     ss << "        case 1: return (rt_value & 0x0000FFFFu) | (word << 16);\n";
@@ -2406,8 +2407,8 @@ std::string CodeGenerator::generate_file(
     ss << " * addr is the effective (possibly unaligned) address.\n";
     ss << " * rt_value is the current value of the destination register.\n";
     ss << " */\n";
-    ss << "static uint32_t psx_lwr(CPUState* cpu, uint32_t addr, uint32_t rt_value) {\n";
-    ss << "    uint32_t word = cpu->read_word(addr & ~3u);\n";
+    ss << "static uint32_t psx_lwr(CPUState* cpu, uint32_t addr, uint32_t rt_value, uint32_t rt, uint32_t reg_mask) {\n";
+    ss << "    uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, reg_mask);  /* full load interlock */\n";
     ss << "    switch (addr & 3u) {\n";
     ss << "        case 0: return word;\n";
     ss << "        case 1: return (rt_value & 0xFF000000u) | (word >> 8);\n";

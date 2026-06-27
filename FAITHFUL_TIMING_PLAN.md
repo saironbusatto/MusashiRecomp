@@ -213,6 +213,25 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-27 (load ReadFudge/LDAbsorb — IMPLEMENTED + VALIDATED, both rulers exact):**
+  Shipped the shared per-instruction R3000A load-delay interlock. New `runtime/include/
+  psx_cyc.h`: §1 base + GPR_DEPRES + DO_LDS (`psx_cyc_step`) as static-inline helpers over
+  new CPUState fields `read_absorb[33]/read_absorb_which/read_fudge/ld_which_t/ld_absorb`;
+  `psx_cyc_load_word/half/byte` + `psx_cyc_lwc2_read` in memory.c do the Beetle ReadMemory
+  timing (clear give-back, +2 fudge iff predecessor committed no load, region RAM +3 +
+  completion +2/+1 as the LDAbsorb give-back, scratchpad +0). The pure dep/res classifier
+  `psx_cyc_dep_res_mask` (transcribed from Beetle per-opcode GPR_DEP/RES) lives in
+  psx_instr_cost.h. Wired into the dirty interp + BOTH static emitters (code_generator game,
+  full_function_emitter+strict_translator BIOS); loads now route value reads through the
+  UNCHARGED psx_read_* (cpu->read_* rewired in main.cpp; the flat +4 charge_main_ram_read is
+  gone). **Δ-validated against Beetle:** ruler #2 `load2` +10 → **+11** == Beetle, every other
+  component still exact (alu+1/load+5/div+38/mult+15/gte_rtps+15/gte_nclip+8); ruler #1
+  [c5c→ca4] 54 → **56** == Beetle steady-state (84/77 spikes = I-cache cold refill, P2). Tomba2
+  boots to the intro FMV (screenshot pixels, no regression). Builds clean (tools/BIOS/game/
+  runtime/cyctest). FOLLOW-UP (separate commit): GTE-read/MFC0 give-back + muldiv-stall
+  give-back consumption (don't affect rulers; needed for mixed-code faithfulness). Supersedes
+  the "MODEL NAILED, impl pending" entry below.
+
 - **2026-06-27 (load ReadFudge/LDAbsorb — MODEL NAILED empirically, impl pending):**
   Derived the last load-path component (the residual on both rulers) by measuring
   Beetle's PER-INSTRUCTION cost via adjacent-PC region cyc_watch. Confirmed:
