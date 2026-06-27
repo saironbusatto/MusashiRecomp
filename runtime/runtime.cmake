@@ -305,14 +305,26 @@ function(psxrecomp_add_runtime_target target)
         ${PSXRT_EXTRAS_SOURCES}
     )
 
-    # Per-game process name (EXE_NAME "mmx6-runtime" -> mmx6-runtime.exe).
-    # Every game repo shipping the default "psx-runtime.exe" means one game's
-    # `taskkill /IM psx-runtime.exe` dev loop kills every other game's instance.
-    # All copy/pack steps use $<TARGET_FILE...> generator expressions, so only
-    # by-name references (docs, kill commands) need to know the per-game name.
+    # Game-specific executable name. Every title instantiates this function with
+    # the same CMake target name ("psx-runtime"), so without this they ALL produce
+    # an identical "psx-runtime.exe" — launching or killing one title's process by
+    # name then hits another title's running instance (e.g. an X5 dev run killing a
+    # concurrent Tomba 2 run in a sibling worktree). An explicit EXE_NAME wins;
+    # otherwise derive a unique, filename-safe OUTPUT_NAME from the window title
+    # (which is already per-game) so each title's binary is distinct
+    # (MegaManX5Recomp.exe, Tomba2Recomp.exe, ...). The CMake target name stays
+    # "psx-runtime", so $<TARGET_FILE...> references and the POST_BUILD asset
+    # copies below are unaffected. Oracle builds get an _oracle suffix so a game
+    # and its Beetle oracle don't collide either.
     if(PSXRT_EXE_NAME)
-        set_target_properties(${target} PROPERTIES OUTPUT_NAME "${PSXRT_EXE_NAME}")
+        set(_psxrt_exe_name "${PSXRT_EXE_NAME}")
+    else()
+        string(MAKE_C_IDENTIFIER "${PSXRT_WINDOW_TITLE}" _psxrt_exe_name)
     endif()
+    if(PSXRT_ORACLE)
+        set(_psxrt_exe_name "${_psxrt_exe_name}_oracle")
+    endif()
+    set_target_properties(${target} PROPERTIES OUTPUT_NAME "${_psxrt_exe_name}")
 
     # ---- overlay codegen hash (auto cache key) -----------------------------
     # Hash the recompiler's codegen sources into runtime/include/overlay_codegen_hash.h
