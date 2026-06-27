@@ -15,6 +15,7 @@
 #include "fmt/format.h"
 #include "mips_decoder.h"
 #include "strict_translator.h"
+#include "../../runtime/include/psx_instr_cost.h"  /* single-source CPU cycle cost (shared with interp + game emitter) */
 
 namespace PSXRecompV4 {
 
@@ -317,7 +318,11 @@ bool FullFunctionEmitter::emit_function(
         uint32_t count = 0;
         auto walker = it;
         while (walker != addr_to_raw.end()) {
-            count++;
+            /* Single-source per-instruction cost (psx_instr_cost.h), summed over
+             * the block — identical for all backends. Identity (1/insn) today, so
+             * this equals the old instruction count; Stage-2 real costs land in
+             * that one function and every backend updates together. */
+            count += psx_instr_base_cycles(walker->second);
             ++walker;
             if (walker == addr_to_raw.end()) break;
             if (block_leaders.count(walker->first)) break;
