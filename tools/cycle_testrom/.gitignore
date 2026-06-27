@@ -1,0 +1,4 @@
+# Regenerable build artifacts (produced by gen_testrom.py / psxrecomp-game).
+cycle_testrom.exe
+*.anchors.json
+generated/
