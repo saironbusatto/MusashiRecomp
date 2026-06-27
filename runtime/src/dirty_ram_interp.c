@@ -920,13 +920,18 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
 
     *next_pc_out = pc + 4;
 
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    /* Instruction FETCH cost (I-cache) — charged FIRST, before the §1 base, exactly
+     * like Beetle ReadInstruction precedes the per-instruction base (cpu.cpp). HIT=+0,
+     * KSEG1=+4, cached miss=+3+refill; a miss also clears the load give-back. */
+    psx_icache_fetch(cpu, pc);
+
     /* Per-instruction R3000A load-delay interlock (single-source: psx_cyc.h, shared
      * with both static emitters). §1 base + GPR_DEPRES + DO_LDS run HERE, before the
      * instruction body, so §1 precedes any muldiv/GTE deadline stall the body applies
      * (Beetle order). CPU loads (op 0x20-0x26) are skipped here — psx_cyc_load_* runs
      * their full interlock inside the body (and arms LDWhich=rt). This replaces the
      * old flat per-instruction psx_advance_cycles(psx_instr_base_cycles). */
-#ifdef PSX_ENABLE_BLOCK_CYCLES
     if (!(opc >= 0x20u && opc <= 0x26u))
         psx_cyc_step(cpu, psx_cyc_dep_res_mask(insn));
 #endif

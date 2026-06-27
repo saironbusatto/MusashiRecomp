@@ -184,6 +184,26 @@ def build():
     # pending load give-back; native==Beetle means no divergence to fix.
     inner_loop("ld_div", [lw("$t4", 0, "$t5"), divu("$t2", "$t3"), mflo("$t7")])
 
+    # icache_miss: force an I-cache miss every iteration via 4KB aliasing. The loop
+    # top and a "victim" block 0x1000 bytes away map to the SAME direct-mapped line
+    # (4 KB / 256-line cache, index = addr bits 4-11) with DIFFERENT tags, so each
+    # fetch evicts the other -> a refill miss every iteration. Isolates the I-cache
+    # refill cost; every other loop is small enough to be all-hits after warm-up.
+    a.emit(li("$t0", ITER))
+    ic_top = a.here()
+    anchors["icache_miss"] = ic_top
+    a.label("icache_miss_top")
+    a.emit(addiu("$t0", "$t0", -1))          # ic_top + 0
+    victim_addr = ic_top + 0x1000            # aliases ic_top's line (only bit 12 differs)
+    a.emit(j(victim_addr >> 2))              # ic_top + 4: jump to the aliased victim
+    a.emit(nop())                            # ic_top + 8: delay slot
+    while a.here() < victim_addr:            # pad (not executed; the j skips it)
+        a.emit(nop())
+    # victim @ ic_top+0x1000: loop back to ic_top (or fall through on exit)
+    voff = (a.labels["icache_miss_top"] - (a.here() + 4)) >> 2
+    a.emit(bne("$t0", "$zero", voff))        # victim + 0
+    a.emit(nop())                            # victim + 4: delay slot
+
     # loop outer forever
     o = a.labels["outer"]
     here = a.here()

@@ -111,6 +111,13 @@ extern uint32_t psx_mult_latency_u(uint32_t rs);   /* MULTU (unsigned) */
  * deadline first. Every COP2 register access calls psx_gte_stall, which advances
  * guest cycles to the deadline if the op is still in flight. Faithful only with
  * per-instruction cycle charging. */
+/* R3000A I-cache instruction-FETCH cost (psx_icache.c). Faithful direct-mapped
+ * model: HIT +0, KSEG1/uncached +4, cached miss +3 + refill. Shared by interp
+ * (per-instruction) and the compiled emitters (per-cache-line leader). */
+extern void     psx_icache_fetch(CPUState* cpu, uint32_t addr);
+extern void     psx_icache_reset(void);
+extern int      psx_icache_enabled(void);   /* opt-in (PSX_ICACHE=1) until both backends charge it */
+
 extern void     psx_gte_set(CPUState* cpu, uint32_t latency);
 extern void     psx_gte_stall(CPUState* cpu);
 /* MFC2/CFC2 GTE register read: stall to the deadline AND arm the load-delay

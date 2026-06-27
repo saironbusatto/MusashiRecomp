@@ -109,6 +109,31 @@ load2/load_use/div/div_spaced/mult/gte_rtps/gte_nclip/gte_read_use/ld_div all ma
 the oracle, so the interpreter's per-instruction interlock model is MEASURED equal
 to the compiled backend and to Beetle, not merely shared-by-construction.
 
+## I-cache fetch (icache_miss loop + PSX_ICACHE)
+
+The `icache_miss` loop forces an I-cache miss every iteration: its top and a victim
+block 0x1000 bytes away map to the SAME direct-mapped line (4 KB / 256-line cache,
+index = addr bits 4-11) with different tags, so each fetch evicts the other. (Every
+other loop is small enough to be all-hits after warm-up — fetch cost 0.)
+
+The faithful R3000A I-cache fetch model lives in `runtime/src/psx_icache.c` (HIT +0,
+KSEG1/uncached +4, cached miss +3 + refill from the missing word to the line end —
+transcribed from Beetle ReadInstruction). It is **opt-in via `PSX_ICACHE=1`** (default
+OFF) until BOTH backends charge it: charging it only in the interp while the compiled
+path does not would make the two backends disagree on fetch cost in mixed execution.
+Measure the interp path with both envs:
+
+```powershell
+$env:PSX_FORCE_INTERP='1'; $env:PSX_ICACHE='1'; Start-Process psx-cyctest.exe -ArgumentList ...
+```
+
+**icache_miss == Beetle EXACT (2026-06-27): native-interp +14 == Beetle +14** (per-iter
+17). The hit path (the other 12 loops) is unchanged at +0 fetch. So the I-cache
+hit AND refill-miss costs are MEASURED equal to the oracle on the interp path.
+STAGE 2 (pending): charge the same model in the compiled emitters (per cache-line
+leader) and flip PSX_ICACHE on by default; validate ruler #1's cold first-hit spike
+(Beetle 84/77 vs steady 56) on the compiled path.
+
 ## Beetle ORACLE results (2026-06-26 — the HW cost targets)
 
 Per-iteration cycle delta, and component cost (minus baseline=3):
