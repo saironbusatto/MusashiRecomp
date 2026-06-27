@@ -1866,8 +1866,17 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     enum { MAX_INSNS_PER_DISPATCH = 1000000 };
     uint32_t pc = addr;
     int insns_executed = 0;
+#ifndef PSX_NO_DEBUG_TOOLS
+    extern void debug_server_cyc_observe(uint32_t block_leader_phys);
+#endif
     for (int i = 0; i < MAX_INSNS_PER_DISPATCH; i++) {
         uint32_t next_pc = 0;
+#ifndef PSX_NO_DEBUG_TOOLS
+        /* Interp-path cycle ruler: make every interpreted PC anchorable by
+         * cyc_watch (parity with the compiled emitter's block-leader observe).
+         * Early-returns when cyc_watch is disarmed → ~free in normal runs. */
+        debug_server_cyc_observe(pc & 0x1FFFFFFFu);
+#endif
         uint32_t insn = fetch_word(pc & 0x1FFFFFFFu);
         uint32_t before_s0 = cpu->gpr[16];
         uint32_t before_ra = cpu->gpr[31];
