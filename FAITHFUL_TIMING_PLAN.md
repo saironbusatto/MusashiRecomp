@@ -112,6 +112,36 @@ Per ChatGPT (validated) + standard practice:
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-26 (holistic cycle-model audit, post-P2):** Audited ALL cycle-charging
+  sites for the dominant class (delay-slot undercount) + cost-model consistency:
+  - GAME + OVERLAY emitter (code_generator.cpp `translate_basic_block`): FIXED in
+    P2 (block_exec_cycles +1 for outside delay-slot clone). Overlay/alias path
+    shares translate_basic_block → covered.
+  - BIOS emitter (full_function_emitter.cpp): NO undercount — different model. It
+    emits delay slots IN-LINE at their real address (charged by the owning block
+    via block_cycles count to next leader) and defers the branch via
+    psx_taken_/psx_delay_ flags, rather than emitting an uncounted clone. So the
+    delay-slot-is-leader case charges correctly. No change needed.
+  - INTERP (exec_one callers): charges psx_advance_cycles(1u) per instruction
+    (3 sites). 
+  => The cost MODEL is "1 cycle/instruction", duplicated in 3 places (interp hard
+  1u; game emitter instruction_count; BIOS emitter leader-to-leader count). They
+  agree (Stage-1 backend-equivalent) but are NOT a shared function and NOT HW-
+  accurate (Stage-2). recompiler CAN include runtime headers (already includes
+  ../../runtime/include/ws_backdrop_detect.h) → a shared psx_instr_base_cycles()
+  header is feasible for P3.
+  NEXT CORRECTNESS STEPS (deliberate, not tail-of-session):
+  1. MEASURE FIRST (don't guess HW costs): native exposes psx_cycle_count already;
+     build the Beetle half — add additive guest-cycle exposure to the Beetle oracle
+     (main checkout beetle_debug_server.c) + a native-vs-Beetle cycle/first-
+     divergence harness (find_divergence.py is STALE/DuckStation-era port 4371 —
+     replace with a Beetle 4382 comparator). This is the holistic correctness
+     instrument; it makes drift visible for ALL code/titles, FMV being one measure.
+  2. P3 shared psx_instr_base_cycles() seam (identity first → byte-identical regen
+     proof → then Stage-2 real R3000A costs calibrated against the measure).
+  3. P6: regress other titles (breaking is OK per Rule -1; just know), delete
+     Tomba2 overlay_native_block.
+  COMMIT: f9d50d7 on wt/tomba2 (local, not pushed, not merged to master).
 - **2026-06-26 (P2 DONE — Tomba 2 reaches the intro FMV):** Implemented the
   delay-slot cycle-ownership fix in code_generator.cpp (translate_basic_block):
   `block_exec_cycles = instruction_count + (exit branch sits AT end_addr with a
