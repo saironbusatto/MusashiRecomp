@@ -1079,6 +1079,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         case 0x0F: /* SYNC */
             return 0;
         case 0x10: /* MFHI */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_muldiv_stall(cpu);   /* stall to mult/div completion (faithful) */
+#endif
             cpu->gpr[rd] = cpu->hi;
             cpu->gpr[0] = 0;
             return 0;
@@ -1086,6 +1089,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             cpu->hi = cpu->gpr[rs];
             return 0;
         case 0x12: /* MFLO */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_muldiv_stall(cpu);   /* stall to mult/div completion (faithful) */
+#endif
             cpu->gpr[rd] = cpu->lo;
             cpu->gpr[0] = 0;
             return 0;
@@ -1096,12 +1102,18 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             int64_t r = (int64_t)(int32_t)cpu->gpr[rs] * (int64_t)(int32_t)cpu->gpr[rt];
             cpu->lo = (uint32_t)r;
             cpu->hi = (uint32_t)((uint64_t)r >> 32);
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_muldiv_set(cpu, psx_mult_latency_s(cpu->gpr[rs]));  /* completion deadline */
+#endif
             return 0;
         }
         case 0x19: { /* MULTU */
             uint64_t r = (uint64_t)cpu->gpr[rs] * (uint64_t)cpu->gpr[rt];
             cpu->lo = (uint32_t)r;
             cpu->hi = (uint32_t)(r >> 32);
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_muldiv_set(cpu, psx_mult_latency_u(cpu->gpr[rs]));  /* completion deadline */
+#endif
             return 0;
         }
         case 0x1A: { /* DIV */
@@ -1117,6 +1129,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                 cpu->lo = (uint32_t)(a / b);
                 cpu->hi = (uint32_t)(a % b);
             }
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_muldiv_set(cpu, 37u);   /* DIV completion deadline (fixed) */
+#endif
             return 0;
         }
         case 0x1B: /* DIVU */
@@ -1127,6 +1142,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                 cpu->lo = cpu->gpr[rs] / cpu->gpr[rt];
                 cpu->hi = cpu->gpr[rs] % cpu->gpr[rt];
             }
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_muldiv_set(cpu, 37u);   /* DIVU completion deadline (fixed) */
+#endif
             return 0;
         case 0x20: /* ADD - overflow traps are delegated if they occur. */
         case 0x21: /* ADDU rd, rs, rt */
