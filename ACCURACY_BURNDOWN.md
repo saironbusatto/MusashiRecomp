@@ -96,8 +96,11 @@ observe added to the recompiler so ANY block leader is anchorable on both backen
   keyed owner. Ruler [c5c→ca4]: native 34→30 (exact), no FMV regression.
 - [ ] Memory wait-state CALIBRATION: memory.c flat +6/RAM-read vs Beetle ReadMemory
   (region wait + completion +2/+1 − load-delay absorb; scratchpad=0). Δ-gate.
-- [ ] Mult/div latency — Beetle cpu.cpp MULT_Tab/muldiv; psx-spx. (Ruler shows the
-  unmodeled divu→mflo stall is the dominant remaining −26 in [c5c→ca4].)
+- [x] **Mult/div completion-stall — DONE, validated EXACT** (commit a3e8f28).
+  CPUState.muldiv_ts_done set by MULT/MULTU/DIV/DIVU, MFLO/MFHI stall to it
+  (psx_cycles.c). Needs per-instruction charging (now default on this branch).
+  Ruler #2: native div +38, div_spaced +38 (absorb), mult +15 — ALL == Beetle.
+  Still TODO in BIOS emitter (block-mode) → ruler #1 not yet moved.
 - [ ] GTE per-command cycles — Beetle gte.cpp GTE_Instruction; DuckStation; psx-spx.
 - [ ] Instruction-fetch / I-cache timing — Beetle ReadInstruction (+0 hit / +4 KSEG1
   / +3+refill miss). Ruler's 56→84 cold spread is the I-cache line-refill transient.

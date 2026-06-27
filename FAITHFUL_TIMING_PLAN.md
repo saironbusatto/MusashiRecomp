@@ -213,6 +213,37 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-27 (RULER #2 closed + mult/div completion-stall VALIDATED EXACT):**
+  Built the full cycle micro-benchmark harness (ruler #2) and used it to land the
+  biggest Stage-2 component.
+  - **ruler #2 = `tools/cycle_testrom/`**: hand-encoded PS-X EXE of single-component
+    isolation loops (baseline/alu/load/load2/div/div_spaced/mult), each measured by
+    consecutive-anchor Δ = one iteration; baseline subtraction isolates the cost.
+    Both backends boot the SAME synthetic disc (mkpsxiso; license region extracted
+    from an OWNED disc via dumpsxiso — LOCAL ONLY, gitignored). Beetle loads it via
+    --disc; native via a dedicated psx-cyctest runtime target (boots disc, serial
+    CYCT-00101 so disc-identity matches). measure.py compares per-component costs.
+  - **Beetle ORACLE costs** (the HW targets): baseline 3, alu +1, load +5, load2
+    +11 (2nd load +1 = ReadFudge), div +38 (~36 stall), div_spaced +38 (fillers
+    ABSORBED), mult +15 (~13 stall).
+  - **MULT/DIV completion-stall IMPLEMENTED + VALIDATED EXACT.** MULT/MULTU/DIV/DIVU
+    set CPUState.muldiv_ts_done = now+latency (DIV=37; MULT via MULT_Tab24 14/10/7
+    on operand magnitude); MFLO/MFHI stall guest cycles to the deadline
+    (psx_muldiv_set/stall in psx_cycles.c). Native previously charged ZERO. Required
+    PER-INSTRUCTION cycle charging (PSX_CODEGEN_CYCLE_PER_INSN) — now the DEFAULT on
+    this audit branch — so the stall absorbs (the running cycle count must be
+    accurate mid-block; block-up-front can't). Game emitter emits set/stall at the
+    op sites. RESULT vs oracle: div +38==+38, div_spaced +38==+38 (absorb correct),
+    mult +15==+15 — ALL EXACT. Tomba 2 still reaches the FMV (no regression).
+  - **Load double-count fix** (earlier today): psx_instr_base_cycles reverted to
+    pure execute base (loads=1); memory.c owns the data-access wait-state.
+  - Commits 9cec60a, 2b5ad88, 47bcfec, a3e8f28 (+ cyc_watch dedupe). NOT pushed.
+  NEXT: (1) calibrate memory.c load wait-state (native +7 vs Beetle +5: flat +6 →
+  ~4 + a ReadFudge term). (2) Apply per-instruction mode + muldiv stall to the BIOS
+  emitter (full_function_emitter.cpp) + dirty interp → closes ruler #1's div-stall
+  gap (still 30 vs 56). (3) GTE per-command cycles (same stall mechanism, gte.cpp
+  table). (4) I-cache fetch. Each Δ-gated on the rulers, FMV-verified.
+
 - **2026-06-26 (RULER #1 BUILT + load double-count bug found & fixed):** Built the
   game-independent BIOS-kernel cycle ruler the §3c "TOOLING NEXT" called for, and
   it immediately paid off. Details:
