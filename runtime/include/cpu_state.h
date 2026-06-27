@@ -78,6 +78,14 @@ extern void psx_native_bad_entry(CPUState* cpu, uint32_t owner, uint32_t pc);
 extern void psx_dispatch(CPUState* cpu, uint32_t target_addr);
 extern void psx_dispatch_call(CPUState* cpu, uint32_t target_addr, uint32_t return_addr);
 
+/* Cycle-budgeted precise event slicing — defined in runtime/src/dirty_ram_interp.c.
+ * Emitted at each compiled block leader: if it returns nonzero the block ran
+ * through the per-instruction interpreter (interrupt taken at the exact
+ * architectural instruction) and cpu->pc holds a dispatchable resume point, so
+ * the caller must `return` without executing its compiled body. See
+ * PRECISE_IRQ_SLICE.md. */
+extern int psx_slice_block(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
+
 /* Unknown dispatch — defined in runtime/src/traps.c */
 extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);
 

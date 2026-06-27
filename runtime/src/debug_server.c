@@ -7174,6 +7174,10 @@ static void handle_freeze_check(int id, const char *json)
     extern uint32_t g_dirty_safe_resume_pc;
     extern uint64_t g_async_rfe_set_count;
     extern uint64_t g_async_rfe_fire_count;
+    extern uint64_t g_slice_fired, g_slice_irq_taken;
+    extern uint32_t g_slice_last_block, g_slice_last_first_pc, g_slice_last_first_insn;
+    extern uint32_t g_slice_last_committed, g_slice_last_istat, g_slice_last_imask, g_slice_last_sr;
+    extern uint32_t g_slice_entry_deliverable;
     extern uint64_t g_sentinel_reach_dirty;
     extern uint64_t g_sentinel_reach_traps;
     extern uint32_t g_sentinel_reach_async;
@@ -7264,6 +7268,16 @@ static void handle_freeze_check(int id, const char *json)
                     "\"dirty_ram_insns\":%llu,"
                     "\"dirty_ram_aborts\":%llu,"
                     "\"dirty_ram_guard_yields\":%llu,"
+                    "\"slice_fired\":%llu,"
+                    "\"slice_irq_taken\":%llu,"
+                    "\"slice_block\":\"0x%08X\","
+                    "\"slice_first_pc\":\"0x%08X\","
+                    "\"slice_first_insn\":\"0x%08X\","
+                    "\"slice_committed\":\"0x%08X\","
+                    "\"slice_istat\":\"0x%08X\","
+                    "\"slice_imask\":\"0x%08X\","
+                    "\"slice_sr\":\"0x%08X\","
+                    "\"slice_entry_deliverable\":%u,"
                     "\"fn_entry_total\":%llu,"
                     "\"sio_irq_total\":%u,"
                     "\"sio_byte_seq\":%u,"
@@ -7307,6 +7321,16 @@ static void handle_freeze_check(int id, const char *json)
                     (unsigned long long)g_dirty_ram_insns_run,
                     (unsigned long long)g_dirty_ram_aborts,
                     (unsigned long long)g_dirty_ram_guard_yields,
+                    (unsigned long long)g_slice_fired,
+                    (unsigned long long)g_slice_irq_taken,
+                    g_slice_last_block,
+                    g_slice_last_first_pc,
+                    g_slice_last_first_insn,
+                    g_slice_last_committed,
+                    g_slice_last_istat,
+                    g_slice_last_imask,
+                    g_slice_last_sr,
+                    g_slice_entry_deliverable,
                     (unsigned long long)s_fn_entry_seq,
                     irq_total,
                     sio_get_seq(),

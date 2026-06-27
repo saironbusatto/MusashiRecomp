@@ -134,6 +134,63 @@ to the safe resume PC, then the block `return`s and the trampoline tail-dispatch
 the safe PC compiled. (Decide seam during impl; keep generated-code change to the
 single emitted guard line.)
 
+## Implementation status (2026-06-26 evening) — Task #4 ROOT-CAUSED (handoff hypothesis CORRECTED)
+
+The prior handoff's Task #4 hypothesis ("nested psx_check_interrupts leaves pc=0
+because of setjmp/dispatch-depth/cooldown/VBlank-pacing") was REFUTED by state
+evidence. The real root cause is the RESUME PC, not the take machinery.
+
+### Evidence (slice-trace + always-on rings, port 4500)
+- Reproduced the deterministic pc=0 with the current build. Added slice-trace
+  globals (g_slice_last_block/_first_pc/_first_insn/_committed/_istat/_imask/_sr/
+  _entry_deliverable) surfaced in freeze_check.
+- The slice fires at game block 0x80017FEC (NOT 0x8001A2F4 — the earlier
+  event-ring read of "resume=0xB0" was a DIFFERENT, earlier delivery; red herring).
+  first_insn = 0x8FA20010 (`lw v0,0x10(sp)`), committed = 0x80017FF0.
+- precise_irq_deliverable was TRUE at slice entry; the loop ran ONE instruction then
+  took the IRQ with resume = 0x80017FF0 — a MID-FUNCTION clean-game-text PC.
+- ROOT CAUSE: psx_dispatch_game_compiled is a switch over function ENTRIES (+ CPS
+  call-return continuations). A mid-function clean-text PC is NOT in it -> returns 0;
+  the page is not dirty -> dirty_ram_dispatch_inner returns 0 (line 1685-1731) ->
+  top-level reads pc as 0 ("execution completed"). NOT a take-machinery bug.
+  Tested+REFUTED: gating cooldown + VBlank-pacing on g_precise_mode did NOT fix it.
+- A/B isolation (PSX_PRECISE_SLICE env toggle, now permanent in psx_slice_block):
+  slice-OFF boots clean past frame 798; slice-ON dies. The slice is the sole cause.
+
+### The fix (ChatGPT-validated, "PSX Static Recompiler Debug" thread 2026-06-26)
+DECISIVE RECOMMENDATION: make EVERY basic-block leader a re-enterable CPS
+continuation. That is the correct class fix for exact-instruction IRQs in a static
+recompiler. Do NOT route clean compiled text through the dirty-RAM interpreter
+(reintroduces the 4096-pump/cap/deadlock class). Invariant:
+  function entry != only valid native entry;
+  basic-block leader = valid intra-function continuation entry.
+- Global dispatch maps each block leader -> its OWNING function with cpu->pc set
+  (`case L: cpu->pc=L; func_OWNER(cpu); return 1;`), NOT a new function entry —
+  preserves "never seed an interior address as a function entry" (truncation rule).
+- Each function's existing `if(cpu->pc!=0) switch(_cont){case X: goto block_X;}`
+  is extended to ALL block leaders (today only CPS call-returns).
+- precise-mode interprets ONLY to the next post-transfer boundary (a block leader),
+  then hands back — bounded to "remaining insns in current block + delay/transfer",
+  NOT "until some future call-return". Fixes the delay-loop deadlock
+  (do{[sp+16]--;}while(!=-1) in func_80017FC4, leaders 0x80017FEC/..34 not entries).
+- Block-leader set must include: branch/jump targets, post-delay fallthrough
+  (branch_pc+8), call-return PCs, statically-known computed-jump targets.
+- Pitfall (live-in safety): satisfied — guest regs are canonical in cpu->gpr[]
+  (generated C uses cpu->gpr[] directly; only block-local _bc_* temps are C locals).
+- FAIL CLOSED, never silent pc=0: if the slice cap trips before reaching a
+  dispatchable PC -> fatal diagnostic precise_slice_failed_to_reach_block_boundary
+  {pc,start,last,count,owner}. If a clean-text transfer target is not a known leader
+  (indirect/jump-table discovery gap) -> log clean_text_undispatchable_pc + fail
+  closed. pc=0 must mean only a real guest pc=0 / explicit termination.
+
+PROGRESS so far: runtime psx_run_precise restructured (irq_taken-once + every exit
+gated on precise_pc_dispatchable, which calls the new generator predicate
+psx_game_is_function_entry). With ONLY function-entries+CPS-returns dispatchable,
+boot advanced frame 798->800 and 1 slice -> 432 slices, then deadlocks on the
+func_80017FC4 delay loop (its leaders aren't entries). NEXT: emit ALL block leaders
+as continuations in the generator (full_function_emitter.cpp + main_psx.cpp), then
+the delay-loop leaders become dispatchable and the slice hands back within one block.
+
 ## Validation  [Task #5]
 - Beetle exc_ring oracle: native exception-entry record (cycle, last/next PC,
   EPC, BD, Status/Cause, I_STAT/I_MASK, pending-load) must match interp + Beetle

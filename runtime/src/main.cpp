@@ -2821,6 +2821,10 @@ int main(int argc, char** argv) {
     }
 
     std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
+    { extern uint64_t g_slice_fired, g_slice_irq_taken, g_dirty_ram_insns_run;
+      std::fprintf(stdout, "psxrecomp runtime: [slice diag] slice_fired=%llu slice_irq_taken=%llu dirty_insns=%llu\n",
+                   (unsigned long long)g_slice_fired, (unsigned long long)g_slice_irq_taken,
+                   (unsigned long long)g_dirty_ram_insns_run); }
 
     shutdown_runtime();
     if (g_gl_active) gl_renderer_shutdown();

@@ -906,6 +906,31 @@ int main(int argc, char** argv) {
         ds << "    }\n";
         ds << "}\n";
 
+        // Non-destructive companion to psx_dispatch_game_compiled: is `addr` a PC
+        // the top-level dispatch can re-enter (a compiled function entry, or a CPS
+        // continuation resume-point)? The precise event slicer (dirty_ram_interp.c)
+        // needs this to know when it may hand a resume PC back to the dispatcher:
+        // a MID-function clean-text PC is NOT re-enterable (the switch falls to
+        // `default: return 0` and the dirty path returns 0 -> top-level PC=0 exit),
+        // so the slicer must keep interpreting until cpu->pc lands on a true entry.
+        // Same case set as the dispatch switch above, minus the function calls.
+        ds << "\n/* 1 iff addr is a re-enterable compiled entry/continuation (no exec). */\n";
+        ds << "int psx_game_is_function_entry(uint32_t addr) {\n";
+        ds << "    switch (addr) {\n";
+        for (uint32_t addr : dispatch_addrs) {
+            ds << fmt::format("        case 0x{:08X}u: return 1;\n", addr);
+        }
+        if (codegen.cps_enabled()) {
+            const auto& conts = codegen.cps_continuations();
+            for (const auto& [cont, owner] : conts) {
+                if (dispatch_addrs.count(cont)) continue;
+                ds << fmt::format("        case 0x{:08X}u: return 1;\n", cont);
+            }
+        }
+        ds << "        default: return 0;\n";
+        ds << "    }\n";
+        ds << "}\n";
+
         if (codegen.cps_enabled()) {
             // RECURSION_BUG.md §25 — mark CPS mode at startup so the overlay sljit
             // JIT (overlay_sljit.c) emits the CPS contract. Static ctor: no clash

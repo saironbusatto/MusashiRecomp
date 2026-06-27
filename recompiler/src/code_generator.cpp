@@ -1177,16 +1177,73 @@ std::string CodeGenerator::translate_basic_block(
 
     // Block label
     ss << fmt::format("block_{:08X}:\n", block.start_addr);
+
+    // Cycle-budgeted precise event slicing (PRECISE_IRQ_SLICE.md). At the block
+    // leader — before any cycle is charged or the body runs — divert to the
+    // per-instruction interpreter when an interrupt could be taken inside this
+    // block, so the IRQ lands at its exact architectural instruction instead of
+    // the coarse block edge. psx_slice_block returns nonzero iff it sliced (it
+    // interpreted the block — and possibly more — and left cpu->pc at a
+    // dispatchable resume point), in which case this function returns so its
+    // compiled body does not re-execute the same instructions.
+    // side_effects=1 marks blocks that change interrupt visibility on the CPU
+    // (mtc0 Status/Cause, rfe), which can make a pending+masked IRQ deliverable
+    // mid-block with no external event deadline.
+    // Faithful cycle accounting (FAITHFUL_TIMING_PLAN.md P2): the exit branch/jump
+    // ALWAYS executes its delay-slot instruction (emitted as a clone before the
+    // transfer, below). When the delay slot lives INSIDE this block
+    // (block.exit_instr.address < end_addr) it is already part of
+    // instruction_count. But when the delay slot is a SEPARATE block leader (a
+    // branch target, or a split-function edge) the branch sits AT end_addr and the
+    // delay slot at end_addr+4 is outside [start,end]; instruction_count then
+    // EXCLUDES it, yet the clone still executes — so the block undercharges by one
+    // cycle vs the per-instruction interpreter on BOTH paths. (This is the measured
+    // -8 drift in the Tomba 2 logo init subtree: ~8 such sites on the boot path,
+    // native runs behind interp, the elapsed-Timer1 logo-delay loop exits early.)
+    // Charge the always-executed clone here so every dynamically executed
+    // instruction is charged exactly once. (R3000 is MIPS-I: no branch-likely, so
+    // the delay slot is unconditional.) cycle_per_insn mode already charges the
+    // clone per-instruction at its emit site, so this adjustment is block-mode only.
+    const bool exit_delay_slot_outside =
+        block.exit_instr.has_delay_slot &&
+        block.exit_instr.type != ControlFlowType::None &&
+        block.exit_instr.address == block.end_addr;
+    const uint32_t block_exec_cycles =
+        static_cast<uint32_t>(block.instruction_count) + (exit_delay_slot_outside ? 1u : 0u);
+
+    {
+        uint32_t slice_bcyc = block_exec_cycles;
+        if (slice_bcyc == 0) slice_bcyc = 1;
+        int slice_side_effects = 0;
+        for (uint32_t a = block.start_addr; a <= block.end_addr; a += 4) {
+            auto w = exe_.read_word(a);
+            if (!w.has_value()) break;
+            uint32_t insn = *w;
+            if ((insn >> 26) == 0x10u) {                 // COP0
+                uint32_t rs = (insn >> 21) & 0x1Fu;
+                uint32_t co = (insn >> 25) & 0x1u;
+                uint32_t funct = insn & 0x3Fu;
+                if (rs == 0x04u) slice_side_effects = 1;            // MTC0 (writes Status/Cause)
+                if (co && funct == 0x10u) slice_side_effects = 1;   // RFE
+            }
+        }
+        ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+        ss << config_.indent
+           << fmt::format("if (psx_slice_block(cpu, 0x{:08X}u, {}u, {})) return;\n",
+                          block.start_addr, slice_bcyc, slice_side_effects);
+        ss << "#endif\n";
+    }
+
     const bool cycle_per_insn = codegen_cycle_per_insn();
     auto emit_one_cycle = [&](const std::string& indent) {
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
         ss << indent << "psx_advance_cycles(1u);\n";
         ss << "#endif\n";
     };
-    if (!cycle_per_insn && block.instruction_count > 0) {
+    if (!cycle_per_insn && block_exec_cycles > 0) {
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
         ss << config_.indent << fmt::format("psx_advance_cycles({}u);\n",
-                                            static_cast<uint32_t>(block.instruction_count));
+                                            block_exec_cycles);
         ss << "#endif\n";
     }
 

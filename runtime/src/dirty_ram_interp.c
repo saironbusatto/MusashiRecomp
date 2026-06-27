@@ -58,6 +58,27 @@ uint64_t g_dirty_pump_count         = 0;
  * this 0 -> the sentinel + host-GPR-restore + longjmp path (unchanged: T1/MMX6/Ape). */
 uint32_t g_dirty_safe_resume_pc = 0;
 
+/* Cycle-budgeted precise event slicing (PRECISE_IRQ_SLICE.md). Set while the
+ * block-leader slice guard is running a block through the per-instruction
+ * interpreter so the interrupt is taken at the EXACT architectural instruction
+ * (not the coarse block edge). While set, exec_one's jal/jalr short-circuit to a
+ * plain transfer (cpu->pc = target; return 1) so precise-mode steps INTO callees
+ * per-instruction instead of running them compiled — the "ignore native
+ * availability" invariant (ChatGPT-validated option b). Default 0 => every other
+ * path is byte-for-byte unchanged. */
+int g_precise_mode = 0;
+uint64_t g_slice_fired = 0;        /* diagnostic: slices actually run */
+uint64_t g_slice_irq_taken = 0;    /* diagnostic: IRQs taken inside precise-mode */
+/* First-divergence trace for the precise slice (PRECISE_IRQ_SLICE.md Task #4). */
+uint32_t g_slice_last_block     = 0;  /* block_addr the guard fired on            */
+uint32_t g_slice_last_first_pc  = 0;  /* pc of the first interp instruction       */
+uint32_t g_slice_last_first_insn= 0;  /* raw word of that first instruction       */
+uint32_t g_slice_last_committed = 0;  /* committed PC handed back as resume/EPC   */
+uint32_t g_slice_last_istat     = 0;  /* i_stat at the take                        */
+uint32_t g_slice_last_imask     = 0;  /* i_mask at the take                        */
+uint32_t g_slice_last_sr        = 0;  /* COP0 SR at the take                       */
+uint32_t g_slice_entry_deliverable = 0; /* was IRQ deliverable at slice entry?    */
+
 /* Persistent async-RFE resume PC (Tomba 2 frame-1997 fix). psx_check_interrupts latches
  * this from g_dirty_safe_resume_pc at each dirty-safe-point exception entry, so it holds
  * the real guest PC of the most recent dirty-interp interruption. When a game-installed
@@ -185,6 +206,8 @@ uint32_t g_overlay_region_floor = OVERLAY_REGION_FLOOR_DEFAULT;
 
 #ifdef PSX_HAS_GAME_DISPATCH
 extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
+extern int psx_game_address_in_text(uint32_t addr);
+extern int psx_game_is_function_entry(uint32_t addr);  /* non-destructive entry test */
 #endif
 extern void psx_dispatch_call(CPUState* cpu, uint32_t addr, uint32_t return_addr);
 
@@ -1007,6 +1030,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
             xprobe_event(pc, XOP_JALR, XSITE_INTERP, target,
                          fetch_word((pc + 4) & 0x1FFFFFFFu), site_sp, cpu->gpr[31], 1);
+            if (g_precise_mode) { cpu->pc = target; return 1; }  /* slice: step INTO callee per-insn */
 #ifdef PSX_HAS_GAME_DISPATCH
             cpu->pc = 0;
             if (interp_enter_compiled(cpu, target)) {
@@ -1156,6 +1180,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
         xprobe_event(pc, XOP_JAL, XSITE_INTERP, target,
                      fetch_word((pc + 4) & 0x1FFFFFFFu), site_sp, cpu->gpr[31], 1);
+        if (g_precise_mode) { cpu->pc = target; return 1; }  /* slice: step INTO callee per-insn */
 #ifdef PSX_HAS_GAME_DISPATCH
         cpu->pc = 0;
         if (interp_enter_compiled(cpu, target)) {
@@ -1495,6 +1520,173 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
 
     g_dirty_interp_active = prev;
     return r;
+}
+
+/* ===== Cycle-budgeted precise event slicing (PRECISE_IRQ_SLICE.md) ===== */
+
+/* Is a hardware interrupt deliverable to the guest at this exact instruction
+ * boundary? Mirrors the gate in psx_check_interrupts: a pending+unmasked I_STAT
+ * bit, COP0 IEc + IM2 set, and not already inside the exception handler. */
+static int precise_irq_deliverable(CPUState *cpu) {
+    extern uint32_t i_stat;
+    if ((i_stat & i_mask) == 0) return 0;
+    if (psx_get_in_exception()) return 0;
+    uint32_t sr = cpu->cop0[12];
+    if (!(sr & 0x1u))        return 0;   /* IEc: interrupts globally enabled */
+    if (!(sr & (1u << 10)))  return 0;   /* IM2: hardware interrupt mask bit */
+    return 1;
+}
+
+/* Is `pc` a point the TOP-LEVEL dispatcher can re-enter? Clean (compiled) game
+ * text is only re-enterable at a FUNCTION ENTRY: psx_dispatch_game_compiled is a
+ * switch over entries and returns 0 for any mid-function PC; the dirty path then
+ * sees a non-dirty page and also returns 0, which the top dispatch reads as PC=0
+ * ("execution completed" — the deterministic precise-slice boot exit, root-caused
+ * to a mid-function clean-text resume PC, PRECISE_IRQ_SLICE.md Task #4). Every
+ * other PC class — BIOS ROM, dirty RAM (overlays / install-at-runtime stubs),
+ * overlay candidates, the A0/B0/C0 kernel call vectors, scratchpad — is handled by
+ * psx_dispatch / the dirty interp / the overlay loader, so it is dispatchable.
+ * Therefore the precise slicer must never hand control back at a mid-function
+ * clean-text PC: it keeps interpreting (exec_one handles arbitrary mid-function
+ * flow) until cpu->pc satisfies this predicate. */
+static int precise_pc_dispatchable(uint32_t pc) {
+#ifdef PSX_HAS_GAME_DISPATCH
+    uint32_t phys = pc & 0x1FFFFFFFu;
+    if (psx_game_address_in_text(pc) && !dirty_ram_is_dirty(phys))
+        return psx_game_is_function_entry(pc);
+#endif
+    (void)pc;
+    return 1;
+}
+
+/* Run the guest per-instruction from cpu->pc through the interpreter, taking any
+ * deliverable interrupt at the EXACT instruction boundary, until a safe resume
+ * point. g_precise_mode makes exec_one step INTO jal/jalr callees per-instruction
+ * (ignore native availability), so the slice is owned by the event deadline, not
+ * the function boundary. ALL exits land on a control-transfer target — every
+ * branch/jump target is dispatchable (compiled blocks end with cpu->pc=target;
+ * return), whereas an arbitrary mid-block PC is not — so after taking a mid-block
+ * IRQ we keep interpreting to the next transfer before handing back to compiled.
+ * `bcyc` = originating block's cycle budget; `deadline_entry` = entered because an
+ * event is due within bcyc (vs a side-effect-only block, which runs one block). */
+static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
+    int prev_precise = g_precise_mode;
+    int prev_active  = g_dirty_interp_active;
+    g_precise_mode = 1;
+    g_dirty_interp_active = 1;
+
+    uint32_t pc = cpu->pc;
+    g_slice_last_block    = pc;
+    g_slice_last_first_pc = pc;
+    g_slice_last_first_insn = fetch_word(pc & 0x1FFFFFFFu);
+    int irq_taken = 0;   /* one take per slice (avoid re-taking an unacked IRQ) */
+    enum { MAX_PRECISE_INSNS = 200000 };
+    for (int i = 0; i < MAX_PRECISE_INSNS; i++) {
+        uint32_t next_pc = 0;
+        g_unsupported_seen = 0;
+        int transferred = exec_one(cpu, pc, &next_pc);
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+        psx_advance_cycles(1u);
+#endif
+        g_dirty_ram_insns_run++;
+        if (g_unsupported_seen) {
+            /* Valid compiled code always decodes; if not, hand the committed PC to
+             * the dispatcher rather than abort the slice. */
+            g_unsupported_seen = 0;
+            pc = transferred ? cpu->pc : next_pc;
+            break;
+        }
+        uint32_t committed = transferred ? cpu->pc : next_pc;
+
+        /* `want_exit`: the slice has done its job and would like to hand back. But
+         * it may ONLY return control at a dispatchable PC (precise_pc_dispatchable)
+         * — a mid-function clean-text resume PC is unhandleable by the top dispatch
+         * (root cause of the deterministic boot PC=0). When we want to exit but the
+         * committed PC is mid-function clean text, keep interpreting (exec_one runs
+         * arbitrary mid-function flow) until control lands on a real entry / leaves
+         * clean game text. */
+        int want_exit = 0;
+
+        /* Exact take-point: an interrupt deliverable on THIS instruction's cycle is
+         * taken before the next instruction retires — once per slice. Re-checking
+         * after a take re-fires an IRQ the handler has not acked yet (an
+         * 8-takes-in-11-insns storm), so gate on !irq_taken. */
+        if (!irq_taken && precise_irq_deliverable(cpu)) {
+            extern uint32_t i_stat;
+            g_slice_last_committed = committed;
+            g_slice_last_istat = i_stat;
+            g_slice_last_imask = i_mask;
+            g_slice_last_sr    = cpu->cop0[12];
+            cpu->pc = committed;
+            g_dirty_safe_resume_pc = committed;   /* real EPC for exception entry */
+            psx_check_interrupts(cpu);            /* takes it; runs handler; restores GPRs */
+            g_dirty_safe_resume_pc = 0;
+            g_slice_irq_taken++;
+            irq_taken = 1;
+            cpu->pc = committed;   /* resume the interrupted stream at the exact PC */
+            want_exit = 1;
+        }
+
+        pc = committed;
+        cpu->pc = committed;
+
+        if (g_psx_call_bail) break;   /* wild unwind: hand cpu->pc to the dispatcher */
+
+        if (irq_taken) {
+            want_exit = 1;            /* after the take, leave as soon as it is safe */
+        } else if (transferred) {
+            if (!deadline_entry) want_exit = 1;                 /* side-effect block: one block */
+            else if (cycles_to_next_event() > bcyc) want_exit = 1; /* imminent window passed */
+            /* else still imminent — keep slicing across this boundary */
+        }
+
+        /* Hand back ONLY at a dispatchable PC. Otherwise (mid-function clean text)
+         * keep interpreting until one is reached. */
+        if (want_exit && precise_pc_dispatchable(cpu->pc)) break;
+    }
+
+    cpu->pc = pc;
+    g_precise_mode = prev_precise;
+    g_dirty_interp_active = prev_active;
+}
+
+/* Block-leader slice guard, called by the emitted prologue of every compiled
+ * block BEFORE it charges cycles / runs its body:
+ *     if (psx_slice_block(cpu, <block_addr>, <bcyc>, <side_effects>)) return;
+ * Returns 1 if it sliced (ran the block — and possibly more — through the precise
+ * interpreter and left cpu->pc at a dispatchable resume point; the caller MUST
+ * `return` so its compiled body does not re-execute the same instructions).
+ * Returns 0 if the whole block is provably safe to run as fast compiled C. */
+int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
+    /* Runtime A/B toggle (diagnostic, stays in the build): PSX_PRECISE_SLICE=0
+     * disables precise slicing entirely so the SAME binary can be run slice-on vs
+     * slice-off to isolate the first divergence the slice introduces. Read once. */
+    /* PARKED (PRECISE_IRQ_SLICE.md): precise take-point slicing is a later
+     * correctness upgrade, NOT the current FMV blocker (that is the -8 cycle
+     * drift / faithful per-instruction cycle model — see CLAUDE.md Rule -1).
+     * Default OFF so the runtime boots on the baseline; opt in with
+     * PSX_PRECISE_SLICE=1 to continue the block-leader-continuation work. */
+    static int s_slice_enabled = -1;
+    if (s_slice_enabled < 0) {
+        const char *e = getenv("PSX_PRECISE_SLICE");
+        s_slice_enabled = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (!s_slice_enabled) return 0;
+
+    /* No nested slicing: a handler dispatched from inside precise-mode, and any
+     * block executed while in_exception, run compiled (interrupts are gated during
+     * exception handling anyway). Keeps re-entrancy structurally impossible. */
+    if (g_precise_mode || psx_get_in_exception()) return 0;
+
+    int entry_deliverable = precise_irq_deliverable(cpu);
+    int has_deadline = entry_deliverable || (cycles_to_next_event() <= bcyc);
+    if (!has_deadline && !side_effects) return 0;   /* fast path: no event in this block */
+
+    g_slice_entry_deliverable = (uint32_t)entry_deliverable;
+    g_slice_fired++;
+    cpu->pc = block_addr;
+    psx_run_precise(cpu, bcyc, has_deadline);
+    return 1;
 }
 
 static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
