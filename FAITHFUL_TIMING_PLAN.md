@@ -213,6 +213,19 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-27 (load ReadFudge/LDAbsorb — MODEL NAILED empirically, impl pending):**
+  Derived the last load-path component (the residual on both rulers) by measuring
+  Beetle's PER-INSTRUCTION cost via adjacent-PC region cyc_watch. Confirmed:
+  fudge = +2 iff the previous instruction committed no pending load (ReadFudge=0x20;
+  `(reg>>4)&2` is 0 for all real regs), else 0; region+completion=5 (LDAbsorb excludes
+  fudge); the load-delay-slot instruction does NOT absorb (its §1 precedes its DO_LDS),
+  the instructions after it do. Per-instruction Beetle data: load = lw7/addiu1/bne0/nop0;
+  load2 = lw7/lw6/addiu1/bne0/nop0. Full model + implementation spec in
+  `accuracy/load_readfudge_ldabsorb.md`. Implementation is pervasive (per-instruction
+  ReadAbsorb + GPR_DEP/RES in both emitters + interp) → a focused next task on a clean
+  tree; validate via the ruler-loop anchors (baseline 3 / load 8 / load2 14). No code
+  changed this step (read-only empirical derivation).
+
 - **2026-06-27 (interp-path cycle ruler — enabler DONE + validated):** The dirty
   interp now emits `debug_server_cyc_observe(pc)` per instruction (gated), so
   interp-executed PCs are cyc_watch-anchorable (were not). Validated: a live
