@@ -110,7 +110,13 @@ observe added to the recompiler so ANY block leader is anchorable on both backen
 - [ ] **Instruction-fetch / I-cache** — ruler #1 shows the residual: Beetle 84 on
   cold-line hits (I-cache refill) vs native flat 56. Next component. Beetle
   ReadInstruction (+0 hit / +4 KSEG1 / +3+refill miss).
-- [ ] GTE per-command cycles — Beetle gte.cpp GTE_Instruction; DuckStation; psx-spx.
+- [x] **GTE per-command cycles — DONE, validated EXACT** (commit ec1fd76).
+  CPUState.gte_ts_done armed in gte_execute (cost-1 table verified from beetle
+  gte.cpp op returns; AVSZ4=5 not 6); any COP2 reg access stalls to it; both
+  emitters + interp. Ruler #2 gte_rtps +15 / gte_nclip +8 == Beetle. FMV no-reg.
+- [x] **Mult/div stall — also completed to the dirty-RAM interpreter** (commit
+  75d5d1a): backend parity (interp was charging 0 for mult/div). By-construction
+  + no-regression (no interp-path ruler yet — see below).
 - [ ] Instruction-fetch / I-cache timing — Beetle ReadInstruction (+0 hit / +4 KSEG1
   / +3+refill miss). Ruler's 56→84 cold spread is the I-cache line-refill transient.
 - [ ] **HW test-ROM ruler (#2)** — Amidog CPU/GTE timing ROMs for hand-crafted
