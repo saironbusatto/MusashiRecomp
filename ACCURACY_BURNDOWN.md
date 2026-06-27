@@ -4,6 +4,27 @@ Companion to FAITHFUL_TIMING_PLAN.md. That doc owns the CYCLE/TIMING axis (the
 area under active implementation); THIS doc is the full-coverage burndown across
 ALL accuracy axes for the faithful-core build.
 
+## ⚠️ LESSON (2026-06-26): oracle-validate OUTPUT before applying a fix
+
+The MDEC "fix" (agent branch `fix/mdec-faithful-accuracy`) was applied from
+research-claimed source-level divergences and REGRESSED both Tomba 2 FMVs
+(Whoopee Camp logo + Tomba intro) on color — REVERTED. The original MDEC output
+was user-verified CORRECT. Takeaways, now binding:
+- A research-claimed discrepancy is a HYPOTHESIS, not a bug. Validate the OUTPUT
+  (diff our decoded result vs Beetle's on the SAME input) BEFORE changing code.
+- "Matches Beetle's source conventions" does NOT justify rewriting code whose
+  OUTPUT is already correct. Our impl may be a valid equivalent.
+- The user's eyes / the oracle's OUTPUT override source-reading. "Looked right
+  before, wrong after" = revert, always.
+- MDEC fix is PARKED on its branch pending a real MDEC output-diff harness (decode
+  the same stream on native + Beetle, compare blocks). Only fix proven output
+  divergence. Do NOT re-apply blind.
+- Same gate applies to ALL agent fixes (hybrid-pad etc.): reconcile onto wt/tomba2
+  + validate vs the oracle BEFORE trusting.
+
+Separately: the Tomba intro FMV left/right SPLIT seam is a PRE-EXISTING GPU/display
+presentation bug (present before today's work), not MDEC — its own axis-5 item.
+
 ## Method (non-negotiable)
 
 - Every item gets: **status**, the **external comparative(s)** to cross-reference
