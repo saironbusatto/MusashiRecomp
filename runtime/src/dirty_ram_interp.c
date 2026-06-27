@@ -369,8 +369,9 @@ void dirty_ram_log_marker(uint32_t addr, uint32_t tag, int kind) {
     e->transferred = (uint8_t)(200 + kind);
 }
 
-static inline uint32_t interp_lwl(CPUState *cpu, uint32_t addr, uint32_t rt_value) {
-    uint32_t word = cpu->read_word(addr & ~3u);
+/* LWL/LWR are merge-only here; the timed aligned-word read is done by the caller via
+ * psx_cyc_load_word (Beetle reads the aligned word; GPR_DEP rs only, arms LDWhich=rt). */
+static inline uint32_t lwl_merge(uint32_t addr, uint32_t word, uint32_t rt_value) {
     switch (addr & 3u) {
         case 0: return (rt_value & 0x00FFFFFFu) | (word << 24);
         case 1: return (rt_value & 0x0000FFFFu) | (word << 16);
@@ -379,8 +380,7 @@ static inline uint32_t interp_lwl(CPUState *cpu, uint32_t addr, uint32_t rt_valu
     }
 }
 
-static inline uint32_t interp_lwr(CPUState *cpu, uint32_t addr, uint32_t rt_value) {
-    uint32_t word = cpu->read_word(addr & ~3u);
+static inline uint32_t lwr_merge(uint32_t addr, uint32_t word, uint32_t rt_value) {
     switch (addr & 3u) {
         case 0: return word;
         case 1: return (rt_value & 0xFF000000u) | (word >> 8);
@@ -899,17 +899,10 @@ static void exec_delay_slot(CPUState *cpu, uint32_t pc) {
     uint32_t dummy_next = 0;
     (void)exec_one(cpu, pc, &dummy_next);
     g_dirty_ram_insns_run++;
-    /* CYCLE MODEL: the delay-slot instruction is a real retired R3000A
-     * instruction and costs its own cycle. The main interp loop charges 1 for
-     * the branch/jump itself; charge 1 here for the delay slot so a branch+slot
-     * pair costs 2 — matching the recompiler's block.instruction_count (which
-     * counts both) and hardware. Without this the dirty-interp under-charges 1
-     * cycle per taken branch vs compiled-overlay code, drifting the shared
-     * guest-cycle timeline and forking timer-sensitive code (Tomba2 logo).
-     * Charged through the single-source cost fn (psx_instr_cost.h). */
-#ifdef PSX_ENABLE_BLOCK_CYCLES
-    psx_advance_cycles(psx_instr_base_cycles(insn));
-#endif
+    /* CYCLE MODEL: the delay-slot instruction is a real retired R3000A instruction
+     * and is charged its own per-instruction interlock INSIDE exec_one (top-of-fn
+     * §1+deps+DO_LDS, or psx_cyc_load_* for a load delay slot) — so a branch+slot
+     * pair costs both, matching hardware. No separate charge here. */
 }
 
 static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
@@ -926,6 +919,17 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     uint32_t imm  = imm16_field(insn);
 
     *next_pc_out = pc + 4;
+
+    /* Per-instruction R3000A load-delay interlock (single-source: psx_cyc.h, shared
+     * with both static emitters). §1 base + GPR_DEPRES + DO_LDS run HERE, before the
+     * instruction body, so §1 precedes any muldiv/GTE deadline stall the body applies
+     * (Beetle order). CPU loads (op 0x20-0x26) are skipped here — psx_cyc_load_* runs
+     * their full interlock inside the body (and arms LDWhich=rt). This replaces the
+     * old flat per-instruction psx_advance_cycles(psx_instr_base_cycles). */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    if (!(opc >= 0x20u && opc <= 0x26u))
+        psx_cyc_step(cpu, psx_cyc_dep_res_mask(insn));
+#endif
 
     /* Update last-store PC tracker so SIO PC tracer attribution stays
      * coherent through interpreted stubs. */
@@ -1373,45 +1377,52 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         }
         return abort_unsupported(pc, insn, "COP2 op");
     }
+    /* CPU loads: the full per-instruction R3000A interlock (§1 + GPR_DEPRES(rs) +
+     * DO_LDS + ReadMemory timing + arm LDWhich=rt) lives in psx_cyc_load_*; exec_one's
+     * top-of-function step is skipped for op 0x20-0x26 so it is not double-charged.
+     * #ifndef PSX_ENABLE_BLOCK_CYCLES these still read the value via the uncharged
+     * accessor (psx_cyc_load_* falls back to a plain read when cycles are off). */
     case 0x20: { /* LB rt, simm(rs) */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = (uint32_t)(int32_t)(int8_t)cpu->read_byte(addr);
+        cpu->gpr[rt] = (uint32_t)(int32_t)(int8_t)psx_cyc_load_byte(cpu, addr, rt, 1u << rs);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x21: { /* LH */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = (uint32_t)(int32_t)(int16_t)cpu->read_half(addr);
+        cpu->gpr[rt] = (uint32_t)(int32_t)(int16_t)psx_cyc_load_half(cpu, addr, rt, 1u << rs);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x22: { /* LWL */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = interp_lwl(cpu, addr, cpu->gpr[rt]);
+        uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, 1u << rs);
+        cpu->gpr[rt] = lwl_merge(addr, word, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x23: { /* LW */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = cpu->read_word(addr);
+        cpu->gpr[rt] = psx_cyc_load_word(cpu, addr, rt, 1u << rs);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x24: { /* LBU */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = (uint32_t)cpu->read_byte(addr);
+        cpu->gpr[rt] = (uint32_t)psx_cyc_load_byte(cpu, addr, rt, 1u << rs);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x25: { /* LHU */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = (uint32_t)cpu->read_half(addr);
+        cpu->gpr[rt] = (uint32_t)psx_cyc_load_half(cpu, addr, rt, 1u << rs);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x26: { /* LWR */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = interp_lwr(cpu, addr, cpu->gpr[rt]);
+        uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, 1u << rs);
+        cpu->gpr[rt] = lwr_merge(addr, word, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -1448,12 +1459,12 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         interp_swr(cpu, addr, cpu->gpr[rt]);
         return 0;
     }
-    case 0x32: { /* LWC2 */
+    case 0x32: { /* LWC2 — §1+DO_LDS charged by exec_one's top step (mask 0) */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
 #ifdef PSX_ENABLE_BLOCK_CYCLES
         psx_gte_stall(cpu);   /* COP2 reg write stalls to GTE completion */
 #endif
-        gte_write_data(cpu, (uint8_t)rt, cpu->read_word(addr));
+        gte_write_data(cpu, (uint8_t)rt, psx_cyc_lwc2_read(cpu, addr));
         return 0;
     }
     case 0x3A: { /* SWC2 */
@@ -1624,10 +1635,7 @@ static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
     for (int i = 0; i < MAX_PRECISE_INSNS; i++) {
         uint32_t next_pc = 0;
         g_unsupported_seen = 0;
-        int transferred = exec_one(cpu, pc, &next_pc);
-#ifdef PSX_ENABLE_BLOCK_CYCLES
-        psx_advance_cycles(psx_instr_base_cycles(fetch_word(pc & 0x1FFFFFFFu)));
-#endif
+        int transferred = exec_one(cpu, pc, &next_pc);  /* charges its own interlock */
         g_dirty_ram_insns_run++;
         if (g_unsupported_seen) {
             /* Valid compiled code always decodes; if not, hand the committed PC to
@@ -1909,9 +1917,8 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 g_ra_load_snap_srcaddr = 0;
             }
         }
-#ifdef PSX_ENABLE_BLOCK_CYCLES
-        psx_advance_cycles(psx_instr_base_cycles(insn));  /* single-source cost */
-#endif
+        /* Per-instruction cycle cost (R3000A load-delay interlock) is charged
+         * INSIDE exec_one (top-of-fn §1+deps+DO_LDS, or psx_cyc_load_* for loads). */
         dirty_ram_log_instruction(cpu, pc, insn, before_s0, next_pc,
                                   transferred ? cpu->pc : next_pc,
                                   transferred);
