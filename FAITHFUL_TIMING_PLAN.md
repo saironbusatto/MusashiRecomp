@@ -99,6 +99,47 @@ Per ChatGPT (validated) + standard practice:
   reach FMV/title); calibrate the shared model against Beetle/psx-spx. Pin bump is
   user-gated.
 
+## 3b. Cycle-cost model SOURCE (no clean-room needed — transcribe + verify)
+
+The HW-intended cycle model is documented AND available as reference source we
+already have in-tree (our oracle's own code). Stage-2 = transcribe the NUMBERS
+(facts, not GPL-protected expression; also in psx-spx) into OUR shared cost
+function, then VERIFY each against Beetle at runtime. Do NOT paste Beetle code
+(architecture differs + GPLv2 hygiene); write our own informed by the facts.
+
+Extraction map — `psxrecomp/beetle-psx/mednafen/psx/` (main checkout):
+- **CPU base / instruction fetch:** cpu.cpp `ReadInstruction()` (~L534) — icache
+  model: `timestamp += 4` cache-disabled (0xA000_0000+), `+3` on cache miss/fill,
+  `+1` per fill word, near-0 on hit. For a static recompiler this becomes a
+  per-block fetch-cost constant (assume cache-enabled steady state; calibrate).
+- **Memory wait-states:** cpu.cpp `ReadMemory()` (~L365) / `WriteMemory()` (~L454)
+  — `timestamp += (ReadFudge>>4)&2`, the `lts` delta from `PSX_MemRead*` is the
+  region wait-state; `LDAbsorb = lts - timestamp` is the load-delay absorb. Charge
+  in OUR psx_read/write path by region (RAM fast, BIOS ROM slow, scratchpad fast,
+  MMIO per-device). Split clean from CPU base (don't double-count).
+- **Mult/Div latency:** cpu.cpp `MULT_Tab24` (~L101), `muldiv_ts_done` (~L154) —
+  mult/div set a completion timestamp; a later MFHI/MFLO stalls until then. Model
+  as a documented latency (mult ~6-13 by operand magnitude via MULT_Tab; div/divu
+  ~36). Encode as instruction cost + optional stall-on-read.
+- **GTE/COP2 per-command cycles:** gte.cpp `GTE_Instruction()` (L1713) returns the
+  count via each op fn (DPCS/MVMVA/NCDS/…). Well-known table (also psx-spx):
+  RTPS=15 RTPT=23 MVMVA=8 SQR=5 OP=6 AVSZ3=5 AVSZ4=6 NCLIP=8 NCDS=19 NCDT=44
+  NCCS=17 NCCT=39 NCS=14 NCT=30 CC=11 CCS? CDP=13 DPCS=8 DPCT=17 DCPL=8 INTPL=8
+  GPF=5 GPL=5 (verify each against gte.cpp op-fn returns + psx-spx before use).
+- **Timers (already partly faithful):** timer.cpp — divider ratios already used
+  (T1 hblank ÷2146 etc.); move to on-demand counter = f(global cycles) at read.
+
+Build order for the model (P3 → Stage-2):
+1. Shared header (single source of truth) consumed by interp (runtime) AND
+   recompiler (it already includes ../../runtime/include/*.h): identity first
+   (cost=1) → regen → prove byte-identical generated cycle charges (zero behaviour
+   change) → seam established.
+2. Fill real costs from the extraction map, ONE component at a time, each verified
+   against Beetle at runtime (native cumulative cycles == Beetle at convergence).
+3. Memory wait-states in the psx_read/write path (region table).
+DO each transcription with the Beetle source open + a runtime cross-check; a wrong
+cycle number CREATES divergence, so verify, don't rush.
+
 ## 4. Tooling / oracle
 - Runtime TCP port 4500; Beetle oracle 4382. Always-on rings: `event_ring`,
   `wtrace_all` (write trace; `newest=1`). `freeze_check` has slice-trace + cycle
