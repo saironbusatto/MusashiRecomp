@@ -4,15 +4,15 @@
 # native cost-model side; sideloaded raw into Beetle for the HW-oracle side.
 [game]
 name = "CycleTestROM"
-id = "CYCTEST-001"
-exe = "tools/cycle_testrom/cycle_testrom.exe"
+id = "CYCT-00101"
+exe = "cycle_testrom.exe"
 load_address = "0x80010000"
 entry_pc = "0x80010000"
 text_size = "0x00000800"
 
 [recompiler]
-seeds = "tools/cycle_testrom/seeds.txt"
-out_dir = "tools/cycle_testrom/generated"
+seeds = "seeds.txt"
+out_dir = "generated"
 strict = true
 
 [runtime]

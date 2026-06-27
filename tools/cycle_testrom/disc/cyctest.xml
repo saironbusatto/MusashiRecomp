@@ -4,16 +4,16 @@
 		<identifiers
 			system      = "PLAYSTATION"
 			application = "PLAYSTATION"
-			volume      = "CYCTEST"
-			volume_set  = "CYCTEST"
+			volume      = "CYCT00101"
+			volume_set  = "CYCT00101"
 			publisher   = "PSXRECOMP"
 			data_preparer= "MKPSXISO"
 			copyright   = "SYSTEM.CNF;1"
 		/>
 		<license file="license_data.dat"/>
 		<directory_tree>
-			<file name="system.cnf" type="data" source="SYSTEM.CNF"/>
-			<file name="cyctest.exe" type="data" source="../cycle_testrom.exe"/>
+			<file name="system.cnf"  type="data" source="SYSTEM.CNF"/>
+			<file name="cyct_001.01" type="data" source="../cycle_testrom.exe"/>
 		</directory_tree>
 	</track>
 </iso_project>

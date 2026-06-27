@@ -55,6 +55,12 @@ typedef struct CPUState {
      * precompiled gcc overlay DLLs (which bake field offsets) are unaffected;
      * only the sljit JIT reads it. Populated once at startup. */
     void *sljit_helpers[SLJIT_HLP_COUNT];
+
+    /* Mult/div completion deadline (absolute guest cycle). Set by MULT/MULTU/
+     * DIV/DIVU to psx_cycle_count()+latency; a later MFLO/MFHI stalls (advances
+     * cycles) until this deadline — faithful R3000A behavior (Beetle
+     * muldiv_ts_done). Appended at END so prior field offsets are unchanged. */
+    uint64_t muldiv_ts_done;
 } CPUState;
 
 /* Trap trampolines — defined in runtime/src/traps.c */
@@ -66,6 +72,16 @@ typedef struct CPUState {
  * value and rely on cpu->pc (0 = handled, resume at caller). */
 extern int psx_syscall(CPUState* cpu, uint32_t code);
 extern void psx_arith_overflow(CPUState* cpu);
+/* Mult/div completion-stall timing (psx_cycles.c). MULT/MULTU/DIV/DIVU call
+ * psx_muldiv_set with their latency (DIV/DIVU = 37; MULT/MULTU via the latency
+ * helpers, indexed on the first operand magnitude). MFLO/MFHI call
+ * psx_muldiv_stall, which advances guest cycles to the deadline if not yet
+ * reached. Faithful only with per-instruction cycle charging. */
+extern void     psx_muldiv_set(CPUState* cpu, uint32_t latency);
+extern void     psx_muldiv_stall(CPUState* cpu);
+extern uint32_t psx_mult_latency_s(uint32_t rs);   /* MULT  (signed)   */
+extern uint32_t psx_mult_latency_u(uint32_t rs);   /* MULTU (unsigned) */
+
 extern void psx_unaligned_access(CPUState* cpu, uint32_t addr, uint32_t pc);
 extern void psx_break(CPUState* cpu, uint32_t code, uint32_t pc);
 /* Fail-closed native entry guard: a function's CPS entry-switch calls this when

@@ -15,8 +15,16 @@
 namespace PSXRecomp {
 
 static bool codegen_cycle_per_insn() {
+    // DEFAULT ON for the faithful-timing (cycle-audit) branch: each instruction
+    // charges its cost at its own site, so the running cycle count is correct
+    // mid-block. This is REQUIRED for stateful timing — mult/div completion-stall
+    // (mflo/mfhi wait for muldiv_ts_done) and later GTE stalls — to absorb
+    // correctly, exactly like Beetle's per-instruction timestamp. Block-up-front
+    // charging loses the in-between timing and can only charge full latency.
+    // Set PSX_CODEGEN_CYCLE_PER_INSN=0 to force the old block-up-front mode.
     const char* e = std::getenv("PSX_CODEGEN_CYCLE_PER_INSN");
-    return e != nullptr && e[0] != '\0' && e[0] != '0';
+    if (e != nullptr && e[0] != '\0') return e[0] != '0';
+    return true;
 }
 
 /*
@@ -628,16 +636,18 @@ std::string CodeGenerator::translate_mult(uint32_t instr) {
     uint32_t rs = get_rs(instr);
     uint32_t rt = get_rt(instr);
 
-    return fmt::format("{{ int64_t result = (int64_t)(int32_t){} * (int64_t)(int32_t){}; cpu->lo = (uint32_t)result; cpu->hi = (uint32_t)(result >> 32); }}",
-                      reg_name(rs), reg_name(rt));
+    return fmt::format("{{ int64_t result = (int64_t)(int32_t){} * (int64_t)(int32_t){}; cpu->lo = (uint32_t)result; cpu->hi = (uint32_t)(result >> 32); }}"
+                      "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, psx_mult_latency_s({}));\n#endif",
+                      reg_name(rs), reg_name(rt), reg_name(rs));
 }
 
 std::string CodeGenerator::translate_multu(uint32_t instr) {
     uint32_t rs = get_rs(instr);
     uint32_t rt = get_rt(instr);
 
-    return fmt::format("{{ uint64_t result = (uint64_t){} * (uint64_t){}; cpu->lo = (uint32_t)result; cpu->hi = (uint32_t)(result >> 32); }}",
-                      reg_name(rs), reg_name(rt));
+    return fmt::format("{{ uint64_t result = (uint64_t){} * (uint64_t){}; cpu->lo = (uint32_t)result; cpu->hi = (uint32_t)(result >> 32); }}"
+                      "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, psx_mult_latency_u({}));\n#endif",
+                      reg_name(rs), reg_name(rt), reg_name(rs));
 }
 
 std::string CodeGenerator::translate_div(uint32_t instr) {
@@ -646,7 +656,8 @@ std::string CodeGenerator::translate_div(uint32_t instr) {
 
     // MIPS division: quotient in LO, remainder in HI
     // Handle division by zero (MIPS behavior: result is unpredictable but doesn't trap)
-    return fmt::format("if ({} != 0) {{ cpu->lo = (uint32_t)((int32_t){} / (int32_t){}); cpu->hi = (uint32_t)((int32_t){} % (int32_t){}); }} else {{ cpu->lo = ((int32_t){} >= 0) ? 0xFFFFFFFF : 1; cpu->hi = (uint32_t){}; }}",
+    return fmt::format("if ({} != 0) {{ cpu->lo = (uint32_t)((int32_t){} / (int32_t){}); cpu->hi = (uint32_t)((int32_t){} % (int32_t){}); }} else {{ cpu->lo = ((int32_t){} >= 0) ? 0xFFFFFFFF : 1; cpu->hi = (uint32_t){}; }}"
+                      "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, 37u);\n#endif",
                       reg_name(rt), reg_name(rs), reg_name(rt), reg_name(rs), reg_name(rt), reg_name(rs), reg_name(rs));
 }
 
@@ -656,28 +667,33 @@ std::string CodeGenerator::translate_divu(uint32_t instr) {
 
     // MIPS division: quotient in LO, remainder in HI
     // Handle division by zero (MIPS behavior: result is unpredictable but doesn't trap)
-    return fmt::format("if ({} != 0) {{ cpu->lo = {} / {}; cpu->hi = {} % {}; }} else {{ cpu->lo = 0xFFFFFFFF; cpu->hi = {}; }}",
+    return fmt::format("if ({} != 0) {{ cpu->lo = {} / {}; cpu->hi = {} % {}; }} else {{ cpu->lo = 0xFFFFFFFF; cpu->hi = {}; }}"
+                      "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_set(cpu, 37u);\n#endif",
                       reg_name(rt), reg_name(rs), reg_name(rt), reg_name(rs), reg_name(rt), reg_name(rs));
 }
 
 std::string CodeGenerator::translate_mfhi(uint32_t instr) {
     uint32_t rd = get_rd(instr);
 
+    // Stall until the mult/div completion deadline (faithful R3000A) — happens
+    // even when rd==$zero (the read still stalls on HW).
+    const char* stall = "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_stall(cpu);\n#endif";
     if (config_.optimize_zero_reg && rd == 0) {
-        return "/* nop: write to $zero */";
+        return fmt::format("/* nop: write to $zero */{}", stall);
     }
 
-    return fmt::format("{} = cpu->hi;", reg_name(rd));
+    return fmt::format("{} = cpu->hi;{}", reg_name(rd), stall);
 }
 
 std::string CodeGenerator::translate_mflo(uint32_t instr) {
     uint32_t rd = get_rd(instr);
 
+    const char* stall = "\n#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_muldiv_stall(cpu);\n#endif";
     if (config_.optimize_zero_reg && rd == 0) {
-        return "/* nop: write to $zero */";
+        return fmt::format("/* nop: write to $zero */{}", stall);
     }
 
-    return fmt::format("{} = cpu->lo;", reg_name(rd));
+    return fmt::format("{} = cpu->lo;{}", reg_name(rd), stall);
 }
 
 std::string CodeGenerator::translate_mthi(uint32_t instr) {

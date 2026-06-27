@@ -11,3 +11,5 @@ generated/
 disc/license_data.dat
 disc/*.bin
 disc/*.cue
+build/
+psx_freeze_heartbeat.json
