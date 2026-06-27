@@ -129,6 +129,48 @@ Status: SOFT SPOT.
 
 ---
 
+## Research findings (2026-06-26, parallel subagents, cross-referenced vs in-tree Beetle + psx-spx)
+
+Per-axis deep-dives in `accuracy/*.md`. Headlines + priorities below. NOTE much is
+already faithful — these are the GAPS. Implement serially (one branch each, code to
+just-before-build, pull in + validate on the oracle one at a time). NONE of these
+overlap the cycle axis or each other (different files), so they parallelize.
+
+- **`accuracy/axis5_sio_controller.md` — HYBRID PAD BUG ROOT-CAUSED.** P0: cmd `0x43`
+  must transmit the LIVE button frame (like `0x42`) + use the trailing byte to toggle
+  config; we send all-zeros → active-low → "all buttons pressed" phantom input every
+  `0x43` frame. P0: `0x45` status must report the LIVE analog/digital mode, not always
+  analog-ON (→ frame-length misparse after a flip). Fixing both lets the
+  `g_pad_legacy_cfg` Tomba hack be DELETED. P1: analog-mode lock (`0x44`); P2: `0x4D`
+  rumble echo + cycle-paced pad ACK. Validate: `sio_trace` diff on `0x43`/`0x45`.
+- **`accuracy/axis5_gpu.md`.** P1: dithering ENTIRELY MISSING in both renderers (decoded
+  but never forwarded) — largest systematic banding divergence. P2: SW rasterizer uses
+  float + inclusive spans vs HW fixed-point half-open DDA w/ top-left bias → shared-edge
+  double-draw + 1px over-fill. P3: sprite FlipX/FlipY unmodeled; mono-rect size mask
+  wrong. FAITHFUL: all 4 semi-transparency modes, mask set/check, texture-window, CLUT
+  4/8/15, texel-0, ×2 modulation, GP0/GP1 coverage. Validate: VRAM byte-diff + GPU test ROMs.
+- **`accuracy/axis5_spu.md` — weakest subsystem.** P0: reverb ENTIRELY MISSING; P0:
+  volume sweeps missing + ~2× gain-scale error; P1: noise gen + pitch-modulation absent;
+  P1/P2: no SPU IRQ address-match, no capture buffers, SPUSTAT hardcoded; P1: host-audio-
+  pull timing not guest-768-cycle clock. FAITHFUL: ADPCM decode + ADSR envelope (verbatim
+  Beetle ports). Recommend: port Beetle PS_SPU on a guest-clock timeline. Validate: audio
+  sample-stream diff.
+- **`accuracy/axis5_mdec.md` — explains the slightly-off FMV.** HIGH: IDCT rounding/clamp
+  diverges (contrast/ringing); HIGH: YUV→RGB lacks HW green-precision truncation (off-hue
+  greens); HIGH: dequant domain/bias/clamp wrong (DC banding). MED: 4bpp output broken
+  (textures, not FMV); MED: one-shot decode vs FIFO/block state machine. Validate:
+  per-block decode diff + live FMV pixel-diff.
+- **`accuracy/axis4_memory_mmio.md`.** GOOD: I_STAT/I_MASK/DICR ack semantics CORRECT.
+  P1: RAM mirror wrong (we gate `<2MB`; HW aliases 2MB DRAM across an 8MB window 4× —
+  mirror accesses silently read 0 / drop writes). P2: `IsC` over-broadly drops scratchpad
+  writes (scratchpad is the D-cache, must stay addressable). P3: level-IRQ relatch; P4:
+  per-segment addr masking; P5: open-bus high bits on I_STAT readback. Validate: MMIO
+  trace diff + RAM-mirror sentinel probe.
+
+Cross-cutting: every validation is a native(4500)↔Beetle(4382) ring-buffer diff on the
+relevant state surface — the same oracle methodology as the cycle axis. Several need the
+test-ROM harness (axis 1/GPU) which is worth building early.
+
 ## Phasing
 
 1. NOW: cycle axis (axis 2) Stage-2 on Tomba 2 (FAITHFUL_TIMING_PLAN.md).
