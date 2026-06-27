@@ -1179,6 +1179,16 @@ std::string CodeGenerator::translate_basic_block(
     // Block label
     ss << fmt::format("block_{:08X}:\n", block.start_addr);
 
+    // Per-block-leader cycle observe (cyc_watch ruler — universal with the BIOS
+    // emitter). Sampled at the block leader BEFORE any cycle is charged, matching
+    // Beetle's before-instruction sample and the cycle_compare.py anchor
+    // semantics, so ANY block-leader PC is anchorable on both backends (not just
+    // function entries). Debug-only: prod (PSX_NO_DEBUG_TOOLS) emits nothing.
+    ss << "#ifndef PSX_NO_DEBUG_TOOLS\n";
+    ss << config_.indent
+       << fmt::format("debug_server_cyc_observe(0x{:08X}u);\n", block.start_addr);
+    ss << "#endif\n";
+
     // Cycle-budgeted precise event slicing (PRECISE_IRQ_SLICE.md). At the block
     // leader — before any cycle is charged or the body runs — divert to the
     // per-instruction interpreter when an interrupt could be taken inside this
@@ -2322,6 +2332,9 @@ std::string CodeGenerator::generate_file(
     // This provides CPUState, GTE/trap declarations, and call_by_address().
     ss << "#include \"psx_runtime.h\"\n\n";
     ss << "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
+    ss << "#ifndef PSX_NO_DEBUG_TOOLS\n";
+    ss << "extern void debug_server_cyc_observe(uint32_t block_leader_phys);\n";
+    ss << "#endif\n";
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
