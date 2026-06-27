@@ -213,6 +213,22 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-27 (interp-path Δ-ruler — INTERP == Beetle EXACT on all 12 components):**
+  Closed the last validation gap: the dirty-RAM INTERPRETER is now MEASURED equal to the
+  oracle, not just shared-by-construction. New tooling: `PSX_FORCE_INTERP=1` makes
+  `dirty_ram_is_dirty` (memory.c) report all RAM above the kernel window dirty, so the
+  dispatcher routes clean compiled game text through the dirty-RAM interpreter (the same path
+  overlays take) — no emitter/dispatch change. Launch psx-cyctest with the env set; the test
+  ROM runs interpreted (dirty_ram_insns → hundreds of millions). measure.py --port 4600
+  (interp) vs 4382 (Beetle): ALL 12 loops match EXACTLY (baseline/alu/load/load2/load_use/
+  div/div_spaced/mult/gte_rtps/gte_nclip/gte_read_use/ld_div). Commit b0391bc.
+  TWO PROCESS LESSONS (cost real time — now in cyctest README): (1) launch psx-cyctest via
+  PowerShell Start-Process — a bash '&' launch fails to boot (pc=0); (2) sample cyc_watch /
+  freeze_check AT STEADY STATE — an early query (before the BIOS boots to the EXE entry)
+  reports dirty_ram_insns=0 / warm-up values. That premature-sampling artifact was the entire
+  "dispatch paradox" I chased (the interp engages only after the EXE entry is reached).
+  NEXT axis: I-cache fetch (ruler #1 84/77 cold-refill spikes).
+
 - **2026-06-27 (GTE-read + MFC0 + muldiv give-back — IMPLEMENTED + VALIDATED, ruler #2 100%):**
   Closed the last steady-state divergences. KEY METHODOLOGY FINDING (Rule 15): Beetle's
   cyc_watch must be sampled at STEADY STATE — its boot/warm-up window reports the
