@@ -153,6 +153,11 @@ def build():
     inner_loop("load", [lw("$t4", 0, "$t5")])
     # load2: two lw (linearity check: should be ~2x the load delta)
     inner_loop("load2", [lw("$t4", 0, "$t5"), lw("$t7", 0, "$t5")])
+    # load_use: lw then an addu that DEPs the loaded reg ($t4) — the dependent
+    # use ends the LDAbsorb give-back (GPR_DEP), so the following instrs do NOT
+    # absorb it. Isolates the give-back-TERMINATION path (load/load2 load into
+    # dead regs and never exercise it). Δ vs Beetle pins psx_cyc_deps.
+    inner_loop("load_use", [lw("$t4", 0, "$t5"), addu("$t6", "$t4", "$t3")])
     # div: divu + mflo (isolates div latency + stall-on-read, worst case)
     inner_loop("div", [divu("$t2", "$t3"), mflo("$t4")])
     # div_spaced: divu, 2 filler addu, then mflo (stall partly absorbed)
@@ -168,6 +173,16 @@ def build():
     inner_loop("gte_rtps", [cop2cmd(0x01), mfc2("$t4", 14)])
     # gte_nclip: NCLIP command (0x06, cost 8) + mfc2 MAC0 (reg 24) read.
     inner_loop("gte_nclip", [cop2cmd(0x06), mfc2("$t4", 24)])
+    # gte_read_use: RTPS + mfc2 result read + an addu that DEPs the mfc2 dest
+    # ($t4). PROBE for the GTE-read LDAbsorb give-back (Beetle MFC2 sets
+    # LDAbsorb=gte_ts_done-ts). If our stall-only model diverges from Beetle this
+    # loop reveals it; if native==Beetle there is no give-back divergence to fix.
+    inner_loop("gte_read_use", [cop2cmd(0x01), mfc2("$t4", 14), addu("$t6", "$t4", "$t3")])
+    # ld_div: lw arms a load give-back, then divu+mflo. PROBE for the muldiv-stall
+    # give-back consumption (Beetle decrements ReadAbsorb while stalling MFLO to
+    # muldiv_ts_done). Divergence here would mean the muldiv stall must consume the
+    # pending load give-back; native==Beetle means no divergence to fix.
+    inner_loop("ld_div", [lw("$t4", 0, "$t5"), divu("$t2", "$t3"), mflo("$t7")])
 
     # loop outer forever
     o = a.labels["outer"]

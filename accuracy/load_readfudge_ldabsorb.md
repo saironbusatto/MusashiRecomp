@@ -14,10 +14,27 @@ unchanged + matching); ruler #1 [0x80001C5C→0x80001CA4] 54 → **56** == Beetl
 intro FMV (no regression). The `(ReadFudge>>4)&2` fudge, the region(RAM +3)+completion(+2)
 LDAbsorb give-back, and scratchpad +0 are all modeled per below.
 
-FOLLOW-UP (not in this commit; ACCURACY axis-2): GTE-read (MFC2/CFC2) + MFC0 LDAbsorb
+FOLLOW-UP (CONFIRMED divergences — ACCURACY axis-2): GTE-read (MFC2/CFC2) + MFC0 LDAbsorb
 give-back arming, and the muldiv-stall give-back consumption / off-by-one (Beetle
-cpu.cpp:1332-1338 / 1723-1736). These don't affect the rulers (no CPU-load give-back in the
-div/mult/gte loops) but are needed for full faithfulness in mixed game/FMV code.
+cpu.cpp:1332-1338 / 1723-1736). **NOW Δ-GATED** by new ruler #2 probe loops, measured at
+STEADY STATE (Beetle must run long enough — its warm-up window reports the no-give-back
+value, which is why the handoff mis-recorded gte_rtps as "+15 EXACT"; the true steady
+Beetle value is +11). Steady-state native(no give-back) vs Beetle(give-back):
+
+| loop          | native | Beetle | gap | divergence source                        |
+|---------------|--------|--------|-----|------------------------------------------|
+| gte_rtps      | 18     | **14** | +4  | MFC2 give-back (LDAbsorb=gte_ts_done-ts)  |
+| gte_nclip     | 11     | **7**  | +4  | MFC2 give-back                            |
+| gte_read_use  | 19     | **14** | +5  | MFC2 give-back (then dependent use)       |
+| ld_div        | 45     | **49** | −4  | muldiv stall must CONSUME the lw give-back|
+
+Implementation: MFC2/CFC2 — after §1+DO_LDS, stall to gte_ts_done AND set
+ld_absorb = (gte_ts_done - now), ld_which_t = rt (replace psx_gte_stall on READS only;
+MTC2/CTC2 stay stall-only). MFC0 — arm ld_which_t=rt, ld_absorb=0. muldiv stall (MFLO/MFHI)
+— while stalling to muldiv_ts_done, decrement read_absorb[read_absorb_which] per cycle, and
+the muldiv_ts_done-1 off-by-one decrement (Beetle cpu.cpp:1723-1736). Re-validate the FULL
+12-loop suite at steady state (the 8 passing components must stay matched).
+All-CPU-load + alu + div + mult components MATCH at steady state — COMMIT 1 is solid.
 
 ---
 ORIGINAL SPEC (model derivation) follows.
