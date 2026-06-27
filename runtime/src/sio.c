@@ -1423,6 +1423,19 @@ uint32_t sio_read(uint32_t addr) {
     }
 }
 
+/* Side-effect-FREE SIO register peeks for the debug/observability path ONLY.
+ * sio_read() deliberately has guest-visible side effects (sio_tick advances the
+ * delayed-IRQ state machine; reading SIO_STAT decrements sio_ack_visible_reads
+ * and clears the ACK bit; reading SIO_RX_DATA pops the RX FIFO / clears RX_RDY).
+ * Those are correct for the GUEST bus, but the TCP debug server reading SIO every
+ * vblank (record_frame) or per query (sio_state) MUST NOT perturb the SIO/pad
+ * handshake — that is the observer corrupting the observed, and it desynced the
+ * DualShock handshake the Mega Man X engine depends on (dev builds skipped the
+ * boot FMV; release, which never records frames, played it). Read raw state. */
+uint16_t sio_peek_stat(void) { return sio_stat; }
+uint16_t sio_peek_ctrl(void) { return sio_ctrl; }
+uint8_t  sio_peek_rx_data(void) { return sio_rx_data; }
+
 void sio_write(uint32_t addr, uint32_t value) {
     sio_debug_poll_maybe();
 
