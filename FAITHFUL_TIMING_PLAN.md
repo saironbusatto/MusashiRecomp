@@ -213,6 +213,18 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-27 (interp-path cycle ruler — enabler DONE + validated):** The dirty
+  interp now emits `debug_server_cyc_observe(pc)` per instruction (gated), so
+  interp-executed PCs are cyc_watch-anchorable (were not). Validated: a live
+  Tomba2 overlay interp loop (0x8010724C) records stable cyc_watch hits at 38
+  cyc/iter, parity with compiled-PC anchoring; FMV no-regression over 150M+
+  interp insns. Commit fc85d8b. This lets interp-side cycle work (the muldiv +
+  GTE stalls) be MEASURED, not just by-construction. REMAINING for a fully
+  isolated single-component interp ruler: the cyctest harness does not route
+  indirect jumps to the dirty interp (a jalr to a scratch dirty address left
+  dirty_ram_insns=0 there), so a clean dirty-RAM component loop needs cyctest
+  interp-dispatch wiring (or an overlay_cache=off Tomba2 component anchor).
+
 - **2026-06-27 (GTE per-command completion-stall — VALIDATED EXACT):** Modeled
   GTE (COP2) command latency + stall-on-COP2-access. New CPUState.gte_ts_done;
   a GTE command arms it (now + cost-1, serializing back-to-back ops); any COP2
