@@ -156,6 +156,18 @@ same anchor (one iteration of identical code), native charged 46 cycles vs Beetl
   regions (consecutive same-anchor hits, or entry/exit anchor pairs), NOT absolute.
 First concrete target: make the 0x80017FC4 inter-hit Δ 46 -> 91 (== Beetle).
 
+### Stage-2 progress log
+- #1a data-load cost DONE (2ef47bd): psx_instr_base_cycles +2 per CPU load (LWC2 +1).
+  Δ gate @0x80017FC4: native per-iter 46 -> 56 (Beetle 91). FMV still streams (no
+  regression). Closed ~10/45. Approximation: no scratchpad-free / region / load-delay
+  ABSORB yet — those are refinements (absorb would LOWER native, so it's not the
+  remaining 35; the remaining gap is other components below).
+- REMAINING ~35 cyc on that region: attribute faithfully before stacking guesses —
+  the within-burst region's instruction mix is unknown. Either disassemble it (count
+  mult/div, MMIO reads, GTE) OR validate the model on a KNOWN small region. Likely
+  candidates: a mult/div in the region (div ~36 ≈ the whole gap), or non-RAM/MMIO
+  reads (bigger region wait-state than +2). Do NOT blind-stack; confirm composition.
+
 ### Components to transcribe (from in-tree Beetle + psx-spx; verify each by Δ)
 The ~2x gap is dominated by what 1/insn ignores. Implement one at a time, re-measure Δ:
 1. **Memory access wait-states (biggest lever).** Real loads/stores cost >1 cycle by
