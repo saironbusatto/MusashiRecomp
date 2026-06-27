@@ -1321,7 +1321,11 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         return 0;
     case 0x10: { /* COP0 */
         uint32_t cop_op = rs;
-        if (cop_op == 0x00) { /* MFC0 */
+        if (cop_op == 0x00) { /* MFC0 — delayed load (Beetle: LDAbsorb=0, LDWhich=rt) */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            cpu->ld_absorb = 0u;
+            cpu->ld_which_t = (uint8_t)rt;
+#endif
             cpu->gpr[rt] = cpu->cop0[rd];
             cpu->gpr[0] = 0;
             return 0;
@@ -1341,17 +1345,17 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         uint32_t cop_op = rs;
         /* Faithful GTE: any COP2 register access stalls to the pending command
          * completion deadline (gte_execute armed it via psx_gte_set). */
-        if (cop_op == 0x00) { /* MFC2 */
+        if (cop_op == 0x00) { /* MFC2 — read: stall + give-back (Beetle) */
 #ifdef PSX_ENABLE_BLOCK_CYCLES
-            psx_gte_stall(cpu);
+            psx_gte_read(cpu, rt);
 #endif
             cpu->gpr[rt] = gte_read_data(cpu, (uint8_t)rd);
             cpu->gpr[0] = 0;
             return 0;
         }
-        if (cop_op == 0x02) { /* CFC2 */
+        if (cop_op == 0x02) { /* CFC2 — read: stall + give-back (Beetle) */
 #ifdef PSX_ENABLE_BLOCK_CYCLES
-            psx_gte_stall(cpu);
+            psx_gte_read(cpu, rt);
 #endif
             cpu->gpr[rt] = gte_read_ctrl(cpu, (uint8_t)rd);
             cpu->gpr[0] = 0;

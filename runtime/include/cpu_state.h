@@ -113,6 +113,9 @@ extern uint32_t psx_mult_latency_u(uint32_t rs);   /* MULTU (unsigned) */
  * per-instruction cycle charging. */
 extern void     psx_gte_set(CPUState* cpu, uint32_t latency);
 extern void     psx_gte_stall(CPUState* cpu);
+/* MFC2/CFC2 GTE register read: stall to the deadline AND arm the load-delay
+ * give-back (ld_absorb=gte_ts_done-now, ld_which_t=rt) — Beetle MFC2/CFC2. */
+extern void     psx_gte_read(CPUState* cpu, uint32_t rt);
 extern uint32_t psx_gte_cmd_latency(uint32_t cmd);  /* cost-1 for the 6-bit op  */
 
 extern void psx_unaligned_access(CPUState* cpu, uint32_t addr, uint32_t pc);

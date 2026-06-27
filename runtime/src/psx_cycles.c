@@ -108,9 +108,39 @@ void psx_muldiv_set(CPUState* cpu, uint32_t latency) {
 }
 
 void psx_muldiv_stall(CPUState* cpu) {
+    /* MFLO/MFHI stall to the mult/div completion deadline (Beetle cpu.cpp:1723-1736).
+     * While stalling it CONSUMES a pending load-delay give-back (read_absorb) — each
+     * stalled cycle decrements read_absorb[read_absorb_which] — so cycles that would
+     * have been "free" for following instructions are spent here instead. Plus the
+     * off-by-one shortcut: a deadline exactly one cycle out just retracts (no stall).
+     * (No-load code has read_absorb==0, so this reduces to a plain advance.) */
     if (cpu->muldiv_ts_done > psx_cycle_count) {
-        psx_advance_cycles((uint32_t)(cpu->muldiv_ts_done - psx_cycle_count));
+        if (cpu->muldiv_ts_done == psx_cycle_count + 1u) {
+            cpu->muldiv_ts_done--;   /* off-by-one: retract the deadline, no advance */
+            return;
+        }
+        uint32_t stall = (uint32_t)(cpu->muldiv_ts_done - psx_cycle_count);
+        uint8_t w = cpu->read_absorb_which;          /* fixed during the stall */
+        uint32_t give = cpu->read_absorb[w];
+        cpu->read_absorb[w] = (uint8_t)(give > stall ? give - stall : 0u);  /* consume */
+        psx_advance_cycles(stall);
     }
+}
+
+/* MFC2/CFC2 (GTE register read → GPR): stall to the GTE command completion deadline
+ * AND hand the stall amount to the next instruction(s) as a load-delay give-back
+ * (Beetle cpu.cpp:1332-1341: LDAbsorb = gte_ts_done - timestamp, LDWhich = rt). The
+ * §1+DO_LDS that bracket this ran in the instruction's psx_cyc_step (COP2 is non-load).
+ * MTC2/CTC2 (writes) use psx_gte_stall (stall only, no give-back). */
+void psx_gte_read(CPUState* cpu, uint32_t rt) {
+    if (cpu->gte_ts_done > psx_cycle_count) {
+        uint32_t stall = (uint32_t)(cpu->gte_ts_done - psx_cycle_count);
+        cpu->ld_absorb = stall;
+        psx_advance_cycles(stall);
+    } else {
+        cpu->ld_absorb = 0u;
+    }
+    cpu->ld_which_t = (uint8_t)rt;
 }
 
 /* ---- GTE (COP2) per-command completion-stall timing ----
