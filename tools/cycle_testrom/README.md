@@ -43,17 +43,59 @@ Each component is then transcribed/calibrated into `psx_instr_base_cycles`
 (execute latencies: mult/div, GTE) or the memory-path wait-state (`memory.c`),
 Δ-gated against Beetle on these loops + FMV-no-regression, one at a time.
 
-## Regenerate
+## Boot disc (how the EXE reaches both backends)
+
+The real BIOS only boots a disc that carries the PlayStation license region; a
+license-less disc drops to the BIOS shell (Memory-Card/CD-Player menu). So the
+test EXE ships on a synthetic disc built with the in-tree `tools/mkpsxiso`:
 
 ```bash
 cd tools/cycle_testrom
-python gen_testrom.py cycle_testrom.exe        # writes the EXE + .anchors.json
-# recompile for native:
-../../recompiler/build-t2/psxrecomp-game.exe --config game.toml
+python gen_testrom.py cycle_testrom.exe                    # EXE + .anchors.json
+../../recompiler/build-t2/psxrecomp-game.exe --config game.toml   # recompile (native)
+
+# ONE-TIME: extract the license region from a disc YOU OWN (local only, never
+# redistributed). dumpsxiso writes license_data.dat from the disc system area:
+DUMP=../mkpsxiso/mkpsxiso-2.20-win64/dumpsxiso.exe
+"$DUMP" -x /tmp/own_disc -s /tmp/own_disc/x.xml "<path to a PS1 disc you own>.cue"
+cp /tmp/own_disc/license_data.dat disc/license_data.dat    # gitignored, stays local
+
+# build the disc (embeds license + SYSTEM.CNF + cyctest.exe):
+cd disc && ../../mkpsxiso/mkpsxiso-2.20-win64/mkpsxiso.exe -y cyctest.xml
 ```
 
-Tracked: `gen_testrom.py`, `game.toml`, `seeds.txt`, this README.
-Ignored (regenerable): `cycle_testrom.exe`, `*.anchors.json`, `generated/`.
+`disc/license_data.dat` and the built `disc/*.bin`/`*.cue` are **gitignored** —
+copyrighted Sony data, local only. Everything else (gen, xml, SYSTEM.CNF) is
+tracked, so each developer reproduces the disc from a disc they own.
+
+## Measure
+
+```bash
+# both backends boot the same disc/cyctest.cue:
+#   beetle: psx-beetle <bios> --disc disc/cyctest.cue --port 4382
+#   native: <test-runtime> ... --disc disc/cyctest.cue   (TODO: test-runtime)
+python measure.py --port 4382      # Beetle oracle: per-iter + per-component delta
+python measure.py --port 4500      # native cost model (once the test-runtime exists)
+```
+
+## Beetle ORACLE results (2026-06-26 — the HW cost targets)
+
+Per-iteration cycle delta, and component cost (minus baseline=3):
+
+| loop        | per-iter | component | reads as |
+|-------------|----------|-----------|----------|
+| baseline    | 3        | —         | addiu+bne+nop, base 1 each |
+| alu         | 4        | +1        | one addu (pure execute) |
+| load        | 8        | +5        | one main-RAM lw (result unused → no absorb) |
+| load2       | 14       | +11       | 2 lw: 5 + 6 (2nd load's +1 = ReadFudge) |
+| div         | 41       | +38       | divu+mflo base 2 + ~36 div stall |
+| div_spaced  | 41       | +38       | divu+2addu+mflo — fillers ABSORBED by stall |
+| mult        | 18       | +15       | multu+mflo base 2 + ~13 mult stall |
+
+Key targets for the native cost model: **div stall ~36, mult stall ~13** (native
+charges 0). Load ~5/6 (native memory.c flat +6 — close). **`div_spaced`==`div`
+proves the stall must be modeled as a completion-timestamp + stall-on-mflo-read
+(fillers absorb it), NOT a flat charge on the divu.**
 
 ## Status / TODO
 
