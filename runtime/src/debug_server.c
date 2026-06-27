@@ -5247,9 +5247,10 @@ static void handle_sio_state(int id, const char *json)
              "\"tx_gated\":%d,"
              "\"last_ctrl_on_tx\":\"0x%04X\"}",
              id,
-             (uint16_t)sio_read(0x1F801044),
-             (uint16_t)sio_read(0x1F80104A),
-             (uint8_t)sio_read(0x1F801040),
+             /* Side-effect-free peeks (sio_read pops the RX FIFO / clears ACK). */
+             sio_peek_stat(),
+             sio_peek_ctrl(),
+             sio_peek_rx_data(),
              sio_get_pad_buttons(),
              sio_get_mc_probe_count(),
              sio_get_mc_ack_count(),
@@ -9100,6 +9101,36 @@ static void handle_mdec_state(int id, const char *json)
              (unsigned long long)mdec_debug_get_event_total());
 }
 
+/* fmv_state: report the RESOLVED FMV-skip + config state — the runtime truth for
+ * "is the FMV-skip feature on / what config actually loaded", so we observe instead
+ * of inferring from the .toml on disk. Reports the loaded config path, the resolved
+ * auto_skip_fmv + frame-count-table params, the live MDEC decode count and XA-stream
+ * flag (the feature's detection inputs), and the current pad word (so a phantom
+ * skip-press is visible). */
+static void handle_fmv_state(int id, const char *json)
+{
+    (void)json;
+    extern void debug_get_fmv_config(int *, uint32_t *, uint32_t *, const char **);
+    extern uint32_t mdec_get_decode_count(void);
+    extern int cdrom_xa_stream_active(void);
+    extern uint16_t sio_get_pad_buttons(void);
+    int auto_skip = -1; uint32_t total_table = 0, movie_id = 0; const char *cfg = "(null)";
+    debug_get_fmv_config(&auto_skip, &total_table, &movie_id, &cfg);
+    MDECDebugState s; mdec_debug_get_state(&s);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"config_path\":\"%s\","
+             "\"auto_skip_fmv\":%d,"
+             "\"fmv_skip_total_table\":\"0x%08X\",\"fmv_skip_movie_id\":\"0x%08X\","
+             "\"mdec_decode_count\":%u,\"mdec_decode_macroblocks\":%u,\"mdec_dma_out_words\":%u,"
+             "\"xa_stream_active\":%d,"
+             "\"pad1\":\"0x%04X\"}",
+             id, cfg ? cfg : "(null)", auto_skip,
+             total_table, movie_id,
+             mdec_get_decode_count(), s.decode_macroblocks, s.dma_out_words,
+             cdrom_xa_stream_active(),
+             (unsigned)(sio_get_pad_buttons() & 0xFFFFu));
+}
+
 static void handle_mdec_trace(int id, const char *json)
 {
     uint64_t total = mdec_debug_get_event_total();
@@ -10879,6 +10910,7 @@ static const CmdEntry s_commands[] = {
     { "gp1_dump",          handle_gp1_dump },
     { "mdec_state",        handle_mdec_state },
     { "mdec_trace",        handle_mdec_trace },
+    { "fmv_state",         handle_fmv_state },
     { "mdec_trace_clear",  handle_mdec_trace_clear },
     { "set_input",         handle_set_input },
     { "press",             handle_press },
@@ -11515,8 +11547,11 @@ void debug_server_record_frame(void)
 
     /* SIO state */
     r->pad_buttons = sio_get_pad_buttons();
-    r->sio_stat = (uint16_t)sio_read(0x1F801044);
-    r->sio_ctrl = (uint16_t)sio_read(0x1F80104A);
+    /* Side-effect-free peeks: sio_read() advances sio_tick and clears the ACK bit,
+     * so recording it every vblank corrupted the SIO/DualShock handshake (Mega Man
+     * X boot FMV skipped in dev builds only). Observability must not alter state. */
+    r->sio_stat = sio_peek_stat();
+    r->sio_ctrl = sio_peek_ctrl();
 
     /* Timing */
     r->dispatch_count = 0; /* filled externally if needed */

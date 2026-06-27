@@ -177,6 +177,20 @@ static int           g_video_vsync        = 1;
 extern "C" int      cdrom_xa_stream_active(void);
 extern "C" uint32_t mdec_get_decode_count(void);
 
+/* Debug observability: expose the RESOLVED FMV-skip + config state so the TCP
+ * debug server can report the runtime truth (which game.toml path actually loaded,
+ * and what auto_skip_fmv / the frame-count-table params resolved to) instead of us
+ * inferring it from the .toml on disk. Set once in main() after the config path is
+ * resolved. */
+const char *g_active_config_path = nullptr;
+extern "C" void debug_get_fmv_config(int *auto_skip, uint32_t *total_table,
+                                     uint32_t *movie_id, const char **cfg_path) {
+    if (auto_skip)   *auto_skip   = g_auto_skip_fmv;
+    if (total_table) *total_table = g_fmv_skip_total_table;
+    if (movie_id)    *movie_id    = g_fmv_skip_movie_id;
+    if (cfg_path)    *cfg_path    = g_active_config_path ? g_active_config_path : "(null)";
+}
+
 /* Display aspect W:H (default 4:3 = native). Wider aspects enable the
  * widescreen hack: GTE X-squash + stretched present (see [video] aspect_ratio
  * in config_loader.h). */
@@ -1970,6 +1984,9 @@ int main(int argc, char** argv) {
             game_config_path = default_game_config_storage.c_str();
         }
     }
+    /* Record the resolved config path for the TCP fmv_state report (observability:
+     * proves which game.toml actually loaded — CLI --game vs the baked default). */
+    g_active_config_path = game_config_path;
 
     std::filesystem::path memcard_dir;
     std::filesystem::path memcard1_path;   /* explicit slot-1 .mcd (empty => dir/card1.mcd) */
