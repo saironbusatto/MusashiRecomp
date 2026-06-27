@@ -32,7 +32,12 @@ This supersedes any pressure to ship fast. Completeness is absolute here.
 
 **The authoritative game plan is `FAITHFUL_TIMING_PLAN.md` — READ IT EACH
 SESSION** (north star, phased plan P1–P6, current status/log). Update its
-Status/Log section every session.
+Status/Log section every session. The full-coverage accuracy burndown across ALL
+axes (semantics, cycle, IRQ, MMIO, peripherals, static-vs-dynamic, determinism)
+lives in `ACCURACY_BURNDOWN.md` — every item must be cross-referenced against an
+external comparative (psx-spx / in-tree Beetle source / DuckStation / HW test
+ROMs), not asserted. Axis 5 (peripherals — esp. SIO/controller, the hybrid-pad
+bug) is the suspected-weakest second front after the cycle axis.
 
 ---
 
