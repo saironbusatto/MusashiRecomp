@@ -153,9 +153,12 @@ def _is_unknown_command(resp):
             "no such" in err or "not found" in err or err == "")
 
 
-def arm(host, port, label, anchor, hits):
+def arm(host, port, label, anchor, hits, end=None):
+    cmd = {"cmd": "cyc_watch", "pc": anchor, "n": hits}
+    if end:
+        cmd["end"] = end   # two-anchor REGION mode: each entry = Δcycles of one A->B pass
     try:
-        resp = query(host, port, {"cmd": "cyc_watch", "pc": anchor, "n": hits})
+        resp = query(host, port, cmd)
     except (ConnectionRefusedError, TimeoutError, OSError, ConnectionError) as e:
         raise BackendError(f"{label} ({host}:{port}) unreachable: {e}")
     if _is_unknown_command(resp):
@@ -281,7 +284,13 @@ def report(anchor, native_resp, beetle_resp):
 def main():
     p = argparse.ArgumentParser(add_help=True, description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("anchor", nargs="?", help="anchor guest PC, hex (e.g. 0x80012345)")
+    p.add_argument("anchor", nargs="?", help="anchor guest PC (region START), hex (e.g. 0x80012345)")
+    p.add_argument("--end", default=None,
+                   help="region END PC, hex. Enables two-anchor REGION mode: each "
+                        "recorded value is Δcycles of one START->END pass (the cost of "
+                        "the known code path between two dispatch points). Both anchors "
+                        "must be dispatch points (function entry / CPS continuation / "
+                        "dirty block). Omit for single-anchor (absolute-cycles-at-anchor).")
     p.add_argument("--hits", type=int, default=16)
     p.add_argument("--wait", type=float, default=5.0)
     p.add_argument("--native-port", type=int, default=DEFAULT_NATIVE_PORT)
@@ -315,8 +324,8 @@ def main():
 
     try:
         if not opts.no_arm:
-            r_n = arm(host, np_, "native", anchor, opts.hits)
-            r_b = arm(host, bp_, "beetle", anchor, opts.hits)
+            r_n = arm(host, np_, "native", anchor, opts.hits, end=opts.end)
+            r_b = arm(host, bp_, "beetle", anchor, opts.hits, end=opts.end)
             print(f"Armed native: {json.dumps(r_n)}")
             print(f"Armed beetle: {json.dumps(r_b)}")
             print(f"Letting both run for {opts.wait:.1f}s ...")

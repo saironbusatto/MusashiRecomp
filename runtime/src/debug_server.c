@@ -2057,19 +2057,50 @@ typedef struct {
 } CycWatchEntry;
 static CycWatchEntry s_cyc_watch_ring[CYC_WATCH_RING_CAP];
 static volatile int s_cyc_watch_armed = 0; /* 1 = recording active */
-static uint32_t s_cyc_watch_anchor_phys = 0; /* armed anchor, masked to phys */
+static uint32_t s_cyc_watch_anchor_phys = 0; /* armed anchor (A / start), masked to phys */
 static uint32_t s_cyc_watch_anchor_raw = 0;  /* armed anchor as supplied (for echo) */
 static uint32_t s_cyc_watch_max_hits = 16;   /* stop after this many hits */
 static uint32_t s_cyc_watch_hits = 0;        /* hits recorded so far */
+/* Two-anchor REGION mode (FAITHFUL_TIMING_PLAN.md §3c): when end_phys != 0, each
+ * recorded entry is the Δcycles of one A->B pass (cycles at B minus cycles at A),
+ * i.e. the cost of the KNOWN code path between two dispatch points (e.g. a function
+ * entry -> its exit-transfer target). end_phys == 0 keeps the single-anchor mode
+ * (entry stores absolute cycles at A). Both anchors must be dispatch points (the
+ * native observer only fires at function entries / compiled-dispatch / dirty
+ * blocks). */
+static uint32_t s_cyc_watch_end_phys = 0;    /* B / end anchor (0 = single-anchor) */
+static uint32_t s_cyc_watch_end_raw  = 0;
+static int      s_cyc_watch_in_region = 0;   /* 1 = saw A, awaiting B */
+static uint64_t s_cyc_watch_region_start = 0;
 
-/* Hot-path block-entry observer. Called from BOTH the compiled-dispatch
- * path (debug_server_trace_dispatch, arg already physical) and the
- * dirty-RAM interpreter path (debug_server_dirty_break_maybe_pause, arg
- * virtual). `block_leader_phys` must be the physical block-leader PC. */
+/* Hot-path block-entry observer. Called from the compiled-dispatch path
+ * (debug_server_trace_dispatch), the universal function-entry hook
+ * (debug_server_log_call_entry), and the dirty-RAM path
+ * (debug_server_dirty_break_maybe_pause). `block_leader_phys` is physical. */
 static inline void cyc_watch_observe(uint32_t block_leader_phys)
 {
     if (!s_cyc_watch_armed) return;                 /* disarmed: no cost */
-    if (block_leader_phys != s_cyc_watch_anchor_phys) return;
+
+    if (s_cyc_watch_end_phys != 0u) {               /* ── REGION mode (A..B Δ) ── */
+        if (!s_cyc_watch_in_region) {
+            if (block_leader_phys == s_cyc_watch_anchor_phys) {
+                s_cyc_watch_region_start = psx_get_cycle_count();
+                s_cyc_watch_in_region = 1;
+            }
+        } else if (block_leader_phys == s_cyc_watch_end_phys) {
+            uint64_t now = psx_get_cycle_count();
+            CycWatchEntry *e = &s_cyc_watch_ring[s_cyc_watch_hits];
+            e->hit_index       = s_cyc_watch_hits;
+            e->pc              = block_leader_phys;
+            e->psx_cycle_count = now - s_cyc_watch_region_start;  /* Δ(B-A) */
+            s_cyc_watch_hits++;
+            s_cyc_watch_in_region = 0;
+            if (s_cyc_watch_hits >= s_cyc_watch_max_hits) s_cyc_watch_armed = 0;
+        }
+        return;
+    }
+
+    if (block_leader_phys != s_cyc_watch_anchor_phys) return;  /* ── single-anchor ── */
     if (s_cyc_watch_hits >= s_cyc_watch_max_hits) {
         s_cyc_watch_armed = 0;                      /* full: stop sampling */
         return;
@@ -7221,20 +7252,29 @@ static void handle_cyc_watch(int id, const char *json)
     int n = json_get_int(json, "n", 16);
     if (n < 1) n = 1;
     if (n > CYC_WATCH_RING_CAP) n = CYC_WATCH_RING_CAP;
+    /* Optional second anchor -> REGION mode: each entry = Δcycles of one A->B pass. */
+    char endbuf[64];
+    uint32_t end_raw = json_get_str(json, "end", endbuf, sizeof(endbuf)) ? hex_to_u32(endbuf) : 0u;
 
     /* Disarm first so the hot path can't sample mid-reset. */
     s_cyc_watch_armed = 0;
     s_cyc_watch_anchor_raw  = raw;
     s_cyc_watch_anchor_phys = raw & 0x1FFFFFFFu;
+    s_cyc_watch_end_raw     = end_raw;
+    s_cyc_watch_end_phys    = end_raw & 0x1FFFFFFFu;
+    s_cyc_watch_in_region   = 0;
+    s_cyc_watch_region_start= 0;
     s_cyc_watch_max_hits    = (uint32_t)n;
     s_cyc_watch_hits        = 0;
     memset(s_cyc_watch_ring, 0, sizeof(s_cyc_watch_ring));
     s_cyc_watch_armed = 1;
 
     send_fmt("{\"id\":%d,\"ok\":true,\"anchor\":\"0x%08X\","
-             "\"anchor_phys\":\"0x%08X\",\"max_hits\":%u}",
+             "\"anchor_phys\":\"0x%08X\",\"end\":\"0x%08X\",\"end_phys\":\"0x%08X\","
+             "\"region\":%d,\"max_hits\":%u}",
              id, s_cyc_watch_anchor_raw, s_cyc_watch_anchor_phys,
-             s_cyc_watch_max_hits);
+             s_cyc_watch_end_raw, s_cyc_watch_end_phys,
+             (s_cyc_watch_end_phys != 0u) ? 1 : 0, s_cyc_watch_max_hits);
 }
 
 /* cyc_watch_dump — return the recorded ring as JSON. */
@@ -7244,9 +7284,12 @@ static void handle_cyc_watch_dump(int id, const char *json)
     char buf[256];
     snprintf(buf, sizeof(buf),
              "{\"id\":%d,\"ok\":true,\"anchor\":\"0x%08X\","
-             "\"anchor_phys\":\"0x%08X\",\"armed\":%d,\"max_hits\":%u,"
+             "\"anchor_phys\":\"0x%08X\",\"end\":\"0x%08X\",\"end_phys\":\"0x%08X\","
+             "\"region\":%d,\"armed\":%d,\"max_hits\":%u,"
              "\"hits\":%u,\"entries\":[",
              id, s_cyc_watch_anchor_raw, s_cyc_watch_anchor_phys,
+             s_cyc_watch_end_raw, s_cyc_watch_end_phys,
+             (s_cyc_watch_end_phys != 0u) ? 1 : 0,
              s_cyc_watch_armed ? 1 : 0, s_cyc_watch_max_hits,
              s_cyc_watch_hits);
     send_line(buf);
@@ -7270,6 +7313,10 @@ static void handle_cyc_watch_clear(int id, const char *json)
     s_cyc_watch_hits  = 0;
     s_cyc_watch_anchor_phys = 0;
     s_cyc_watch_anchor_raw  = 0;
+    s_cyc_watch_end_phys = 0;
+    s_cyc_watch_end_raw  = 0;
+    s_cyc_watch_in_region = 0;
+    s_cyc_watch_region_start = 0;
     memset(s_cyc_watch_ring, 0, sizeof(s_cyc_watch_ring));
     send_ok(id);
 }
