@@ -94,8 +94,13 @@ observe added to the recompiler so ANY block leader is anchorable on both backen
   psx_instr_base_cycles while memory.c already charged +6/main-RAM-load → counted
   twice. Reverted opcode fn to pure execute base; memory.c is the single address-
   keyed owner. Ruler [c5c→ca4]: native 34→30 (exact), no FMV regression.
-- [ ] Memory wait-state CALIBRATION: memory.c flat +6/RAM-read vs Beetle ReadMemory
-  (region wait + completion +2/+1 − load-delay absorb; scratchpad=0). Δ-gate.
+- [~] Memory wait-state: oracle value = 4 (ruler #2 load +5 = base 1 + 4, vs old
+  DuckStation 6). PARKED: memory.c=4 DETERMINISTICALLY WEDGES Tomba 2 boot (pc=0 /
+  exception at BIOS-shell pc 0xBFC2CE64, epc 0x80000048; faster load outruns a shell
+  loop's timing). Kept at 6 to preserve a booting vehicle. ROOT-CAUSE the shell pc=0
+  first (a real device-timing/loop bug the accurate load exposes), THEN land 4.
+  Residual beyond the constant: Beetle ReadFudge per-load variation (load2 10 vs 11)
+  + LDAbsorb give-back (result-used-next absorbs) — stateful, future. (commit 8b30246)
 - [x] **Mult/div completion-stall — DONE, validated EXACT in BOTH emitters**
   (commits a3e8f28 game, 180b821 BIOS). CPUState.muldiv_ts_done set by
   MULT/MULTU/DIV/DIVU, MFLO/MFHI stall to it (psx_cycles.c). Per-instruction
