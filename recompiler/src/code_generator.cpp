@@ -5,6 +5,7 @@
 // included via relative path to avoid an include-dir collision (recompiler and
 // runtime both ship a gte.h).
 #include "../../runtime/include/ws_backdrop_detect.h"
+#include "../../runtime/include/psx_instr_cost.h"  /* single-source CPU cycle cost (shared with interp) */
 #include <fmt/format.h>
 #include <algorithm>
 #include <cstdlib>
@@ -1208,8 +1209,24 @@ std::string CodeGenerator::translate_basic_block(
         block.exit_instr.has_delay_slot &&
         block.exit_instr.type != ControlFlowType::None &&
         block.exit_instr.address == block.end_addr;
-    const uint32_t block_exec_cycles =
-        static_cast<uint32_t>(block.instruction_count) + (exit_delay_slot_outside ? 1u : 0u);
+    // Block cycle charge = sum of the single-source per-instruction cost
+    // (psx_instr_cost.h) over every instruction the block executes, INCLUDING
+    // the always-executed delay-slot clone when the exit branch sits at end_addr
+    // (delay slot outside [start,end]). The interpreter charges the same cost
+    // per instruction through the same function, so the two backends cannot
+    // disagree. Stage 1 cost is identity (1/insn) => this equals
+    // instruction_count(+1 outside delay) exactly => byte-identical regen; Stage 2
+    // edits ONLY psx_instr_base_cycles and both backends update together.
+    uint32_t block_exec_cycles = 0;
+    for (uint32_t a = block.start_addr; a <= block.end_addr; a += 4) {
+        auto w = exe_.read_word(a);
+        if (!w.has_value()) break;
+        block_exec_cycles += psx_instr_base_cycles(*w);
+    }
+    if (exit_delay_slot_outside) {
+        auto dw = exe_.read_word(block.end_addr + 4u);  // the delay-slot clone
+        if (dw.has_value()) block_exec_cycles += psx_instr_base_cycles(*dw);
+    }
 
     {
         uint32_t slice_bcyc = block_exec_cycles;

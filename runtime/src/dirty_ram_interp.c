@@ -28,6 +28,7 @@
 #include "debug_server.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
+#include "psx_instr_cost.h"  /* psx_instr_base_cycles — single-source cycle cost */
 #include "gpu.h"   /* psx_ws_is_backdrop_site / psx_ws_backdrop_x (interp hook) */
 #include "ws_backdrop_detect.h"  /* shared backdrop-window detector (auto_backdrop) */
 
@@ -904,9 +905,10 @@ static void exec_delay_slot(CPUState *cpu, uint32_t pc) {
      * pair costs 2 — matching the recompiler's block.instruction_count (which
      * counts both) and hardware. Without this the dirty-interp under-charges 1
      * cycle per taken branch vs compiled-overlay code, drifting the shared
-     * guest-cycle timeline and forking timer-sensitive code (Tomba2 logo). */
+     * guest-cycle timeline and forking timer-sensitive code (Tomba2 logo).
+     * Charged through the single-source cost fn (psx_instr_cost.h). */
 #ifdef PSX_ENABLE_BLOCK_CYCLES
-    psx_advance_cycles(1u);
+    psx_advance_cycles(psx_instr_base_cycles(insn));
 #endif
 }
 
@@ -1586,7 +1588,7 @@ static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
         g_unsupported_seen = 0;
         int transferred = exec_one(cpu, pc, &next_pc);
 #ifdef PSX_ENABLE_BLOCK_CYCLES
-        psx_advance_cycles(1u);
+        psx_advance_cycles(psx_instr_base_cycles(fetch_word(pc & 0x1FFFFFFFu)));
 #endif
         g_dirty_ram_insns_run++;
         if (g_unsupported_seen) {
@@ -1861,7 +1863,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             }
         }
 #ifdef PSX_ENABLE_BLOCK_CYCLES
-        psx_advance_cycles(1u);
+        psx_advance_cycles(psx_instr_base_cycles(insn));  /* single-source cost */
 #endif
         dirty_ram_log_instruction(cpu, pc, insn, before_s0, next_pc,
                                   transferred ? cpu->pc : next_pc,
