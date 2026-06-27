@@ -1410,12 +1410,27 @@ void sio_write(uint32_t addr, uint32_t value) {
                 int armed_now = 0;
                 if ((sio_stat & SIO_STAT_ACK) && (sio_ctrl & SIO_CTRL_ACK_IRQ_EN)) {
                     sio_stat &= ~(SIO_STAT_ACK | SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY);
-                    sio_irq_pending = 1;
-                    sio_irq_countdown = SIO_IRQ_DELAY_PAD;
-                    event_ring_record_aux(EV_ENQ, (uint8_t)SRC_SIO, (uint32_t)sio_irq_countdown);
+                    /* FAITHFUL pad ACK timing (faithful-core, replaces the
+                     * access-paced sio_irq_countdown=SIO_IRQ_DELAY_PAD hack).
+                     * On real hardware the controller's DSR/ACK pulse arrives
+                     * ~one byte-shift (baud) + ack-pulse after the TX byte —
+                     * a GUEST-CYCLE delay, independent of how many SIO register
+                     * reads the CPU manages to issue while it waits. The old
+                     * countdown decremented once per SIO register access
+                     * (sio_tick(0)), so a faithful/faster CPU (load=4) fired the
+                     * pad IRQ at the wrong guest-cycle phase relative to the
+                     * cycle-paced timers/VBLANK, diverging the BIOS pad-detect
+                     * state machine (load=4 Tomba2 boot wedge). Route through the
+                     * same cycle-paced ack scheduler the card path uses, driven
+                     * by sio_advance() from psx_advance_cycles(). */
+                    sio_pending_ack        = 1;
+                    sio_ack_remaining      = SIO_BAUD_CYCLES_DEFAULT + SIO_ACK_CYCLES_DEFAULT;
+                    sio_pending_ack_irq_en = 1;
+                    g_sio_timing_active    = 1;
+                    event_ring_record_aux(EV_ENQ, (uint8_t)SRC_SIO, (uint32_t)sio_ack_remaining);
                     sio_irq_pending_source = SIO_IRQ_SRC_PAD_ACK;
                     sio_irq_pending_slot = (uint8_t)selected_slot;
-                    sio_irq_pending_delay = (uint8_t)sio_irq_countdown;
+                    sio_irq_pending_delay = (uint8_t)SIO_ACK_CYCLES_DEFAULT;
                     sio_irq_pending_mc_state = (uint8_t)mc_state;
                     sio_irq_pending_byte_seq = sio_trace_seq;
                     armed_now = 1;

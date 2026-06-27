@@ -140,9 +140,17 @@ Status: MODERATE-STRONG (regions games use).
 Status: MIXED — "works for tested games," NOT edge-validated. Likely more gaps
 than we think; the **hybrid-pad failure in Tomba is an axis-5 (SIO/controller)
 bug**, not timing.
-- [ ] **SIO / controllers / memcard**: DualShock config-mode handshake (0x43),
+- [~] **SIO / controllers / memcard**: DualShock config-mode handshake (0x43),
   analog vs digital pad ID, the **hybrid pad mode failure** (Tomba) — Beetle
   frontio/input + psx-spx "Controllers and Memory Cards". HIGH PRIORITY per user.
+  - DONE 2026-06-27: **pad ACK→IRQ7 timing made guest-cycle-paced** (was
+    access-count-paced via `sio_irq_countdown=SIO_IRQ_DELAY_PAD`; pad fast-path
+    now arms the cycle-paced ack scheduler, BAUD+ACK=1258 cyc, like the card
+    path). This was the cause of the load=4 Tomba 2 boot wedge (accurate CPU
+    exposed access-paced pad timing). See WEDGE_load4_shell_rootcause.md.
+  - TODO (axis5 Fix-6 / "1.0e-e2"): fully remove the pad fast-path so pad+card
+    share the unified shifter path; D4/D8 config-mode `0x43`/`0x45` semantics
+    (hybrid-pad fix, retire g_pad_legacy_cfg) still open.
 - [ ] **GPU**: GP0/GP1 command set, rasterization rules (top-left fill, dithering,
   semi-transparency modes, mask bit, texture windows, blending), VRAM-as-texture —
   cross-ref DuckStation gpu_*, Beetle gpu.cpp, GPU test ROMs; validate by VRAM diff.

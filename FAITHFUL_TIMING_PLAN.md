@@ -213,6 +213,29 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-27 (load=4 boot wedge RESOLVED — faithful guest-cycle pad ACK):**
+  The oracle-accurate load wait-state (=4) had deterministically wedged Tomba 2
+  boot in the BIOS shell (handle s1=104 → 1672-stride table index → wild ptr
+  0x8013B608 → RAM corruption → pc=0). Step A (confirm, not hypothesise): the
+  proximate runaway was **100% controller (pad) polling** — `sio_irq_dump` showed
+  the last 150+ SIO IRQs all `source=pad, delay=4, active_device=PAD, mc_state=0`
+  (card idle), NOT the memcard enumeration the handoff guessed. Source-confirmed
+  unfaithfulness: the pad fast-path (`sio.c:1386`) armed the access-paced
+  `sio_irq_countdown=SIO_IRQ_DELAY_PAD(4)`, decremented once **per SIO register
+  access** (sio_tick is only ever called cycles=0), so pad ACK→IRQ7 was
+  access-count-paced, not guest-cycle-paced; the faster (accurate) CPU fired it at
+  the wrong guest-cycle phase vs the cycle-paced timers/VBLANK → BIOS pad-detect
+  state machine diverged. Step B (faithful fix): the pad fast-path now arms the
+  **guest-cycle-paced ack scheduler** (`sio_pending_ack`/`sio_ack_remaining =
+  BAUD+ACK = 1258 cyc`, driven by `sio_advance`←`psx_advance_cycles`), identical
+  to the already-faithful card path. RESULT: load=4 boots **past the wedge to the
+  intro FMV** (screenshot-verified, frame 11k+ stable). Ruler #1 native 54 vs
+  Beetle 56 = the known load-ReadFudge gap on the load=4 branch, NOT a regression
+  (SIO timing can't change CPU instruction cost). Runtime-only (`runtime/src/sio.c`),
+  no regen, UNCOMMITTED. Write-up: WEDGE_load4_shell_rootcause.md. Follow-up
+  (completeness, non-blocking): axis5 Fix-6 / "1.0e-e2" fully removes the pad
+  fast-path so pad+card share one shifter path — needs menu input validation.
+
 - **2026-06-27 (BIOS emitter muldiv stall — ruler #1 now EXACT):** Applied
   per-instruction cycle charging + the mult/div completion-stall to the BIOS
   emitter (full_function_emitter.cpp: +1 at the top of every in-function
