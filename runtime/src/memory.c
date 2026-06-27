@@ -855,19 +855,32 @@ uint8_t psx_read_byte(uint32_t addr) {
 
 /* ---- CPU guest-side data reads: model PS1 main-RAM read latency ----
  * The R3000A has no usable D-cache (its data cache is repurposed as the 1 KB
- * scratchpad), so every CPU data read from main DRAM costs 1 opcode cycle plus
- * 6 wait-state cycles (DuckStation RAM_READ_TICKS = 6; "1 opcode + 6 waitstates
- * = 7 cycles"). The base opcode cycle is already charged by the per-block
- * psx_advance_cycles(instruction_count); here we add only the +6 wait states,
- * and only for main-RAM targets — scratchpad, MMIO, BIOS ROM and open-bus are
- * excluded (they have their own access timing). The penalty is keyed on the
- * runtime effective physical address (all of KUSEG/KSEG0/KSEG1 alias the same
- * DRAM), NOT on the code region, so relocated kernel code is timed correctly.
+ * scratchpad), so every CPU data read from main DRAM costs the base opcode cycle
+ * plus a data-access wait-state. The base opcode cycle is charged per instruction
+ * by the emitter/interp (psx_instr_base_cycles); here we add ONLY the data-access
+ * wait-state, and only for main-RAM targets — scratchpad, MMIO, BIOS ROM and
+ * open-bus are excluded (they have their own access timing). Keyed on the runtime
+ * effective physical address (all of KUSEG/KSEG0/KSEG1 alias the same DRAM), NOT
+ * the code region, so relocated kernel code is timed correctly.
  *
- * These wrappers are wired to cpu->read_* (see main.cpp), so the penalty
- * applies to BOTH statically-recompiled and dirty-RAM-interpreted guest loads,
- * but NOT to debug-server / device reads that call psx_read_* directly. */
-#define PSX_RAM_READ_WAIT_CYCLES 6u
+ * VALUE: the Beetle ORACLE says 4 (the cycle test ROM load-isolation loop measures
+ * a main-RAM load at +5 over baseline = base 1 + 4; Beetle ReadMemory = fudge(0/2)
+ * + region wait(0 RAM) + completion(+2), netting 4 in the common fudged case).
+ * BUT lowering this from 6 to 4 DETERMINISTICALLY WEDGES Tomba 2's BIOS-shell boot
+ * (reproducible: pc=0/exception at shell pc 0xBFC2CE64, epc 0x80000048, identical
+ * total_checks across restarts — i.e. a real timing-sensitivity in a shell loop,
+ * exposed by the faster-but-accurate load cost). Kept at 6 for now to preserve a
+ * BOOTING validation vehicle (the FMV + ruler #1 need a live boot). The accurate
+ * value (4) is PARKED behind that wedge — root-cause the shell pc=0 first, then
+ * land 4. The ruler #2 load loop validates 4 == Beetle when this is enabled.
+ * RESIDUAL beyond the constant (stateful, future): Beetle's per-load ReadFudge
+ * variation (back-to-back loads differ ~1; ruler load2 was 10 vs 11) and LDAbsorb
+ * give-back (a load whose result is read by the next instruction is absorbed).
+ *
+ * These wrappers are wired to cpu->read_* (see main.cpp), so the penalty applies
+ * to BOTH statically-recompiled and dirty-RAM-interpreted guest loads, but NOT to
+ * debug-server / device reads that call psx_read_* directly. */
+#define PSX_RAM_READ_WAIT_CYCLES 6u   /* oracle value is 4 — PARKED: 4 wedges Tomba 2 boot (see above) */
 extern void psx_advance_cycles(uint32_t cycles);
 
 static inline void charge_main_ram_read(uint32_t addr) {
