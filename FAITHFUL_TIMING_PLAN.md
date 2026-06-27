@@ -153,6 +153,23 @@ cycle number CREATES divergence, so verify, don't rush.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-26 (measure: Beetle cycle clock BUILT + VALIDATED):** Added absolute
+  guest-cycle exposure to the Beetle oracle (MAIN checkout, additive diagnostic):
+  beetle-psx/libretro.cpp accumulates per-frame `timestamp` (CPU->Run slice) into
+  `beetle_total_guest_cycles` (+ reset on init) with `extern "C"
+  beetle_core_get_guest_cycles()`; runtime/src/beetle_debug_server.c h_ping now
+  reports `guest_cycles`. Rebuilt beetle static lib + psx-beetle. VALIDATED (Rule
+  0): guest_cycles advances ~565,022 cyc/frame = real PSX rate (33.8688MHz/~59.94).
+  Beetle needs the .CUE (not raw .bin). FIRST CROSS-CHECK: native psx_cycle_count
+  rate = 565,470 cyc/frame vs Beetle 565,022 (within 0.08%) => gross cycle-rate
+  parity confirmed; remaining drift is fine per-instruction-path (needs same-PC
+  alignment). Main-checkout Beetle edits are UNCOMMITTED (additive; master has
+  other prior uncommitted work — leave for user to manage).
+  NEXT (aligned comparator): Beetle has get_registers (PC) but NO run-to/step/pause,
+  so same-PC cycle comparison needs a "capture guest_cycles when guest reaches PC X"
+  hook on BOTH servers (native has run_to_frame/step; Beetle needs a PC-watch). Then
+  diff cycles@PC native vs Beetle to see the residual drift, and Stage-2 cost
+  transcription verified against it.
 - **2026-06-26 (P3 step 1 DONE — single-source cost seam, identity):** Created
   runtime/include/psx_instr_cost.h `psx_instr_base_cycles(insn)` (identity, 1/insn).
   Routed BOTH backends through it: interp (exec_delay_slot, dirty-dispatch loop,
