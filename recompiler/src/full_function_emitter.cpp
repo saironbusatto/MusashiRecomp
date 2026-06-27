@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <set>
@@ -18,6 +19,16 @@
 #include "../../runtime/include/psx_instr_cost.h"  /* single-source CPU cycle cost (shared with interp + game emitter) */
 
 namespace PSXRecompV4 {
+
+// Per-instruction cycle charging (mirrors code_generator.cpp). DEFAULT ON for
+// the faithful-timing branch so the running cycle count is accurate mid-block —
+// required for the mult/div completion-stall (mflo/mfhi wait for muldiv_ts_done)
+// to absorb correctly. Set PSX_CODEGEN_CYCLE_PER_INSN=0 to force block-up-front.
+static bool bios_cycle_per_insn() {
+    const char* e = std::getenv("PSX_CODEGEN_CYCLE_PER_INSN");
+    if (e != nullptr && e[0] != '\0') return e[0] != '0';
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -362,6 +373,8 @@ bool FullFunctionEmitter::emit_function(
         }
     };
 
+    const bool per_insn_cycles = bios_cycle_per_insn();
+
     for (auto it = addr_to_raw.begin(); it != addr_to_raw.end(); ++it) {
         uint32_t addr = it->first;
         uint32_t raw = it->second;
@@ -386,17 +399,31 @@ bool FullFunctionEmitter::emit_function(
             out += "#endif\n";
             // Phase 1.0e-d: advance guest cycles for this block. Macro-
             // gated; when off, generated code matches pre-1.0e-d output.
-            uint32_t bcyc = 0;
-            auto bcit = block_cycles.find(addr);
-            if (bcit != block_cycles.end()) bcyc = bcit->second;
-            if (bcyc > 0) {
-                out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-                out += fmt::format("    psx_advance_cycles({}u);\n", bcyc);
-                out += "#endif\n";
+            // In per-instruction mode the charge is emitted per instruction
+            // below (so muldiv/GTE stalls absorb correctly), NOT block-up-front.
+            if (!per_insn_cycles) {
+                uint32_t bcyc = 0;
+                auto bcit = block_cycles.find(addr);
+                if (bcit != block_cycles.end()) bcyc = bcit->second;
+                if (bcyc > 0) {
+                    out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+                    out += fmt::format("    psx_advance_cycles({}u);\n", bcyc);
+                    out += "#endif\n";
+                }
             }
             if (should_probe_pc(addr)) {
                 out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n", addr);
             }
+        }
+
+        // Per-instruction cycle charge (faithful-timing mode). Emitted for EVERY
+        // in-function instruction (terminators, non-terminators, in-block delay
+        // slots are all separate addr_to_raw entries) in execution order, so the
+        // running cycle count is exact at MULT/DIV/MFLO/MFHI (and later GTE) for
+        // the completion-stall to absorb correctly. Orphaned (out-of-function)
+        // delay slots are inlined elsewhere and charged at those sites.
+        if (per_insn_cycles) {
+            out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_advance_cycles(1u);\n#endif\n";
         }
 
         // Decode and translate.
@@ -521,6 +548,12 @@ bool FullFunctionEmitter::emit_function(
                             out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
                                                ds_addr, ds_raw, ds_tr.comment);
                             out += fmt::format("    {}\n", ds_tr.c_code);
+                            // Orphaned delay slot is inlined here (not an
+                            // addr_to_raw entry), so charge its cycle directly
+                            // in per-instruction mode (block mode already counts
+                            // it in the owning block_cycles).
+                            if (per_insn_cycles)
+                                out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_advance_cycles(1u);\n#endif\n";
                         }
                     }
                     // Resolve branch.  Target was decoded as absolute virtual addr.
@@ -552,6 +585,12 @@ bool FullFunctionEmitter::emit_function(
                             out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
                                                ds_addr, ds_raw, ds_tr.comment);
                             out += fmt::format("    {}\n", ds_tr.c_code);
+                            // Orphaned delay slot is inlined here (not an
+                            // addr_to_raw entry), so charge its cycle directly
+                            // in per-instruction mode (block mode already counts
+                            // it in the owning block_cycles).
+                            if (per_insn_cycles)
+                                out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_advance_cycles(1u);\n#endif\n";
                         }
                     }
                     uint32_t target = relocate_j_target(addr, tr.terminator_target);
@@ -572,6 +611,12 @@ bool FullFunctionEmitter::emit_function(
                             out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
                                                ds_addr, ds_raw, ds_tr.comment);
                             out += fmt::format("    {}\n", ds_tr.c_code);
+                            // Orphaned delay slot is inlined here (not an
+                            // addr_to_raw entry), so charge its cycle directly
+                            // in per-instruction mode (block mode already counts
+                            // it in the owning block_cycles).
+                            if (per_insn_cycles)
+                                out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_advance_cycles(1u);\n#endif\n";
                         }
                     }
                     uint32_t target = relocate_j_target(addr, tr.terminator_target);
@@ -609,6 +654,12 @@ bool FullFunctionEmitter::emit_function(
                             out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
                                                ds_addr, ds_raw, ds_tr.comment);
                             out += fmt::format("    {}\n", ds_tr.c_code);
+                            // Orphaned delay slot is inlined here (not an
+                            // addr_to_raw entry), so charge its cycle directly
+                            // in per-instruction mode (block mode already counts
+                            // it in the owning block_cycles).
+                            if (per_insn_cycles)
+                                out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_advance_cycles(1u);\n#endif\n";
                         }
                     }
                     uint8_t rs = (raw >> 21) & 0x1F;
