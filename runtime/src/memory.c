@@ -863,16 +863,22 @@ uint8_t psx_read_byte(uint32_t addr) {
  * effective physical address (all of KUSEG/KSEG0/KSEG1 alias the same DRAM), NOT
  * the code region, so relocated kernel code is timed correctly.
  *
- * VALUE: the Beetle ORACLE says 4 (the cycle test ROM load-isolation loop measures
- * a main-RAM load at +5 over baseline = base 1 + 4; Beetle ReadMemory = fudge(0/2)
- * + region wait(0 RAM) + completion(+2), netting 4 in the common fudged case).
- * BUT lowering this from 6 to 4 DETERMINISTICALLY WEDGES Tomba 2's BIOS-shell boot
- * (reproducible: pc=0/exception at shell pc 0xBFC2CE64, epc 0x80000048, identical
- * total_checks across restarts — i.e. a real timing-sensitivity in a shell loop,
- * exposed by the faster-but-accurate load cost). Kept at 6 for now to preserve a
- * BOOTING validation vehicle (the FMV + ruler #1 need a live boot). The accurate
- * value (4) is PARKED behind that wedge — root-cause the shell pc=0 first, then
- * land 4. The ruler #2 load loop validates 4 == Beetle when this is enabled.
+ * VALUE = 4, the Beetle ORACLE-accurate cost (the cycle test ROM load-isolation
+ * loop measures a main-RAM load at +5 over baseline = base 1 + 4; Beetle ReadMemory
+ * = fudge(0/2) + region wait(0 RAM) + completion(+2), netting 4 in the common fudged
+ * case). The old 6 came from DuckStation (RAM_READ_TICKS), which our oracle
+ * contradicts. Ruler #2 load == Beetle EXACTLY at 4.
+ *
+ * ⚠ KNOWN ISSUE this value CAUSES (under active root-cause on branch
+ *   wt/tomba2-load-accuracy): lowering 6→4 DETERMINISTICALLY WEDGES Tomba 2's
+ *   BIOS-shell boot — pc=0/exception at shell pc 0xBFC2CE64 (epc 0x80000048),
+ *   reproducible at identical total_checks across restarts. The faster-but-accurate
+ *   load cost makes the CPU outrun a shell loop's timing assumption, exposing a
+ *   downstream bug (likely incomplete device/loop timing). We deliberately KEEP the
+ *   accurate value and fix the real cause rather than mask it with a wrong cost —
+ *   faithful core (CLAUDE.md Rule -1). Until the wedge is fixed, Tomba 2 will not
+ *   reach the FMV on this branch; ruler #2 (its own boot disc) is unaffected.
+ *
  * RESIDUAL beyond the constant (stateful, future): Beetle's per-load ReadFudge
  * variation (back-to-back loads differ ~1; ruler load2 was 10 vs 11) and LDAbsorb
  * give-back (a load whose result is read by the next instruction is absorbed).
@@ -880,7 +886,7 @@ uint8_t psx_read_byte(uint32_t addr) {
  * These wrappers are wired to cpu->read_* (see main.cpp), so the penalty applies
  * to BOTH statically-recompiled and dirty-RAM-interpreted guest loads, but NOT to
  * debug-server / device reads that call psx_read_* directly. */
-#define PSX_RAM_READ_WAIT_CYCLES 6u   /* oracle value is 4 — PARKED: 4 wedges Tomba 2 boot (see above) */
+#define PSX_RAM_READ_WAIT_CYCLES 4u   /* oracle-accurate; ⚠ causes Tomba 2 boot wedge @0xBFC2CE64 — root-cause in progress */
 extern void psx_advance_cycles(uint32_t cycles);
 
 static inline void charge_main_ram_read(uint32_t addr) {
