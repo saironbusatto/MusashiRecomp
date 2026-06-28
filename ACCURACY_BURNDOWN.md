@@ -94,22 +94,27 @@ observe added to the recompiler so ANY block leader is anchorable on both backen
   psx_instr_base_cycles while memory.c already charged +6/main-RAM-load → counted
   twice. Reverted opcode fn to pure execute base; memory.c is the single address-
   keyed owner. Ruler [c5c→ca4]: native 34→30 (exact), no FMV regression.
-- [~] Memory wait-state: oracle value = 4 (ruler #2 load +5 = base 1 + 4, vs old
-  DuckStation 6). PARKED: memory.c=4 DETERMINISTICALLY WEDGES Tomba 2 boot (pc=0 /
-  exception at BIOS-shell pc 0xBFC2CE64, epc 0x80000048; faster load outruns a shell
-  loop's timing). Kept at 6 to preserve a booting vehicle. ROOT-CAUSE the shell pc=0
-  first (a real device-timing/loop bug the accurate load exposes), THEN land 4.
-  Residual beyond the constant: Beetle ReadFudge per-load variation (load2 10 vs 11)
-  + LDAbsorb give-back (result-used-next absorbs) — stateful, future. (commit 8b30246)
+- [x] **Memory wait-state — DONE (full R3000A load model).** load=4 LANDED (the boot
+  wedge was a real device-timing bug the accurate load exposed — pad ACK→IRQ7 made
+  guest-cycle-paced, see axis 5; commit d8c4a8e). ReadFudge + LDAbsorb give-back state
+  machine SHIPPED across both emitters + interp (psx_cyc.h §1/deps/DO_LDS; commits
+  d8c4a8e/fade560/d597797) — load2 10→11. **Device-region MMIO read waits DONE** (commit
+  9ae534d, branch wt/tomba2-mmio-waits): Beetle MemRW table in psx_cyc_readmem, size-aware
+  (SPU +36/+16, CDC +6×size, GPU/MDEC/SysCtrl/FIO/SIO/IRQ/DMA/Timers +1, RAM +3, else +0).
+  Ruler #2: all 15 loops (incl. mmio_timer +3, mmio_spu +38) == Beetle EXACT.
+  RESIDUAL: DMACycleSteal (dynamic per-read DMA bus-steal, libretro.cpp:868) unmodeled.
 - [x] **Mult/div completion-stall — DONE, validated EXACT in BOTH emitters**
   (commits a3e8f28 game, 180b821 BIOS). CPUState.muldiv_ts_done set by
   MULT/MULTU/DIV/DIVU, MFLO/MFHI stall to it (psx_cycles.c). Per-instruction
   charging default on this branch (both emitters). Ruler #2 (game): div +38,
   div_spaced +38 (absorb), mult +15 — ALL == Beetle. Ruler #1 (BIOS kernel):
   [c5c→ca4] native 30→56 == Beetle 56, STEADY DELTA 0 EXACT. FMV no regression.
-- [ ] **Instruction-fetch / I-cache** — ruler #1 shows the residual: Beetle 84 on
-  cold-line hits (I-cache refill) vs native flat 56. Next component. Beetle
-  ReadInstruction (+0 hit / +4 KSEG1 / +3+refill miss).
+- [x] **Instruction-fetch / I-cache — DONE both backends.** Stage 1 (interp, commit
+  958a928) + Stage 2 (BOTH static emitters at cache-line leaders via the runtime PC;
+  relocate_ra for BIOS shell/kernel; default-on; commit 0edb935). Faithful direct-mapped
+  4 KB/256-line model (psx_icache.c, from Beetle ReadInstruction: +0 hit / +4 KSEG1 /
+  +3+refill miss). Ruler #2 icache_miss == Beetle; ruler #1 [c5c→ca4] steady 56==Beetle
+  AND native now produces the cold-refill spikes (77/84) that were absent. FMV no-reg.
 - [x] **GTE per-command cycles — DONE, validated EXACT** (commit ec1fd76).
   CPUState.gte_ts_done armed in gte_execute (cost-1 table verified from beetle
   gte.cpp op returns; AVSZ4=5 not 6); any COP2 reg access stalls to it; both
@@ -117,8 +122,8 @@ observe added to the recompiler so ANY block leader is anchorable on both backen
 - [x] **Mult/div stall — also completed to the dirty-RAM interpreter** (commit
   75d5d1a): backend parity (interp was charging 0 for mult/div). By-construction
   + no-regression (no interp-path ruler yet — see below).
-- [ ] Instruction-fetch / I-cache timing — Beetle ReadInstruction (+0 hit / +4 KSEG1
-  / +3+refill miss). Ruler's 56→84 cold spread is the I-cache line-refill transient.
+- [x] Instruction-fetch / I-cache timing — DONE (see above; commits 958a928 + 0edb935).
+  The ruler's 56→84 cold spread (I-cache line-refill transient) now reproduced natively.
 - [ ] **HW test-ROM ruler (#2)** — Amidog CPU/GTE timing ROMs for hand-crafted
   single-COMPONENT isolation (div-only, load-only loops) that organic BIOS code
   can't give (the prologue combines div+loads in one block). Strongest validator.
