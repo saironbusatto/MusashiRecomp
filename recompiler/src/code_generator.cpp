@@ -1308,6 +1308,24 @@ std::string CodeGenerator::translate_basic_block(
                                     psx_cyc_dep_res_mask(in));
         ss << "#endif\n";
     };
+    // I-cache FETCH cost (faithful R3000A), emitted BEFORE the per-instruction
+    // interlock/load — exactly like Beetle ReadInstruction precedes the base, and so a
+    // fetch MISS clears any pending load give-back before the next load arms one. Only
+    // emitted at cache-line LEADERS: a block leader / mid-block jump-table target (any
+    // address reachable other than by fall-through, i.e. a possibly-cold cache entry) OR
+    // a 16-byte-line start (addr&0xC==0, a sequential line crossing). Intra-line
+    // followers reached by fall-through are guaranteed hits — the leader's fetch
+    // refilled the line to its end — so they need no call (+0). Extra fetch points are
+    // harmless (a hit is +0); only UNDER-counting a cold entry would diverge, which the
+    // leader set prevents. The game runs at its KSEG0 load address, so `insn_addr` is
+    // already the runtime guest PC (matching the dirty-RAM interp's cpu->pc and Beetle).
+    auto emit_pre_icache = [&](uint32_t insn_addr, const std::string& indent) {
+        if (!(insn_addr == block.start_addr || (insn_addr & 0xCu) == 0 ||
+              extra_labels_.count(insn_addr))) return;
+        ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+        ss << indent << fmt::format("psx_icache_fetch(cpu, 0x{:08X}u);\n", insn_addr);
+        ss << "#endif\n";
+    };
     if (!cycle_per_insn && block_exec_cycles > 0) {
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
         ss << config_.indent << fmt::format("psx_advance_cycles({}u);\n",
@@ -1366,6 +1384,7 @@ std::string CodeGenerator::translate_basic_block(
         }
 
         if (!is_cf) {
+            if (cycle_per_insn) emit_pre_icache(addr, config_.indent);
             if (cycle_per_insn) emit_pre_timing(instr, config_.indent);
             ss << translate_instruction(addr, instr) << "\n";
         } else {
@@ -1375,6 +1394,8 @@ std::string CodeGenerator::translate_basic_block(
                 // runs at the branch PC, THEN the delay slot's at PC+4. Emit the branch
                 // step FIRST (it is pure timing — does not touch GPR values, so it is
                 // safe before the branch-condition capture below).
+                if (cycle_per_insn)
+                    emit_pre_icache(exit_branch_addr, config_.indent);
                 if (cycle_per_insn)
                     emit_pre_timing(block.exit_instr.instruction, config_.indent);
 
@@ -1406,7 +1427,8 @@ std::string CodeGenerator::translate_basic_block(
                                                   delay_saved_cond, cond);
                             }
                             ss << config_.indent << "/* delay slot (always executes) */\n";
-                            // Delay slot's own §1+deps+DO_LDS, before its body (skipped if a load).
+                            // Delay slot's own fetch + §1+deps+DO_LDS, before its body (skipped if a load).
+                            if (cycle_per_insn) emit_pre_icache(delay_slot_addr, config_.indent);
                             if (cycle_per_insn) emit_pre_timing(delay_instr, config_.indent);
                             ss << translate_instruction(delay_slot_addr, delay_instr) << "\n";
                         }

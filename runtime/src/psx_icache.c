@@ -33,16 +33,18 @@
 
 extern void psx_advance_cycles(uint32_t cycles);
 
-/* Opt-in gate (default OFF). The I-cache fetch cost must be charged by BOTH backends
- * or NEITHER — charging it only in the interp (Stage 1) while the compiled path does
- * not would make the two backends disagree on fetch cost in mixed compiled/interp
- * execution (e.g. Tomba 2 overlays), forking timing. So until the compiled emitters
- * also charge it (Stage 2), this is enabled only for measurement (PSX_ICACHE=1, used
- * with PSX_FORCE_INTERP=1 so ALL code is interp'd → consistent). Stage 2 flips the
- * default on once both backends charge it. */
+/* Gate (default ON as of Stage 2). The I-cache fetch cost is now charged by BOTH
+ * backends: the dirty-RAM interp (exec_one) AND both static emitters (code_generator
+ * game path + full_function_emitter BIOS path, at each cache-line leader, using the
+ * runtime guest PC). Because both charge it from a SHARED tag array, mixed
+ * compiled/interp execution stays consistent and the cache evolves like Beetle.
+ * Validated Stage 2 (2026-06-27): ruler #2 compiled == Beetle EXACT on all 13 loops
+ * incl. icache_miss +14; ruler #1 steady delta 0 with native cold-refill spikes
+ * (77/84) now matching Beetle's range; Tomba 2 FMV no-regression. Set PSX_ICACHE=0 to
+ * disable (e.g. to A/B the fetch-cost component). */
 int psx_icache_enabled(void) {
     static int s = -1;
-    if (s < 0) { const char* e = getenv("PSX_ICACHE"); s = (e && e[0] && e[0] != '0'); }
+    if (s < 0) { const char* e = getenv("PSX_ICACHE"); s = (e == NULL || e[0] == '\0') ? 1 : (e[0] != '0'); }
     return s;
 }
 

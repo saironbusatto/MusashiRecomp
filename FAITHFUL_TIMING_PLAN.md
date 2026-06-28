@@ -213,6 +213,30 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-27 (I-cache fetch — Stage 2 DONE: compiled-path emit + production default-on):**
+  Both static emitters now charge the I-cache fetch cost at each cache-line LEADER, BEFORE
+  the per-instruction interlock/load (Beetle ReadInstruction order, so a fetch miss clears
+  the pending load give-back first). Leader = a block leader / mid-block jump-table target
+  (any non-fall-through entry → possibly-cold line) OR a 16-byte-line start (addr&0xC==0);
+  intra-line fall-through followers are provably hits (the leader refilled the line to its
+  end) so they emit nothing (+0). code_generator (game): `addr` is already the KSEG0 runtime
+  PC. full_function_emitter (BIOS): the loop addr is the ROM/compile addr, mapped to the
+  RUNTIME guest PC via the existing `relocate_ra` (BIOS main stays in-place KSEG1 0xBFC..
+  uncached; kernel Part 2 → 0x500+, shell → 0x80030000+) so the shared TV array evolves
+  identically to the interp's cpu->pc and the KSEG1 (>=0xA0000000) uncached test sees the
+  true virtual address. The compiled path emits at the SAME address value the interp would
+  for the same instruction (they share s_icache_tv), so mixed compiled/interp stays
+  consistent. VALIDATED: ruler #2 COMPILED (port 4600, PSX_ICACHE=1) == Beetle (4382) EXACT
+  on all 13 loops incl. `icache_miss +14` (was +0 pre-Stage-2); ruler #1 [0x1C5C→0x1CA4]
+  steady delta 0 (56==56) AND native now produces the I-cache cold-refill spikes (77/84,
+  Beetle's range) that were absent before — exact per-hit magnitude varies run-to-run
+  because the two processes free-run (Rule 16), not a bug. Tomba 2 boots past the load wedge
+  → intro FMV (jungle) + crisp PS BIOS logo, total_checks advancing, no freeze. Then flipped
+  `psx_icache_enabled()` DEFAULT ON (PSX_ICACHE=0 still disables for A/B) — re-validated the
+  default-on path (cyctest no-env == +14; Tomba 2 boots clean). psx_icache.c + both emitters.
+  NEXT axis: DMA cycle-steal / device-region MMIO load waits (SPU +36 etc.), currently
+  unmodeled. Eventually merge wt/tomba2-load-accuracy to master after cross-title regen+smoke.
+
 - **2026-06-27 (I-cache fetch — MODEL built + interp-validated EXACT; Stage 1 of 2):**
   New runtime/src/psx_icache.c: faithful direct-mapped (4 KB / 256-line) instruction-cache
   fetch cost, transcribed from Beetle PS_CPU::ReadInstruction — HIT +0 (no give-back clear),

@@ -388,6 +388,26 @@ bool FullFunctionEmitter::emit_function(
                            psx_cyc_dep_res_mask(w));
     };
 
+    // I-cache FETCH cost (faithful R3000A), emitted BEFORE the per-instruction
+    // interlock/load — like Beetle ReadInstruction precedes the base, so a fetch MISS
+    // clears any pending load give-back before the next load arms one. Only emitted at
+    // cache-line LEADERS: a block leader (any branch/dispatch entry — a possibly-cold
+    // cache entry; cross-function targets are inserted into block_leaders above) OR a
+    // 16-byte-line start (addr&0xC==0, a sequential line crossing). Intra-line followers
+    // reached by fall-through are guaranteed hits (the leader refilled the line to its
+    // end) → no call (+0). `rom_addr` is the ROM/compile-time address; relocate_ra maps
+    // it to the RUNTIME guest PC the CPU actually fetches from (BIOS main stays in-place
+    // KSEG1 0xBFC..; relocated kernel Part 2 → 0x500+, shell → 0x80030000+), so the
+    // shared I-cache evolves identically to the dirty-RAM interp (cpu->pc) and Beetle —
+    // and the KSEG1 uncached test (>=0xA0000000) sees the true virtual address. The
+    // relocation preserves bits[3:0], so the line-leader test is space-independent.
+    auto emit_icache_fetch = [&](uint32_t rom_addr) {
+        if (!per_insn_cycles) return;
+        if (!(block_leaders.count(rom_addr) || (rom_addr & 0xCu) == 0)) return;
+        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_icache_fetch(cpu, 0x{:08X}u);\n#endif\n",
+                           relocate_ra(rom_addr));
+    };
+
     for (auto it = addr_to_raw.begin(); it != addr_to_raw.end(); ++it) {
         uint32_t addr = it->first;
         uint32_t raw = it->second;
@@ -435,6 +455,7 @@ bool FullFunctionEmitter::emit_function(
         // running cycle count is exact at MULT/DIV/MFLO/MFHI (and later GTE) for
         // the completion-stall to absorb correctly. Orphaned (out-of-function)
         // delay slots are inlined elsewhere and charged at those sites.
+        emit_icache_fetch(addr);
         emit_insn_interlock(raw);
 
         // Decode and translate.
@@ -561,6 +582,7 @@ bool FullFunctionEmitter::emit_function(
                             // Orphaned delay slot is inlined here (not an addr_to_raw
                             // entry), so charge its interlock directly, BEFORE its body
                             // (block mode already counts it in the owning block_cycles).
+                            emit_icache_fetch(ds_addr);
                             emit_insn_interlock(ds_raw);
                             out += fmt::format("    {}\n", ds_tr.c_code);
                         }
@@ -596,6 +618,7 @@ bool FullFunctionEmitter::emit_function(
                             // Orphaned delay slot is inlined here (not an addr_to_raw
                             // entry), so charge its interlock directly, BEFORE its body
                             // (block mode already counts it in the owning block_cycles).
+                            emit_icache_fetch(ds_addr);
                             emit_insn_interlock(ds_raw);
                             out += fmt::format("    {}\n", ds_tr.c_code);
                         }
@@ -620,6 +643,7 @@ bool FullFunctionEmitter::emit_function(
                             // Orphaned delay slot is inlined here (not an addr_to_raw
                             // entry), so charge its interlock directly, BEFORE its body
                             // (block mode already counts it in the owning block_cycles).
+                            emit_icache_fetch(ds_addr);
                             emit_insn_interlock(ds_raw);
                             out += fmt::format("    {}\n", ds_tr.c_code);
                         }
@@ -661,6 +685,7 @@ bool FullFunctionEmitter::emit_function(
                             // Orphaned delay slot is inlined here (not an addr_to_raw
                             // entry), so charge its interlock directly, BEFORE its body
                             // (block mode already counts it in the owning block_cycles).
+                            emit_icache_fetch(ds_addr);
                             emit_insn_interlock(ds_raw);
                             out += fmt::format("    {}\n", ds_tr.c_code);
                         }
