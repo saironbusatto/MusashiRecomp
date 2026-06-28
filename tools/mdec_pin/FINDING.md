@@ -1,36 +1,30 @@
-# MDEC numeric pin — finding (2026-06-27)
+# MDEC pin — finding + RESOLUTION (2026-06-27)
 
-`mdec_pin.c` runs OUR mdec.c numeric pipeline (dequant/IDCT/YUV, verbatim from the
-WIP transcription) vs BEETLE's verbatim pipeline (mdec.cpp) on identical synthetic
-input, diffing each stage.
+## The bug (FOUND + FIXED)
+The faithful dequant/IDCT/YUV transcription was correct, but the **15bpp pack lost the
+uint8 truncation** Beetle's `RGB_to_RGB555(uint8 r,g,b)` performs implicitly:
 
-## Result: numeric core is BYTE-EXACT vs Beetle
-    [scale matrix]   diffs: 0
-    [dequant Coeff]  diffs: 0
-    [idct block]     diffs: 0
-    [yuv->rgb]       diffs: 0
-So the D1/D2/D4/D5 transcription (dequant <<4 + bias, two-pass IDCT (sum+0x4000)>>15
-+ Mask9ClampS8 + transposed >>3 matrix + Beetle ZigZag, YUV /256 + green mask) is a
-faithful match to the oracle IN ISOLATION.
+    int ru = r ^ 0x80;            // r = Mask9ClampS8 ∈ [-128,127], a SIGNED int
+    ... rgb_to_555_chan(ru) ...   // (c+4)>>3 on a possibly-NEGATIVE int → garbage
 
-## BUT the integrated change REGRESSES the live FMV
-Live Tomba 2 with the WIP change: the Whoopee Camp logo shows RAINBOW colour fringing.
-Baseline (old numeric core) renders it CLEAN PINK (matching Beetle). So the numeric-only
-change makes it worse on-screen even though the math is byte-exact.
+For negative `r`, `r ^ 0x80` is a negative int (e.g. r=-1 → -129), and the old
+`rgb_to_555_chan(int)` did `(c+4)>>3` on it without truncating to 0..255. Beetle passes
+the value through `uint8` params, truncating first. Result on real FMV: B saturated to
+31, R/G ~doubled → the rainbow fringing. The 24bpp path was unaffected (it already casts
+to `uint8_t`). FIX: `rgb_to_555_chan(uint8_t c)` (caller's `int` truncates on the call),
+matching Beetle. mdec.c:rgb_to_555_chan.
 
-## Root cause: layout pairing, not the math
-Adopting Beetle's ZigZag + transposed IDCT changes the block's internal spatial layout.
-The old numeric core and the old block-assembly (`append_color_macroblock` + the
-multi-block Cr/Cb/Y flow) were a MATCHED PAIR producing correct output. Swapping only the
-numeric core to Beetle's convention without transcribing the assembly breaks the pairing
-→ chroma misaligns vs luma → rainbow fringing.
+## Why both pins initially MISSED it (important)
+`mdec_pin.c` and `mdec_e2e.c`'s reference both computed the 555 channel on the same
+un-truncated `int` — i.e. the reference REPLICATED mdec.c's bug, so they agreed (0 diffs)
+while BOTH diverged from real Beetle. A standalone pin whose oracle is your own
+transcription cannot catch an error shared by both. The truth came from the
+**real Beetle process**: a `vram_peek` added to beetle_debug_server.c, diffing our VRAM
+vs Beetle's VRAM at the held FMV (the gold-standard oracle). That collapsed the channel
+deltas from mean (dR 12, dG 16, dB 27) to (0.7, 0.9, 1.3) and removed the rainbow.
 
-## Proper completion (do NOT merge until this passes)
-1. Transcribe Beetle's EncodeImage assembly (mdec.cpp:324-419) too — block→output pixel
-   mapping — so the assembly matches the new (Beetle) block layout.
-2. Build a FULL-PATH pin: drive the REAL mdec.c end-to-end via its DMA API (mdec_write /
-   mdec_dma_write_word / mdec_dma_read_word) on a synthetic full 6-block colour macroblock,
-   diff the packed output against a Beetle-faithful full pipeline (decode + EncodeImage).
-   The isolated pin here misses the integration; the full-path pin would have caught it.
-3. Only when the full-path packed output is byte-exact AND the live FMV renders clean →
-   merge.
+## Validation now
+- `mdec_e2e.c` full-path pin (with the corrected uint8 oracle): byte-exact.
+- Live VRAM vs real Beetle: rainbow gone, FMV renders natural colours; residual <1.3
+  mean (sub-LSB / Beetle's upscaled-VRAM representation + free-running frame mismatch).
+LESSON: validate against the REAL oracle process, not a self-transcribed reference.
