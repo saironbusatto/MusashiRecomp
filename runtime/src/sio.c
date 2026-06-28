@@ -48,6 +48,15 @@ static uint8_t pad_analog[2]    = { 0, 0 };
 static uint8_t pad_stick[2][4]  = { { 0x80, 0x80, 0x80, 0x80 },
                                     { 0x80, 0x80, 0x80, 0x80 } }; /* lx,ly,rx,ry */
 
+/* Analog-mode lock, per slot. A real DualShock's config command 0x44 0x..02/0x03
+ * locks/unlocks the mode (dualshock.cpp:714-725); a locked pad ignores the
+ * physical analog button (dualshock.cpp:203). We emulate the analog button via
+ * the host hybrid heuristic (pad_type_req), so when a game LOCKS the mode the
+ * hybrid auto-flip must not override it — else the type flips underneath a game
+ * that pinned DualShock, the exact desync the deferred-request machinery cannot
+ * otherwise prevent. */
+static uint8_t analog_mode_locked[2] = { 0, 0 };
+
 /* Which slots have devices connected */
 static uint8_t pad_connected = 0;
 
@@ -532,6 +541,7 @@ void sio_init(void) {
     pad_buttons[0] = pad_buttons[1] = 0xFFFF;
     pad_in_config[0] = pad_in_config[1] = 0;   /* clear stale config latch on reset */
     pad_type_req[0]  = pad_type_req[1]  = -1;  /* no pending host type change */
+    analog_mode_locked[0] = analog_mode_locked[1] = 0;  /* unlocked on reset */
     pad_connected = 0;
     mc_state = MC_IDLE;
     for (int i = 0; i < 2; i++) {
@@ -732,7 +742,10 @@ static void pad_process_byte(uint8_t tx_byte) {
      * mid-transaction. A request raised during config stays pending until exit. */
     if (pad_state == PAD_IDLE) {
         for (int s = 0; s < 2; s++) {
-            if (pad_type_req[s] >= 0 && !pad_in_config[s]) {
+            /* A game-LOCKED analog mode (0x44 ..03) ignores the physical analog
+             * button — and our hybrid auto-flip IS that button — so a locked slot
+             * drops the pending host request instead of applying it. */
+            if (pad_type_req[s] >= 0 && !pad_in_config[s] && !analog_mode_locked[s]) {
                 pad_analog[s] = (uint8_t)pad_type_req[s];
                 pad_type_req[s] = -1;
             }
@@ -787,15 +800,46 @@ static void pad_process_byte(uint8_t tx_byte) {
         } else if (ds && tx_byte == 0x43) {
             /* Enter/exit config mode. The ID byte reflects the CURRENT mode; the
              * enter(0x01)/exit(0x00) flag is the second data byte, latched in
-             * PAD_SEND_RESPONSE so it takes effect after this transaction.
-             * LEGACY (pre-98aa688): 0x43 always answered with the config ID 0xF3
-             * and did NOT track enter/exit state. */
-            pad_response[0] = g_pad_legacy_cfg ? 0xF3 : cur_id;
+             * PAD_SEND_RESPONSE so it takes effect after this transaction. */
+            const uint16_t btn = pad_buttons[selected_slot];
             pad_response[1] = 0x5A;
-            pad_response[2] = 0x00; pad_response[3] = 0x00;
-            pad_response[4] = 0x00; pad_response[5] = 0x00;
-            pad_response[6] = 0x00; pad_response[7] = 0x00;
-            pad_response_len = 8;
+            if (g_pad_legacy_cfg) {
+                /* LEGACY (pre-98aa688): always config ID 0xF3, zero frame, no
+                 * enter/exit tracking. */
+                pad_response[0] = 0xF3;
+                pad_response[2] = 0x00; pad_response[3] = 0x00;
+                pad_response[4] = 0x00; pad_response[5] = 0x00;
+                pad_response[6] = 0x00; pad_response[7] = 0x00;
+                pad_response_len = 8;
+            } else if (!pad_in_config[selected_slot]) {
+                /* ENTER attempt (normal mode): a real DualShock transmits the LIVE
+                 * poll frame here — identical framing to 0x42 (dualshock.cpp:471-490)
+                 * — and only latches config entry from the 0x01 data byte AFTERWARD.
+                 * The old all-zero frame fed any driver that reads the 0x43 frame as
+                 * input (most do; 0x43-with-data is a poll on the wire) a phantom
+                 * "all pressed"/centered-stick garbage — the hybrid phantom-input
+                 * mechanism (axis5_sio_controller.md D4). */
+                pad_response[0] = cur_id;
+                pad_response[2] = (uint8_t)(btn & 0xFF);
+                pad_response[3] = (uint8_t)(btn >> 8);
+                if (pad_analog[selected_slot]) {
+                    pad_response[4] = pad_stick[selected_slot][2]; /* right X */
+                    pad_response[5] = pad_stick[selected_slot][3]; /* right Y */
+                    pad_response[6] = pad_stick[selected_slot][0]; /* left X */
+                    pad_response[7] = pad_stick[selected_slot][1]; /* left Y */
+                    pad_response_len = 8;
+                } else {
+                    pad_response_len = 4;
+                }
+            } else {
+                /* EXIT attempt (in config): config-mode 0x43 returns the zero frame
+                 * (dualshock.cpp:660-674); cur_id is 0xF3 while in config. */
+                pad_response[0] = cur_id;
+                pad_response[2] = 0x00; pad_response[3] = 0x00;
+                pad_response[4] = 0x00; pad_response[5] = 0x00;
+                pad_response[6] = 0x00; pad_response[7] = 0x00;
+                pad_response_len = 8;
+            }
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;
@@ -816,6 +860,10 @@ static void pad_process_byte(uint8_t tx_byte) {
             else if (tx_byte == 0x47) r = r_47;
             else if (tx_byte == 0x4C) r = r_4c;
             memcpy(pad_response, r, 8);
+            /* 0x45 status byte must report the LIVE analog mode, not a fixed
+             * analog-on (dualshock.cpp:743) — see fix below for the modern path. */
+            if (tx_byte == 0x45)
+                pad_response[3] = pad_analog[selected_slot] ? 0x01 : 0x00;
             pad_response_len = 8;
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
@@ -838,6 +886,14 @@ static void pad_process_byte(uint8_t tx_byte) {
             else if (tx_byte == 0x47) r = r_47;
             else if (tx_byte == 0x4C) r = r_4c;
             memcpy(pad_response, r, 8);
+            /* 0x45 reports the analog-status byte: a driver polling 0x45 to learn
+             * the live mode must read the CURRENT analog state, not a hard-coded
+             * analog-on (dualshock.cpp:743 transmit_buffer[1]=analog_mode?1:0).
+             * Reporting "analog" while we present digital (or vice-versa) makes the
+             * driver mis-parse the poll frame length → off-by-frame garbage buttons
+             * (axis5_sio_controller.md D8). */
+            if (tx_byte == 0x45)
+                pad_response[3] = pad_analog[selected_slot] ? 0x01 : 0x00;
             pad_response_len = 8;
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
@@ -870,6 +926,13 @@ static void pad_process_byte(uint8_t tx_byte) {
         if (!g_pad_legacy_cfg && pad_current_cmd == 0x44 && pad_response_idx == 2) {
             pad_analog[selected_slot] = (tx_byte == 0x01) ? 1 : 0;
             pad_type_req[selected_slot] = -1;
+        }
+        /* 0x44 lock byte (data position 4, the byte after the mode byte): 0x03 =>
+         * lock analog mode, 0x02 => unlock (dualshock.cpp:714-725). A locked slot
+         * ignores the host hybrid auto-flip (see analog_mode_locked). */
+        if (!g_pad_legacy_cfg && pad_current_cmd == 0x44 && pad_response_idx == 3) {
+            if      (tx_byte == 0x03) analog_mode_locked[selected_slot] = 1;
+            else if (tx_byte == 0x02) analog_mode_locked[selected_slot] = 0;
         }
         if (pad_response_idx < pad_response_len) {
             sio_rx_data = pad_response[pad_response_idx++];
