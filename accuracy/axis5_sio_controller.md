@@ -245,6 +245,17 @@ every title — which is exactly what the LEGACY comment predicted, letting the
 
 ## 4. Prioritized fix list (player-visible impact first)
 
+> **STATUS 2026-06-27 (branch wt/tomba2-axis5-controller):** Fixes 1, 2, 3 IMPLEMENTED
+> in sio.c (0x43 live frame; 0x45 live analog byte; 0x44 analog-mode-lock + hybrid-flip
+> lock gate), transcribed from dualshock.cpp. Validated no-regression on Tomba 2
+> (digital pad, pad 0xFFFF at rest, boots). These are gated to the MODERN SM and leave
+> Tomba 1's legacy path untouched, so they're safe to ship; MMX6 (modern SM) gains the
+> phantom-dash fix. **Fix 4 (retire `g_pad_legacy_cfg`) is GATED on a behavioral
+> DualShock-game validation** (MMX6 phantom-dash gone / Tomba 1 benign hybrid on the
+> modern SM) — that needs a Tomba 1/MMX6 build against THIS framework worktree (a full
+> regen, since the runtime ABI now carries the cycle-axis CPUState fields), so it's a
+> separate validated pass, not a blind delete. Fixes 5/6 not yet done.
+
 1. **[P0] Make `0x43` transmit the live poll frame, not zeros** (D4 / §3a).
    In `pad_process_byte` `0x43` branch (`sio.c:787`), populate
    `pad_response[2..]` with the same button (+axis when analog) bytes as the
