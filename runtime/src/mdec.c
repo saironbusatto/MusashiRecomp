@@ -291,11 +291,13 @@ static uint8_t to_output_u8(int value) {
     return (uint8_t)(value + 128);
 }
 
-/* 8-bit unsigned channel → 5-bit, Beetle RGB_to_RGB555 rounding (mdec.cpp:306). */
-static int rgb_to_555_chan(int c) {
-    c = (c + 4) >> 3;
-    if (c > 0x1F) c = 0x1F;
-    return c;
+/* 8-bit unsigned channel → 5-bit, Beetle RGB_to_RGB555 rounding (mdec.cpp:306).
+ * Beetle's RGB_to_RGB555 takes uint8 params, so the ^0x80 result is truncated to
+ * 0..255 BEFORE the round/shift — `c` here is already that uint8. */
+static int rgb_to_555_chan(uint8_t c) {
+    int v = (c + 4) >> 3;
+    if (v > 0x1F) v = 0x1F;
+    return v;
 }
 
 static void append_rgb_pixel(int y, int cr, int cb) {
