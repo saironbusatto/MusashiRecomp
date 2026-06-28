@@ -38,7 +38,7 @@ REG.update({  # ABI names we use
     "$a0": 4, "$a1": 5, "$a2": 6, "$a3": 7,
     "$t0": 8, "$t1": 9, "$t2": 10, "$t3": 11,
     "$t4": 12, "$t5": 13, "$t6": 14, "$t7": 15,
-    "$s0": 16, "$s1": 17, "$ra": 31, "$sp": 29, "$gp": 28,
+    "$s0": 16, "$s1": 17, "$t8": 24, "$t9": 25, "$ra": 31, "$sp": 29, "$gp": 28,
 })
 
 def _r(x):
@@ -119,6 +119,7 @@ def build():
     a.label("entry")
     a.emit(li("$sp", STACK_TOP))
     a.emit(li("$t5", SCRATCH_RAM))     # load/store base
+    a.emit(li("$t8", 0x1F800000))      # MMIO base (scratchpad base; +0x1100 timer, +0x1C00 SPU)
     a.emit(li("$t2", 0x12345678))      # div/mult operand (dividend/multiplicand)
     a.emit(li("$t3", 0x0000007F))      # div/mult operand (divisor/multiplier, !=0)
     # store something at the scratch addr so loads read a known value
@@ -183,6 +184,15 @@ def build():
     # muldiv_ts_done). Divergence here would mean the muldiv stall must consume the
     # pending load give-back; native==Beetle means no divergence to fix.
     inner_loop("ld_div", [lw("$t4", 0, "$t5"), divu("$t2", "$t3"), mflo("$t7")])
+    # mmio_timer: one lw from Timer0 (0x1F801100). Isolates a device-region MMIO read
+    # wait: Beetle MemRW charges +1 for the timer/counter region, then ReadMemory adds
+    # the +2 completion -> component +3 (vs main-RAM load's region 3 -> +5). Timer reads
+    # are side-effect-free + value-independent, so the per-iter delta is deterministic.
+    inner_loop("mmio_timer", [lw("$t4", 0x1100, "$t8")])
+    # mmio_spu: one 32-bit lw from the SPU region (0x1F801C00, voice 0). The dramatic
+    # case: Beetle MemRW charges +36 for a 32-bit SPU read, + the +2 completion ->
+    # component +38. Pins the size-dependent SPU wait (the largest device wait modeled).
+    inner_loop("mmio_spu", [lw("$t4", 0x1C00, "$t8")])
 
     # icache_miss: force an I-cache miss every iteration via 4KB aliasing. The loop
     # top and a "victim" block 0x1000 bytes away map to the SAME direct-mapped line

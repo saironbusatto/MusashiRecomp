@@ -213,6 +213,26 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-06-27 (device-region MMIO read waits — DONE, branch wt/tomba2-mmio-waits off the
+  I-cache tip):** Replaced the placeholder `region = (phys<RAM_SIZE)?3:0` in psx_cyc_readmem
+  (memory.c) with the full Beetle MemRW device-region read-wait table (libretro.cpp:859-1131),
+  size-aware: main RAM (phys<0x800000) +3; SPU 0x1F801C00-1FFF +36 (32-bit) / +16 (8/16-bit);
+  CDC 0x1F801800-180F +6×size; GPU/MDEC/SysControl/FrontIO/SIO/IRQ/DMA/Timers (within
+  0x1F801000-113F) +1; BIOS ROM / Expansion-PIO / unmatched +0; scratchpad +0 (early-out).
+  Threaded the access size (1/2/4) from psx_cyc_load_word/half/byte + psx_cyc_lwc2_read into
+  psx_cyc_readmem (the SPU/CDC waits are width-dependent). The device wait combines with the
+  existing +2 completion (+1 LWC2) and fudge exactly as Beetle ReadMemory (LDAbsorb = region +
+  completion). RUNTIME-ONLY — psx_cyc_load_* signatures unchanged, so NO emitter regen; just
+  rebuild runtime/cyctest. New ruler #2 loops `mmio_timer` (Timer0 read → +3 = 1 dev + 2 compl)
+  and `mmio_spu` (32-bit SPU read → +38 = 36 + 2). VALIDATED: cyctest COMPILED (4600) == Beetle
+  (4382) EXACT on ALL 15 loops incl. mmio_timer +3 / mmio_spu +38; the 13 prior loops unchanged.
+  Tomba 2 boots past the BIOS to its "SCEA Presents" intro splash, total_checks advancing, no
+  freeze (the faster-MMIO change did not trigger a device-timing cascade like load=4 did).
+  RESIDUAL (documented, unmodeled dynamic axis): DMACycleSteal — Beetle adds the live DMA
+  bus-steal count to EVERY read (libretro.cpp:868); non-zero only during active DMA, needs the
+  steal count threaded out of the DMA controller, can't be isolated by a static ruler.
+  memory.c + gen_testrom.py.
+
 - **2026-06-27 (I-cache fetch — Stage 2 DONE: compiled-path emit + production default-on):**
   Both static emitters now charge the I-cache fetch cost at each cache-line LEADER, BEFORE
   the per-instruction interlock/load (Beetle ReadInstruction order, so a fetch miss clears

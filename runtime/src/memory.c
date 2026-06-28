@@ -883,15 +883,46 @@ uint8_t psx_read_byte(uint32_t addr) {
  * data-access cost is charged exactly once, here). Keyed on the runtime effective
  * physical address (KUSEG/KSEG0/KSEG1 alias the same DRAM).
  *
- * Region residual: only main-RAM (+3) and scratchpad (+0) region waits are modeled;
- * MMIO/BIOS-ROM device read waits (e.g. SPU +36) remain a separate unmodeled axis —
- * those loads still get the +2 completion (faithful) but region 0. */
+ * DMACycleSteal residual: Beetle adds the (dynamic) DMACycleSteal to EVERY read
+ * (libretro.cpp:868-869). That is non-zero only while a DMA channel is actively
+ * stealing the bus; modeling it needs the live steal count threaded out of the DMA
+ * controller, and it can't be isolated by a static ruler. It remains an unmodeled
+ * dynamic axis; the per-region device waits below are the static, validatable piece. */
 extern void psx_advance_cycles(uint32_t cycles);
+
+/* Beetle MemRW device-region READ wait (libretro.cpp:859-1131), the device-dependent
+ * part of a load's access cost (added to the timestamp before the +completion). `size`
+ * is the access width in bytes (1/2/4) — the SPU and CDC waits are width-dependent.
+ * Reads only; writes are posted (~free) in MemRW. phys is the masked physical address. */
+static inline uint32_t psx_mmio_read_wait(uint32_t phys, uint32_t size) {
+    /* Main RAM, mirrored across phys 0..0x7FFFFF (libretro.cpp:874 `A < 0x00800000`). */
+    if (phys < 0x00800000u) return 3u;
+    /* BIOS ROM (905) and Expansion 1 / PIO (1134): no extra device wait. */
+    if (phys >= 0x1FC00000u && phys <= 0x1FC7FFFFu) return 0u;
+    if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return 0u;
+    /* Hardware MMIO window 0x1F801000..0x1F802FFF (921). */
+    if (phys >= 0x1F801000u && phys <= 0x1F802FFFu) {
+        if (phys >= 0x1F801C00u && phys <= 0x1F801FFFu)            /* SPU (929) */
+            return (size == 4u) ? 36u : 16u;
+        if (phys >= 0x1F801800u && phys <= 0x1F80180Fu)            /* CDC (979) */
+            return 6u * size;
+        if (phys >= 0x1F801810u && phys <= 0x1F801817u) return 1u; /* GPU (994) */
+        if (phys >= 0x1F801820u && phys <= 0x1F801827u) return 1u; /* MDEC (1007) */
+        if (phys >= 0x1F801000u && phys <= 0x1F801023u) return 1u; /* SysControl (1020) */
+        if (phys >= 0x1F801040u && phys <= 0x1F80104Fu) return 1u; /* FrontIO/pad (1043) */
+        if (phys >= 0x1F801050u && phys <= 0x1F80105Fu) return 1u; /* SIO (1055) */
+        if (phys >= 0x1F801070u && phys <= 0x1F801077u) return 1u; /* IRQ (1094) */
+        if (phys >= 0x1F801080u && phys <= 0x1F8010FFu) return 1u; /* DMA (1106) */
+        if (phys >= 0x1F801100u && phys <= 0x1F80113Fu) return 1u; /* Timers (1119) */
+        return 0u;   /* unmatched MMIO: Beetle adds no device wait */
+    }
+    return 0u;       /* unknown / open-bus region */
+}
 
 /* Beetle ReadMemory data-access timing (cpu.cpp:369-448), after §1/deps/DO_LDS.
  * compl_cost = 2 (CPU load) / 1 (LWC2); arm_rt = GPR to arm as pending load, or
- * 0x20 = none (LWC2, dest is a GTE reg). */
-static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys,
+ * 0x20 = none (LWC2, dest is a GTE reg). size = access width in bytes (1/2/4). */
+static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
                                    uint32_t compl_cost, uint32_t arm_rt) {
     /* ReadMemory start (369-370): clear the current give-back slot. */
     cpu->read_absorb[cpu->read_absorb_which] = 0u;
@@ -904,8 +935,8 @@ static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys,
     }
     /* fudge (424): +2 iff the predecessor committed no load (read_fudge==0x20). */
     psx_advance_cycles((uint32_t)((cpu->read_fudge >> 4) & 2u));
-    uint32_t region = (phys < RAM_SIZE) ? 3u : 0u;   /* main RAM +3; others: separate axis */
-    uint32_t cost = region + compl_cost;             /* LDAbsorb = region + completion */
+    uint32_t region = psx_mmio_read_wait(phys, size);  /* device-region wait */
+    uint32_t cost = region + compl_cost;               /* LDAbsorb = region + completion */
     cpu->ld_absorb = cost;
     psx_advance_cycles(cost);
     cpu->ld_which_t = (uint8_t)arm_rt;
@@ -913,37 +944,38 @@ static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys,
 
 /* The interlock half of a load (§1+deps+(cancel)+DO_LDS+ReadMemory). Gated on
  * PSX_ENABLE_BLOCK_CYCLES so the Beetle-oracle build (cycles off) does a plain read. */
-static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr,
+static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr, uint32_t size,
                                        uint32_t rt, uint32_t reg_mask) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
     psx_cyc_base(cpu);
     psx_cyc_deps(cpu, reg_mask);
     if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;   /* cancel pending load to same dest */
     psx_cyc_lds(cpu);
-    psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, 2u, rt);
+    psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, size, 2u, rt);
 #else
-    (void)cpu; (void)addr; (void)rt; (void)reg_mask;
+    (void)cpu; (void)addr; (void)size; (void)rt; (void)reg_mask;
 #endif
 }
 
 uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
-    psx_cyc_load_timing(cpu, addr, rt, reg_mask);
+    psx_cyc_load_timing(cpu, addr, 4u, rt, reg_mask);
     return psx_read_word(addr);
 }
 uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
-    psx_cyc_load_timing(cpu, addr, rt, reg_mask);
+    psx_cyc_load_timing(cpu, addr, 2u, rt, reg_mask);
     return psx_read_half(addr);
 }
 uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
-    psx_cyc_load_timing(cpu, addr, rt, reg_mask);
+    psx_cyc_load_timing(cpu, addr, 1u, rt, reg_mask);
     return psx_read_byte(addr);
 }
 
 /* LWC2 (GTE load): §1/DO_LDS done by psx_cyc_step(cpu,0); the GTE deadline stall by
- * psx_gte_stall — both emitted before this call. Completion +1, no LDWhich arm. */
+ * psx_gte_stall — both emitted before this call. 32-bit access, completion +1, no
+ * LDWhich arm. */
 uint32_t psx_cyc_lwc2_read(CPUState* cpu, uint32_t addr) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
-    psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, 1u, 0x20u);
+    psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, 4u, 1u, 0x20u);
 #else
     (void)cpu;
 #endif
