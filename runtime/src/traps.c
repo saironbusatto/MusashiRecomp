@@ -13,10 +13,34 @@
 #include <string.h>
 #include <setjmp.h>
 #include "psx_fiber.h"   /* cross-platform fibers (Win32 fibers / POSIX ucontext) */
+#include "psx_scheduler.h" /* deterministic TCB scheduler carve-out (scaffolding) */
 
 /* Forward declarations from interrupts.c */
 int psx_get_in_exception(void);
 void psx_exception_longjmp(void);
+
+/* ── Deterministic TCB scheduler — SCAFFOLDING (plan steps 1-2, INERT) ───────
+ * These definitions back psx_scheduler.h. They are NOT yet wired into the live
+ * thread-switch path: psx_change_thread_fiber (the host-fiber bridge) below is
+ * still authoritative. Later steps add the outer scheduler loop, route
+ * ChangeThread / ReturnFromException through structured escapes (longjmp to
+ * g_scheduler_jmpbuf with a psx_run_reason_t), and remove the cpu->pc=0
+ * host-control signalling + per-frame fiber recreation. Exported (external
+ * linkage) so the inert symbols don't trip unused-symbol checks. */
+jmp_buf            g_scheduler_jmpbuf;
+psx_sched_escape_t g_sched_escape;
+
+int psx_is_dispatchable(uint32_t pc)
+{
+    /* Fail closed on the known-bad resume PCs that the old pc=0 sentinel +
+     * sentinel-EPC pathologies produced. A nonzero, non-sentinel PC is treated
+     * as potentially dispatchable for now; a later step tightens this to "is a
+     * registered function entry / re-enterable block leader" via the dispatch
+     * tables (psx_game_is_function_entry + the BIOS dispatch table). */
+    if (pc == 0u) return 0;
+    if (pc == PSX_EXC_SENTINEL_PC) return 0;
+    return 1;
+}
 
 /* Dispatch call contract state (see cpu_state.h for the model). */
 int      g_psx_call_bail      = 0;
