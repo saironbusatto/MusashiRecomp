@@ -2605,6 +2605,55 @@ static void handle_dirty_insn_dump_file(int id, const char *json)
  * argument-passing chains, and answer "who called X with what args"
  * across processes (psx-runtime port 4370, psx-beetle port 4380). */
 #include "fntrace.h"
+#include "parity_trace.h"
+
+/* ---- parity_dump / parity_ctl: general two-process control-flow parity ring.
+ * Mirrors the IDENTICAL command on psx-beetle so tools/parity_diff.py can pull
+ * both timelines and align by logical sequence (PRINCIPLES.md first-divergence). */
+static void handle_parity_dump(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 8192);
+    if (count < 1) count = 1;
+    if (count > 16384) count = 16384;
+    ParityEntry *e = (ParityEntry *)malloc(sizeof(ParityEntry) * (size_t)count);
+    if (!e) { send_err(id, "oom"); return; }
+    uint32_t got = parity_trace_get(e, (uint32_t)count);
+    const size_t BUF_SZ = 12 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) { free(e); send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+        "{\"id\":%d,\"ok\":true,\"total\":%llu,\"armed\":%d,\"frozen\":%d,\"count\":%u,\"entries\":[",
+        id, (unsigned long long)parity_trace_total(), parity_trace_is_armed(),
+        parity_trace_is_frozen(), got);
+    for (uint32_t i = 0; i < got; i++) {
+        if (pos > BUF_SZ - 1024) break;
+        ParityEntry *r = &e[i];
+        pos += snprintf(out + pos, BUF_SZ - pos,
+            "%s{\"seq\":%llu,\"frame\":%u,\"kind\":\"%s\",\"cur_tcb\":\"0x%08X\","
+            "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"sp\":\"0x%08X\",\"epc\":\"0x%08X\","
+            "\"state\":\"0x%08X\",\"target\":\"0x%08X\","
+            "\"w\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"]}",
+            i ? "," : "", (unsigned long long)r->seq, r->frame, parity_kind_str(r->kind),
+            r->current_tcb, r->pc, r->ra, r->sp, r->epc, r->tcb_state, r->target,
+            r->watch[0], r->watch[1], r->watch[2], r->watch[3], r->watch[4], r->watch[5]);
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
+    debug_server_send_line(out); free(out); free(e);
+}
+
+static void handle_parity_ctl(int id, const char *json)
+{
+    if (json_get_int(json, "reset", 0)) parity_trace_reset();
+    long armv = json_get_int(json, "arm", -1);
+    if (armv == 0 || armv == 1) parity_trace_arm((int)armv);
+    char buf[160];
+    snprintf(buf, sizeof buf,
+        "{\"id\":%d,\"ok\":true,\"armed\":%d,\"frozen\":%d,\"total\":%llu}\n",
+        id, parity_trace_is_armed(), parity_trace_is_frozen(),
+        (unsigned long long)parity_trace_total());
+    debug_server_send_line(buf);
+}
 
 static void handle_fntrace_arm(int id, const char *json)
 {
@@ -10251,6 +10300,8 @@ static void handle_vk_perf(int id, const char *json)
 
 static const CmdEntry s_commands[] = {
     { "ping",              handle_ping },
+    { "parity_dump",       handle_parity_dump },
+    { "parity_ctl",        handle_parity_ctl },
     { "latency",           handle_latency },
     { "vk_perf",           handle_vk_perf },
     { "game_options",      handle_game_options },

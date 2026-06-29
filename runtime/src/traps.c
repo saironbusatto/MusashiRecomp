@@ -14,6 +14,12 @@
 #include <setjmp.h>
 #include "psx_fiber.h"   /* cross-platform fibers (Win32 fibers / POSIX ucontext) */
 #include "psx_scheduler.h" /* deterministic TCB scheduler carve-out (scaffolding) */
+#include "parity_trace.h"  /* general two-process control-flow parity ring */
+
+/* RAM reader adapter for the parity trace (cpu->read_word takes only addr). */
+static uint32_t traps_parity_rw(void* ctx, uint32_t addr) {
+    return ((CPUState*)ctx)->read_word(addr);
+}
 
 /* Forward declarations from interrupts.c */
 int psx_get_in_exception(void);
@@ -623,6 +629,9 @@ static int psx_request_thread_switch(CPUState* cpu, uint32_t target_tcb)
     g_sched_escape.reason     = PSX_RUN_YIELD_TO_TCB;
     sched_escape_ring_log(cpu, PSX_RUN_YIELD_TO_TCB, current_tcb, target_tcb, 0);
     debug_server_log_thread_event(8, cpu, current_tcb, target_tcb, 0);
+    if (parity_trace_is_armed())
+        parity_trace_record(PARITY_KIND_YIELD, cpu->pc, cpu->gpr[31],
+                            cpu->gpr[29], target_tcb, traps_parity_rw, cpu);
     longjmp(g_scheduler_jmpbuf, 1); /* unwind to psx_scheduler_run; never returns */
     return 1;                        /* unreachable */
 }

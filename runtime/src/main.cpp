@@ -7,6 +7,7 @@
 
 #include "cpu_state.h"
 #include "psx_scheduler.h"   /* psx_scheduler_run — deterministic TCB scheduler */
+#include "parity_trace.h"    /* general two-process control-flow parity ring */
 #include "psx_interpreter.h"
 #include "cdrom.h"
 #include "fntrace.h"
@@ -2789,6 +2790,44 @@ int main(int argc, char** argv) {
                  psx_hle_scheduler_enabled() ? "HLE (deterministic TCB)"
                                              : "LLE (host fibers)");
     std::fflush(stdout);
+
+    /* General control-flow parity trace (parity_trace.h). Armed from boot via
+     * PSX_PARITY_TRACE=1 so the pre-divergence window is always covered (never
+     * arm-then-time). Watched TCB / freeze trigger / watch words are env-tunable;
+     * defaults target the MMX6 cutscene→gameplay wedge (thread1 0xA000E35C,
+     * trigger dispatch 0x800CD3F8, watch the handshake flag + state struct). */
+    if (const char* pt = std::getenv("PSX_PARITY_TRACE"); pt && pt[0] && pt[0] != '0') {
+        auto envhex = [](const char* k, uint32_t dflt) -> uint32_t {
+            const char* v = std::getenv(k);
+            return (v && v[0]) ? (uint32_t)std::strtoul(v, nullptr, 0) : dflt;
+        };
+        uint32_t tcb     = envhex("PSX_PARITY_TCB",     0xA000E35Cu);
+        uint32_t trigger = envhex("PSX_PARITY_TRIGGER", 0x800CD3F8u);
+        uint32_t watch[PARITY_WATCH_MAX] = {
+            0x801FEB78u, /* thread1 stack saved-ra slot */
+            0x8006D9ACu, /* handshake flag (setter target) */
+            0x800CD3F8u, /* cutscene state struct: outer/sub */
+            0x800CD3FCu, /* countdown */
+            0x800CD404u, /* done flag region */
+            0x800200F4u, /* func_8002000C resume point */
+        };
+        int wc = PARITY_WATCH_MAX;
+        if (const char* wl = std::getenv("PSX_PARITY_WATCH"); wl && wl[0]) {
+            wc = 0; std::string s(wl); size_t p = 0;
+            while (p < s.size() && wc < PARITY_WATCH_MAX) {
+                size_t c = s.find(',', p);
+                std::string tok = s.substr(p, c == std::string::npos ? c : c - p);
+                if (!tok.empty()) watch[wc++] = (uint32_t)std::strtoul(tok.c_str(), nullptr, 0);
+                if (c == std::string::npos) break; p = c + 1;
+            }
+        }
+        parity_trace_config(tcb, trigger, 0x88u, 0x00u, watch, wc);
+        parity_trace_arm(1);
+        std::fprintf(stdout, "psxrecomp: parity trace ARMED tcb=0x%08X trigger=0x%08X (%d watch)\n",
+                     tcb, trigger, wc);
+        std::fflush(stdout);
+    }
+
     psx_scheduler_run(&cpu);
 #endif
 

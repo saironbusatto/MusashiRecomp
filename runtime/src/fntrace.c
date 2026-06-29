@@ -1,8 +1,17 @@
 /* fntrace.c — runtime side of psx_dispatch call ring. See fntrace.h. */
 
 #include "fntrace.h"
+#include "parity_trace.h"   /* general control-flow parity ring (native producer) */
 #include <string.h>
 #include <stdlib.h>
+
+/* RAM reader adapter for the parity trace (cpu->read_word takes only addr). */
+static uint32_t parity_rw_cb(void* ctx, uint32_t addr) {
+    return ((CPUState*)ctx)->read_word(addr);
+}
+
+/* Frame-source accessor for parity_trace.c (decoupled from s_frame_count type). */
+uint32_t parity_host_frame(void) { extern uint64_t s_frame_count; return (uint32_t)s_frame_count; }
 
 FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
 uint64_t     g_fntrace_seq = 0;
@@ -46,6 +55,14 @@ static inline int armed_match(uint32_t target) {
 }
 
 void fntrace_record(CPUState* cpu, uint32_t target) {
+    /* General parity ring: one DISPATCH row per leader while current_tcb matches
+     * the watched thread. Gated by the cheap armed flag so disarmed runs pay only
+     * a single branch on this hot path. pc==target (the leader being entered). */
+    if (parity_trace_is_armed()) {
+        parity_trace_record(PARITY_KIND_DISPATCH, target, cpu->gpr[31],
+                            cpu->gpr[29], target, parity_rw_cb, cpu);
+    }
+
     /* Dispatch-level bail-source capture (Tomba 2 wild-return spin, runtime-only,
      * no BIOS regen). The generated psx_dispatch_impl calls us at the top of each
      * dispatch iteration. When a previous iteration bail-FLATTENED a compiled
