@@ -93,6 +93,28 @@ void     cd_dma_log_get_entry(uint32_t idx, int *lba, uint32_t *dest, uint32_t *
 #define DMA_MDEC_OUT_CYCLES_PER_WORD 14u
 #define DMA_GPU_CYCLES_PER_WORD       1u
 #define DMA_CDROM_CYCLES_PER_WORD     1u
+/* SPU DMA (ch4) per-word cost. Faithful to the Beetle/mednafen oracle, which
+ * charges `extra_cyc_overhead = 47` per word plus the universal 1 cyc/word in
+ * RunChannel (mednafen/psx/dma.cpp:267,294,456) => 48 cyc/word. Previously ch4
+ * completed in ZERO cycles (instant complete_transfer), so the DMA-completion
+ * IRQ fired the same cycle as the kick. Once the I-cache cycle model lands, the
+ * BIOS SPU-init loop's instruction timing interleaves with that instant IRQ into
+ * an exception re-entry storm (MMX6 boot wedge: kick ch4 -> 0-cyc done -> IRQ ->
+ * ack -> re-kick, forever). Deferring completion the faithful ~48 cyc/word breaks
+ * the storm and matches hardware (the SPU RAM payload still moves immediately;
+ * only the busy-bit clear + completion IRQ are deferred). */
+#define DMA_SPU_CYCLES_PER_WORD      48u
+
+/* DMA-execution provenance flags (read by memory.c's psx_write_word d44_note probe
+ * for the MMX6 VSync-callback-pointer corruption hunt). g_dma_exec_depth>0 means a
+ * DMA is currently moving data through psx_write_word, so a RAM write seen there is
+ * DMA-sourced (not a CPU/dirty-interp store, whose g_debug_last_store_pc is accurate).
+ * cur_ch/cur_madr/cur_bcr name the in-flight channel + its destination, so a wrong
+ * DMA destination clobbering kernel data becomes directly visible. */
+int      g_dma_exec_depth = 0;
+int      g_dma_cur_ch     = -1;
+uint32_t g_dma_cur_madr   = 0;
+uint32_t g_dma_cur_bcr    = 0;
 
 typedef struct {
     uint8_t active;
@@ -688,7 +710,11 @@ static void execute_ch3_cdrom(void) {
     start_async_cdrom_transfer();
 }
 
-static void execute_ch4_spu(void) {
+/* Returns the number of words moved so the caller can schedule a faithful
+ * delayed completion (DMA_SPU_CYCLES_PER_WORD). The payload moves immediately
+ * (SPU RAM is correct the instant this returns); only the busy-bit clear and
+ * completion IRQ are deferred by schedule_delayed_complete. */
+static uint32_t execute_ch4_spu(void) {
     uint32_t chcr = channels[4].chcr;
     uint32_t direction = chcr & 1;           /* 1=from RAM to SPU, 0=SPU to RAM */
     uint32_t step = (chcr >> 1) & 1;
@@ -709,7 +735,7 @@ static void execute_ch4_spu(void) {
     }
 
     channels[4].madr = addr;
-    complete_transfer(4);
+    return total_words;
 }
 
 static void execute_ch6_otc(void) {
@@ -752,6 +778,8 @@ static void try_execute(int ch) {
     /* After the kick is in the rings, refuse corrupt-length transfers. */
     validate_transfer_length(ch);
 
+    g_dma_exec_depth++;
+    g_dma_cur_ch = ch; g_dma_cur_madr = channels[ch].madr; g_dma_cur_bcr = channels[ch].bcr;
     switch (ch) {
         case 0:
             start_async_mdec_transfer(0);
@@ -767,7 +795,8 @@ static void try_execute(int ch) {
             execute_ch3_cdrom();
             break;
         case 4:
-            execute_ch4_spu();
+            schedule_delayed_complete(4, execute_ch4_spu(),
+                                      DMA_SPU_CYCLES_PER_WORD);
             break;
         case 6:
             execute_ch6_otc();
@@ -781,6 +810,8 @@ static void try_execute(int ch) {
             psx_fatal_halt(reason);
         }
     }
+    g_dma_exec_depth--;
+    g_dma_cur_ch = -1;
 }
 
 /* ---- Public interface ---- */
@@ -821,6 +852,7 @@ uint32_t dma_cycles_to_irq(uint32_t i_mask) {
 
 void dma_advance(uint32_t cycles) {
     if (cycles == 0) return;
+    g_dma_exec_depth++;   /* async to-RAM DMA writes below run through psx_write_word */
     advance_mdec_channel(0, cycles);
     advance_mdec_channel(1, cycles);
     DMAAsyncChannel *a = &cdrom_async;
@@ -843,8 +875,10 @@ void dma_advance(uint32_t cycles) {
             uint32_t words_budget = a->cycles_accum / DMA_CDROM_CYCLES_PER_WORD;
             uint32_t addr = channels[3].madr & 0x1FFFFCu;
             uint32_t moved = 0;
+            g_dma_cur_ch = 3; g_dma_cur_bcr = channels[3].bcr;
             while (a->remaining_words > 0 && words_budget > 0 && cdrom_dma_ready()) {
                 uint32_t word = cdrom_dma_read();
+                g_dma_cur_madr = addr;
                 psx_write_word(addr, word);
                 record_cdrom_dma_word(word);
                 dirty_ram_mark_executable_range(addr, 4);
@@ -863,7 +897,12 @@ void dma_advance(uint32_t cycles) {
             }
         }
     }
-    advance_delayed_complete(2, cycles);
+    /* Drive every delayed-complete channel (ch2 GPU + ch4 SPU today; any future
+     * delayed channel is covered automatically — inactive slots no-op). */
+    for (int ch = 0; ch < 7; ch++)
+        advance_delayed_complete(ch, cycles);
+    g_dma_cur_ch = -1;
+    g_dma_exec_depth--;
 }
 
 void dma_init(void) {

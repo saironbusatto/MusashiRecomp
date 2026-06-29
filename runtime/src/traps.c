@@ -5,6 +5,7 @@
  */
 
 #include "cpu_state.h"
+#include "psx_runtime.h"   /* fix B: psx_exc_escape_reason_t + g_exc_escape_reason */
 #include "debug_server.h"
 #include "crash_trace.h"
 #include <stdio.h>
@@ -146,6 +147,22 @@ static int psx_is_valid_tcb(CPUState* cpu, uint32_t tcb)
     return offset < size && (offset % 0xC0u) == 0;
 }
 
+/* ChatGPT-conferred 2026-06-29 "slice-exit provenance": records WHY cpu->pc became 0
+ * when a thread fiber's psx_dispatch returns (fiber_dispatch_exit). Distinguishes a
+ * legitimate GUEST return (the guest's own jr/function-return left pc=0 — normal
+ * per-frame recreate, fiber theory dead) from a HOST artifact (fiber-switch resume,
+ * dispatch miss, etc.). Reset to GUEST_RETURN before each psx_dispatch slice; the
+ * artifact sites override it. Logged as the value of the kind-13/26 fiber_dispatch_exit
+ * thread event (was cpu->pc, which is always 0 there and uninformative). */
+enum {
+    PSX_PC0_GUEST_RETURN = 0,   /* default: guest jr/function-return set pc=0 */
+    PSX_PC0_CHANGE_SELF  = 1,   /* psx_change_thread_fiber current==target */
+    PSX_PC0_FIBER_SWITCH = 2,   /* psx_change_thread_fiber after psx_fiber_switch resume */
+    PSX_PC0_CRIT_SECTION = 3,   /* EnterCriticalSection/ExitCriticalSection */
+    PSX_PC0_DISPATCH_MISS = 4,  /* psx_unknown_dispatch couldn't resolve a target */
+};
+uint32_t g_pc0_reason = PSX_PC0_GUEST_RETURN;
+
 static uint32_t psx_current_tcb_ptr(CPUState* cpu)
 {
     uint32_t tcbh = cpu->read_word(0x00000108u);
@@ -200,8 +217,26 @@ static void thread_ctx_ring_log(CPUState* cpu, uint32_t tcb,
     g_thread_ctx_ring_seq++;
 }
 
+/* Fail-closed: the host exception sentinel must NEVER be persisted into a TCB as a
+ * thread's resume PC, nor read back out of one. Fix B made the interrupted resume PC
+ * the REAL guest PC; if a sentinel ever lands in a TCB EPC slot again it means the
+ * legacy boundary-fallback (interrupts.c) leaked into a SAVED (cross-thread) context,
+ * which would silently mis-resume that thread through stale host escape state. Halt
+ * loudly instead of resuming wrong. Never returns on a hit. */
+static void psx_assert_no_sentinel_pc(const char* where, uint32_t tcb, uint32_t pc)
+{
+    if (pc == PSX_EXC_SENTINEL_PC) {
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "fatal: exception sentinel 0x%08X persisted in TCB 0x%08X resume PC (%s)",
+                 (unsigned)pc, (unsigned)tcb, where);
+        trap_crash(buf);
+    }
+}
+
 static void psx_save_context_to_tcb(CPUState* cpu, uint32_t tcb, uint32_t resume_pc)
 {
+    psx_assert_no_sentinel_pc("save_context_to_tcb", tcb, resume_pc);
     uint32_t save = tcb + 8u;
     uint32_t sr = cpu->cop0[12];
     for (int i = 1; i < 32; i++) {
@@ -232,6 +267,7 @@ static uint32_t psx_restore_context_from_tcb(CPUState* cpu, uint32_t tcb)
     }
     cpu->cop0[13] = cpu->read_word(save + 144u);
     cpu->gpr[26] = cpu->read_word(save + 128u);
+    psx_assert_no_sentinel_pc("restore_context_from_tcb", tcb, cpu->gpr[26]);
     thread_ctx_ring_log(cpu, tcb, cpu->gpr[26], 1);
     debug_server_log_thread_event(2, cpu, psx_current_tcb_ptr(cpu), tcb, cpu->gpr[26]);
     return cpu->gpr[26];
@@ -315,6 +351,8 @@ static void psx_thread_fiber_entry(void* param)
     debug_server_log_thread_event(10, cpu, psx_current_tcb_ptr(cpu), slot->tcb, 0);
     psx_set_current_tcb(cpu, slot->tcb);
     uint32_t target_pc = psx_restore_context_from_tcb(cpu, slot->tcb);
+    psx_assert_no_sentinel_pc("thread_fiber_entry dispatch", slot->tcb, target_pc);
+    g_pc0_reason = PSX_PC0_GUEST_RETURN; /* default; artifact sites override during dispatch */
     if (target_pc != 0) {
         psx_dispatch(cpu, target_pc);
     }
@@ -327,8 +365,9 @@ static void psx_thread_fiber_entry(void* param)
      * garbage ra): if the worker thread's dispatch returns with cpu->pc==0 / a
      * surfaced transfer rather than a verified thread-close, closing the fiber here
      * is wrong. */
+    /* value = g_pc0_reason (slice-exit provenance) instead of cpu->pc (always 0 here). */
     debug_server_log_thread_event(psx_get_in_exception() ? 26u : 13u, cpu,
-                                  psx_current_tcb_ptr(cpu), slot->tcb, cpu->pc);
+                                  psx_current_tcb_ptr(cpu), slot->tcb, g_pc0_reason);
     debug_server_log_thread_event(11, cpu, psx_current_tcb_ptr(cpu), slot->tcb, target_pc);
     slot->closed = 1;
     /* Guest BIOS code owns the TCB state. A host fiber can finish because a
@@ -400,6 +439,7 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     }
     if (current_tcb == target_tcb) {
         debug_server_log_thread_event(5, cpu, current_tcb, target_tcb, cpu->gpr[31]);
+        g_pc0_reason = PSX_PC0_CHANGE_SELF;
         cpu->pc = 0;
         return 1;
     }
@@ -454,6 +494,7 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     }
 
     debug_server_log_thread_event(9, cpu, target_tcb, current_tcb, 0);
+    g_pc0_reason = PSX_PC0_FIBER_SWITCH;
     cpu->pc = 0;
     return 1;
 }
@@ -490,6 +531,7 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
         case 1: /* EnterCriticalSection: disable interrupts */
             cpu->cop0[12] = sr & ~1u; /* clear IEc (bit 0) */
             cpu->gpr[2] = sr & 1u; /* return old IEc */
+            g_pc0_reason = PSX_PC0_CRIT_SECTION;
             cpu->pc = 0;
             /* Directly handled "void" syscall. Return 0: under CPS the caller
              * (`if (psx_syscall(...)) return;`) falls through to the inline
@@ -501,6 +543,7 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
         case 2: /* ExitCriticalSection: enable interrupts */
             cpu->cop0[12] = sr | 0x0401u; /* set IEc (bit 0) + IM[2] (bit 10) */
             cpu->gpr[2] = 0;
+            g_pc0_reason = PSX_PC0_CRIT_SECTION;
             cpu->pc = 0;
             return 0;
 
@@ -545,6 +588,13 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
                     cpu->cop0[12] = (saved_sr & 0xFFFFFFC0u) | ((saved_sr >> 2) & 0x0Fu);
                     cpu->pc = saved_epc;
                     if (psx_get_in_exception()) {
+                        /* Fix B: saved_epc is the REAL guest EPC restored from the TCB
+                         * (never the sentinel). Mark the escape reason so the landing in
+                         * psx_check_interrupts does NOT clobber the resumed thread's
+                         * TCB-restored GPRs with the entering thread's saved_gpr. */
+                        extern int g_exc_escape_reason; extern int g_rfe_escape_pending;
+                        g_exc_escape_reason  = PSX_EXC_ESCAPE_SYSCALL_RETURN;
+                        g_rfe_escape_pending = 0;
                         psx_exception_longjmp(); /* unwind handler */
                     }
                     return 1;
@@ -635,6 +685,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
      * Silently absorb — this can happen when a corrupt function pointer
      * or uninitialized callback slot is dispatched. */
     if (addr == 0) {
+        g_pc0_reason = PSX_PC0_DISPATCH_MISS; /* guest jumped/returned to a null (0) target */
         cpu->pc = 0;
         return;
     }
@@ -887,6 +938,7 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
         }
 
         /* Return without executing — function is a no-op. */
+        g_pc0_reason = PSX_PC0_DISPATCH_MISS;
         cpu->pc = 0;
     }
 }

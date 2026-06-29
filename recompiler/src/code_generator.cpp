@@ -870,10 +870,11 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         if (opcode == 0x29) {  // sh
             uint32_t rs = get_rs(instr), rt = get_rt(instr);
             int16_t offset = get_imm16(instr);
+            std::string store_pc = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr);
             if (offset == 0)
-                return fmt::format("cpu->write_half({}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
+                return store_pc + fmt::format("cpu->write_half({}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
                                    reg_name(rs), reg_name(rt), comment);
-            return fmt::format("cpu->write_half({} + {}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
+            return store_pc + fmt::format("cpu->write_half({} + {}, (uint16_t)psx_ws_backdrop_x((int16_t){}));{}",
                                reg_name(rs), offset, reg_name(rt), comment);
         } else if (!config_.overlay_mode) {
             fmt::print(stderr, "ERROR: [widescreen.backdrop] x site 0x{:08X} is not "
@@ -994,11 +995,12 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
         std::string aexpr = (offset != 0)
             ? fmt::format("({} + {})", reg_name(rs), offset)
             : std::string(reg_name(rs));
+        std::string store_pc = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr);
         if (opcode == 0x28)  // sb
-            return fmt::format("cpu->write_byte({0}, (uint8_t)psx_game_option_store({0}, (int){1}));{2}",
+            return store_pc + fmt::format("cpu->write_byte({0}, (uint8_t)psx_game_option_store({0}, (int){1}));{2}",
                                aexpr, reg_name(rt), comment);
         if (opcode == 0x29)  // sh
-            return fmt::format("cpu->write_half({0}, (uint16_t)psx_game_option_store({0}, (int){1}));{2}",
+            return store_pc + fmt::format("cpu->write_half({0}, (uint16_t)psx_game_option_store({0}, (int){1}));{2}",
                                aexpr, reg_name(rt), comment);
         fmt::print(stderr, "ERROR: [persist_options] init site 0x{:08X} is not sb/sh "
                    "(opcode 0x{:02X})\n", addr, opcode);
@@ -1085,9 +1087,12 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     } else if (cop_op == 0x04) { // MTC0 - move to COP0
                         code = fmt::format("cpu->cop0[{}] = {};  /* mtc0 */", rd, reg_name(rt));
                     } else if (cop_op == 0x10 && (instr & 0x3F) == 0x10) { // RFE
-                        // Restore interrupt enable bits: shift bits 5:2 → 3:0
+                        // Restore interrupt enable bits: shift bits 5:2 → 3:0.
+                        // Fix B: arm the host exception-return escape if this RFE runs
+                        // inside the synchronous exception handler (see psx_runtime.h).
                         code = "{ uint32_t sr = cpu->cop0[12]; "
-                               "cpu->cop0[12] = (sr & 0xFFFFFFF0u) | ((sr >> 2) & 0x0Fu); }  /* rfe */";
+                               "cpu->cop0[12] = (sr & 0xFFFFFFF0u) | ((sr >> 2) & 0x0Fu); } "
+                               "psx_rfe_mark_escape();  /* rfe */";
                     } else {
                         code = fmt::format("/* cop0: 0x{:08X} */", instr);
                     }
@@ -1141,11 +1146,16 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
             case 0x24: code = translate_lbu(instr); break;    // lbu
             case 0x25: code = translate_lhu(instr); break;    // lhu
             case 0x26: code = translate_lwr(instr); break;    // lwr
-            case 0x28: code = translate_sb(instr); break;     // sb
-            case 0x29: code = translate_sh(instr); break;     // sh
-            case 0x2A: code = translate_swl(instr); break;    // swl
-            case 0x2B: code = translate_sw(instr); break;     // sw
-            case 0x2E: code = translate_swr(instr); break;    // swr
+            // Stores: stamp the EXACT executing store PC before the write so
+            // wtrace/readtrace producer attribution is correct for game code.
+            // (The BIOS emitter does the same in strict_translator.cpp; the game
+            // emitter previously left g_debug_last_store_pc holding a STALE pc —
+            // the last BIOS store — which mis-attributed game writes to BIOS.)
+            case 0x28: code = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr) + translate_sb(instr); break;     // sb
+            case 0x29: code = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr) + translate_sh(instr); break;     // sh
+            case 0x2A: code = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr) + translate_swl(instr); break;    // swl
+            case 0x2B: code = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr) + translate_sw(instr); break;     // sw
+            case 0x2E: code = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr) + translate_swr(instr); break;    // swr
             case 0x2F:                                         // CACHE - cache op (no-op for static recomp)
                 code = "/* cache (no-op: static recompilation has no I/D cache) */";
                 break;
@@ -1185,11 +1195,12 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                     std::string value = ((rt >= 8 && rt <= 11) || rt == 15 || rt == 28 || rt == 29 || rt == 31)
                         ? fmt::format("gte_read_data(cpu, {})", rt)
                         : fmt::format("cpu->gte_data[{}]", rt);
+                    std::string swc2_store_pc = fmt::format("g_debug_last_store_pc = 0x{:08X}u; ", addr);
                     if (offset == 0) {
-                        code = gte_stall + fmt::format("cpu->write_word({}, {});  /* swc2 gte[{}], ({}) */",
+                        code = gte_stall + swc2_store_pc + fmt::format("cpu->write_word({}, {});  /* swc2 gte[{}], ({}) */",
                                           reg_name(rs), value, rt, reg_name(rs));
                     } else {
-                        code = gte_stall + fmt::format("cpu->write_word({} + {}, {});  /* swc2 gte[{}], {}({}) */",
+                        code = gte_stall + swc2_store_pc + fmt::format("cpu->write_word({} + {}, {});  /* swc2 gte[{}], {}({}) */",
                                           reg_name(rs), offset, value, rt, offset, reg_name(rs));
                     }
                 }
@@ -1963,6 +1974,26 @@ GeneratedFunction CodeGenerator::generate_function(
         blocks_ss << "\n" << translate_basic_block(block, cfg);
     }
 
+    // FAITHFUL RE-ENTRY — every basic-block leader is a dispatchable continuation
+    // (MMX6 boot-wedge class B, resume PC 0x8005B07C). psx_check_interrupts_at is
+    // emitted at EVERY block leader, so ANY leader can be published as an async-RFE
+    // / interp-handoff interrupt-resume PC. The compiled top-level trampoline can
+    // only re-enter a function at a registered continuation; a leader that is only
+    // an interrupt-resume point (not a CPS jal-return) was NOT registered, so a
+    // mid-function resume PC missed dispatch and the top loop read pc=0 =
+    // "execution completed" abnormal exit. Game functions keep ALL guest state
+    // canonical in cpu->gpr[]/RAM (no cross-block C-locals), so entering at
+    // block_LEADER from a fresh call reconstructs identical state to normal flow.
+    // Register every leader (the jal/jalr call-returns pushed during translation
+    // above are a subset, deduped by `seen`/the owner map). Entry block runs from
+    // the top (cpu->pc==0) and is dispatched as a function entry, so skip it.
+    if (cps_enabled_) {
+        for (uint32_t block_addr : cfg.block_order) {
+            if (block_addr == func.start_addr) continue;
+            cps_cur_continuations_.push_back(block_addr);
+        }
+    }
+
     std::stringstream body_ss;
     body_ss << "{\n";
 
@@ -2215,6 +2246,23 @@ std::vector<GeneratedFunction> CodeGenerator::generate_alias_group(
         blocks_buf << "\n" << translate_basic_block(block, cfg);
     }
 
+    // FAITHFUL RE-ENTRY — every live block leader is a dispatchable continuation
+    // (see generate_function for the full rationale: psx_check_interrupts_at is at
+    // every leader, so any leader can be an async-RFE/interp-handoff resume PC and
+    // must be re-enterable, not just CPS jal-returns). Alias-set blocks live behind
+    // an entry switch; the leaders re-enter via the continuation switch below.
+    // Owner = aliases[0]->start_addr (same as the call-return continuations). Skip
+    // the alias entry PCs (they are dispatched as function entries with cpu->pc==0).
+    if (cps_enabled_) {
+        std::set<uint32_t> alias_entries;
+        for (const Function* a : aliases) alias_entries.insert(a->start_addr);
+        for (uint32_t block_addr : cfg.block_order) {
+            if (!live_blocks.count(block_addr)) continue;
+            if (alias_entries.count(block_addr)) continue;
+            cps_cur_continuations_.push_back(block_addr);
+        }
+    }
+
     // Shared body: host-range blocks (live subset) behind an entry switch.
     std::stringstream body;
     body << fmt::format("/* Overlapping-alias body for host func_{:08X}: {} entries */\n",
@@ -2411,7 +2459,8 @@ std::string CodeGenerator::generate_file(
     ss << "extern int  psx_ws_mmx6_bg_undercap(int counter);/* ws 2D bg per-frame tile cap (gpu.c) */\n";
     ss << "extern int  psx_game_option_store(uint32_t addr, int val);  /* persisted OPTION restore-at-init (game_options.c) */\n";
     ss << "extern uint32_t psx_ws_backdrop_value(uint32_t orig, int is_end, int window_cols);  /* ws backdrop preload (gpu.c) */\n";
-    ss << "extern void gte_ws_set_suppress(int on);  /* widescreen far-backdrop un-squash (gte.cpp) */\n\n";
+    ss << "extern void gte_ws_set_suppress(int on);  /* widescreen far-backdrop un-squash (gte.cpp) */\n";
+    ss << "extern uint32_t g_debug_last_store_pc;  /* exact PC of the executing SW/SH/SB — wtrace/readtrace producer attribution (debug_server.c) */\n\n";
 
     // Emit reference implementations for unaligned memory helpers.
     // These implement the MIPS lwl/lwr/swl/swr semantics.

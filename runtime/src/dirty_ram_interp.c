@@ -98,6 +98,20 @@ uint64_t g_sentinel_reach_dirty = 0;
 uint64_t g_sentinel_reach_traps = 0;
 uint32_t g_sentinel_reach_async = 0;
 
+/* One-shot pc=0 producer tripwire (MMX6 boot-wedge investigation, Task #4 family).
+ * Latches the FIRST time dirty_ram_dispatch returns "handled" (r==1) but leaves
+ * cpu->pc == 0 — i.e. the dirty path produced the abnormal-exit null PC rather
+ * than psx_unknown_dispatch (which has its own fail-fast). Captures the dispatch
+ * addr + interrupt-return context so the exact producing path is identifiable
+ * without printf. Surfaced in freeze_check (pczero_*). */
+int      g_pczero_latched     = 0;
+uint32_t g_pczero_addr        = 0;
+uint32_t g_pczero_ra          = 0;
+uint32_t g_pczero_in_exc      = 0;
+uint32_t g_pczero_async_rfe   = 0;
+uint32_t g_pczero_dirty_safe  = 0;
+uint64_t g_pczero_count       = 0;
+
 /* Mid-block unsupported-opcode counters. Bumped instead of fprintf-spamming
  * stderr (CLAUDE.md §3). Read via dirty_ram_get_unsupported(). The "last_*"
  * fields capture the most recent occurrence so a TCP query can see what
@@ -1535,6 +1549,22 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     int prev = g_dirty_interp_active;
     g_dirty_interp_active = 1;
     int r = dirty_ram_dispatch_inner(cpu, addr, stop_addr);
+
+    /* pc=0 producer tripwire: the dirty path reported "handled" yet published a
+     * null PC — the abnormal-exit source we're hunting (MMX6 boot wedge). Latch
+     * full context the first time; count every occurrence. */
+    if (r == 1 && cpu->pc == 0u) {
+        extern uint32_t g_async_rfe_resume_pc, g_dirty_safe_resume_pc;
+        g_pczero_count++;
+        if (!g_pczero_latched) {
+            g_pczero_latched    = 1;
+            g_pczero_addr       = addr;
+            g_pczero_ra         = cpu->gpr[31];
+            g_pczero_in_exc     = (uint32_t)psx_get_in_exception();
+            g_pczero_async_rfe  = g_async_rfe_resume_pc;
+            g_pczero_dirty_safe = g_dirty_safe_resume_pc;
+        }
+    }
 
     /* Dirty-RAM scheduling contract (Tomba 2 Whoopee-Camp softlock fix):
      * ANY path that advanced guest cycles must periodically expose the CPU to

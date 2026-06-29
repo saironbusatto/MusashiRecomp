@@ -9,6 +9,9 @@
 extern "C" {
 #endif
 
+/* Fix B exception-return escape state + helpers are declared in cpu_state.h
+ * (the lowest common header the generated BIOS/game both include). */
+
 static inline void call_by_address(CPUState* cpu, uint32_t addr) {
     psx_dispatch_call(cpu, addr, cpu->gpr[31]);
 }

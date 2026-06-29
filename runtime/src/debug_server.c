@@ -1993,6 +1993,11 @@ typedef struct {
 } BiosCallEntry;
 static BiosCallEntry s_bioscall_ring[BIOSCALL_RING_CAP];
 static uint64_t s_bioscall_seq = 0;
+/* Arm flag for the B0 event/thread-op capture in debug_server_trace_dispatch.
+ * OFF by default: recording every IRQ-context DeliverEvent per dispatch floods the
+ * ring and starves the poll-based command path at a freeze. Arm via `event_hook`
+ * only for the window of interest. */
+int g_event_hook_armed = 0;
 #define BIOSCALL_UNIQUE_CAP 2048
 typedef struct { uint32_t table_base; uint32_t index; uint64_t count; } BiosCallUnique;
 static BiosCallUnique s_bioscall_unique[BIOSCALL_UNIQUE_CAP];
@@ -2165,6 +2170,35 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
                                 debug_cpu_ptr->gpr[4], debug_cpu_ptr->gpr[5],
                                 debug_cpu_ptr->gpr[6], debug_cpu_ptr->gpr[7],
                                 debug_cpu_ptr->gpr[31]);
+        }
+        /* Event/thread-op stream (ChatGPT-conferred blocked-main-thread hunt,
+         * MMX6 cutscene->gameplay freeze). The recompiler resolves B0 event calls
+         * to DIRECT compiled-function calls, so they bypass the 0xB0 vector above
+         * (the vector ring stays empty). But the event functions ARE dispatched as
+         * compiled funcs (they appear in dispatch_tail), so capture them HERE keyed
+         * on their SCPH1001 RAM entry addresses (from B0_table @ 0x874), recorded
+         * with a synthetic table_base=0xB0 + the real B0 index so bioscall_dump
+         * surfaces the full OpenEvent/WaitEvent/DeliverEvent/EnableEvent/... stream.
+         * in_exception distinguishes IRQ-context DeliverEvent from main-thread calls. */
+        else if (debug_cpu_ptr && g_event_hook_armed) {
+            int evi = -1;
+            switch (vphys) {
+                case 0x1B44u: evi = 0x07; break; /* DeliverEvent(class,spec) */
+                case 0x1D8Cu: evi = 0x08; break; /* OpenEvent(class,spec,mode,func) */
+                case 0x1E1Cu: evi = 0x09; break; /* CloseEvent(event) */
+                case 0x1E44u: evi = 0x0A; break; /* WaitEvent(event) */
+                case 0x1EC8u: evi = 0x0B; break; /* TestEvent(event) */
+                case 0x1F10u: evi = 0x0C; break; /* EnableEvent(event) */
+                case 0x1F4Cu: evi = 0x0D; break; /* DisableEvent(event) */
+                case 0x20D4u: evi = 0x10; break; /* ChangeTh(pcb,tcb) */
+                default: break;
+            }
+            if (evi >= 0) {
+                psx_bioscall_record(0xB0u, (uint32_t)evi, vphys,
+                                    debug_cpu_ptr->gpr[4], debug_cpu_ptr->gpr[5],
+                                    debug_cpu_ptr->gpr[6], debug_cpu_ptr->gpr[7],
+                                    debug_cpu_ptr->gpr[31]);
+            }
         }
     }
 
@@ -3141,6 +3175,10 @@ static const char *thread_kind_name(uint32_t kind)
         case 10: return "fiber_entry";
         case 11: return "fiber_done";
         case 12: return "fiber_return_restore";
+        case 13: return "fiber_dispatch_exit";        /* fiber's psx_dispatch returned, in_exc==0 */
+        case 20: return "syscall3_enter";             /* ChangeThread/RFE syscall, in_exc==0 (switch-eligible) */
+        case 24: return "syscall3_enter_in_exc";      /* ChangeThread/RFE syscall, in_exc==1 (forced manual-RFE) */
+        case 26: return "fiber_dispatch_exit_in_exc"; /* fiber's psx_dispatch returned, in_exc==1 */
         default: return "unknown";
     }
 }
@@ -7372,6 +7410,69 @@ static void handle_cyc_watch_clear(int id, const char *json)
  *   - fn_entry histogram dominance               → stuck-in-N-functions loop
  *   - dispatch_count change between calls       → recompiled code progressing
  *   - sio.irq_pending + countdown stuck         → IRQ pacing breakdown */
+/* Dump the VSync callback-pointer (0x80079D44) write-provenance ring (memory.c).
+ * Each entry = one write to that word with its real source: store_pc (accurate for
+ * CPU/dirty-interp stores; stale for DMA), and dma_depth/ch/madr/bcr (set in dma.c
+ * while a DMA moves data). Lets the corrupting 0x016F0110 write be attributed to the
+ * exact channel + destination instead of a stale per-instruction store PC. */
+static void handle_d44_ring(int id, const char *json)
+{
+    (void)json;
+    typedef struct { uint64_t seq; uint32_t val, old, store_pc;
+                     int32_t dma_depth, dma_ch; uint32_t dma_madr, dma_bcr, frame; } D44E;
+    extern D44E g_d44_ring[]; extern uint64_t g_d44_seq;
+    uint64_t total = g_d44_seq;
+    uint32_t cap = 32u;
+    uint32_t n = total < cap ? (uint32_t)total : cap;
+    char buf[8192]; size_t pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
+                    id, (unsigned long long)total);
+    for (uint32_t i = 0; i < n && pos < sizeof(buf) - 256; i++) {
+        uint64_t idx = total - n + i;
+        D44E *e = &g_d44_ring[idx & (cap - 1u)];
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"seq\":%llu,\"frame\":%u,\"old\":\"0x%08X\",\"new\":\"0x%08X\","
+            "\"store_pc\":\"0x%08X\",\"dma_depth\":%d,\"dma_ch\":%d,"
+            "\"dma_madr\":\"0x%08X\",\"dma_bcr\":\"0x%08X\"}",
+            i ? "," : "", (unsigned long long)e->seq, e->frame, e->old, e->val,
+            e->store_pc, e->dma_depth, e->dma_ch, e->dma_madr, e->dma_bcr);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    debug_server_send_line(buf);
+}
+
+/* Dump the IRQ-delivery context ring (interrupts.c): per IRQ delivery, the VSync
+ * callback word [0x80079D44], CD-DMA-active + dma-depth, and COP0/IRQ state. Shows
+ * whether VBlank was delivered while 0x80079D44 was the clobbered 0x016F0110 AND a
+ * CD DMA was mid-transfer (the VSync-in-DMA-window bug). */
+static void handle_irqctx_ring(int id, const char *json)
+{
+    (void)json;
+    typedef struct { uint64_t seq, cycle; uint32_t frame, istat, imask, sr, d44,
+                     cdrom_active, is_vblank; int dma_depth; } E;
+    extern E g_irqctx_ring[]; extern uint64_t g_irqctx_seq;
+    uint64_t total = g_irqctx_seq; uint32_t cap = 64u;
+    uint32_t n = total < cap ? (uint32_t)total : cap;
+    char buf[16384]; size_t pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
+                    id, (unsigned long long)total);
+    for (uint32_t i = 0; i < n && pos < sizeof(buf) - 256; i++) {
+        uint64_t idx = total - n + i;
+        E *e = &g_irqctx_ring[idx & (cap - 1u)];
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,\"vblank\":%u,"
+            "\"d44\":\"0x%08X\",\"cdrom_active\":%u,\"dma_depth\":%d,"
+            "\"sr\":\"0x%08X\",\"istat\":\"0x%08X\",\"imask\":\"0x%08X\"}",
+            i ? "," : "", (unsigned long long)e->seq, (unsigned long long)e->cycle,
+            e->frame, e->is_vblank, e->d44, e->cdrom_active, e->dma_depth,
+            e->sr, e->istat, e->imask);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    debug_server_send_line(buf);
+}
+
 static void handle_freeze_check(int id, const char *json)
 {
     int window = json_get_int(json, "window", 256);
@@ -7408,6 +7509,9 @@ static void handle_freeze_check(int id, const char *json)
     extern uint64_t g_async_rfe_set_count;
     extern uint64_t g_async_rfe_fire_count;
     extern uint64_t g_slice_fired, g_slice_irq_taken;
+    extern uint64_t g_pczero_count;
+    extern uint32_t g_pczero_addr, g_pczero_ra, g_pczero_in_exc,
+                    g_pczero_async_rfe, g_pczero_dirty_safe;
     extern uint32_t g_slice_last_block, g_slice_last_first_pc, g_slice_last_first_insn;
     extern uint32_t g_slice_last_committed, g_slice_last_istat, g_slice_last_imask, g_slice_last_sr;
     extern uint32_t g_slice_entry_deliverable;
@@ -7528,6 +7632,12 @@ static void handle_freeze_check(int id, const char *json)
                     "\"recent_func_min\":\"0x%08X\","
                     "\"recent_func_max\":\"0x%08X\","
                     "\"recent_total\":%u,"
+                    "\"pczero_count\":%llu,"
+                    "\"pczero_addr\":\"0x%08X\","
+                    "\"pczero_ra\":\"0x%08X\","
+                    "\"pczero_in_exc\":%u,"
+                    "\"pczero_async_rfe\":\"0x%08X\","
+                    "\"pczero_dirty_safe\":\"0x%08X\","
                     "\"hist\":[",
                     id,
                     g_debug_current_func_addr,
@@ -7580,7 +7690,13 @@ static void handle_freeze_check(int id, const char *json)
                     window,
                     (recent_total ? recent_min_func : 0),
                     recent_max_func,
-                    recent_total);
+                    recent_total,
+                    (unsigned long long)g_pczero_count,
+                    g_pczero_addr,
+                    g_pczero_ra,
+                    g_pczero_in_exc,
+                    g_pczero_async_rfe,
+                    g_pczero_dirty_safe);
     for (int i = 0; i < hist_n && pos < sizeof(buf) - 64; i++) {
         pos += snprintf(buf + pos, sizeof(buf) - pos,
                         "%s{\"func\":\"0x%08X\",\"count\":%u}",
@@ -10273,6 +10389,8 @@ static const CmdEntry s_commands[] = {
     { "wtrace_del",          handle_wtrace_del },
     { "wtrace_clear",        handle_wtrace_clear },
     { "freeze_check",      handle_freeze_check },
+    { "d44_ring",          handle_d44_ring },
+    { "irqctx_ring",       handle_irqctx_ring },
     { "cyc_watch",         handle_cyc_watch },
     { "cyc_watch_dump",    handle_cyc_watch_dump },
     { "cyc_watch_clear",   handle_cyc_watch_clear },
