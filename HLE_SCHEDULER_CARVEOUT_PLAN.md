@@ -232,3 +232,24 @@ diagnosis gate stays FIRST.
 3. Implement the 8-step minimal plan + the C-local-flush / nested-exception guards.
 4. Validate: MMX6 gameplay (user-visual) + conformance diff + CROSS-TITLE regress
    (Tomba1/Tomba2/BIOS boot) per Rule -1 / pre-merge gates.
+
+## 10. PROGRESS (branch spike/hle-tcb-scheduler)
+
+- ✅ **§5 diagnosis gate PASSED** (2026-06-29) — scheduler-induced confirmed: thread1's
+  host fiber recreated EVERY frame (thread_trace kind10 fiber_entry → kind13 dispatch-exit
+  pc=0 → kind11 closed → repeat). func_8002000C confirmed legit (Beetle runs it too, from
+  caller 0x800215A4). Residual to validate post-impl: whether the ~273-frames-early
+  upstream divergence still parks func_8002000C on thread1 early.
+- ✅ **Step 1 DONE** (commit ab8ed36) — `runtime/include/psx_scheduler.h` (psx_run_reason_t
+  + psx_sched_escape_t + design/invariant doc) + traps.c definitions (g_scheduler_jmpbuf,
+  g_sched_escape, psx_is_dispatchable fail-closed guard rejecting 0 + the exc sentinel).
+  INERT (host-fiber bridge still authoritative), builds clean (traps.c only, no game-C
+  regen), no behavior change.
+- ⏭ **NEXT (steps 2-8)**: outer scheduler loop at the exception/syscall boundary;
+  `psx_request_thread_switch` (save current TCB + longjmp YIELD_TO_TCB); route RFE through
+  structured escapes; remove all cpu->pc=0 signalling; runnable-thread dispatch pc=0
+  fail-fast; tighten psx_is_dispatchable to registered-entry/block-leader; add
+  sched_escape_ring + tcb_save_restore_ring; commit pending psx_delay_* C-locals before
+  any escape; nested-exception guards (exception_depth / in_int_rp_callback /
+  in_tcb_save_restore / critical_depth); unify with the existing exception_jmpbuf (ONE
+  escape path). Then validate + cross-title regress.
