@@ -506,6 +506,11 @@ bool FullFunctionEmitter::emit_function(
                         // Emit RFE SR pop without return.
                         out += "    { uint32_t sr = cpu->cop0[12]; "
                                "cpu->cop0[12] = (sr & 0xFFFFFFC0u) | ((sr >> 2) & 0x0Fu); } /* rfe */\n";
+                        // Fix B: arm the host exception-return escape (the jr below sets
+                        // cpu->pc = real EPC; the trampoline's psx_rfe_escape_check then
+                        // unwinds to psx_check_interrupts iff we're in the synchronous
+                        // handler — a fiber/thread resume just dispatches the real EPC).
+                        out += "    psx_rfe_mark_escape();\n";
                         // Emit JR resolution.
                         uint8_t rs = (pb.raw >> 21) & 0x1F;
                         if (rs == 31) {
@@ -1377,7 +1382,20 @@ void FullFunctionEmitter::emit_dispatch(
     out += "         * active game text range, route it through the game/dirty-RAM\n";
     out += "         * path before normalizing it to shell ROM. */\n";
     out += "        uint32_t game_phys = addr & 0x1FFFFFFFu;\n";
-    out += "        if (psx_game_address_in_text(addr) && dirty_ram_is_dirty(game_phys)) {\n";
+    out += "        /* Class-A shell-window collision fix: post-game-start the BIOS shell\n";
+    out += "         * copy at RAM 0x30000-0x5AFFF is DEAD (overwritten by the game EXE),\n";
+    out += "         * so normalize()->shell ROM for a shell-window game address is stale\n";
+    out += "         * and runs dead shell code (func_1FC42090 -> null jalr -> pc=0, the\n";
+    out += "         * MMX6 boot wedge class A). Once the game has started, route the\n";
+    out += "         * shell-overlap window to the GAME image BEFORE normalize() can shadow\n";
+    out += "         * it to the shell. dirty_ram_dispatch -> psx_dispatch_game_compiled\n";
+    out += "         * returns 0 for a non-game PC, so a genuine pre-start shell address\n";
+    out += "         * (game not started) still falls through to normalize(). */\n";
+    out += "        extern int fntrace_is_game_started(void);\n";
+    out += "        int game_shell_overlap = fntrace_is_game_started() &&\n";
+    out += "            game_phys >= 0x00030000u && game_phys <= 0x0005AFFFu;\n";
+    out += "        if (psx_game_address_in_text(addr) &&\n";
+    out += "            (dirty_ram_is_dirty(game_phys) || game_shell_overlap)) {\n";
     out += "            found = dirty_ram_dispatch(cpu, addr, stop_addr);\n";
     out += "        }\n";
     out += "#endif\n";
@@ -1411,6 +1429,12 @@ void FullFunctionEmitter::emit_dispatch(
     out += "                psx_unknown_dispatch(cpu, addr, phys);\n";
     out += "            }\n";
     out += "        }\n";
+    out += "        /* Fix B: if the function just RETURNED via the recompiled exception\n";
+    out += "         * return (jr $k0; rfe) inside the synchronous handler, cpu->pc now holds\n";
+    out += "         * the real resume EPC and the RFE armed the escape — unwind to\n";
+    out += "         * psx_check_interrupts here. A fiber/thread resume (in_exception==0) is a\n";
+    out += "         * no-op, so the real EPC keeps dispatching. */\n";
+    out += "        psx_rfe_escape_check(cpu);\n";
     out += "        if (g_psx_call_bail) {\n";
     out += "            /* A nested generated frame began a bail unwind; cpu->pc\n";
     out += "             * holds the guest's true target.  Resolve here iff the\n";

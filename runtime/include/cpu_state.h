@@ -86,6 +86,33 @@ typedef struct CPUState {
     uint32_t ld_absorb;         /* LDAbsorb: pending load's give-back (region+completion) */
 } CPUState;
 
+/* Faithful exception-return (fix B) — defined in runtime/src/interrupts.c. The
+ * interrupted-thread resume PC is the REAL guest PC, stored in COP0.EPC and (by the
+ * BIOS handler) in the thread's TCB EPC slot — never a sentinel, never a single
+ * global — so a thread suspended mid-exception (ChangeThread) resumes at its OWN PC.
+ * The host longjmp escape out of the NESTED synchronous handler is keyed on "RFE
+ * while in_exception" (psx_rfe_mark_escape, called by the recompiled `rfe` op;
+ * psx_rfe_escape_check, called in the dispatch trampoline), not on pc==sentinel.
+ * Declared here (not psx_runtime.h) because the generated BIOS includes only this. */
+typedef enum {
+    PSX_EXC_ESCAPE_NONE = 0,
+    PSX_EXC_ESCAPE_RFE_RETURN,
+    PSX_EXC_ESCAPE_SYSCALL_RETURN,
+    PSX_EXC_ESCAPE_LEGACY_SENTINEL,
+} psx_exc_escape_reason_t;
+
+/* The host escape token for the SYNCHRONOUS (nested) exception handler. It is a
+ * pure HOST control-flow marker — it must NEVER be persisted into a guest TCB as a
+ * thread's resume PC. If it does, that thread will resume by resolving the sentinel
+ * through host escape state (the multi-thread bug fix B repaired), not at its own
+ * code. The save/restore/fiber-entry guards in traps.c are fail-closed on this. */
+#define PSX_EXC_SENTINEL_PC 0x80000048u
+extern int      g_rfe_escape_pending;
+extern int      g_exc_escape_reason;     /* psx_exc_escape_reason_t */
+extern uint32_t g_exception_real_epc;
+void psx_rfe_mark_escape(void);
+void psx_rfe_escape_check(CPUState* cpu);
+
 /* Trap trampolines — defined in runtime/src/traps.c */
 /* psx_syscall returns 1 if control transfers (cpu->pc set to a dispatch target;
  * the caller must return to the trampoline), 0 for a directly-handled "void"

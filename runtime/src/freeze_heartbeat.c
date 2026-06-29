@@ -255,6 +255,13 @@ static void freeze_dump_main_stack_json(FILE *f) {
         }
         if (got_mod && mod.ModuleName[0]) {
             fprintf(f, ",\"module\":\"%s\"", mod.ModuleName);
+            /* Emit module-relative RVA. DbgHelp/SymFromAddr can't resolve mingw
+             * DWARF symbols for the main module (the symbol field stays absent),
+             * but addr2line CAN — given the RVA. addr - BaseOfImage is the input
+             * for `addr2line -e psx-runtime.exe -f <rva>`. Always present so any
+             * frame is offline-resolvable regardless of the DbgHelp gap. */
+            fprintf(f, ",\"rva\":\"0x%llX\"",
+                    (unsigned long long)(addr - (DWORD64)mod.BaseOfImage));
         }
         fputc('}', f);
         first = 0;

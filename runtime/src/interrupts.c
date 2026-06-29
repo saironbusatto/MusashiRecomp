@@ -44,6 +44,17 @@
  * handler dispatch (see psx_check_interrupts). */
 extern int g_dirty_interp_active;
 
+/* IRQ-delivery context ring (MMX6 VSync-vs-CD-DMA hunt; dumped via `irqctx_ring`). */
+#define IRQCTX_RING_CAP 64u
+typedef struct {
+    uint64_t seq, cycle;
+    uint32_t frame, istat, imask, sr, d44, cdrom_active, is_vblank;
+    int      dma_depth;
+} IrqCtxEntry;
+IrqCtxEntry g_irqctx_ring[IRQCTX_RING_CAP];
+uint64_t    g_irqctx_seq = 0;
+extern uint64_t psx_get_cycle_count(void);
+
 /* Record an interrupt-delivery decision into the event ring. GATE outcomes are
  * edge-suppressed (they repeat every block while blocked); DELIVER is always
  * recorded (once per interrupt); the not-pending (idle) case emits nothing but
@@ -158,6 +169,46 @@ extern int g_psx_dispatch_depth;
 static uint32_t s_compiled_interrupt_resume_pc = 0;
 
 int psx_get_in_exception(void) { return in_exception; }
+
+/* ===== Fix B: faithful exception-return escape state (see psx_runtime.h) ===== */
+int      g_rfe_escape_pending = 0;
+int      g_exc_escape_reason  = PSX_EXC_ESCAPE_NONE;
+uint32_t g_exception_real_epc = 0;
+extern void psx_exception_longjmp(void);
+
+/* Called by the recompiled `rfe` opcode (after it pops the COP0 SR stack). When we
+ * are inside the SYNCHRONOUS exception-handler window (in_exception) AND the handler
+ * is returning to a REAL EPC (not the legacy boundary-sentinel fallback), arm the
+ * host escape so the trampoline unwinds back to psx_check_interrupts after the jr
+ * commits cpu->pc = real EPC. On a fiber/thread resume (in_exception==0) this is a
+ * no-op and the real EPC is dispatched directly — that is how a suspended thread
+ * resumes at its own PC. */
+void psx_rfe_mark_escape(void) {
+    if (in_exception && g_exc_escape_reason != PSX_EXC_ESCAPE_LEGACY_SENTINEL) {
+        g_rfe_escape_pending = 1;
+        g_exc_escape_reason  = PSX_EXC_ESCAPE_RFE_RETURN;
+    }
+}
+
+/* Called in the dispatch trampoline after a function returns (cpu->pc holds the
+ * real resume EPC). If an RFE armed the escape inside the synchronous handler,
+ * longjmp back to psx_check_interrupts (cpu->pc preserved across the longjmp). */
+void psx_rfe_escape_check(CPUState* cpu) {
+    (void)cpu;
+    /* Escape ONLY when this RFE is the synchronous handler completing on the SAME
+     * fiber that set up the exception (the owner of exception_jmpbuf). in_exception
+     * is a single global, so a thread RESUMED on a different fiber (its own real EPC
+     * was restored and it later RFEs) must NOT longjmp here — that would be a
+     * cross-fiber jump to a stale jmpbuf (crash). For that case we fall through and
+     * the trampoline keeps dispatching cpu->pc = the real resume EPC, which is
+     * exactly how a suspended thread continues at its own PC. */
+    extern void* psx_fiber_current(void); /* psx_fiber.h is included further down */
+    if (g_rfe_escape_pending && in_exception &&
+        psx_fiber_current() == g_exception_owner_fiber) {
+        g_rfe_escape_pending = 0;
+        longjmp(exception_jmpbuf, 1); /* same fiber: safe; lands in psx_check_interrupts */
+    }
+}
 
 void psx_get_freeze_diag(uint64_t *out_total_checks,
                          uint32_t *out_dispatch_count,
@@ -396,6 +447,26 @@ void psx_check_interrupts(CPUState* cpu) {
     }
     g_irq_deliver_count++;
     if ((i_stat & i_mask) & (1u << IRQ_VBLANK)) g_vblank_deliver_count++;
+    /* IRQ-delivery context ring (MMX6 VSync-vs-CD-DMA hunt). Capture, at every IRQ
+     * delivery, whether the kernel VSync callback-block word at 0x80079D44 is the
+     * clobbered game value AND whether a CD DMA (ch3) is mid-transfer / a DMA is
+     * executing. If VBlank gets delivered with d44 already==0x016F0110 while the CD
+     * DMA is active, that is ChatGPT's class (c)+(#2): IRQ delivered in the DMA
+     * clobber window because the CPU isn't stalled / the event wasn't torn down. */
+    {
+        extern int dma_cdrom_transfer_active(void);
+        extern int g_dma_exec_depth;
+        extern uint64_t s_frame_count;
+        g_irqctx_ring[g_irqctx_seq & (IRQCTX_RING_CAP - 1u)] = (IrqCtxEntry){
+            .seq = g_irqctx_seq, .cycle = psx_get_cycle_count(),
+            .frame = (uint32_t)s_frame_count, .istat = i_stat, .imask = i_mask,
+            .sr = cpu->cop0[COP0_SR], .d44 = cpu->read_word(0x80079D44u),
+            .cdrom_active = (uint32_t)dma_cdrom_transfer_active(),
+            .dma_depth = g_dma_exec_depth,
+            .is_vblank = (uint32_t)(((i_stat & i_mask) & (1u << IRQ_VBLANK)) != 0),
+        };
+        g_irqctx_seq++;
+    }
     in_exception = 1;
     exception_entries_total++;
     uint32_t pre_handler_istat = i_stat;  /* snapshot for cooldown decision */
@@ -417,33 +488,36 @@ void psx_check_interrupts(CPUState* cpu) {
      * recompiled handler RFEs to it while in_exception, psx_unknown_dispatch /
      * dirty_ram_dispatch longjmp back here and resume the interrupted code via the
      * host-GPR-restore below. This is unchanged (Tomba 1 / MMX6 / Ape rely on it). */
-    uint32_t sentinel = 0x80000048u;
-    cpu->write_word(sentinel, 0x00000000u); /* NOP */
-    cpu->cop0[COP0_EPC] = sentinel;
-
-    /* ASYNC ReturnFromException resume PC (Tomba 2 frame-1997 fix). A game can install
-     * its own interrupt handler (HookEntryInt) that calls ReturnFromException ITSELF,
-     * possibly OUTSIDE this synchronous window (in_exception already 0). The recompiled
-     * BIOS RFE then restores the interrupted GPRs from the TCB and sets pc = saved EPC =
-     * sentinel; with in_exception==0 the sentinel cannot longjmp, and previously
-     * resolved to pc=0 -> abnormal exit. The interrupted code resumes via a real guest
-     * PC only when it was dirty-interpreted (the dirty pump commits cpu->pc before
-     * calling us, exposed as g_dirty_safe_resume_pc). Remember that real PC so the
-     * sentinel-with-in_exception==0 case can RESUME there instead of exiting. Only set
-     * on dirty-safe-point delivery; compiled-interrupted handlers RFE synchronously and
-     * never reach the async branch, so this stays Tomba-2-class behavior. */
+    /* Fix B: COP0.EPC = the REAL interrupted resume PC, NOT a sentinel. The recompiled
+     * BIOS exception handler saves COP0.EPC into the interrupted thread's TCB EPC slot,
+     * so a thread suspended here (ChangeThread) resumes at its OWN real PC — never via a
+     * single global that the next thread's IRQs overwrite (the MMX6 cooperative-thread
+     * freeze). The host escape out of the nested synchronous handler is keyed on the
+     * RFE-pending flag (psx_rfe_mark_escape / psx_rfe_escape_check), not on pc==sentinel.
+     *
+     * real_pc = the committed interrupted PC, latched by the delivery site (the dirty
+     * pump exposes g_dirty_safe_resume_pc; a compiled block-leader check exposes
+     * s_compiled_interrupt_resume_pc). When BOTH are 0 the IRQ was taken at a clean
+     * trampoline boundary (the interrupted function already returned, pc was 0) — there
+     * is no mid-function resume PC, so fall back to the legacy sentinel + saved_gpr path
+     * for THIS delivery only (reason = LEGACY_SENTINEL gates the saved_gpr restore and
+     * disarms the RFE-flag escape). */
     extern uint32_t g_dirty_safe_resume_pc;
-    extern uint32_t g_async_rfe_resume_pc;
-    extern uint64_t g_async_rfe_set_count;
+    g_rfe_escape_pending = 0;
     {
-        uint32_t safe_pc = g_dirty_safe_resume_pc;
-        if (safe_pc == 0u) {
-            safe_pc = s_compiled_interrupt_resume_pc;
-        }
-        if (safe_pc != 0u && (safe_pc & 0x3u) == 0u &&
-            (safe_pc & 0x1FFFFFFFu) < 0x00200000u) {
-            g_async_rfe_resume_pc = safe_pc;
-            g_async_rfe_set_count++;
+        uint32_t real_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
+                                                  : s_compiled_interrupt_resume_pc;
+        if (real_pc != 0u && (real_pc & 0x3u) == 0u &&
+            (real_pc & 0x1FFFFFFFu) < 0x00200000u) {
+            cpu->cop0[COP0_EPC]  = real_pc;     /* architectural: the real resume PC */
+            g_exception_real_epc = real_pc;
+            g_exc_escape_reason  = PSX_EXC_ESCAPE_NONE; /* set at the actual RFE/SYSCALL return */
+        } else {
+            uint32_t sentinel = PSX_EXC_SENTINEL_PC;
+            cpu->write_word(sentinel, 0x00000000u); /* NOP, read by the handler's BD check */
+            cpu->cop0[COP0_EPC]  = sentinel;
+            g_exception_real_epc = sentinel;
+            g_exc_escape_reason  = PSX_EXC_ESCAPE_LEGACY_SENTINEL;
         }
     }
 
@@ -568,10 +642,20 @@ void psx_check_interrupts(CPUState* cpu) {
      * For SR: if the handler did ReturnFromException (RFE already
      * applied, IEc restored), we keep that.  If the handler exited
      * normally (jmpbuf path, no RFE), IEc is still 0 from the
-     * exception push — we do RFE to pop the SR stack. */
-    for (int i = 0; i < 32; i++) cpu->gpr[i] = saved_gpr[i];
-    cpu->hi = saved_hi;
-    cpu->lo = saved_lo;
+     * exception push — we do RFE to pop the SR stack.
+     *
+     * Fix B: only restore saved_gpr on the LEGACY (jmpbuf / boundary-sentinel)
+     * exit. On a real RFE/ReturnFromException the recompiled BIOS handler already
+     * restored the RESUMED thread's GPRs from its TCB; overwriting them with our
+     * saved_gpr would clobber the resumed thread with the state of the thread that
+     * ENTERED the exception (the cross-thread corruption fix B exists to prevent). */
+    if (g_exc_escape_reason == PSX_EXC_ESCAPE_LEGACY_SENTINEL) {
+        for (int i = 0; i < 32; i++) cpu->gpr[i] = saved_gpr[i];
+        cpu->hi = saved_hi;
+        cpu->lo = saved_lo;
+    }
+    g_rfe_escape_pending = 0;
+    g_exc_escape_reason  = PSX_EXC_ESCAPE_NONE;
 
     if (!(cpu->cop0[COP0_SR] & 0x01)) {
         uint32_t sr2 = cpu->cop0[COP0_SR];

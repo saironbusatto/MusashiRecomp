@@ -180,6 +180,43 @@ set(PSXRECOMP_BIOS_GENERATED
     ${PSXRECOMP_ROOT}/generated/SCPH1001_dispatch.c
 )
 
+# --- BIOS generated/ staleness check (hygiene) -----------------------------------
+# generated/SCPH1001_*.c is gitignored build output produced by a SEPARATE build
+# (recompiler/ -> psxrecomp-bios). Editing the BIOS emitter without re-running
+# tools/regen_bios.sh leaves the runtime linking a stale BIOS that no longer matches
+# the emitter (this caused a 4439-vs-4406 drift). regen_bios.sh records an emitter
+# fingerprint in generated/SCPH1001.emitter.sha; recompute it here and WARN on a
+# mismatch so the staleness is impossible to miss. Non-fatal: a stale-but-consistent
+# BIOS still builds; opt out with -DPSXRECOMP_SKIP_BIOS_STALE_CHECK=ON.
+if(NOT PSXRECOMP_SKIP_BIOS_STALE_CHECK)
+    find_program(_psxrt_bash NAMES bash)
+    set(_psxrt_stamp "${PSXRECOMP_ROOT}/generated/SCPH1001.emitter.sha")
+    if(_psxrt_bash AND EXISTS "${PSXRECOMP_ROOT}/tools/bios_emitter_fingerprint.sh")
+        execute_process(
+            COMMAND "${_psxrt_bash}" "${PSXRECOMP_ROOT}/tools/bios_emitter_fingerprint.sh"
+            WORKING_DIRECTORY "${PSXRECOMP_ROOT}"
+            OUTPUT_VARIABLE _psxrt_cur_fp OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _psxrt_fp_rc ERROR_QUIET)
+        if(_psxrt_fp_rc EQUAL 0 AND _psxrt_cur_fp)
+            set(_psxrt_saved_fp "")
+            if(EXISTS "${_psxrt_stamp}")
+                file(READ "${_psxrt_stamp}" _psxrt_saved_fp)
+                string(STRIP "${_psxrt_saved_fp}" _psxrt_saved_fp)
+            endif()
+            if(NOT _psxrt_saved_fp STREQUAL _psxrt_cur_fp)
+                message(WARNING
+                    "BIOS generated/ is STALE vs the recompiler emitter "
+                    "(fingerprint mismatch).\n"
+                    "  Linking generated/SCPH1001_*.c that may not match the current "
+                    "emitter source.\n"
+                    "  Fix:  tools/regen_bios.sh   (rebuilds psxrecomp-bios + "
+                    "regenerates the BIOS)\n"
+                    "  (Suppress: -DPSXRECOMP_SKIP_BIOS_STALE_CHECK=ON)")
+            endif()
+        endif()
+    endif()
+endif()
+
 function(psxrecomp_add_runtime_target target)
     set(options ORACLE)
     set(oneValueArgs

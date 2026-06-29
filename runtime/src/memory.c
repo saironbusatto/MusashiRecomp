@@ -119,9 +119,23 @@ static int dirty_ram_force_interp(void) {
     return s;
 }
 
+/* DIAGNOSTIC ONLY (class-B reproduction, NOT a fix — Rule -1): PSX_SHELLWIN_INTERP=1
+ * reports the BIOS shell-copy relocated RAM window [0x30000, 0x5AFFF] as dirty, so
+ * the compiled dispatch (full_function_emitter.cpp:1380) routes those addresses
+ * through the recovering dirty-RAM interp instead of normalize()->shell ROM. This
+ * peels the class-A shell-window pc=0 wedge (func_1FC42090) so the *general*
+ * class-B compiled exception-return pc=0 (in [0x5B000, 0x8F000)) can surface and be
+ * captured. Must be reverted before any merge; it is a probe, not the fix. */
+static int dirty_ram_shellwin_interp(void) {
+    static int s = -1;
+    if (s < 0) { const char* e = getenv("PSX_SHELLWIN_INTERP"); s = (e && e[0] && e[0] != '0'); }
+    return s;
+}
+
 int dirty_ram_is_dirty(uint32_t phys) {
     if (phys >= RAM_SIZE) return 0;
     if (dirty_ram_force_interp() && phys >= DIRTY_RAM_KERNEL_TRACK_BYTES) return 1;
+    if (dirty_ram_shellwin_interp() && phys >= 0x00030000u && phys <= 0x0005AFFFu) return 1;
     uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
     return (dirty_ram_bitmap[page >> 5] >> (page & 31u)) & 1u;
 }
@@ -743,6 +757,40 @@ uint32_t psx_read_word(uint32_t addr) {
     return 0;
 }
 
+/* ---- VSync callback-pointer provenance probe (MMX6 boot wedge) -------------
+ * The kernel VSync/RCnt callback-block pointer at phys 0x79D44 (KSEG0 0x80079D44)
+ * is corrupted to 0x016F0110 at frame ~1188 by a write whose g_debug_last_store_pc
+ * is STALE (so it is not a compiled/dirty-interp store — a DMA or runtime mem-op
+ * with a wrong destination). This always-on ring records EVERY write to that word
+ * at the unified RAM-write chokepoint, tagging CPU-vs-DMA via the dma.c exec flags,
+ * so the real corrupting writer (and, if DMA, its channel + madr) is captured even
+ * though the per-instruction store-PC tracker can't see it. Dump via `d44_ring`. */
+#define D44_PHYS 0x00079D44u
+#define D44_RING_CAP 32u
+typedef struct {
+    uint64_t seq;
+    uint32_t val, old, store_pc;
+    int32_t  dma_depth, dma_ch;
+    uint32_t dma_madr, dma_bcr, frame;
+} D44Entry;
+D44Entry  g_d44_ring[D44_RING_CAP];
+uint64_t  g_d44_seq = 0;
+extern uint32_t g_debug_last_store_pc;
+extern int      g_dma_exec_depth;     /* >0 while a DMA is moving data (dma.c) */
+extern int      g_dma_cur_ch;         /* channel of the in-flight DMA, else -1  */
+extern uint32_t g_dma_cur_madr;       /* current MADR of the in-flight DMA      */
+extern uint32_t g_dma_cur_bcr;        /* BCR of the in-flight DMA               */
+extern uint64_t s_frame_count;
+static inline void d44_note(uint32_t phys, uint32_t old, uint32_t val) {
+    if (phys != D44_PHYS) return;
+    uint64_t i = g_d44_seq++;
+    D44Entry *e = &g_d44_ring[i & (D44_RING_CAP - 1u)];
+    e->seq = i; e->val = val; e->old = old; e->store_pc = g_debug_last_store_pc;
+    e->dma_depth = g_dma_exec_depth; e->dma_ch = g_dma_cur_ch;
+    e->dma_madr = g_dma_cur_madr; e->dma_bcr = g_dma_cur_bcr;
+    e->frame = (uint32_t)s_frame_count;
+}
+
 void psx_write_word(uint32_t addr, uint32_t val) {
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) { cache_ctrl = val; return; }
@@ -754,6 +802,7 @@ void psx_write_word(uint32_t addr, uint32_t val) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
+        if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
         card_data_writes_check(phys, val, 4);
         dirty_ram_mark_kernel_write(phys);
