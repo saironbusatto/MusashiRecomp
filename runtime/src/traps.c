@@ -30,6 +30,51 @@ void psx_exception_longjmp(void);
 jmp_buf            g_scheduler_jmpbuf;
 psx_sched_escape_t g_sched_escape;
 
+/* Single-level "switch back to the yielder" safety net. The old fiber bridge
+ * remembered each thread's return_fiber so a target whose dispatch RETURNS
+ * (rather than yielding back) resumed its yielder instead of killing the run.
+ * In the redispatch model we keep the same one-level notion: the yielder's TCB
+ * latched at the last YIELD_TO_TCB, restored if the target's top-level dispatch
+ * returns. Zero = no pending return target (top-level pc==0 is a real exit). */
+static uint32_t g_sched_return_tcb = 0;
+
+/* sched_escape_ring (plan step 8) — always-on record of every structured
+ * scheduler escape, queryable via the `sched_escape_ring` debug command. This
+ * is the deterministic replacement for the fiber thread_event kinds 3-12. */
+typedef struct SchedEscapeEntry {
+    uint32_t seq;
+    uint32_t frame;
+    uint32_t reason;       /* psx_run_reason_t */
+    uint32_t current_tcb;
+    uint32_t target_tcb;
+    uint32_t resume_pc;
+    uint32_t pc;
+    uint32_t ra;
+    uint32_t sp;
+} SchedEscapeEntry;
+#define SCHED_ESCAPE_RING_CAP 256u
+SchedEscapeEntry g_sched_escape_ring[SCHED_ESCAPE_RING_CAP];
+uint64_t g_sched_escape_seq = 0;
+
+static void sched_escape_ring_log(CPUState* cpu, uint32_t reason,
+                                  uint32_t current_tcb, uint32_t target_tcb,
+                                  uint32_t resume_pc)
+{
+    extern uint64_t s_frame_count;
+    SchedEscapeEntry* e =
+        &g_sched_escape_ring[g_sched_escape_seq & (SCHED_ESCAPE_RING_CAP - 1u)];
+    e->seq         = (uint32_t)g_sched_escape_seq;
+    e->frame       = (uint32_t)s_frame_count;
+    e->reason      = reason;
+    e->current_tcb = current_tcb;
+    e->target_tcb  = target_tcb;
+    e->resume_pc   = resume_pc;
+    e->pc          = cpu->pc;
+    e->ra          = cpu->gpr[31];
+    e->sp          = cpu->gpr[29];
+    g_sched_escape_seq++;
+}
+
 int psx_is_dispatchable(uint32_t pc)
 {
     /* Fail closed on the known-bad resume PCs that the old pc=0 sentinel +
@@ -523,14 +568,156 @@ static int psx_change_thread_fiber(CPUState* cpu, uint32_t target_tcb)
     return 1;
 }
 
+/* ── Deterministic TCB scheduler — LIVE (carve-out, replaces the fiber bridge) ─
+ *
+ * psx_request_thread_switch performs a cooperative thread switch by committing
+ * the yielding thread's full context to its TCB, repointing dword_108->entry at
+ * the target, and longjmp-ing to the outer scheduler loop (psx_scheduler_run),
+ * which restores the target TCB and re-dispatches its EPC. No host fibers, no
+ * per-thread native stacks, no cpu->pc=0 host signal — thread selection is a
+ * pure function of guest TCB state (HLE_SCHEDULER_CARVEOUT_PLAN.md §9).
+ *
+ * This only runs with in_exception==0 (psx_syscall case 3 gates it), so the
+ * longjmp never unwinds through a live setjmp(exception_jmpbuf) frame — the sole
+ * native state skipped is nested psx_dispatch_impl frames, whose only invariant
+ * (g_psx_dispatch_depth + g_psx_call_bail) the scheduler loop resets on landing.
+ *
+ * INVARIANT (psx_scheduler.h): all guest thread context lives in CPUState / RAM
+ * / the TCB reg array — never in a host stack. The yielding thread resumes by
+ * re-dispatching its saved EPC, which therefore MUST be a dispatchable block
+ * leader (CLASS-B every-leader re-entry guarantees this); psx_is_dispatchable
+ * fails loud if it ever is not. */
+static int psx_request_thread_switch(CPUState* cpu, uint32_t target_tcb)
+{
+    uint32_t current_tcb = psx_current_tcb_ptr(cpu);
+    debug_server_log_thread_event(3, cpu, current_tcb, target_tcb, 0);
+    if (!psx_is_valid_tcb(cpu, current_tcb) || !psx_is_valid_tcb(cpu, target_tcb)) {
+        debug_server_log_thread_event(4, cpu, current_tcb, target_tcb, 0);
+        return 0; /* invalid TCB(s): caller falls back to the manual-RFE path */
+    }
+    if (current_tcb == target_tcb) {
+        /* Same thread — not a switch. The syscall wrapper returns 0 and falls
+         * through to its own jr $ra (CPS); the thread simply continues. No
+         * cpu->pc=0 host signal (removed with the fiber bridge). */
+        debug_server_log_thread_event(5, cpu, current_tcb, target_tcb, cpu->gpr[31]);
+        return 1;
+    }
+    /* The target's entire context already lives in its TCB; it must be runnable
+     * (0x4000). A non-runnable target is not a cooperative yield — let the
+     * manual-RFE fallback handle it rather than dispatch a stale EPC. */
+    if (psx_tcb_state(cpu, target_tcb) != 0x4000u) {
+        debug_server_log_thread_event(7, cpu, current_tcb, target_tcb, 0);
+        return 0;
+    }
+    /* Commit the yielding thread's context so it can be re-dispatched later.
+     * resume PC = its return address (resume right after the ChangeThread call).
+     * Only a still-running (0x4000) thread keeps a live context; a closed/free
+     * (0x1000) thread is being torn down and must not be saved. */
+    if (psx_tcb_state(cpu, current_tcb) == 0x4000u) {
+        psx_save_context_to_tcb(cpu, current_tcb, cpu->gpr[31]);
+    }
+    psx_set_current_tcb(cpu, target_tcb);
+    g_sched_return_tcb        = current_tcb; /* one-level switch-back safety net */
+    g_sched_escape.target_tcb = target_tcb;
+    g_sched_escape.resume_pc  = 0;
+    g_sched_escape.reason     = PSX_RUN_YIELD_TO_TCB;
+    sched_escape_ring_log(cpu, PSX_RUN_YIELD_TO_TCB, current_tcb, target_tcb, 0);
+    debug_server_log_thread_event(8, cpu, current_tcb, target_tcb, 0);
+    longjmp(g_scheduler_jmpbuf, 1); /* unwind to psx_scheduler_run; never returns */
+    return 1;                        /* unreachable */
+}
+
+/* Scheduler mode (hidden dev toggle). HLE = the deterministic TCB scheduler
+ * (psx_request_thread_switch, default); LLE = the legacy host-fiber bridge
+ * (psx_change_thread_fiber). Read ONCE from PSX_HLE_SCHEDULER (default 1 = HLE)
+ * so the mode can't flip mid-run — a thread suspended under one scheduler cannot
+ * be resumed under the other (fibers keep a native stack; the TCB scheduler keeps
+ * none). Keep HLE until the upstream 0x800CD3F8 wedge root is fixed. */
+int psx_hle_scheduler_enabled(void)
+{
+    static int s_mode = -1;
+    if (s_mode < 0) {
+        const char* e = getenv("PSX_HLE_SCHEDULER");
+        s_mode = (e && e[0] == '0') ? 0 : 1; /* default HLE */
+    }
+    return s_mode;
+}
+
 static int psx_change_thread(CPUState* cpu, uint32_t target_tcb)
 {
-    /* One scheduler on every platform now: host fibers (Win32 Fibers on
-     * Windows, ucontext on POSIX). The earlier setjmp/longjmp fallback was
-     * removed — it ran target threads nested on the caller's stack, which
-     * couldn't resume an arbitrary suspended thread (the BIOS CD-boot
-     * WaitEvent handoff hung on it). */
+    if (psx_hle_scheduler_enabled())
+        return psx_request_thread_switch(cpu, target_tcb);
     return psx_change_thread_fiber(cpu, target_tcb);
+}
+
+void psx_scheduler_run(CPUState* cpu)
+{
+    extern int g_psx_dispatch_depth;
+    g_sched_escape.reason = PSX_RUN_CONTINUE;
+    for (;;) {
+        if (setjmp(g_scheduler_jmpbuf) != 0) {
+            /* A structured escape unwound the native stack to here. Reset the
+             * invariants the skipped psx_dispatch_impl frames would otherwise
+             * own. No exception_jmpbuf frame is ever skipped (switch fires only
+             * with in_exception==0), so interrupt state needs no fixup here. */
+            g_psx_dispatch_depth = 0;
+            g_psx_call_bail      = 0;
+        }
+
+        switch (g_sched_escape.reason) {
+            case PSX_RUN_FATAL:
+                trap_crash("scheduler: structured FATAL escape");
+                return;
+            case PSX_RUN_GUEST_EXIT:
+                return; /* abnormal top-level exit — main.cpp dumps diagnostics */
+            default:
+                break;  /* CONTINUE / YIELD_TO_TCB / RESUME_CURRENT */
+        }
+
+        uint32_t run_pc;
+        if (g_sched_escape.reason == PSX_RUN_RESUME_CURRENT &&
+            g_sched_escape.resume_pc != 0u) {
+            /* Same-thread RFE: GPRs already committed by the RFE; just re-dispatch. */
+            run_pc = g_sched_escape.resume_pc;
+        } else {
+            uint32_t cur = psx_current_tcb_ptr(cpu);
+            if (psx_is_valid_tcb(cpu, cur)) {
+                run_pc = psx_restore_context_from_tcb(cpu, cur);
+                if (!psx_is_dispatchable(run_pc)) {
+                    char b[112];
+                    snprintf(b, sizeof(b),
+                        "scheduler: TCB 0x%08X has non-dispatchable resume PC 0x%08X",
+                        (unsigned)cur, (unsigned)run_pc);
+                    trap_crash(b);
+                    return;
+                }
+            } else {
+                run_pc = cpu->pc; /* boot / pre-TCB: run the raw PC */
+            }
+        }
+
+        cpu->pc = run_pc;
+        g_sched_escape.reason = PSX_RUN_CONTINUE;
+        psx_dispatch(cpu, run_pc);
+
+        /* psx_dispatch returned with NO structured escape => the outermost
+         * dispatch saw cpu->pc==0. If a thread yielded to us and then ran to
+         * completion, hand control back to its yielder (one-level safety net)
+         * instead of tearing down the whole run. Otherwise it's the legacy
+         * top-level abnormal exit. */
+        if (psx_is_valid_tcb(cpu, g_sched_return_tcb) &&
+            g_sched_return_tcb != psx_current_tcb_ptr(cpu)) {
+            uint32_t yielder = g_sched_return_tcb;
+            g_sched_return_tcb = 0;
+            psx_set_current_tcb(cpu, yielder);
+            g_sched_escape.reason = PSX_RUN_YIELD_TO_TCB;
+            sched_escape_ring_log(cpu, PSX_RUN_YIELD_TO_TCB,
+                                  psx_current_tcb_ptr(cpu), yielder, 0);
+            continue;
+        }
+        g_sched_escape.reason = PSX_RUN_GUEST_EXIT;
+        return;
+    }
 }
 
 int psx_syscall(CPUState* cpu, uint32_t code) {

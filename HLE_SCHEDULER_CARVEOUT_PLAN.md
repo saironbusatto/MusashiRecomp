@@ -245,7 +245,42 @@ diagnosis gate stays FIRST.
   g_sched_escape, psx_is_dispatchable fail-closed guard rejecting 0 + the exc sentinel).
   INERT (host-fiber bridge still authoritative), builds clean (traps.c only, no game-C
   regen), no behavior change.
-- ⏭ **NEXT (steps 2-8)**: outer scheduler loop at the exception/syscall boundary;
+- ✅ **Steps 2-8 (MINIMAL "A+") IMPLEMENTED + structurally validated** (2026-06-29,
+  runtime-only, UNCOMMITTED). Scope refined from the broad 8-step list to the minimal
+  bridge replacement ChatGPT endorsed: the Beetle-confirmed non-determinism lives ONLY
+  in the `!in_exception` host-fiber bridge; the in-exception RFE path already escapes via
+  `exception_jmpbuf` (no fibers) and was left intact. Implemented:
+  - `psx_scheduler_run` (traps.c) — outer trampoline wrapping the top-level psx_dispatch
+    (main.cpp now calls it instead of bare `psx_dispatch`); setjmp(g_scheduler_jmpbuf),
+    restore-current-TCB / dispatch / on-escape reset g_psx_dispatch_depth + g_psx_call_bail;
+    boot/pre-TCB runs raw cpu->pc; one-level g_sched_return_tcb switch-back safety net;
+    fail-closed psx_is_dispatchable on every restored EPC.
+  - `psx_request_thread_switch` replaces the fiber switch: save yielder ctx (resume=$ra),
+    set dword_108->entry=target, longjmp to the scheduler. No fibers, no cpu->pc=0 signal.
+    Only fires with in_exception==0 ⇒ never unwinds a live exception_jmpbuf frame.
+  - `sched_escape_ring` (step 8) added. Fiber funcs kept compiled-but-dead this pass.
+  - **HIDDEN TOGGLE**: env `PSX_HLE_SCHEDULER` (default 1=HLE; 0=legacy LLE fibers),
+    read once (mode can't flip mid-run); `psx_change_thread` branches on it; startup
+    banner prints the active mode. Trampoline is transparent in LLE mode.
+  - **VALIDATED LIVE (HLE)**: thread1 trace now shows ONLY kinds 3/8/20/1/2 (new
+    TCB-switch path, 50× cross-thread commits) and ZERO fiber kinds 10/11/13 — the
+    per-frame fiber recreate is ELIMINATED. Builds clean (no -Werror).
+- ⛔ **Freeze NOT resolved — separate UPSTREAM root confirmed** (ChatGPT Q5 caution
+  realized). HLE build reaches the IDENTICAL pre-freeze state (gp0_draw frozen at 337079)
+  and wedges on the SAME `0x800CD3F8` dispatch miss, now a tight loop (~4000/s; render
+  thread stuck, gp0_writes still advancing + audio plays ⇒ black screen + music). The
+  scheduler swap removed the fiber-recreate class but the 0xCD3F8 wedge has an upstream
+  cause (the ~273-frames-early thread1 divergence). **Per user (2026-06-29): keep HLE
+  default until the upstream root is fixed.**
+- ⏭ **NEXT — UPSTREAM ROOT**: thread1 first-divergence timeline diff vs Beetle (where
+  does 0x800CD3F8 land on thread1's stack/dispatch path, and where does our thread1 PC
+  first diverge from Beetle's). BLOCKER (Rule 15): Beetle's fntrace per-target filter is
+  broken (total is global, filter ignored) — FIX that tool before trusting Beetle
+  per-target traces. THEN diff from the last common milestone to the first 0xCD3F8.
+- ⏭ **DEFERRED (post-fix)**: route in-exception RFE through structured escapes + unify
+  exception_jmpbuf + nested-exception guards (the broader original steps 4-7); delete the
+  now-dead fiber bridge; cross-title regress (Tomba1/Tomba2/BIOS) per pre-merge gates.
+- ⏭ **(superseded sub-items of the original step list)**: outer scheduler loop at the exception/syscall boundary;
   `psx_request_thread_switch` (save current TCB + longjmp YIELD_TO_TCB); route RFE through
   structured escapes; remove all cpu->pc=0 signalling; runnable-thread dispatch pc=0
   fail-fast; tighten psx_is_dispatchable to registered-entry/block-leader; add

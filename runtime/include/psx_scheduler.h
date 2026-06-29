@@ -69,6 +69,20 @@ extern psx_sched_escape_t g_sched_escape;
  * pc=0 silent fiber-recreate pathology). */
 int psx_is_dispatchable(uint32_t pc);
 
+/* The outer scheduler trampoline. Replaces the bare top-level psx_dispatch()
+ * call in main.cpp: dispatch the current thread until it yields via a
+ * structured escape (longjmp to g_scheduler_jmpbuf), then run whatever the
+ * escape selected. Returns ONLY on an abnormal top-level exit (the outermost
+ * dispatch saw cpu->pc==0 with no escape pending) — main.cpp's existing
+ * exit-diagnostic dump then runs. Forward-declared for main.cpp (C++). */
+struct CPUState;
+void psx_scheduler_run(struct CPUState* cpu);
+
+/* Hidden dev toggle (env PSX_HLE_SCHEDULER, default 1 = HLE). 1 = deterministic
+ * TCB scheduler (carve-out); 0 = legacy host-fiber bridge (LLE). Read once at
+ * first call; the mode cannot change mid-run. */
+int psx_hle_scheduler_enabled(void);
+
 #ifdef __cplusplus
 }
 #endif

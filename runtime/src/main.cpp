@@ -6,6 +6,7 @@
  */
 
 #include "cpu_state.h"
+#include "psx_scheduler.h"   /* psx_scheduler_run — deterministic TCB scheduler */
 #include "psx_interpreter.h"
 #include "cdrom.h"
 #include "fntrace.h"
@@ -2775,7 +2776,20 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "ORACLE: VSync incrementer hit count = %u\n", vsync_hits);
     std::fflush(stderr);
 #else
-    psx_dispatch(&cpu, cpu.pc);
+    /* Deterministic TCB-scheduler trampoline (carve-out): wraps the top-level
+     * dispatch so a cooperative thread switch unwinds here and re-dispatches the
+     * target thread, instead of the old per-frame host-fiber recreate. Returns
+     * only on the abnormal top-level pc==0 exit; the diagnostic dump below runs
+     * exactly as it did for the bare psx_dispatch. (HLE_SCHEDULER_CARVEOUT_PLAN.md)
+     *
+     * Hidden toggle: PSX_HLE_SCHEDULER=0 reverts to the legacy LLE host-fiber
+     * bridge (default 1 = HLE). The trampoline is transparent in LLE mode (the
+     * fiber path never longjmps to it). */
+    std::fprintf(stdout, "psxrecomp: thread scheduler = %s (PSX_HLE_SCHEDULER)\n",
+                 psx_hle_scheduler_enabled() ? "HLE (deterministic TCB)"
+                                             : "LLE (host fibers)");
+    std::fflush(stdout);
+    psx_scheduler_run(&cpu);
 #endif
 
     /* If we reach here, all execution completed without MMIO abort.
