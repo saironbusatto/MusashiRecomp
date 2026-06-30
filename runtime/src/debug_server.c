@@ -2610,9 +2610,25 @@ static void handle_dirty_insn_dump_file(int id, const char *json)
 /* ---- parity_dump / parity_ctl: general two-process control-flow parity ring.
  * Mirrors the IDENTICAL command on psx-beetle so tools/parity_diff.py can pull
  * both timelines and align by logical sequence (PRINCIPLES.md first-divergence). */
+/* Two rows have the same watched-STATE iff their watch words + epc + tcb_state
+ * match (pc/ra/sp ignored). Used by the `transitions` dump filter to collapse
+ * runs of identical-state dispatch rows into one (with a `reps` count), so a
+ * 130k-row cutscene dump trims to the handful of rows where state changed. */
+static int parity_same_state(const ParityEntry *a, const ParityEntry *b)
+{
+    if (a->kind != b->kind) return 0;
+    if (a->epc != b->epc || a->tcb_state != b->tcb_state) return 0;
+    for (int k = 0; k < PARITY_WATCH_MAX; k++)
+        if (a->watch[k] != b->watch[k]) return 0;
+    return 1;
+}
+
 static void handle_parity_dump(int id, const char *json)
 {
     int count = json_get_int(json, "count", 131072);
+    /* transitions=1: emit only state-change rows (collapse identical-state dispatch
+     * runs), each with reps=run length. The decisive trim for cross-process diff. */
+    int trans = json_get_int(json, "transitions", 0);
     if (count < 1) count = 1;
     if (count > 131072) count = 131072;
     ParityEntry *e = (ParityEntry *)malloc(sizeof(ParityEntry) * (size_t)count);
@@ -2626,20 +2642,29 @@ static void handle_parity_dump(int id, const char *json)
         "{\"id\":%d,\"ok\":true,\"total\":%llu,\"armed\":%d,\"frozen\":%d,\"count\":%u,\"entries\":[",
         id, (unsigned long long)parity_trace_total(), parity_trace_is_armed(),
         parity_trace_is_frozen(), got);
+    uint32_t run = 1, emitted = 0;
     for (uint32_t i = 0; i < got; i++) {
         if (pos > BUF_SZ - 1024) break;
+        /* In transitions mode, advance through identical-state dispatch rows until
+         * a boundary (next row differs, is a control event, or end of buffer). */
+        if (trans) {
+            int boundary = (i + 1 >= got) || !parity_same_state(&e[i], &e[i + 1])
+                           || e[i].kind != PARITY_KIND_DISPATCH;
+            if (!boundary) { run++; continue; }
+        }
         ParityEntry *r = &e[i];
         pos += snprintf(out + pos, BUF_SZ - pos,
-            "%s{\"seq\":%llu,\"frame\":%u,\"cycle\":%llu,\"kind\":\"%s\",\"cur_tcb\":\"0x%08X\","
+            "%s{\"seq\":%llu,\"frame\":%u,\"cycle\":%llu,\"reps\":%u,\"kind\":\"%s\",\"cur_tcb\":\"0x%08X\","
             "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"sp\":\"0x%08X\",\"epc\":\"0x%08X\","
             "\"state\":\"0x%08X\",\"target\":\"0x%08X\","
             "\"w\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"]}",
-            i ? "," : "", (unsigned long long)r->seq, r->frame,
-            (unsigned long long)r->cycle, parity_kind_str(r->kind),
+            emitted ? "," : "", (unsigned long long)r->seq, r->frame,
+            (unsigned long long)r->cycle, trans ? run : 1u, parity_kind_str(r->kind),
             r->current_tcb, r->pc, r->ra, r->sp, r->epc, r->tcb_state, r->target,
             r->watch[0], r->watch[1], r->watch[2], r->watch[3], r->watch[4], r->watch[5]);
+        emitted++; run = 1;
     }
-    pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
+    pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%u}\n", emitted);
     debug_server_send_line(out); free(out); free(e);
 }
 
