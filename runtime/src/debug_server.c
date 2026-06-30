@@ -2149,6 +2149,10 @@ void debug_server_cyc_observe(uint32_t block_leader_phys) {
     return;
 #else
     cyc_watch_observe(block_leader_phys & 0x1FFFFFFFu);
+    /* #2 lockstep comparator: per-basic-block compiled-vs-interp check. Self-gates
+     * on the armed frame window; ~free (one branch) when disarmed. */
+    { extern void ls_at_leader(uint32_t, CPUState*); extern CPUState *debug_cpu_ptr;
+      ls_at_leader(block_leader_phys & 0x1FFFFFFFu, debug_cpu_ptr); }
 #endif
 }
 
@@ -10390,7 +10394,24 @@ static void handle_vk_perf(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"vk_perf\":%s}", id, buf);
 }
 
+static void handle_lockstep(int id, const char *json) {
+    /* #2 lockstep comparator. {"lo":N,"hi":M} arms the frame window; the reply
+     * reports the first compiled-vs-interp block divergence (if any) so far. */
+    extern void ls_set_window(uint32_t, uint32_t);
+    extern void ls_set_record_only(int);
+    extern int  ls_get_diverge_json(char*, int);
+    int lo = json_get_int(json, "lo", -1);
+    int hi = json_get_int(json, "hi", -1);
+    int ro = json_get_int(json, "record_only", -1);
+    if (ro >= 0) ls_set_record_only(ro);
+    if (lo >= 0 && hi >= 0) ls_set_window((uint32_t)lo, (uint32_t)hi);
+    char buf[4096];
+    ls_get_diverge_json(buf, (int)sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,\"lockstep\":%s}", id, buf);
+}
+
 static const CmdEntry s_commands[] = {
+    { "lockstep",          handle_lockstep },
     { "ping",              handle_ping },
     { "parity_dump",       handle_parity_dump },
     { "parity_ctl",        handle_parity_ctl },

@@ -68,6 +68,11 @@ uint32_t g_dirty_safe_resume_pc = 0;
  * availability" invariant (ChatGPT-validated option b). Default 0 => every other
  * path is byte-for-byte unchanged. */
 int g_precise_mode = 0;
+/* #2 lockstep: set ONLY around the dirty-interp loop's per-instruction
+ * cyc_observe so the lockstep comparator can tell a real COMPILED block leader
+ * (g_ls_dirty_observe==0) from an interpreted per-instruction sample (==1). */
+int g_ls_dirty_observe = 0;
+extern int g_ls_replay_active;     /* defined in the lockstep section; used by exec_one's jal/jalr guard */
 uint64_t g_slice_fired = 0;        /* diagnostic: slices actually run */
 uint64_t g_slice_irq_taken = 0;    /* diagnostic: IRQs taken inside precise-mode */
 /* First-divergence trace for the precise slice (PRECISE_IRQ_SLICE.md Task #4). */
@@ -1055,7 +1060,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
             xprobe_event(pc, XOP_JALR, XSITE_INTERP, target,
                          fetch_word((pc + 4) & 0x1FFFFFFFu), site_sp, cpu->gpr[31], 1);
-            if (g_precise_mode) { cpu->pc = target; return 1; }  /* slice: step INTO callee per-insn */
+            if (g_precise_mode || g_ls_replay_active) { cpu->pc = target; return 1; }  /* slice / lockstep-replay: plain transfer, never execute the callee */
 #ifdef PSX_HAS_GAME_DISPATCH
             cpu->pc = 0;
             if (interp_enter_compiled(cpu, target)) {
@@ -1223,7 +1228,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
         xprobe_event(pc, XOP_JAL, XSITE_INTERP, target,
                      fetch_word((pc + 4) & 0x1FFFFFFFu), site_sp, cpu->gpr[31], 1);
-        if (g_precise_mode) { cpu->pc = target; return 1; }  /* slice: step INTO callee per-insn */
+        if (g_precise_mode || g_ls_replay_active) { cpu->pc = target; return 1; }  /* slice / lockstep-replay: plain transfer, never execute the callee */
 #ifdef PSX_HAS_GAME_DISPATCH
         cpu->pc = 0;
         if (interp_enter_compiled(cpu, target)) {
@@ -1922,7 +1927,9 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         /* Interp-path cycle ruler: make every interpreted PC anchorable by
          * cyc_watch (parity with the compiled emitter's block-leader observe).
          * Early-returns when cyc_watch is disarmed → ~free in normal runs. */
+        g_ls_dirty_observe = 1;
         debug_server_cyc_observe(pc & 0x1FFFFFFFu);
+        g_ls_dirty_observe = 0;
 #endif
         uint32_t insn = fetch_word(pc & 0x1FFFFFFFu);
         uint32_t before_s0 = cpu->gpr[16];
@@ -2111,3 +2118,215 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     OV_FPLOG_RET1();
 }
 #undef OV_FPLOG_RET1
+
+/* ============================================================================
+ * #2 — Lockstep "unit-test interp" comparator. See lockstep.h.
+ * Compiled-first + read-trace replay, per basic block, window-gated.
+ * ==========================================================================*/
+#include "lockstep.h"
+
+int g_ls_mode = 0;
+int g_ls_replay_active = 0;
+
+static uint32_t s_ls_frame_lo = 0, s_ls_frame_hi = 0;   /* hi==0 => disabled */
+
+typedef struct { uint8_t is_write, size; uint32_t addr, val; } ls_op_t;
+enum { LS_TRACE_CAP = 8192 };
+static ls_op_t  s_ls_trace[LS_TRACE_CAP];
+static int      s_ls_trace_n = 0, s_ls_trace_idx = 0;
+static int      s_ls_overflow = 0, s_ls_mismatch = 0;
+static int      s_ls_replay_done = 0;   /* trace exhausted: stop replay (benign count mismatch) */
+static uint32_t s_ls_cur_pc = 0;          /* pc of the instruction being replayed */
+static CPUState s_ls_R0;                   /* register snapshot at block entry     */
+static uint32_t s_ls_block = 0;
+static int      s_ls_prev_valid = 0;
+
+/* mismatch detail captured by the hooks (read by ls_replay_and_compare) */
+static int      s_ls_m_kind = 0;          /* 1 read-addr 2 write-addr 3 write-val 4 trace-exhausted */
+static uint32_t s_ls_m_pc = 0, s_ls_m_addr = 0, s_ls_m_exp = 0, s_ls_m_act = 0;
+
+static struct {
+    int      found;
+    int      kind;        /* see ls_kind below */
+    uint32_t frame, block, pc, addr;
+    uint32_t exp, act;    /* exp = interp(correct), act = compiled(actual)   */
+    int      detail;      /* reg index for REG kind, else 0                  */
+    uint64_t blocks_checked;
+} s_ls_div = {0};
+/* kinds: 1 REG 2 HI 3 LO 4 WRITE-VAL 5 READ-ADDR 6 WRITE-ADDR 7 TRACE-EXHAUSTED
+ *        8 COMPILED-EXTRA-OPS 9 PATH-CAP */
+/* Post-mortem: the recorded op-trace of the diverging block + the replay's
+ * op index where it diverged, so the desync can be read off directly. */
+static ls_op_t  s_ls_div_trace[48];
+static int      s_ls_div_trace_n = 0, s_ls_div_idx = 0;
+
+static int s_ls_record_only = 0;   /* diagnostic: record but skip inline replay (perturbation test) */
+void ls_set_window(uint32_t lo, uint32_t hi) { s_ls_frame_lo = lo; s_ls_frame_hi = hi; }
+void ls_set_record_only(int on) { s_ls_record_only = on; }
+
+uint32_t ls_read_hook(uint32_t addr, int size, uint32_t real_val) {
+    if (g_ls_mode == 2) {                 /* replay: serve from trace */
+        if (s_ls_trace_idx >= s_ls_trace_n) { s_ls_replay_done = 1; return 0; }  /* count mismatch: benign block-boundary artifact */
+        ls_op_t *o = &s_ls_trace[s_ls_trace_idx];
+        if (o->is_write || o->addr != addr) {
+            if (!s_ls_mismatch) { s_ls_mismatch = 1; s_ls_m_kind = 1; s_ls_m_pc = s_ls_cur_pc;
+                                  s_ls_m_addr = addr; s_ls_m_exp = addr; s_ls_m_act = o->addr; }
+            return 0;
+        }
+        s_ls_trace_idx++;
+        return o->val;
+    }
+    if (g_ls_mode == 1) {                  /* record */
+        if (s_ls_trace_n < LS_TRACE_CAP) {
+            ls_op_t *o = &s_ls_trace[s_ls_trace_n++];
+            o->is_write = 0; o->size = (uint8_t)size; o->addr = addr; o->val = real_val;
+        } else s_ls_overflow = 1;
+    }
+    return real_val;
+}
+
+void ls_write_hook(uint32_t addr, int size, uint32_t val) {
+    if (g_ls_mode == 2) {                 /* replay: verify against trace */
+        if (s_ls_trace_idx >= s_ls_trace_n) { s_ls_replay_done = 1; return; }  /* count mismatch: benign block-boundary artifact */
+        ls_op_t *o = &s_ls_trace[s_ls_trace_idx];
+        if (!o->is_write || o->addr != addr) {
+            if (!s_ls_mismatch) { s_ls_mismatch = 1; s_ls_m_kind = 2; s_ls_m_pc = s_ls_cur_pc;
+                                  s_ls_m_addr = addr; s_ls_m_exp = addr; s_ls_m_act = o->addr; }
+            return;
+        }
+        if (o->val != val) {              /* compiled wrote a different value than interp */
+            if (!s_ls_mismatch) { s_ls_mismatch = 1; s_ls_m_kind = 3; s_ls_m_pc = s_ls_cur_pc;
+                                  s_ls_m_addr = addr; s_ls_m_exp = val; s_ls_m_act = o->val; }
+        }
+        s_ls_trace_idx++;
+        return;
+    }
+    if (g_ls_mode == 1) {                  /* record */
+        if (s_ls_trace_n < LS_TRACE_CAP) {
+            ls_op_t *o = &s_ls_trace[s_ls_trace_n++];
+            o->is_write = 1; o->size = (uint8_t)size; o->addr = addr; o->val = val;
+        } else s_ls_overflow = 1;
+    }
+}
+
+static void ls_latch(int kind, uint32_t frame, uint32_t pc, uint32_t addr,
+                     uint32_t exp, uint32_t act, int detail) {
+    if (s_ls_div.found) return;
+    s_ls_div.found = 1; s_ls_div.kind = kind; s_ls_div.frame = frame;
+    s_ls_div.block = s_ls_block; s_ls_div.pc = pc; s_ls_div.addr = addr;
+    s_ls_div.exp = exp; s_ls_div.act = act; s_ls_div.detail = detail;
+}
+
+/* Re-interpret the just-recorded block from the entry snapshot, comparing the
+ * interp result to native (cpu == post-block native state). */
+static void ls_replay_and_compare(CPUState *cpu, uint32_t frame, uint32_t target_phys) {
+    CPUState rep = s_ls_R0;                 /* registers from block entry (pc is stale in compiled) */
+    rep.pc = s_ls_block | 0x80000000u;      /* start at the recorded block's leader (KSEG0) */
+    s_ls_trace_idx = 0; s_ls_mismatch = 0; s_ls_m_kind = 0; s_ls_replay_done = 0;
+    /* The replay's exec_one writes process-global decode state on any
+     * instruction it can't handle; snapshot+restore so the replay can never
+     * divert the REAL dispatch (which reacts to g_unsupported_seen). */
+    int         sav_unsup_seen   = g_unsupported_seen;
+    uint32_t    sav_unsup_pc     = g_unsupported_pc;
+    uint32_t    sav_unsup_insn   = g_unsupported_insn;
+    const char *sav_unsup_reason = g_unsupported_reason;
+    g_ls_replay_active = 1;
+    g_ls_mode = 2;
+    uint32_t pc = rep.pc;
+    int cap = 512, steps = 0;
+    for (;;) {
+        /* Stop at the next block leader (fall-through block, or a branch's
+         * target). steps>0 so a self-looping block runs one iteration. */
+        if (steps > 0 && (pc & 0x1FFFFFFFu) == target_phys) break;
+        if (cap-- <= 0 || s_ls_mismatch || s_ls_replay_done) break;
+        uint32_t next_pc = 0;
+        s_ls_cur_pc = pc;
+        int transferred = exec_one(&rep, pc, &next_pc);
+        pc = transferred ? rep.pc : next_pc;
+        steps++;
+        /* Also stop at the block TERMINATOR (branch/jump/call) — do NOT follow
+         * it. A call would run the callee (kernel/syscall/another fn) which the
+         * recording dispatched separately or whose ops trail in the trace;
+         * following it desyncs. Compare only the block's own in-line memory ops,
+         * checked op-by-op against the trace as we go. */
+        if (transferred) break;
+    }
+    g_ls_mode = 0;
+    g_ls_replay_active = 0;
+    g_unsupported_seen   = sav_unsup_seen;     /* undo any replay-side decode-state leak */
+    g_unsupported_pc     = sav_unsup_pc;
+    g_unsupported_insn   = sav_unsup_insn;
+    g_unsupported_reason = sav_unsup_reason;
+    s_ls_div.blocks_checked++;
+
+    /* Divergence = an in-block memory-op mismatch (the interp replay read a
+     * different address, or the compiled block wrote a different value, at the
+     * same op index given identical entry state). Leftover trace ops past the
+     * terminator are the callee's (recording spanned a call) and are ignored;
+     * registers are not compared (boundary-sensitive across calls). A wrong
+     * register value still surfaces here later, as a wrong store value / load
+     * address, when the bad value is used. */
+    if (s_ls_mismatch) {
+        int n = s_ls_trace_n; if (n > 48) n = 48;
+        for (int i = 0; i < n; i++) s_ls_div_trace[i] = s_ls_trace[i];
+        s_ls_div_trace_n = n;
+        s_ls_div_idx = s_ls_trace_idx;
+        int k = (s_ls_m_kind == 1) ? 5 : (s_ls_m_kind == 2) ? 6 : (s_ls_m_kind == 3) ? 4 : 7;
+        ls_latch(k, frame, s_ls_m_pc, s_ls_m_addr, s_ls_m_exp, s_ls_m_act, 0);
+        return;
+    }
+}
+
+void ls_at_leader(uint32_t leader_phys, CPUState *cpu) {
+    if (s_ls_frame_hi == 0 || s_ls_div.found || !cpu) return;
+    if (g_ls_mode == 2) return;            /* re-entrancy guard (shouldn't happen) */
+    uint32_t frame = (uint32_t)s_frame_count;
+    int in_win = (frame >= s_ls_frame_lo && frame <= s_ls_frame_hi);
+    if (!in_win) { if (g_ls_mode == 1) { g_ls_mode = 0; s_ls_prev_valid = 0; } return; }
+
+    if (s_ls_prev_valid && g_ls_mode == 1) {   /* finalize previous game block */
+        g_ls_mode = 0;
+        if (!s_ls_record_only) {                /* record_only: skip inline replay (perturbation test) */
+            ls_replay_and_compare(cpu, frame, leader_phys);  /* this leader = where prev block went */
+            if (s_ls_div.found) { s_ls_prev_valid = 0; return; }
+        } else {
+            s_ls_div.blocks_checked++;          /* count recorded blocks */
+        }
+        s_ls_prev_valid = 0;
+    }
+    /* Only START recording for a genuinely COMPILED game-text block:
+     *  - !g_ls_dirty_observe: the dirty-RAM interp loop also calls cyc_observe
+     *    (per-instruction, for the cycle ruler); skip those — they're already
+     *    interpreted (clean game text dispatched FROM the dirty path still runs
+     *    compiled, so we can't use g_dirty_interp_active here).
+     *  - [0x10000, 0x200000): game EXE text in main RAM (above the low-RAM
+     *    kernel/relocated-BIOS area, which isn't the regression locus). */
+    if (!g_ls_dirty_observe && leader_phys >= 0x00010000u && leader_phys < 0x00200000u) {
+        s_ls_R0 = *cpu;
+        s_ls_block = leader_phys;
+        s_ls_trace_n = 0; s_ls_trace_idx = 0; s_ls_overflow = 0; s_ls_mismatch = 0;
+        s_ls_prev_valid = 1;
+        g_ls_mode = 1;
+    }
+}
+
+int ls_get_diverge_json(char *buf, int buflen) {
+    static const char *kn[] = {"none","reg","hi","lo","write-val","read-addr",
+                               "write-addr","trace-exhausted","compiled-extra-ops","path-cap"};
+    int k = (s_ls_div.kind >= 0 && s_ls_div.kind <= 9) ? s_ls_div.kind : 0;
+    int p = snprintf(buf, buflen,
+        "{\"found\":%d,\"kind\":\"%s\",\"frame\":%u,\"block\":\"0x%08X\",\"pc\":\"0x%08X\","
+        "\"addr\":\"0x%08X\",\"interp_expected\":\"0x%08X\",\"compiled_actual\":\"0x%08X\","
+        "\"reg\":%d,\"blocks_checked\":%llu,\"window\":[%u,%u],\"div_idx\":%d,\"trace\":[",
+        s_ls_div.found, kn[k], s_ls_div.frame, s_ls_div.block, s_ls_div.pc,
+        s_ls_div.addr, s_ls_div.exp, s_ls_div.act, s_ls_div.detail,
+        (unsigned long long)s_ls_div.blocks_checked, s_ls_frame_lo, s_ls_frame_hi,
+        s_ls_div_idx);
+    for (int i = 0; i < s_ls_div_trace_n && p < buflen - 48; i++) {
+        p += snprintf(buf + p, buflen - p, "%s\"%c%d:%08X=%08X\"",
+                      i ? "," : "", s_ls_div_trace[i].is_write ? 'W' : 'R',
+                      s_ls_div_trace[i].size, s_ls_div_trace[i].addr, s_ls_div_trace[i].val);
+    }
+    p += snprintf(buf + p, buflen - p, "]}");
+    return p;
+}

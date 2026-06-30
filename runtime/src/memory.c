@@ -17,6 +17,7 @@
 #include "sio.h"
 #include "spu.h"
 #include "timers.h"
+#include "lockstep.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -721,7 +722,24 @@ static void mmio_write8(uint32_t addr, uint8_t val) {
 
 /* --- Read functions --- */
 
+/* lockstep: 1 while a guest-direct memory op's REAL body runs, so nested ops
+ * (device-emulation reads triggered by an MMIO write, etc.) are not recorded —
+ * the shadow replay verifies writes without performing them, so it never sees
+ * those device-internal accesses. Interrupt-handler ops are excluded too
+ * (psx_get_in_exception): the replay runs only the block, never the handler. */
+static int s_ls_op_active = 0;
+extern int psx_get_in_exception(void);
+static uint32_t psx_read_word_raw(uint32_t addr);
 uint32_t psx_read_word(uint32_t addr) {
+    if (g_ls_mode == 2) return ls_read_hook(addr, 4, 0u);
+    if (g_ls_mode != 1 || s_ls_op_active) return psx_read_word_raw(addr);
+    s_ls_op_active = 1;
+    uint32_t v = psx_read_word_raw(addr);
+    s_ls_op_active = 0;
+    if (!psx_get_in_exception()) ls_read_hook(addr, 4, v);
+    return v;
+}
+static uint32_t psx_read_word_raw(uint32_t addr) {
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) return cache_ctrl;
 
@@ -796,7 +814,16 @@ static inline void d44_note(uint32_t phys, uint32_t old, uint32_t val) {
     e->frame = (uint32_t)s_frame_count;
 }
 
+static void psx_write_word_raw(uint32_t addr, uint32_t val);
 void psx_write_word(uint32_t addr, uint32_t val) {
+    if (g_ls_mode == 2) { ls_write_hook(addr, 4, val); return; }
+    if (g_ls_mode != 1 || s_ls_op_active) { psx_write_word_raw(addr, val); return; }
+    if (!psx_get_in_exception()) ls_write_hook(addr, 4, val);
+    s_ls_op_active = 1;
+    psx_write_word_raw(addr, val);
+    s_ls_op_active = 0;
+}
+static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) { cache_ctrl = val; return; }
 
@@ -846,7 +873,17 @@ void psx_write_word(uint32_t addr, uint32_t val) {
     unmapped_fatal(addr, phys, "WRITE");
 }
 
+static uint16_t psx_read_half_raw(uint32_t addr);
 uint16_t psx_read_half(uint32_t addr) {
+    if (g_ls_mode == 2) return (uint16_t)ls_read_hook(addr, 2, 0u);
+    if (g_ls_mode != 1 || s_ls_op_active) return psx_read_half_raw(addr);
+    s_ls_op_active = 1;
+    uint16_t v = psx_read_half_raw(addr);
+    s_ls_op_active = 0;
+    if (!psx_get_in_exception()) ls_read_hook(addr, 2, v);
+    return v;
+}
+static uint16_t psx_read_half_raw(uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
@@ -868,7 +905,16 @@ uint16_t psx_read_half(uint32_t addr) {
     return 0;
 }
 
+static void psx_write_half_raw(uint32_t addr, uint16_t val);
 void psx_write_half(uint32_t addr, uint16_t val) {
+    if (g_ls_mode == 2) { ls_write_hook(addr, 2, val); return; }
+    if (g_ls_mode != 1 || s_ls_op_active) { psx_write_half_raw(addr, val); return; }
+    if (!psx_get_in_exception()) ls_write_hook(addr, 2, val);
+    s_ls_op_active = 1;
+    psx_write_half_raw(addr, val);
+    s_ls_op_active = 0;
+}
+static void psx_write_half_raw(uint32_t addr, uint16_t val) {
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
     uint32_t phys = addr & 0x1FFFFFFFu;
@@ -903,7 +949,17 @@ void psx_write_half(uint32_t addr, uint16_t val) {
     unmapped_fatal(addr, phys, "WRITE");
 }
 
+static uint8_t psx_read_byte_raw(uint32_t addr);
 uint8_t psx_read_byte(uint32_t addr) {
+    if (g_ls_mode == 2) return (uint8_t)ls_read_hook(addr, 1, 0u);
+    if (g_ls_mode != 1 || s_ls_op_active) return psx_read_byte_raw(addr);
+    s_ls_op_active = 1;
+    uint8_t v = psx_read_byte_raw(addr);
+    s_ls_op_active = 0;
+    if (!psx_get_in_exception()) ls_read_hook(addr, 1, v);
+    return v;
+}
+static uint8_t psx_read_byte_raw(uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
@@ -1056,7 +1112,16 @@ uint32_t psx_guest_read_word(uint32_t addr) { return psx_read_word(addr); }
 uint16_t psx_guest_read_half(uint32_t addr) { return psx_read_half(addr); }
 uint8_t  psx_guest_read_byte(uint32_t addr) { return psx_read_byte(addr); }
 
+static void psx_write_byte_raw(uint32_t addr, uint8_t val);
 void psx_write_byte(uint32_t addr, uint8_t val) {
+    if (g_ls_mode == 2) { ls_write_hook(addr, 1, val); return; }
+    if (g_ls_mode != 1 || s_ls_op_active) { psx_write_byte_raw(addr, val); return; }
+    if (!psx_get_in_exception()) ls_write_hook(addr, 1, val);
+    s_ls_op_active = 1;
+    psx_write_byte_raw(addr, val);
+    s_ls_op_active = 0;
+}
+static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
     uint32_t phys = addr & 0x1FFFFFFFu;
