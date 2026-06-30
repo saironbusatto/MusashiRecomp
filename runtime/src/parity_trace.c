@@ -4,7 +4,9 @@
 #include "parity_trace.h"
 #include <string.h>
 
-#define PARITY_RING_CAP 16384u   /* power of two; ~spans the cutscene window */
+#define PARITY_RING_CAP 131072u  /* power of two; ~128K thread1 events of history
+                                  * so the parked-thread1 divergence is in-window,
+                                  * not just the wedge tail (~7.5 MB ring). */
 
 static ParityEntry s_ring[PARITY_RING_CAP];
 static uint64_t    s_seq      = 0;
@@ -18,10 +20,11 @@ static uint32_t    s_state_off     = 0x00u;
 static uint32_t    s_watch[PARITY_WATCH_MAX];
 static int         s_watch_count   = 0;
 
-/* Frame stamp: each host process defines parity_host_frame() (recomp's
- * s_frame_count is uint64_t, Beetle's is uint32_t — an accessor decouples the
- * type/linkage so this single TU compiles into both). */
+/* Frame + guest-cycle stamps: each host process defines these accessors
+ * (decoupled so this single TU compiles into both). cycle = absolute guest CPU
+ * cycles since boot — the deterministic ruler for native<->Beetle drift. */
 extern uint32_t parity_host_frame(void);
+extern uint64_t parity_host_cycle(void);
 
 void parity_trace_config(uint32_t watched_tcb, uint32_t trigger_target,
                          uint32_t tcb_epc_off, uint32_t tcb_state_off,
@@ -73,7 +76,7 @@ void parity_trace_record(parity_kind_t kind, uint32_t pc, uint32_t ra,
     ParityEntry* e = &s_ring[s_seq & (PARITY_RING_CAP - 1u)];
     e->seq         = s_seq;
     e->frame       = parity_host_frame();
-    e->cycle       = 0u; /* best-effort; populated by host hook if available */
+    e->cycle       = parity_host_cycle();
     e->kind        = (uint32_t)kind;
     e->current_tcb = current_tcb;
     e->pc          = pc;

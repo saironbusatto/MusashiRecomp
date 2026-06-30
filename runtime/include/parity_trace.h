@@ -42,8 +42,10 @@ typedef enum {
 typedef struct {
     uint64_t seq;
     uint32_t frame;
-    uint32_t cycle;
     uint32_t kind;
+    uint64_t cycle;      /* absolute guest CPU cycles since boot (the deterministic
+                          * ruler; native psx_get_cycle_count / Beetle
+                          * beetle_core_get_guest_cycles — directly comparable) */
     uint32_t current_tcb;
     uint32_t pc;
     uint32_t ra;
