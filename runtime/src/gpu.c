@@ -1074,6 +1074,8 @@ static uint32_t lcf;             /* bit 31 */
  * BIOS-shell GPUSTAT poll loop, without going through the
  * vblank-callback path (which would call SDL_Delay/Sleep). */
 extern uint32_t i_stat;
+/* Central IRQ-raise choke point (interrupts.c) — also records the device ring. */
+extern void psx_irq_raise(uint32_t bit, uint32_t detail);
 
 /* Display area start (GP1(05h)) */
 static uint32_t display_area_x;
@@ -1229,7 +1231,7 @@ uint32_t gpu_read_gpustat(void) {
     if (gpustat_poll_count >= GPUSTAT_POLL_VBLANK_THRESHOLD) {
         gpustat_poll_count = 0;
         lcf ^= 1;
-        i_stat |= (1u << 0); /* IRQ_VBLANK */
+        psx_irq_raise(0, 0); /* IRQ_VBLANK (GPUSTAT-poll fallback path) */
         /* DEQUEUE: VBlank fired via the GPUSTAT-poll fallback path (distinct
          * from the cycle-paced VBlank in psx_check_interrupts). */
         event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK, 0xFFFFFFFFu);
@@ -1343,7 +1345,7 @@ static uint16_t rgb888_to_rgb555(uint32_t color24) {
 void gpu_vblank_tick(void) {
     lcf ^= 1;
     gpustat_poll_count = 0;
-    i_stat |= (1u << 0); /* IRQ_VBLANK */
+    psx_irq_raise(0, 0); /* IRQ_VBLANK (gpu_vblank_tick) */
     if (vblank_callback) vblank_callback();
 }
 

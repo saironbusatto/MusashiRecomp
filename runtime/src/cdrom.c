@@ -36,6 +36,8 @@ extern int iso_track_is_audio(void* handle, int track);
 
 /* I_STAT owned by memory.c — set bit 2 for CDROM IRQ */
 extern uint32_t i_stat;
+/* Central IRQ-raise choke point (interrupts.c) — also records the device ring. */
+extern void psx_irq_raise(uint32_t bit, uint32_t detail);
 extern uint32_t g_debug_current_func_addr;
 extern uint32_t g_debug_last_store_pc;
 extern uint64_t s_frame_count;
@@ -536,7 +538,7 @@ static void present_cdrom_irq(void) {
      * own trailing INTC ack. */
     if (cdrom_irq_present_delay > 0) return;
     if (irq_flag && (irq_enable & (1 << (irq_flag - 1))) && !cdrom_intc_request_latched) {
-        i_stat |= (1u << 2); /* IRQ_CDROM */
+        psx_irq_raise(2, irq_flag); /* IRQ_CDROM; detail = CD response/IRQ type */
         cdrom_intc_request_latched = 1;
         cdrom_intc_latched_generation = cdrom_irq_generation;
         event_ring_record(EV_ISTAT_RAISE, 2 /* IRQ_CDROM bit */);

@@ -2606,6 +2606,7 @@ static void handle_dirty_insn_dump_file(int id, const char *json)
  * across processes (psx-runtime port 4370, psx-beetle port 4380). */
 #include "fntrace.h"
 #include "parity_trace.h"
+#include "device_trace.h"
 
 /* ---- parity_dump / parity_ctl: general two-process control-flow parity ring.
  * Mirrors the IDENTICAL command on psx-beetle so tools/parity_diff.py can pull
@@ -2688,6 +2689,61 @@ static void handle_parity_ctl(int id, const char *json)
         "{\"id\":%d,\"ok\":true,\"armed\":%d,\"frozen\":%d,\"total\":%llu}\n",
         id, parity_trace_is_armed(), parity_trace_is_frozen(),
         (unsigned long long)parity_trace_total());
+    debug_server_send_line(buf);
+}
+
+/* ---- devtrace_dump / devtrace_ctl: general two-process device-event ring.
+ * Identical command + JSON on psx-beetle so tools/devtrace_diff.py pulls both
+ * device-IRQ timelines and aligns them by guest cycle. Optional filters:
+ *   count           max newest events to return (default 65536, cap = ring)
+ *   cyc_lo / cyc_hi half-open guest-cycle window (decimal) — slice the load
+ *   src             only this I_STAT source bit (0..10); omit/negative = all */
+static void handle_devtrace_dump(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 65536);
+    if (count < 1) count = 1;
+    if (count > (1 << 20)) count = (1 << 20);
+    char buf[32];
+    uint64_t cyc_lo = 0, cyc_hi = ~0ull;
+    if (json_get_str(json, "cyc_lo", buf, sizeof buf)) cyc_lo = strtoull(buf, NULL, 0);
+    if (json_get_str(json, "cyc_hi", buf, sizeof buf)) cyc_hi = strtoull(buf, NULL, 0);
+    int src = json_get_int(json, "src", -1);
+
+    DevEvent *e = (DevEvent *)malloc(sizeof(DevEvent) * (size_t)count);
+    if (!e) { send_err(id, "oom"); return; }
+    uint32_t got = device_trace_get(e, (uint32_t)count);
+    const size_t BUF_SZ = 12 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) { free(e); send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+        "{\"id\":%d,\"ok\":true,\"total\":%llu,\"armed\":%d,\"count\":%u,\"events\":[",
+        id, (unsigned long long)device_trace_total(), device_trace_is_armed(), got);
+    uint32_t emitted = 0;
+    for (uint32_t i = 0; i < got; i++) {
+        if (pos > BUF_SZ - 256) break;
+        DevEvent *r = &e[i];
+        if (r->cycle < cyc_lo || r->cycle >= cyc_hi) continue;
+        if (src >= 0 && (int)r->source != src) continue;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+            "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,\"srcn\":%u,\"src\":\"%s\",\"detail\":%u}",
+            emitted ? "," : "", (unsigned long long)r->seq, (unsigned long long)r->cycle,
+            r->frame, r->source, device_source_str(r->source), r->detail);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%u}\n", emitted);
+    debug_server_send_line(out); free(out); free(e);
+}
+
+static void handle_devtrace_ctl(int id, const char *json)
+{
+    if (json_get_int(json, "reset", 0)) device_trace_reset();
+    long armv = json_get_int(json, "arm", -1);
+    if (armv == 0 || armv == 1) device_trace_arm((int)armv);
+    char buf[128];
+    snprintf(buf, sizeof buf,
+        "{\"id\":%d,\"ok\":true,\"armed\":%d,\"total\":%llu}\n",
+        id, device_trace_is_armed(), (unsigned long long)device_trace_total());
     debug_server_send_line(buf);
 }
 
@@ -10338,6 +10394,8 @@ static const CmdEntry s_commands[] = {
     { "ping",              handle_ping },
     { "parity_dump",       handle_parity_dump },
     { "parity_ctl",        handle_parity_ctl },
+    { "devtrace_dump",     handle_devtrace_dump },
+    { "devtrace_ctl",      handle_devtrace_ctl },
     { "latency",           handle_latency },
     { "vk_perf",           handle_vk_perf },
     { "game_options",      handle_game_options },

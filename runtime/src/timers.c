@@ -67,6 +67,8 @@ void timers_get_debug(int t, uint16_t *counter, uint16_t *target,
 
 /* I_STAT is owned by memory.c — we poke it directly via this extern. */
 extern uint32_t i_stat;
+/* Central IRQ-raise choke point (interrupts.c) — also records the device ring. */
+extern void psx_irq_raise(uint32_t bit, uint32_t detail);
 
 void timers_init(void) {
     memset(timers, 0, sizeof(timers));
@@ -119,14 +121,14 @@ static void timer_fire_irq(int t) {
         tm->irq_line ^= 1;
         if (tm->irq_line) {
             tm->mode &= ~MODE_IRQ_REQUEST;
-            i_stat |= (1 << timer_irq[t]);
+            psx_irq_raise(timer_irq[t], t); /* detail = timer index */
         } else {
             tm->mode |= MODE_IRQ_REQUEST;
         }
     } else {
         /* Pulse mode */
         tm->mode &= ~MODE_IRQ_REQUEST;
-        i_stat |= (1 << timer_irq[t]);
+        psx_irq_raise(timer_irq[t], t); /* detail = timer index */
         tm->mode |= MODE_IRQ_REQUEST;
     }
 

@@ -23,6 +23,8 @@
 
 /* I_STAT and I_MASK are owned by memory.c */
 extern uint32_t i_stat;
+/* Central IRQ-raise choke point (interrupts.c) — also records the device ring. */
+extern void psx_irq_raise(uint32_t bit, uint32_t detail);
 extern uint32_t i_mask;
 
 #define COP0_SR    12
@@ -521,7 +523,7 @@ static void interp_check_interrupts(CPUState* cpu) {
     s_vblank_count++;
     if (s_vblank_count >= VBLANK_INTERVAL) {
         s_vblank_count = 0;
-        i_stat |= (1u << IRQ_VBLANK);
+        psx_irq_raise(IRQ_VBLANK, 0);
         gpu_vblank_tick();
         timers_tick(33868);
         cdrom_tick();

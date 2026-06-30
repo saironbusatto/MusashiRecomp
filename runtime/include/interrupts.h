@@ -24,6 +24,13 @@ struct CPUState;
 
 void interrupts_init(void);
 
+/* Central IRQ-raise choke point: sets the I_STAT bit AND records the raise edge
+ * into the always-on device-event ring (device_trace) with the guest cycle.
+ * Every hardware source (VBLANK/GPU/CDROM/DMA/timers/SIO/SPU) funnels its raise
+ * through here so the device-timing audit sees every event from one place.
+ * `detail` is source-specific (DMA channel, timer index) or 0. */
+void psx_irq_raise(uint32_t bit, uint32_t detail);
+
 /* Called from the dispatch loop after each function returns.
  * Fires vblank on schedule, checks (i_stat & i_mask), and if
  * pending + COP0 allows, dispatches the exception handler. */
