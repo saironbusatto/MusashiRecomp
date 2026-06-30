@@ -2644,7 +2644,7 @@ static void handle_parity_dump(int id, const char *json)
         parity_trace_is_frozen(), got);
     uint32_t run = 1, emitted = 0;
     for (uint32_t i = 0; i < got; i++) {
-        if (pos > BUF_SZ - 1024) break;
+        if (pos > BUF_SZ - 2048) break;
         /* In transitions mode, advance through identical-state dispatch rows until
          * a boundary (next row differs, is a control event, or end of buffer). */
         if (trans) {
@@ -2657,11 +2657,21 @@ static void handle_parity_dump(int id, const char *json)
             "%s{\"seq\":%llu,\"frame\":%u,\"cycle\":%llu,\"reps\":%u,\"kind\":\"%s\",\"cur_tcb\":\"0x%08X\","
             "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"sp\":\"0x%08X\",\"epc\":\"0x%08X\","
             "\"state\":\"0x%08X\",\"target\":\"0x%08X\","
-            "\"w\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"]}",
+            "\"w\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"],"
+            "\"wwpc\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"],"
+            "\"wwcy\":[%llu,%llu,%llu,%llu,%llu,%llu],"
+            "\"wwf\":[%u,%u,%u,%u,%u,%u],"
+            "\"wwt\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"]}",
             emitted ? "," : "", (unsigned long long)r->seq, r->frame,
             (unsigned long long)r->cycle, trans ? run : 1u, parity_kind_str(r->kind),
             r->current_tcb, r->pc, r->ra, r->sp, r->epc, r->tcb_state, r->target,
-            r->watch[0], r->watch[1], r->watch[2], r->watch[3], r->watch[4], r->watch[5]);
+            r->watch[0], r->watch[1], r->watch[2], r->watch[3], r->watch[4], r->watch[5],
+            r->watch_wpc[0], r->watch_wpc[1], r->watch_wpc[2], r->watch_wpc[3], r->watch_wpc[4], r->watch_wpc[5],
+            (unsigned long long)r->watch_wcycle[0], (unsigned long long)r->watch_wcycle[1],
+            (unsigned long long)r->watch_wcycle[2], (unsigned long long)r->watch_wcycle[3],
+            (unsigned long long)r->watch_wcycle[4], (unsigned long long)r->watch_wcycle[5],
+            r->watch_wframe[0], r->watch_wframe[1], r->watch_wframe[2], r->watch_wframe[3], r->watch_wframe[4], r->watch_wframe[5],
+            r->watch_wtcb[0], r->watch_wtcb[1], r->watch_wtcb[2], r->watch_wtcb[3], r->watch_wtcb[4], r->watch_wtcb[5]);
         emitted++; run = 1;
     }
     pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%u}\n", emitted);

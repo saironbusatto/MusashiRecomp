@@ -54,6 +54,15 @@ typedef struct {
     uint32_t tcb_state;  /* state/status word read from watched TCB */
     uint32_t target;     /* dispatch / switch target */
     uint32_t watch[PARITY_WATCH_MAX];
+    /* Per-watch-word LAST-WRITER provenance (set by parity_trace_note_write):
+     * the exact store PC, guest cycle, frame, and (approx) writing TCB of the
+     * most recent write to each watch word. This is what turns "the value
+     * diverged" into "who/when produced the divergent value" — diff these across
+     * native vs Beetle to name the early producer of a gate input. */
+    uint32_t watch_wpc[PARITY_WATCH_MAX];
+    uint64_t watch_wcycle[PARITY_WATCH_MAX];
+    uint32_t watch_wframe[PARITY_WATCH_MAX];
+    uint32_t watch_wtcb[PARITY_WATCH_MAX];
 } ParityEntry;
 
 /* Each process supplies its own RAM reader (recomp: cpu->read_word; Beetle:
@@ -78,6 +87,17 @@ int  parity_trace_is_frozen(void);
 void parity_trace_record(parity_kind_t kind, uint32_t pc, uint32_t ra,
                          uint32_t sp, uint32_t target,
                          parity_read_word_fn read_word, void* ctx);
+
+/* Note a guest memory write so the per-watch-word last-writer table stays
+ * current. addr may be guest-virtual or physical (masked internally); width is
+ * the access size in bytes (1/2/4); writer_pc is the EXACT store instruction PC
+ * (native: g_debug_last_store_pc; Beetle: the store pc from the wtrace hook).
+ * Updates a watch slot iff [addr,addr+width) overlaps that watch word. No-op
+ * unless armed and not frozen. Called from BOTH processes' write paths so the
+ * provenance is directly comparable. The writing TCB is taken from the most
+ * recent recorded control event (a cheap, accurate-in-practice approximation —
+ * the writer is the running thread). */
+void parity_trace_note_write(uint32_t addr, uint32_t width, uint32_t writer_pc);
 
 /* Readback (matches the beetle_fntrace_get pattern): copies up to max_rows
  * NEWEST entries, oldest-first, into out[]; returns the count copied. */

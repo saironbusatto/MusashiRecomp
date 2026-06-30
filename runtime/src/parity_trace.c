@@ -20,6 +20,13 @@ static uint32_t    s_state_off     = 0x00u;
 static uint32_t    s_watch[PARITY_WATCH_MAX];
 static int         s_watch_count   = 0;
 
+/* Per-watch-word last-writer table (see parity_trace_note_write). */
+static uint32_t    s_wpc[PARITY_WATCH_MAX];
+static uint64_t    s_wcycle[PARITY_WATCH_MAX];
+static uint32_t    s_wframe[PARITY_WATCH_MAX];
+static uint32_t    s_wtcb[PARITY_WATCH_MAX];
+static uint32_t    s_last_current_tcb = 0; /* writer-TCB attribution for note_write */
+
 /* Frame + guest-cycle stamps: each host process defines these accessors
  * (decoupled so this single TU compiles into both). cycle = absolute guest CPU
  * cycles since boot — the deterministic ruler for native<->Beetle drift. */
@@ -37,12 +44,18 @@ void parity_trace_config(uint32_t watched_tcb, uint32_t trigger_target,
     if (watch_count < 0) watch_count = 0;
     if (watch_count > PARITY_WATCH_MAX) watch_count = PARITY_WATCH_MAX;
     s_watch_count = watch_count;
-    for (int i = 0; i < PARITY_WATCH_MAX; i++)
+    for (int i = 0; i < PARITY_WATCH_MAX; i++) {
         s_watch[i] = (watch_addrs && i < watch_count) ? watch_addrs[i] : 0;
+        s_wpc[i] = 0; s_wcycle[i] = 0; s_wframe[i] = 0; s_wtcb[i] = 0;
+    }
 }
 
 void parity_trace_arm(int on)        { s_armed = on ? 1u : 0u; }
-void parity_trace_reset(void)        { s_seq = 0; s_frozen = 0; memset(s_ring, 0, sizeof(s_ring)); }
+void parity_trace_reset(void)        {
+    s_seq = 0; s_frozen = 0; memset(s_ring, 0, sizeof(s_ring));
+    for (int i = 0; i < PARITY_WATCH_MAX; i++) { s_wpc[i] = 0; s_wcycle[i] = 0; s_wframe[i] = 0; s_wtcb[i] = 0; }
+    s_last_current_tcb = 0;
+}
 int  parity_trace_is_armed(void)     { return (int)s_armed; }
 int  parity_trace_is_frozen(void)    { return (int)s_frozen; }
 uint64_t parity_trace_total(void)    { return s_seq; }
@@ -71,6 +84,10 @@ void parity_trace_record(parity_kind_t kind, uint32_t pc, uint32_t ra,
     uint32_t tcbh = read_word(ctx, 0x00000108u);
     uint32_t current_tcb = tcbh ? read_word(ctx, tcbh) : 0u;
 
+    /* Track the running thread for note_write's writer-TCB attribution. Updated
+     * even for non-watched TCBs so a write by another thread is attributed to it. */
+    s_last_current_tcb = current_tcb;
+
     if (s_watched_tcb && current_tcb != s_watched_tcb) return;
 
     ParityEntry* e = &s_ring[s_seq & (PARITY_RING_CAP - 1u)];
@@ -85,8 +102,13 @@ void parity_trace_record(parity_kind_t kind, uint32_t pc, uint32_t ra,
     e->target      = target;
     e->epc         = s_watched_tcb ? read_word(ctx, s_watched_tcb + s_epc_off)   : 0u;
     e->tcb_state   = s_watched_tcb ? read_word(ctx, s_watched_tcb + s_state_off) : 0u;
-    for (int i = 0; i < PARITY_WATCH_MAX; i++)
-        e->watch[i] = (i < s_watch_count && s_watch[i]) ? read_word(ctx, s_watch[i]) : 0u;
+    for (int i = 0; i < PARITY_WATCH_MAX; i++) {
+        e->watch[i]        = (i < s_watch_count && s_watch[i]) ? read_word(ctx, s_watch[i]) : 0u;
+        e->watch_wpc[i]    = s_wpc[i];
+        e->watch_wcycle[i] = s_wcycle[i];
+        e->watch_wframe[i] = s_wframe[i];
+        e->watch_wtcb[i]   = s_wtcb[i];
+    }
     s_seq++;
 
     /* Latch on the trigger so the pre-divergence window survives the wedge. The
@@ -95,6 +117,23 @@ void parity_trace_record(parity_kind_t kind, uint32_t pc, uint32_t ra,
         /* re-tag the just-written row as the trigger for easy diffing */
         e->kind = (uint32_t)PARITY_KIND_TRIGGER;
         s_frozen = 1;
+    }
+}
+
+void parity_trace_note_write(uint32_t addr, uint32_t width, uint32_t writer_pc)
+{
+    if (!s_armed || s_frozen) return;
+    uint32_t pa    = addr & 0x1FFFFFFFu;
+    uint32_t pa_hi = pa + (width ? width : 1u);
+    for (int i = 0; i < s_watch_count; i++) {
+        if (!s_watch[i]) continue;
+        uint32_t wa = s_watch[i] & 0x1FFFFFFFu;   /* watch word occupies [wa, wa+4) */
+        if (pa < wa + 4u && pa_hi > wa) {
+            s_wpc[i]    = writer_pc;
+            s_wcycle[i] = parity_host_cycle();
+            s_wframe[i] = parity_host_frame();
+            s_wtcb[i]   = s_last_current_tcb;
+        }
     }
 }
 

@@ -326,6 +326,11 @@ extern void debug_server_trace_entryint_write(uint32_t phys, uint32_t old_val,
 extern CPUState *debug_cpu_ptr;
 extern uint32_t g_debug_last_store_pc;
 
+/* Parity last-writer provenance (parity_trace.c): note every main-RAM write so
+ * the watch-word last-writer table tracks the exact producing store. No-op
+ * unless the parity ring is armed. */
+extern void parity_trace_note_write(uint32_t addr, uint32_t width, uint32_t writer_pc);
+
 /* Card-byte destination capture (Phase 3 audit). Always-on. */
 extern int card_data_writes_check(uint32_t phys, uint32_t value, uint8_t width);
 
@@ -804,6 +809,7 @@ void psx_write_word(uint32_t addr, uint32_t val) {
     if (phys < RAM_SIZE) {
         if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
+        parity_trace_note_write(phys, 4, g_debug_last_store_pc);
         card_data_writes_check(phys, val, 4);
         dirty_ram_mark_kernel_write(phys);
         overlay_watch_note_write(phys, 4);
@@ -869,6 +875,7 @@ void psx_write_half(uint32_t addr, uint16_t val) {
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
+        parity_trace_note_write(phys, 2, g_debug_last_store_pc);
         card_data_writes_check(phys, (uint32_t)val, 2);
         dirty_ram_mark_kernel_write(phys);
         overlay_watch_note_write(phys, 2);
@@ -1056,6 +1063,7 @@ void psx_write_byte(uint32_t addr, uint8_t val) {
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
+        parity_trace_note_write(phys, 1, g_debug_last_store_pc);
         card_data_writes_check(phys, (uint32_t)val, 1);
         dirty_ram_mark_kernel_write(phys);
         overlay_watch_note_write(phys, 1);
