@@ -4,6 +4,8 @@
 
 #include <SDL.h>
 #include "frame_pacing.h"
+#include "parity_trace.h"
+#include "device_trace.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -11,6 +13,8 @@
 extern "C" {
 int  beetle_init(const char* bios_path);
 int  beetle_init_with_disc(const char* bios_path, const char* disc_path);
+int  beetle_wtrace_arm(uint32_t lo, uint32_t hi);
+int  beetle_rtrace_arm(uint32_t lo, uint32_t hi);
 void beetle_shutdown(void);
 void beetle_run_frame(uint16_t pad1_buttons);
 int  beetle_get_framebuffer(uint32_t **out_pixels, unsigned *out_w, unsigned *out_h);
@@ -62,6 +66,12 @@ int main(int argc, char** argv) {
 
     const char* bios_path = "bios/SCPH1001.BIN";
     const char* disc_path = NULL;
+    /* --wtrace-boot: arm wtrace on the CD command/param/ack regs + I_STAT/I_MASK
+     * from frame 0, so the BIOS boot-EXE-load CD/IRQ activity is captured before
+     * the oracle races past it into the game. Excludes the CD index reg 0x1F801800
+     * on purpose: the BIOS status-poll writes it ~750x/frame and would flood the
+     * ring, evicting the meaningful cmd/ack/IRQ-enable writes. */
+    int wtrace_boot = 0;
     /* Default debug port 4382: 4380 collides with psxref and other recomp
      * projects' oracles (e.g. cdirecomp's CdiRuntime), and two LISTENers on
      * the same port silently route connections to the wrong process. Give
@@ -72,6 +82,8 @@ int main(int argc, char** argv) {
             disc_path = argv[++i];
         } else if (!std::strcmp(argv[i], "--port") && i + 1 < argc) {
             dbg_port = std::atoi(argv[++i]);
+        } else if (!std::strcmp(argv[i], "--wtrace-boot")) {
+            wtrace_boot = 1;
         } else if (argv[i][0] != '-') {
             bios_path = argv[i];
         }
@@ -119,10 +131,58 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (wtrace_boot) {
+        beetle_wtrace_arm(0x1F801801u, 0x1F801804u);  /* CD cmd/param/ack (not index 1800) */
+        beetle_wtrace_arm(0x1F801070u, 0x1F801078u);  /* I_STAT / I_MASK */
+        /* MMIO-READ trace from frame 0: capture what the IRQ handler READS from
+         * the CD IRQ-flag reg (0x1F801803 idx1) and I_STAT during the boot-EXE
+         * SeekL INT3 — the decisive verifier-vs-lowering signal. Include the
+         * full CD reg window (0x1800-1803) for reads since the IRQ-flag read is
+         * at index reg 0x1800/0x1803. */
+        beetle_rtrace_arm(0x1F801800u, 0x1F801804u);  /* CD regs (incl. index/IRQ-flag) */
+        beetle_rtrace_arm(0x1F801070u, 0x1F801078u);  /* I_STAT / I_MASK */
+        std::fprintf(stdout, "psx-beetle: --wtrace-boot armed (wtrace CD cmd/ack + I_STAT; rtrace CD regs + I_STAT from frame 0)\n");
+    }
+
 #ifndef PSX_NO_DEBUG_TOOLS
     beetle_debug_server_init(dbg_port);
     std::fprintf(stdout, "psx-beetle: debug server on port %d\n", dbg_port);
 #endif
+
+    /* General control-flow parity trace (oracle producer). Armed from boot via
+     * PSX_PARITY_TRACE=1 so the cutscene-transition window is covered. Default
+     * trigger is the MMX6 setter func_8001344C (the behavior native is MISSING):
+     * Beetle freezes its ring when thread1 reaches the setter, capturing the
+     * correct lead-up to diff against native's parked-at-func_8002000C ring.
+     * TCB / trigger / watch are env-tunable (same vars as psx-runtime). */
+    if (const char* pt = std::getenv("PSX_PARITY_TRACE"); pt && pt[0] && pt[0] != '0') {
+        auto envhex = [](const char* k, uint32_t dflt) -> uint32_t {
+            const char* v = std::getenv(k);
+            return (v && v[0]) ? (uint32_t)std::strtoul(v, nullptr, 0) : dflt;
+        };
+        uint32_t tcb     = envhex("PSX_PARITY_TCB",     0xA000E35Cu);
+        uint32_t trigger = envhex("PSX_PARITY_TRIGGER", 0x8001344Cu); /* setter */
+        uint32_t watch[PARITY_WATCH_MAX] = {
+            0x801FEB78u, 0x8006D9ACu, 0x800CD3F8u,
+            0x800CD3FCu, 0x800CD404u, 0x800200F4u,
+        };
+        parity_trace_config(tcb, trigger, 0x88u, 0x00u, watch, PARITY_WATCH_MAX);
+        parity_trace_arm(1);
+        std::fprintf(stdout, "psx-beetle: parity trace ARMED tcb=0x%08X trigger=0x%08X\n",
+                     tcb, trigger);
+    }
+
+    /* Device-event cycle ring (oracle producer). Same gate as native: armed from
+     * boot under PSX_PARITY_TRACE or PSX_DEVTRACE so every mednafen IRQ_Assert
+     * rising edge is recorded with its guest cycle for the device-timing diff. */
+    {
+        const char* pt = std::getenv("PSX_PARITY_TRACE");
+        const char* dt = std::getenv("PSX_DEVTRACE");
+        if ((pt && pt[0] && pt[0] != '0') || (dt && dt[0] && dt[0] != '0')) {
+            device_trace_arm(1);
+            std::fprintf(stdout, "psx-beetle: device-event trace ARMED\n");
+        }
+    }
 
     static uint32_t pixels[640 * 512];
 
