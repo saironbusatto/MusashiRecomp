@@ -41,6 +41,7 @@ static void advance_devices(uint32_t c) {
 }
 
 void psx_advance_cycles(uint32_t cycles) {
+    { extern int g_ls_replay_active; if (g_ls_replay_active) return; }  /* lockstep replay: no global cycle/device mutation */
     if (cycles == 0) return;
     if (g_event_step_conservative && cycles > 1u) {
         /* Fine-step so sub-block events fire in true cycle order. */

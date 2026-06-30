@@ -60,6 +60,7 @@ void psx_icache_reset(void) {
 /* Charge the fetch cost for the instruction at `addr` and update the cache tags.
  * `addr` is the runtime guest virtual PC (aligned). Gated on PSX_ENABLE_BLOCK_CYCLES. */
 void psx_icache_fetch(CPUState* cpu, uint32_t addr) {
+    { extern int g_ls_replay_active; if (g_ls_replay_active) return; }  /* lockstep replay: no global icache mutation */
 #ifdef PSX_ENABLE_BLOCK_CYCLES
     if (!psx_icache_enabled()) return;
     uint32_t idx = (addr & 0xFFCu) >> 2;
