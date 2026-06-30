@@ -10,8 +10,9 @@ static uint32_t parity_rw_cb(void* ctx, uint32_t addr) {
     return ((CPUState*)ctx)->read_word(addr);
 }
 
-/* Frame-source accessor for parity_trace.c (decoupled from s_frame_count type). */
+/* Frame + guest-cycle accessors for parity_trace.c (decoupled per process). */
 uint32_t parity_host_frame(void) { extern uint64_t s_frame_count; return (uint32_t)s_frame_count; }
+uint64_t parity_host_cycle(void) { extern uint64_t psx_get_cycle_count(void); return psx_get_cycle_count(); }
 
 FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
 uint64_t     g_fntrace_seq = 0;
