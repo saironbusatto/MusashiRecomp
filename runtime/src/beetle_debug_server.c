@@ -45,6 +45,20 @@ extern uint16_t beetle_get_pad(void);
 extern int      beetle_get_framebuffer(uint32_t **out_pixels,
                                         unsigned *out_w, unsigned *out_h);
 extern uint32_t beetle_get_frame_count(void);
+/* Absolute guest CPU cycles since boot (oracle cycle clock, beetle-psx
+ * libretro.cpp). For native<->Beetle cycle-drift comparison
+ * (FAITHFUL_TIMING_PLAN.md). */
+extern unsigned long long beetle_core_get_guest_cycles(void);
+/* cyc_watch: Beetle half of the per-anchor cycle comparator (libretro.cpp). Same
+ * spec/wire-format as the native cyc_watch (runtime/src/debug_server.c). */
+extern void beetle_cyc_watch_arm(uint32_t anchor_raw, uint32_t end_raw, int n);
+extern void beetle_cyc_watch_clear(void);
+extern void beetle_cyc_watch_get_state(uint32_t *anchor_raw, uint32_t *anchor_phys,
+                                       uint32_t *end_raw, uint32_t *end_phys,
+                                       uint32_t *max_hits, uint32_t *hits, int *armed);
+extern int  beetle_cyc_watch_get(uint32_t i, uint32_t *hit_index, uint32_t *pc,
+                                 unsigned long long *cycles);
+extern int      beetle_get_registers(uint32_t *out /* >= 38 words */);
 
 /* SIO trace */
 extern uint32_t beetle_get_sio_trace(uint32_t *out_seq, uint8_t *out_tx,
@@ -74,6 +88,21 @@ extern uint32_t beetle_wtrace_get_rich(uint64_t *out_seq, uint32_t *out_addr,
                                         uint32_t *out_frame,
                                         uint8_t *out_slot, uint8_t *out_size,
                                         int max_count);
+
+/* rtrace (MMIO-READ trace; CPU loads filtered by armed ranges) */
+extern int      beetle_rtrace_arm(uint32_t lo, uint32_t hi);
+extern int      beetle_rtrace_disarm(int slot);
+extern void     beetle_rtrace_disarm_all(void);
+extern int      beetle_rtrace_range_count(void);
+extern int      beetle_rtrace_max_ranges(void);
+extern int      beetle_rtrace_capacity(void);
+extern int      beetle_rtrace_get_range(int slot, uint32_t *out_lo, uint32_t *out_hi);
+extern void     beetle_rtrace_reset(void);
+extern uint64_t beetle_rtrace_total(void);
+extern uint32_t beetle_rtrace_get(uint64_t *out_seq, uint32_t *out_addr,
+                                  uint32_t *out_val, uint32_t *out_pc,
+                                  uint32_t *out_ra, uint32_t *out_frame,
+                                  uint8_t *out_size, int count);
 
 /* wtrace_all (always-on, no-filter, lean fields) */
 extern uint64_t beetle_wtrace_all_total(void);
@@ -110,6 +139,8 @@ extern int beetle_spu_get_global_state(
 
 /* Per-frame history ring (parity with runtime's frame_history). */
 #include "beetle_history.h"
+#include "parity_trace.h"
+#include "device_trace.h"
 extern void beetle_history_get_bounds(uint64_t *out_count,
                                        uint64_t *out_oldest,
                                        uint64_t *out_newest);
@@ -219,8 +250,47 @@ static uint32_t hex_to_u32(const char *s) {
 
 static void h_ping(int id, const char *json) {
     (void)json;
-    send_fmt("{\"id\":%d,\"ok\":true,\"backend\":\"beetle\",\"port\":%d,\"frame\":%u}\n",
-             id, s_port, beetle_get_frame_count());
+    send_fmt("{\"id\":%d,\"ok\":true,\"backend\":\"beetle\",\"port\":%d,\"frame\":%u,"
+             "\"guest_cycles\":%llu}\n",
+             id, s_port, beetle_get_frame_count(), beetle_core_get_guest_cycles());
+}
+
+/* get_registers — oracle CPU state, same JSON shape as the recomp server so
+ * one tool parses both ports (Rule 16). Fields: gpr[32], pc, lo, hi, cop0_sr,
+ * cop0_cause, cop0_epc. (i_stat/i_mask omitted: read via wtrace/read_ram.) */
+static void h_get_registers(int id, const char *json) {
+    (void)json;
+    uint32_t r[38];
+    if (!beetle_get_registers(r)) { send_err(id, "no cpu"); return; }
+    char buf[2048];
+    int pos = snprintf(buf, sizeof(buf),
+        "{\"id\":%d,\"ok\":true,\"frame\":%u,\"gpr\":[", id, beetle_get_frame_count());
+    for (int i = 0; i < 32; i++)
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%s\"0x%08X\"", i ? "," : "", r[i]);
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+        "],\"pc\":\"0x%08X\",\"lo\":\"0x%08X\",\"hi\":\"0x%08X\","
+        "\"cop0_sr\":\"0x%08X\",\"cop0_cause\":\"0x%08X\",\"cop0_epc\":\"0x%08X\"}\n",
+        r[32], r[33], r[34], r[35], r[36], r[37]);
+    send_raw(buf, pos);
+}
+
+/* exc_ring — INDEPENDENT-oracle interrupt take-point. Dumps the patched
+ * mednafen core's exception-entry ring (EPC = architectural take-PC per CPU
+ * exception). The core emits its own complete {"ok":true,...,"entries":[...]}
+ * object (retro_psxref_exc_ring_dump, statically linked here). Lets the recomp
+ * native/interp IRQ take-PC be arbitrated against real-HW behaviour by ORDER +
+ * EPC VALUE (cross-emulator cycle counts are not comparable). */
+extern int retro_psxref_exc_ring_dump(char *out, int cap);
+static void h_exc_ring(int id, const char *json) {
+    (void)json;
+    int cap = 4 * 1024 * 1024;
+    char *buf = (char *)malloc((size_t)cap);
+    if (!buf) { send_err(id, "alloc"); return; }
+    int n = retro_psxref_exc_ring_dump(buf, cap);
+    if (n <= 0) { free(buf); send_err(id, "exc_ring dump failed"); return; }
+    if (n < cap) buf[n++] = '\n';
+    send_raw(buf, n);
+    free(buf);
 }
 
 static void h_read_ram(int id, const char *json) {
@@ -293,6 +363,27 @@ static void h_pad_status(int id, const char *json) {
 }
 
 /* ---- Screenshot ---- */
+extern uint16_t beetle_vram_peek(uint32_t x, uint32_t y);
+static void h_vram_peek(int id, const char *json) {
+    int x = json_get_int(json, "x", 0);
+    int y = json_get_int(json, "y", 0);
+    int w = json_get_int(json, "w", 8);
+    int h = json_get_int(json, "h", 1);
+    if (w < 1) w = 1; if (h < 1) h = 1;
+    if (w > 128) w = 128; if (h > 128) h = 128;
+    size_t hex_len = (size_t)w * h * 4 + 1;
+    char *hex = (char *)malloc(hex_len);
+    if (!hex) { send_err(id, "alloc failed"); return; }
+    int pos = 0;
+    for (int row = 0; row < h; row++)
+        for (int col = 0; col < w; col++)
+            pos += snprintf(hex + pos, hex_len - pos, "%04x",
+                            beetle_vram_peek((uint32_t)(x + col), (uint32_t)(y + row)));
+    send_fmt("{\"id\":%d,\"ok\":true,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"hex\":\"%s\"}\n",
+             id, x, y, w, h, hex);
+    free(hex);
+}
+
 static void h_screenshot_file(int id, const char *json) {
     char path[512] = {0};
     if (!json_get_str(json, "path", path, sizeof(path))) {
@@ -606,6 +697,125 @@ static void h_wtrace_dump(int id, const char *json) {
     free(seqs); free(addrs); free(vals); free(pcs); free(ras); free(sps);
     free(v0s); free(v1s); free(a0s); free(a1s); free(a2s); free(a3s);
     free(t0s); free(t1s); free(frames); free(slots); free(sizes);
+}
+
+/* ---- rtrace (MMIO-READ trace) ----
+ * Field names mirror the runtime's mmio rtrace dump (addr/val/pc/ra/frame/w)
+ * so one cross-port tool reads both. Reads are voluminous → always armed by
+ * range; arm CD + I_STAT at boot via --wtrace-boot for the boot-window census. */
+static void h_rtrace_arm(int id, const char *json) {
+    char lo_s[32] = {0}, hi_s[32] = {0};
+    if (!json_get_str(json, "lo", lo_s, sizeof(lo_s)) ||
+        !json_get_str(json, "hi", hi_s, sizeof(hi_s))) {
+        send_err(id, "need lo,hi"); return;
+    }
+    uint32_t lo = hex_to_u32(lo_s) & 0x1FFFFFFFu;
+    uint32_t hi = hex_to_u32(hi_s) & 0x1FFFFFFFu;
+    int slot = beetle_rtrace_arm(lo, hi);
+    if (slot < 0) { send_err(id, slot == -1 ? "ranges full" : "lo>=hi"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"slot\":%d,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}\n",
+             id, slot, lo, hi);
+}
+
+static void h_rtrace_disarm(int id, const char *json) {
+    int slot = json_get_int(json, "slot", -1);
+    if (slot < 0) { send_err(id, "missing slot"); return; }
+    if (beetle_rtrace_disarm(slot) != 0) { send_err(id, "invalid slot"); return; }
+    send_ok(id);
+}
+
+static void h_rtrace_disarm_all(int id, const char *json) {
+    (void)json; beetle_rtrace_disarm_all(); send_ok(id);
+}
+
+static void h_rtrace_reset(int id, const char *json) {
+    (void)json; beetle_rtrace_reset(); send_ok(id);
+}
+
+static void h_rtrace_stats(int id, const char *json) {
+    (void)json;
+    uint64_t total = beetle_rtrace_total();
+    int cap = beetle_rtrace_capacity();
+    uint64_t oldest = (total <= (uint64_t)cap) ? 0 : total - (uint64_t)cap;
+    uint64_t newest = (total > 0) ? total - 1 : 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"capacity\":%d,"
+             "\"oldest_seq\":%llu,\"newest_seq\":%llu,\"ranges\":%d}\n",
+             id, (unsigned long long)total, cap,
+             (unsigned long long)oldest, (unsigned long long)newest,
+             beetle_rtrace_range_count());
+}
+
+static void h_rtrace_ranges(int id, const char *json) {
+    (void)json;
+    int n = beetle_rtrace_range_count();
+    send_fmt("{\"id\":%d,\"ok\":true,\"count\":%d,\"ranges\":[", id, n);
+    for (int i = 0; i < n; i++) {
+        uint32_t lo = 0, hi = 0;
+        beetle_rtrace_get_range(i, &lo, &hi);
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"slot\":%d,\"lo\":\"0x%08X\",\"hi\":\"0x%08X\"}", i, lo, hi);
+    }
+    send_fmt("]}\n");
+}
+
+static void h_rtrace_dump(int id, const char *json) {
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 65536) count = 65536;
+
+    /* Optional post-hoc address filter (parity with wtrace_dump). */
+    char lo_s[32] = {0}, hi_s[32] = {0};
+    uint32_t flo = 0, fhi = 0xFFFFFFFFu;
+    if (json_get_str(json, "addr_lo", lo_s, sizeof(lo_s)))
+        flo = hex_to_u32(lo_s) & 0x1FFFFFFFu;
+    if (json_get_str(json, "addr_hi", hi_s, sizeof(hi_s)))
+        fhi = hex_to_u32(hi_s) & 0x1FFFFFFFu;
+
+    uint64_t *seqs   = (uint64_t*)malloc((size_t)count * sizeof(uint64_t));
+    uint32_t *addrs  = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *vals   = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *pcs    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *ras    = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint32_t *frames = (uint32_t*)malloc((size_t)count * sizeof(uint32_t));
+    uint8_t  *sizes  = (uint8_t*) malloc((size_t)count);
+    if (!seqs || !addrs || !vals || !pcs || !ras || !frames || !sizes) {
+        free(seqs); free(addrs); free(vals); free(pcs); free(ras);
+        free(frames); free(sizes);
+        send_err(id, "alloc"); return;
+    }
+
+    uint32_t got = beetle_rtrace_get(seqs, addrs, vals, pcs, ras, frames, sizes, count);
+    uint64_t total = beetle_rtrace_total();
+    int cap = beetle_rtrace_capacity();
+    uint32_t avail = (total < (uint64_t)cap) ? (uint32_t)total : (uint32_t)cap;
+
+    size_t out_cap = 256 + (size_t)got * 200u;
+    char *out = (char *)malloc(out_cap);
+    if (!out) {
+        free(seqs); free(addrs); free(vals); free(pcs); free(ras);
+        free(frames); free(sizes);
+        send_err(id, "alloc"); return;
+    }
+    size_t pos = (size_t)snprintf(out, out_cap,
+             "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
+             id, (unsigned long long)total, avail);
+    uint32_t emitted = 0;
+    for (uint32_t i = 0; i < got && pos < out_cap - 256; i++) {
+        uint32_t phys = addrs[i] & 0x1FFFFFFFu;
+        if (phys < flo || phys >= fhi) continue;
+        pos += (size_t)snprintf(out + pos, out_cap - pos,
+                 "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"val\":\"0x%08X\","
+                 "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"frame\":%u,\"w\":%u}",
+                 (emitted == 0) ? "" : ",",
+                 (unsigned long long)seqs[i], addrs[i], vals[i],
+                 pcs[i], ras[i], frames[i], (unsigned)sizes[i]);
+        emitted++;
+    }
+    pos += (size_t)snprintf(out + pos, out_cap - pos, "],\"emitted\":%u}\n", emitted);
+    send_raw(out, (int)pos);
+    free(out);
+    free(seqs); free(addrs); free(vals); free(pcs); free(ras);
+    free(frames); free(sizes);
 }
 
 /* ---- fntrace ---- */
@@ -1073,13 +1283,197 @@ static void h_get_snapshots(int id, const char *json) {
              a[2], act[2], a[3], act[3]);
 }
 
+/* ---- cyc_watch: Beetle per-anchor cycle comparator (matches native wire) ---- */
+static void h_cyc_watch(int id, const char *json) {
+    char pcbuf[64], endbuf[64];
+    if (!json_get_str(json, "pc", pcbuf, sizeof(pcbuf))) { send_err(id, "cyc_watch requires pc"); return; }
+    uint32_t raw = hex_to_u32(pcbuf);
+    uint32_t end_raw = json_get_str(json, "end", endbuf, sizeof(endbuf)) ? hex_to_u32(endbuf) : 0u;
+    int n = json_get_int(json, "n", 16);
+    beetle_cyc_watch_arm(raw, end_raw, n);
+    uint32_t araw, aphys, eraw, ephys, maxh, hits; int armed;
+    beetle_cyc_watch_get_state(&araw, &aphys, &eraw, &ephys, &maxh, &hits, &armed);
+    send_fmt("{\"id\":%d,\"ok\":true,\"anchor\":\"0x%08X\",\"anchor_phys\":\"0x%08X\","
+             "\"end\":\"0x%08X\",\"end_phys\":\"0x%08X\",\"region\":%d,\"max_hits\":%u}\n",
+             id, araw, aphys, eraw, ephys, (ephys != 0u) ? 1 : 0, maxh);
+}
+static void h_cyc_watch_clear(int id, const char *json) {
+    (void)json; beetle_cyc_watch_clear(); send_fmt("{\"id\":%d,\"ok\":true}\n", id);
+}
+static void h_cyc_watch_dump(int id, const char *json) {
+    (void)json;
+    uint32_t araw, aphys, eraw, ephys, maxh, hits; int armed;
+    beetle_cyc_watch_get_state(&araw, &aphys, &eraw, &ephys, &maxh, &hits, &armed);
+    size_t cap = 256 + (size_t)hits * 96;
+    char *buf = (char *)malloc(cap);
+    if (!buf) { send_err(id, "alloc"); return; }
+    int pos = snprintf(buf, cap,
+        "{\"id\":%d,\"ok\":true,\"anchor\":\"0x%08X\",\"anchor_phys\":\"0x%08X\","
+        "\"end\":\"0x%08X\",\"end_phys\":\"0x%08X\",\"region\":%d,"
+        "\"armed\":%d,\"max_hits\":%u,\"hits\":%u,\"entries\":[",
+        id, araw, aphys, eraw, ephys, (ephys != 0u) ? 1 : 0, armed, maxh, hits);
+    for (uint32_t i = 0; i < hits; i++) {
+        uint32_t hi, pc; unsigned long long cyc;
+        if (!beetle_cyc_watch_get(i, &hi, &pc, &cyc)) break;
+        pos += snprintf(buf + pos, cap - pos,
+            "%s{\"hit_index\":%u,\"pc\":\"0x%08X\",\"cycles\":%llu}",
+            i ? "," : "", hi, pc, cyc);
+    }
+    pos += snprintf(buf + pos, cap - pos, "]}\n");
+    send_raw(buf, pos);
+    free(buf);
+}
+
+/* ---- parity_dump / parity_ctl: oracle side of the control-flow parity ring.
+ * Byte-identical wire format to psx-runtime so tools/parity_diff.py diffs both. */
+/* Same watched-state test as native (watch words + epc + tcb_state; pc/ra/sp
+ * ignored) — backs the `transitions` filter that collapses identical-state runs. */
+static int parity_same_state(const ParityEntry *a, const ParityEntry *b)
+{
+    if (a->kind != b->kind) return 0;
+    if (a->epc != b->epc || a->tcb_state != b->tcb_state) return 0;
+    for (int k = 0; k < PARITY_WATCH_MAX; k++)
+        if (a->watch[k] != b->watch[k]) return 0;
+    return 1;
+}
+
+static void h_parity_dump(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 131072);
+    int trans = json_get_int(json, "transitions", 0);
+    /* reads=1: dump the dedicated READ ring (parity_trace_note_read) — read-side
+     * provenance source, byte-identical wire to native (tools/parity_diff.py). */
+    int reads = json_get_int(json, "reads", 0);
+    if (count < 1) count = 1;
+    if (count > 131072) count = 131072;
+    ParityEntry *e = (ParityEntry *)malloc(sizeof(ParityEntry) * (size_t)count);
+    if (!e) { send_err(id, "oom"); return; }
+    uint32_t got = reads ? parity_trace_reads_get(e, (uint32_t)count)
+                         : parity_trace_get(e, (uint32_t)count);
+    uint64_t dump_total = reads ? parity_trace_reads_total() : parity_trace_total();
+    const size_t cap = 16 * 1024 * 1024;
+    char *out = (char *)malloc(cap);
+    if (!out) { free(e); send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, cap - pos,
+        "{\"id\":%d,\"ok\":true,\"total\":%llu,\"armed\":%d,\"frozen\":%d,\"count\":%u,\"entries\":[",
+        id, (unsigned long long)dump_total, parity_trace_is_armed(),
+        parity_trace_is_frozen(), got);
+    uint32_t run = 1, emitted = 0;
+    for (uint32_t i = 0; i < got; i++) {
+        if (pos > cap - 2048) break;
+        if (trans) {
+            int boundary = (i + 1 >= got) || !parity_same_state(&e[i], &e[i + 1])
+                           || e[i].kind != PARITY_KIND_DISPATCH;
+            if (!boundary) { run++; continue; }
+        }
+        ParityEntry *r = &e[i];
+        pos += snprintf(out + pos, cap - pos,
+            "%s{\"seq\":%llu,\"frame\":%u,\"cycle\":%llu,\"reps\":%u,\"kind\":\"%s\",\"cur_tcb\":\"0x%08X\","
+            "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"sp\":\"0x%08X\",\"epc\":\"0x%08X\","
+            "\"state\":\"0x%08X\",\"target\":\"0x%08X\","
+            "\"w\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"],"
+            "\"wwpc\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"],"
+            "\"wwcy\":[%llu,%llu,%llu,%llu,%llu,%llu],"
+            "\"wwf\":[%u,%u,%u,%u,%u,%u],"
+            "\"wwt\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"]}",
+            emitted ? "," : "", (unsigned long long)r->seq, r->frame,
+            (unsigned long long)r->cycle, trans ? run : 1u, parity_kind_str(r->kind),
+            r->current_tcb, r->pc, r->ra, r->sp, r->epc, r->tcb_state, r->target,
+            r->watch[0], r->watch[1], r->watch[2], r->watch[3], r->watch[4], r->watch[5],
+            r->watch_wpc[0], r->watch_wpc[1], r->watch_wpc[2], r->watch_wpc[3], r->watch_wpc[4], r->watch_wpc[5],
+            (unsigned long long)r->watch_wcycle[0], (unsigned long long)r->watch_wcycle[1],
+            (unsigned long long)r->watch_wcycle[2], (unsigned long long)r->watch_wcycle[3],
+            (unsigned long long)r->watch_wcycle[4], (unsigned long long)r->watch_wcycle[5],
+            r->watch_wframe[0], r->watch_wframe[1], r->watch_wframe[2], r->watch_wframe[3], r->watch_wframe[4], r->watch_wframe[5],
+            r->watch_wtcb[0], r->watch_wtcb[1], r->watch_wtcb[2], r->watch_wtcb[3], r->watch_wtcb[4], r->watch_wtcb[5]);
+        emitted++; run = 1;
+    }
+    pos += snprintf(out + pos, cap - pos, "],\"emitted\":%u}\n", emitted);
+    send_raw(out, (int)pos); free(out); free(e);
+}
+
+static void h_parity_ctl(int id, const char *json)
+{
+    if (json_get_int(json, "reset", 0)) parity_trace_reset();
+    int armv = json_get_int(json, "arm", -1);
+    if (armv == 0 || armv == 1) parity_trace_arm(armv);
+    char buf[160];
+    int n = snprintf(buf, sizeof buf,
+        "{\"id\":%d,\"ok\":true,\"armed\":%d,\"frozen\":%d,\"total\":%llu,\"reads_total\":%llu}\n",
+        id, parity_trace_is_armed(), parity_trace_is_frozen(),
+        (unsigned long long)parity_trace_total(),
+        (unsigned long long)parity_trace_reads_total());
+    send_raw(buf, n);
+}
+
+/* ---- devtrace_dump / devtrace_ctl: oracle side of the device-event ring.
+ * IDENTICAL JSON to the native command (see debug_server.c) so devtrace_diff.py
+ * reads both ports unchanged. */
+static void h_devtrace_dump(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 65536);
+    if (count < 1) count = 1;
+    if (count > (1 << 20)) count = (1 << 20);
+    char buf[32];
+    uint64_t cyc_lo = 0, cyc_hi = ~0ull;
+    if (json_get_str(json, "cyc_lo", buf, sizeof buf)) cyc_lo = strtoull(buf, NULL, 0);
+    if (json_get_str(json, "cyc_hi", buf, sizeof buf)) cyc_hi = strtoull(buf, NULL, 0);
+    int src = json_get_int(json, "src", -1);
+
+    DevEvent *e = (DevEvent *)malloc(sizeof(DevEvent) * (size_t)count);
+    if (!e) { send_err(id, "oom"); return; }
+    uint32_t got = device_trace_get(e, (uint32_t)count);
+    const size_t cap = 12 * 1024 * 1024;
+    char *out = (char *)malloc(cap);
+    if (!out) { free(e); send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, cap - pos,
+        "{\"id\":%d,\"ok\":true,\"total\":%llu,\"armed\":%d,\"count\":%u,\"events\":[",
+        id, (unsigned long long)device_trace_total(), device_trace_is_armed(), got);
+    uint32_t emitted = 0;
+    for (uint32_t i = 0; i < got; i++) {
+        if (pos > cap - 256) break;
+        DevEvent *r = &e[i];
+        if (r->cycle < cyc_lo || r->cycle >= cyc_hi) continue;
+        if (src >= 0 && (int)r->source != src) continue;
+        pos += snprintf(out + pos, cap - pos,
+            "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,\"srcn\":%u,\"src\":\"%s\",\"detail\":%u}",
+            emitted ? "," : "", (unsigned long long)r->seq, (unsigned long long)r->cycle,
+            r->frame, r->source, device_source_str(r->source), r->detail);
+        emitted++;
+    }
+    pos += snprintf(out + pos, cap - pos, "],\"emitted\":%u}\n", emitted);
+    send_raw(out, (int)pos); free(out); free(e);
+}
+
+static void h_devtrace_ctl(int id, const char *json)
+{
+    if (json_get_int(json, "reset", 0)) device_trace_reset();
+    int armv = json_get_int(json, "arm", -1);
+    if (armv == 0 || armv == 1) device_trace_arm(armv);
+    char buf[128];
+    int n = snprintf(buf, sizeof buf,
+        "{\"id\":%d,\"ok\":true,\"armed\":%d,\"total\":%llu}\n",
+        id, device_trace_is_armed(), (unsigned long long)device_trace_total());
+    send_raw(buf, n);
+}
+
 /* ---- Command dispatch ---- */
 typedef void (*cmd_handler)(int id, const char *json);
 typedef struct { const char *name; cmd_handler handler; } CmdEntry;
 
 static const CmdEntry CMDS[] = {
     { "ping",                  h_ping },
+    { "parity_dump",           h_parity_dump },
+    { "parity_ctl",            h_parity_ctl },
+    { "devtrace_dump",         h_devtrace_dump },
+    { "devtrace_ctl",          h_devtrace_ctl },
+    { "cyc_watch",             h_cyc_watch },
+    { "cyc_watch_dump",        h_cyc_watch_dump },
+    { "cyc_watch_clear",       h_cyc_watch_clear },
     { "read_ram",              h_read_ram },
+    { "get_registers",         h_get_registers },
     { "dump_ram",              h_read_ram },        /* alias, parity with native */
     { "press",                 h_press },
     { "set_input",             h_set_input },
@@ -1087,6 +1481,7 @@ static const CmdEntry CMDS[] = {
     { "pad_status",            h_pad_status },
     { "screenshot",            h_screenshot_file },
     { "screenshot_file",       h_screenshot_file },  /* alias */
+    { "vram_peek",             h_vram_peek },
     { "sio_trace_reset",       h_sio_trace_reset },
     { "sio_trace",             h_sio_trace },
     { "sio_write_window",      h_sio_write_window },
@@ -1102,6 +1497,14 @@ static const CmdEntry CMDS[] = {
     { "wtrace_all_dump",       h_wtrace_all_dump },
     { "wtrace_all_stats",      h_wtrace_all_stats },
     { "wtrace_all_reset",      h_wtrace_all_reset },
+    /* rtrace — MMIO-READ trace (CPU loads, range-filtered). */
+    { "rtrace_arm",            h_rtrace_arm },
+    { "rtrace_disarm",         h_rtrace_disarm },       /* per-slot */
+    { "rtrace_disarm_all",     h_rtrace_disarm_all },
+    { "rtrace_reset",          h_rtrace_reset },
+    { "rtrace_ranges",         h_rtrace_ranges },
+    { "rtrace_dump",           h_rtrace_dump },
+    { "rtrace_stats",          h_rtrace_stats },
     { "fntrace_arm",           h_fntrace_arm },
     { "fntrace_disarm",        h_fntrace_disarm },
     { "fntrace_arms",          h_fntrace_arms },
@@ -1119,6 +1522,7 @@ static const CmdEntry CMDS[] = {
     { "read_frame_ram",        h_read_frame_ram },
     { "set_snapshot",          h_set_snapshot },
     { "get_snapshots",         h_get_snapshots },
+    { "exc_ring",              h_exc_ring },
     { NULL, NULL }
 };
 

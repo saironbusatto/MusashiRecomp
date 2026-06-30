@@ -24,6 +24,9 @@
 #include "mednafen/psx/frontio.h"
 #include "mednafen/psx/irq.h"
 #include "beetle_history.h"
+#include "parity_trace.h"   /* general control-flow parity ring (oracle producer) */
+#include "device_trace.h"   /* general device-event cycle ring (oracle producer) */
+static void irq_event_callback(int which);  /* fwd: device-event ring producer */
 
 /* GPU global lives in PS_GPU's translation unit; psx.h doesn't extern it.
  * Declared here for the per-frame display-state snapshot. NOTE: GPU is
@@ -120,6 +123,12 @@ static int s_wtrace_range_count = 0;
 static void wtrace_callback(uint32_t addr, uint32_t value,
                             uint32_t pc, uint32_t ra, uint8_t size)
 {
+    /* Parity last-writer provenance (oracle side): note every write so the
+     * watch-word last-writer table mirrors the runtime's. pc is the exact store
+     * PC. No-op unless the parity ring is armed. Identical wire effect to the
+     * runtime's memory.c hook so parity_diff can compare producers. */
+    parity_trace_note_write(addr, size, pc);
+
     /* ALWAYS-ON catch-all ring: lean fields, no filter, fires before the
      * focused-range filter so a connected probe can read recent writes
      * regardless of what's armed. */
@@ -180,6 +189,61 @@ static void wtrace_callback(uint32_t addr, uint32_t value,
     s_wtrace_idx = (s_wtrace_idx + 1) % BEETLE_WTRACE_CAP;
 }
 
+/* ---- rtrace ring (CPU loads, filtered by armed physical-RAM ranges) ----
+ * The MMIO-READ counterpart to wtrace. CPU loads are far more voluminous
+ * than stores, so this ring is ALWAYS range-filtered (there is no always-on
+ * catch-all twin): arm only the device regs of interest (CD + I_STAT) and the
+ * ring retains a long window of just those reads. This is THE decisive signal
+ * for the verifier-vs-lowering classification — what value did the IRQ handler
+ * actually read from a device register at exception time. Field names mirror
+ * the runtime's mmio rtrace so one tool reads both ports (Rule 16). */
+#define BEETLE_RTRACE_CAP        65536
+#define BEETLE_RTRACE_MAX_RANGES 16
+struct BeetleRtraceEntry {
+    uint64_t seq;
+    uint32_t addr;
+    uint32_t value;     /* "val" on the wire — the loaded (bus) value */
+    uint32_t pc;
+    uint32_t ra;
+    uint32_t frame;
+    uint8_t  size;      /* "w" on the wire */
+    uint8_t  pad[3];
+};
+static BeetleRtraceEntry s_rtrace[BEETLE_RTRACE_CAP];
+static uint32_t s_rtrace_idx = 0;
+static uint64_t s_rtrace_seq = 0;
+static struct { uint32_t lo, hi; } s_rtrace_ranges[BEETLE_RTRACE_MAX_RANGES];
+static int s_rtrace_range_count = 0;
+
+static void rtrace_callback(uint32_t addr, uint32_t value,
+                            uint32_t pc, uint32_t ra, uint8_t size)
+{
+    /* Read-side parity provenance (mirror of wtrace_callback's note_write): record
+     * every CPU load that consumes a watch word, with the exact load PC. No-op
+     * unless the parity ring is armed. Called BEFORE the rtrace range filter so it
+     * fires on all loads, just like the runtime's psx_cyc_load_* hook. */
+    parity_trace_note_read(addr, value, pc);
+
+    if (s_rtrace_range_count == 0) return;
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    for (int i = 0; i < s_rtrace_range_count; i++) {
+        uint32_t lo = s_rtrace_ranges[i].lo;
+        uint32_t hi = s_rtrace_ranges[i].hi;
+        if (phys + size > lo && phys < hi) {
+            BeetleRtraceEntry *e = &s_rtrace[s_rtrace_idx];
+            e->seq   = s_rtrace_seq++;
+            e->addr  = addr;
+            e->value = value;
+            e->pc    = pc;
+            e->ra    = ra;
+            e->frame = s_frame_count;
+            e->size  = size;
+            s_rtrace_idx = (s_rtrace_idx + 1) % BEETLE_RTRACE_CAP;
+            return;
+        }
+    }
+}
+
 /* ---- fntrace ring (filtered by armed target PCs, or unfiltered) ---- */
 #define BEETLE_FNTRACE_CAP        65536
 #define BEETLE_FNTRACE_MAX_ARMS   64
@@ -195,10 +259,28 @@ static uint32_t s_fntrace_arms[BEETLE_FNTRACE_MAX_ARMS];
 static int      s_fntrace_arm_count = 0;
 static int      s_fntrace_unfiltered = 0;
 
+/* Parity RAM reader: addresses are guest-virtual; mask to phys for
+ * beetle_read_word (extern "C", defined later) which RAM-decodes below 0x800000. */
+extern "C" uint32_t beetle_read_word(uint32_t phys);
+static uint32_t beetle_parity_rw(void* /*ctx*/, uint32_t addr) {
+    return beetle_read_word(addr & 0x1FFFFFFFu);
+}
+
 static void fntrace_callback(uint32_t caller_pc, uint32_t target_pc,
                              uint32_t parent_ra, uint32_t a0, uint32_t a1,
                              uint8_t kind)
 {
+    /* General parity ring (oracle producer): one DISPATCH row per call/jump while
+     * current_tcb matches the watched thread, mirroring psx-runtime's fntrace
+     * hook. Independent of the fntrace arm filter; gated by the cheap armed flag. */
+    if (parity_trace_is_armed() && PSX_CPU) {
+        char d[8] = {0};
+        uint32_t ra = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR + 31, d, sizeof d);
+        uint32_t sp = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR + 29, d, sizeof d);
+        parity_trace_record(PARITY_KIND_DISPATCH, target_pc, ra, sp, target_pc,
+                            beetle_parity_rw, nullptr);
+    }
+
     if (!s_fntrace_unfiltered) {
         if (s_fntrace_arm_count == 0) return;
         uint32_t tphys = target_pc & 0x1FFFFFFFu;
@@ -434,7 +516,9 @@ extern "C" int beetle_init_with_disc(const char *bios_path, const char *disc_pat
 
     g_psxrecomp_wtrace_cb = wtrace_callback;
     g_psxrecomp_fntrace_cb = fntrace_callback;
-    std::fprintf(stderr, "[psx-beetle] wtrace + fntrace callbacks registered\n");
+    g_psxrecomp_rtrace_cb = rtrace_callback;
+    g_psxrecomp_irq_cb = irq_event_callback;
+    std::fprintf(stderr, "[psx-beetle] wtrace + fntrace + rtrace + irq callbacks registered\n");
     std::fflush(stderr);
 
     return 0;
@@ -464,9 +548,35 @@ extern "C" int beetle_get_framebuffer(uint32_t **out_pixels,
     return 1;
 }
 
+/* Raw VRAM 15bpp peek (parity with psx-runtime gpu_vram_peek) — for the MDEC
+ * full-path oracle diff. (x,y) in 1024x512 VRAM; A = (y<<10)|x. */
+extern "C" uint16_t beetle_vram_peek(uint32_t x, uint32_t y) {
+    return GPU_PeekRAM(((y & 0x1FF) << 10) | (x & 0x3FF));
+}
+
 extern "C" uint16_t beetle_get_pad(void) { return s_joypad; }
 extern "C" uint32_t beetle_get_frame_count(void) { return s_frame_count; }
 extern "C" int beetle_is_loaded(void) { return s_loaded ? 1 : 0; }
+
+/* Oracle CPU register snapshot (ground truth via PS_CPU::GetRegister).
+ * Fills out[0..37]: [0..31]=GPR, [32]=PC, [33]=LO, [34]=HI, [35]=SR(cop0.12),
+ * [36]=CAUSE(cop0.13), [37]=EPC(cop0.14). Returns 0 if the CPU isn't up yet.
+ * This closes the get_registers gap so the oracle can serve full CPU state
+ * for order+state+caller first-divergence (PRINCIPLES.md), matching the
+ * recomp's get_registers. */
+extern "C" int beetle_get_registers(uint32_t *out /* >= 38 words */) {
+    if (!PSX_CPU || !out) return 0;
+    char dummy[8] = {0};
+    for (int i = 0; i < 32; i++)
+        out[i] = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR + (unsigned)i, dummy, sizeof(dummy));
+    out[32] = PSX_CPU->GetRegister(PS_CPU::GSREG_PC,    dummy, sizeof(dummy));
+    out[33] = PSX_CPU->GetRegister(PS_CPU::GSREG_LO,    dummy, sizeof(dummy));
+    out[34] = PSX_CPU->GetRegister(PS_CPU::GSREG_HI,    dummy, sizeof(dummy));
+    out[35] = PSX_CPU->GetRegister(PS_CPU::GSREG_SR,    dummy, sizeof(dummy));
+    out[36] = PSX_CPU->GetRegister(PS_CPU::GSREG_CAUSE, dummy, sizeof(dummy));
+    out[37] = PSX_CPU->GetRegister(PS_CPU::GSREG_EPC,   dummy, sizeof(dummy));
+    return 1;
+}
 
 extern "C" uint8_t beetle_read_byte(uint32_t phys) {
     if (phys < 0x00800000u) {
@@ -502,6 +612,28 @@ extern "C" uint32_t beetle_read_word(uint32_t phys) {
         }
     }
     return 0;
+}
+
+/* ---- Parity trace oracle producer (parity_trace.h): frame + cycle accessors. ---- */
+extern "C" uint32_t parity_host_frame(void) { return s_frame_count; }
+extern "C" unsigned long long beetle_core_get_guest_cycles(void); /* beetle-psx lib */
+extern "C" uint64_t parity_host_cycle(void) { return (uint64_t)beetle_core_get_guest_cycles(); }
+
+/* Device-event ring producer: mednafen IRQ_Assert rising edge -> device_trace.
+ * device_trace_note() stamps the guest cycle via parity_host_cycle() above and
+ * is a no-op unless the ring is armed. `which` is the I_STAT bit (same numbering
+ * as the runtime: 2=CD, 3=DMA). Per-source detail matches native's:
+ *   CD  -> low nibble of cdc IRQBuffer (INT type: 1=sector-data,2=complete,3=ack)
+ *   DMA -> DMAIntStatus per-channel bitmask (bit n = channel n completed)
+ * so devtrace can compare native vs Beetle like-for-like (INT1-sector cadence,
+ * per-channel DMA-completion cadence). */
+extern "C" unsigned psxrecomp_cdc_irq_type(void);   /* beetle-psx cdc.cpp */
+extern "C" unsigned psxrecomp_dma_int_status(void); /* beetle-psx dma.cpp */
+static void irq_event_callback(int which) {
+    uint32_t detail = 0u;
+    if (which == 2)      detail = psxrecomp_cdc_irq_type();    /* IRQ_CD  */
+    else if (which == 3) detail = psxrecomp_dma_int_status();  /* IRQ_DMA */
+    device_trace_note((uint32_t)which, detail);
 }
 
 extern "C" void beetle_get_ram(uint8_t *out_2mb) {
@@ -585,6 +717,64 @@ extern "C" void beetle_wtrace_reset(void) {
     memset(s_wtrace, 0, sizeof(s_wtrace));
 }
 extern "C" uint64_t beetle_wtrace_total(void) { return s_wtrace_seq; }
+
+/* ---- rtrace accessors (MMIO-READ trace) — parity with wtrace verbs ---- */
+extern "C" int beetle_rtrace_arm(uint32_t lo, uint32_t hi) {
+    if (s_rtrace_range_count >= BEETLE_RTRACE_MAX_RANGES) return -1;
+    lo &= 0x1FFFFFFFu; hi &= 0x1FFFFFFFu;
+    if (lo >= hi) return -2;
+    int slot = s_rtrace_range_count++;
+    s_rtrace_ranges[slot].lo = lo;
+    s_rtrace_ranges[slot].hi = hi;
+    return slot;
+}
+extern "C" void beetle_rtrace_disarm_all(void) { s_rtrace_range_count = 0; }
+extern "C" int  beetle_rtrace_disarm(int slot) {
+    if (slot < 0 || slot >= s_rtrace_range_count) return -1;
+    for (int i = slot; i < s_rtrace_range_count - 1; i++)
+        s_rtrace_ranges[i] = s_rtrace_ranges[i + 1];
+    s_rtrace_range_count--;
+    return 0;
+}
+extern "C" int  beetle_rtrace_range_count(void) { return s_rtrace_range_count; }
+extern "C" int  beetle_rtrace_capacity(void)    { return BEETLE_RTRACE_CAP; }
+extern "C" int  beetle_rtrace_max_ranges(void)  { return BEETLE_RTRACE_MAX_RANGES; }
+extern "C" int  beetle_rtrace_get_range(int slot, uint32_t *out_lo, uint32_t *out_hi) {
+    if (slot < 0 || slot >= s_rtrace_range_count) return -1;
+    *out_lo = s_rtrace_ranges[slot].lo;
+    *out_hi = s_rtrace_ranges[slot].hi;
+    return 0;
+}
+extern "C" void beetle_rtrace_reset(void) {
+    s_rtrace_idx = 0; s_rtrace_seq = 0;
+    memset(s_rtrace, 0, sizeof(s_rtrace));
+}
+extern "C" uint64_t beetle_rtrace_total(void) { return s_rtrace_seq; }
+
+/* Fill the newest `count` entries (oldest-first) into the caller arrays.
+ * Returns the number filled. Mirrors beetle_wtrace_all_get. */
+extern "C" uint32_t beetle_rtrace_get(uint64_t *out_seq, uint32_t *out_addr,
+                                      uint32_t *out_val, uint32_t *out_pc,
+                                      uint32_t *out_ra, uint32_t *out_frame,
+                                      uint8_t *out_size, int count) {
+    if (count < 1) return 0;
+    int avail = (int)(s_rtrace_seq < (uint64_t)BEETLE_RTRACE_CAP
+                      ? s_rtrace_seq : BEETLE_RTRACE_CAP);
+    if (count > avail) count = avail;
+    int start = ((int)s_rtrace_idx - count + BEETLE_RTRACE_CAP) % BEETLE_RTRACE_CAP;
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % BEETLE_RTRACE_CAP;
+        const BeetleRtraceEntry *e = &s_rtrace[idx];
+        out_seq[i]   = e->seq;
+        out_addr[i]  = e->addr;
+        out_val[i]   = e->value;
+        out_pc[i]    = e->pc;
+        out_ra[i]    = e->ra;
+        out_frame[i] = e->frame;
+        out_size[i]  = e->size;
+    }
+    return (uint32_t)count;
+}
 
 /* ---- wtrace_all (always-on, no-filter) accessors ---- */
 extern "C" uint64_t beetle_wtrace_all_total(void) { return s_wtrace_all_seq; }

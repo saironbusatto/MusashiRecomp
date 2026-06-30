@@ -32,8 +32,34 @@ stubs. Hand-delivering an event because the chain handler isn't
 installed is a stub wearing a costume and is the worst kind because it
 hides the missing integration.
 
+**AMENDMENT 2026-06-29 — LLE-first baseline; a faithful HLE _subsystem
+replacement_ is permitted (the three prohibitions above are the DEFAULT, not an
+absolute ban on all HLE).** LLE / the recompiled BIOS is the BASELINE and the
+spirit — architect as much as possible that way. But a whole subsystem MAY be
+swapped for a host-side HLE reimplementation when, and ONLY when, ALL of these
+hold: (1) the LLE path has a genuine landmine there — non-determinism with no
+hardware analog (e.g. the host coroutine/fiber cooperative-thread scheduler), or
+profound performance loss — not mere inconvenience; (2) the replacement is
+GENERAL (every game, keyed to the documented PSX kernel/hardware mechanism),
+never per-game; (3) it operates on the REAL guest structures (TCB / EvCB /
+queues in guest RAM) and reproduces the DOCUMENTED mechanism
+(`docs/psx_bios_disasm.txt` / PSX-SPX), not a guess; (4) it is continuously
+validated against the independent Beetle oracle. This is a deliberate SUBSYSTEM
+REPLACEMENT on top of a proven LLE baseline — NEVER the starting point or sole
+implementation (HLE-first leaves "half an ecosystem"). It does NOT relax the
+no-stubs / no-faking rule: the forbidden "HLE BIOS shim that hand-delivers the
+answer the BIOS would have produced" (above) stays forbidden, because it fakes
+the result and no oracle checks it. Discriminator — "if my reimplementation is
+wrong, what happens?": "the game misbehaves / a recompiler bug stays hidden" ⇒
+forbidden; "we diverge loudly from Beetle / fall back to the faithful path" ⇒
+permitted. **Faithfulness is the FOUNDATION, not the destination:** once the
+faithful core is proven, the goals are accelerated load times (toward 0) and
+enhancements (widescreen), where per-game shims/hacks become legitimate
+(`ENHANCEMENTS.md`). Per-game hacks remain forbidden during foundation work.
+
 If you find yourself wanting to violate any of the above three
-paragraphs, **stop and re-read PLAN.md**. Every prior attempt failed by
+paragraphs **beyond the narrow, oracle-validated amendment just above**,
+**stop and re-read PLAN.md**. Every prior attempt failed by
 violating exactly these rules under pressure.
 
 ---
