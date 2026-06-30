@@ -951,6 +951,12 @@ static inline uint32_t psx_mmio_read_wait(uint32_t phys, uint32_t size) {
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return 0u;
     /* Hardware MMIO window 0x1F801000..0x1F802FFF (921). */
     if (phys >= 0x1F801000u && phys <= 0x1F802FFFu) {
+        /* Bisect gate (PSX_MMIO_WAIT=0): disable the device-region read waits
+         * (the 9ae534d feature) to test whether they move the MMX6 cutscene
+         * ordering. Read once. */
+        static int s_mw = -1;
+        if (s_mw < 0) { const char* e = getenv("PSX_MMIO_WAIT"); s_mw = (e && e[0] == '0') ? 0 : 1; }
+        if (!s_mw) return 0u;
         if (phys >= 0x1F801C00u && phys <= 0x1F801FFFu)            /* SPU (929) */
             return (size == 4u) ? 36u : 16u;
         if (phys >= 0x1F801800u && phys <= 0x1F80180Fu)            /* CDC (979) */
