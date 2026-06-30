@@ -1002,6 +1002,12 @@ static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
 static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr, uint32_t size,
                                        uint32_t rt, uint32_t reg_mask) {
 #ifdef PSX_ENABLE_BLOCK_CYCLES
+    /* Bisect gate (PSX_LOAD_DELAY=0): disable the R3000A load-delay interlock
+     * timing (the d8c4a8e/fade560/d597797 feature) to test whether it moves the
+     * MMX6 cutscene ordering. Read once; default on. */
+    static int s_ld = -1;
+    if (s_ld < 0) { const char* e = getenv("PSX_LOAD_DELAY"); s_ld = (e && e[0] == '0') ? 0 : 1; }
+    if (!s_ld) { (void)addr; (void)size; (void)rt; (void)reg_mask; return; }
     psx_cyc_base(cpu);
     psx_cyc_deps(cpu, reg_mask);
     if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;   /* cancel pending load to same dest */
