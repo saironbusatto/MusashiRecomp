@@ -8,6 +8,7 @@
 #include "cpu_state.h"
 #include "psx_scheduler.h"   /* psx_scheduler_run — deterministic TCB scheduler */
 #include "parity_trace.h"    /* general two-process control-flow parity ring */
+#include "device_trace.h"    /* general two-process device-event cycle ring */
 #include "psx_interpreter.h"
 #include "cdrom.h"
 #include "fntrace.h"
@@ -2826,6 +2827,20 @@ int main(int argc, char** argv) {
         std::fprintf(stdout, "psxrecomp: parity trace ARMED tcb=0x%08X trigger=0x%08X (%d watch)\n",
                      tcb, trigger, wc);
         std::fflush(stdout);
+    }
+
+    /* Device-event cycle ring (device_trace.h): armed from boot under the same
+     * PSX_PARITY_TRACE gate, or PSX_DEVTRACE=1 standalone. Captures every
+     * CD/DMA/timer/VBlank/SIO/SPU IRQ raise with its guest cycle for the
+     * cross-process device-timing diff (tools/devtrace_diff.py). */
+    {
+        const char* pt = std::getenv("PSX_PARITY_TRACE");
+        const char* dt = std::getenv("PSX_DEVTRACE");
+        if ((pt && pt[0] && pt[0] != '0') || (dt && dt[0] && dt[0] != '0')) {
+            device_trace_arm(1);
+            std::fprintf(stdout, "psxrecomp: device-event trace ARMED\n");
+            std::fflush(stdout);
+        }
     }
 
     psx_scheduler_run(&cpu);

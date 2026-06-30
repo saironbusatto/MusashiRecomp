@@ -133,6 +133,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/dirty_ram_interp.c
     ${PSXRECOMP_ROOT}/runtime/src/fntrace.c
     ${PSXRECOMP_ROOT}/runtime/src/parity_trace.c
+    ${PSXRECOMP_ROOT}/runtime/src/device_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/boot_state.c
     ${PSXRECOMP_ROOT}/runtime/src/traps.c
     ${PSXRECOMP_ROOT}/runtime/src/crash_trace.c

@@ -32,6 +32,8 @@ extern void     psx_write_word(uint32_t addr, uint32_t val);
 
 /* Interrupt status — defined in memory.c */
 extern uint32_t i_stat;
+/* Central IRQ-raise choke point (interrupts.c) — also records the device ring. */
+extern void psx_irq_raise(uint32_t bit, uint32_t detail);
 extern uint32_t g_debug_current_func_addr;
 extern uint32_t g_debug_last_store_pc;
 extern uint64_t s_frame_count;
@@ -215,7 +217,7 @@ static void raise_dma_irq_on_master_edge(uint32_t before) {
      * from 0 to 1. Pending channel flags keep bit 31 high, but do not
      * continuously re-latch I_STAT after software acknowledges IRQ3. */
     if (!dicr_master_flag(before) && dicr_master_flag(dicr)) {
-        i_stat |= (1u << 3);
+        psx_irq_raise(3, (dicr >> 24) & 0x7Fu);  /* detail = DICR per-channel IRQ flags */
     }
 }
 

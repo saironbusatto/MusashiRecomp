@@ -20,6 +20,8 @@
 
 /* I_STAT is owned by memory.c */
 extern uint32_t i_stat;
+/* Central IRQ-raise choke point (interrupts.c) — also records the device ring. */
+extern void psx_irq_raise(uint32_t bit, uint32_t detail);
 
 /* IRQ bit for SIO0 */
 #define IRQ_SIO0 7
@@ -1872,7 +1874,7 @@ static void sio_fire_ack_irq(void) {
     sio_stat |= SIO_STAT_IRQ;
 
     uint32_t i_stat_before = i_stat;
-    i_stat |= (1 << IRQ_SIO0);
+    psx_irq_raise(IRQ_SIO0, 0); /* SIO ACK IRQ */
     event_ring_record_aux(EV_DEQ, (uint8_t)SRC_SIO, 0u); /* SIO ACK IRQ fired */
 
     extern uint32_t g_debug_current_func_addr;
@@ -2070,7 +2072,7 @@ void sio_tick(int cycles) {
              * on TX_RDY before writing the next byte. */
             sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
             uint32_t i_stat_before = i_stat;
-            i_stat |= (1 << IRQ_SIO0);
+            psx_irq_raise(IRQ_SIO0, 1); /* SIO shift IRQ */
             event_ring_record_aux(EV_DEQ, (uint8_t)SRC_SIO, 1u); /* SIO shift IRQ fired */
 
             /* SIO IRQ ring capture. */

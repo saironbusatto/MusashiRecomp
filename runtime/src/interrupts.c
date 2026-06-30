@@ -85,6 +85,20 @@ static void irq_record_outcome(uint8_t kind, uint8_t detail, uint32_t aux) {
 extern uint32_t i_stat;
 extern uint32_t i_mask;
 
+/* Device-event cycle ring (device_trace.c): every hardware IRQ-raise edge is
+ * recorded here with its guest cycle. */
+#include "device_trace.h"
+
+/* Central IRQ-raise choke point. All device sources call this to set their
+ * I_STAT bit so the device-event ring sees every raise from one place with the
+ * exact guest cycle. Pure addition over `i_stat |= (1<<bit)` — identical effect
+ * on i_stat, plus the trace note (no-op unless the ring is armed). */
+void psx_irq_raise(uint32_t bit, uint32_t detail)
+{
+    i_stat |= (1u << bit);
+    device_trace_note(bit, detail);
+}
+
 /* Dispatch counter for vblank scheduling. */
 #define VBLANK_INTERVAL 50000        /* legacy: dispatch-count fallback (unused for VBlank gating now) */
 #define VBLANK_CYCLES   564480u      /* 33.8688 MHz / 60 Hz — real PSX NTSC VBlank period */
@@ -391,7 +405,7 @@ void psx_check_interrupts(CPUState* cpu) {
                                       (uint32_t)psx_get_cycle_count());
                 event_ring_record_aux(EV_ENQ, (uint8_t)SRC_VBLANK,
                                       (uint32_t)(psx_get_cycle_count() + VBLANK_CYCLES));
-                i_stat |= (1 << IRQ_VBLANK);
+                psx_irq_raise(IRQ_VBLANK, 0);
                 g_vblank_raise_count++;
                 event_ring_record(EV_ISTAT_RAISE, IRQ_VBLANK);
                 gpu_vblank_tick();  /* Toggle LCF (GPUSTAT bit 31) */
