@@ -30,9 +30,11 @@
 #include "timers.h"
 #include "gpu.h"
 #include "cdrom.h"
+#include "dma.h"
 #include "cpu_state.h"
 #include "debug_server.h"
 #include "event_ring.h"
+#include "lockstep.h"
 #include "psx_cycles.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,18 +44,37 @@
  * static BIOS exception handler is NOT interp code, so we clear it around the
  * handler dispatch (see psx_check_interrupts). */
 extern int g_dirty_interp_active;
+extern uint32_t g_dirty_safe_resume_pc;
+
+/* IRQ-delivery context ring (MMX6 VSync-vs-CD-DMA hunt; dumped via `irqctx_ring`). */
+#define IRQCTX_RING_CAP 64u
+typedef struct {
+    uint64_t seq, cycle;
+    uint32_t frame, istat, imask, sr, d44, cdrom_active, is_vblank;
+    int      dma_depth;
+} IrqCtxEntry;
+IrqCtxEntry g_irqctx_ring[IRQCTX_RING_CAP];
+uint64_t    g_irqctx_seq = 0;
+extern uint64_t psx_get_cycle_count(void);
 
 /* Record an interrupt-delivery decision into the event ring. GATE outcomes are
  * edge-suppressed (they repeat every block while blocked); DELIVER is always
  * recorded (once per interrupt); the not-pending (idle) case emits nothing but
  * still updates the edge key so the next gate/deliver is captured. */
-static void irq_record_outcome(uint8_t kind, uint8_t detail) {
+static void irq_record_outcome(uint8_t kind, uint8_t detail, uint32_t aux) {
     static uint16_t s_last = 0xFFFFu;
     uint16_t key = ((uint16_t)kind << 8) | detail;
     int repeat = (key == s_last);
     s_last = key;
     if (kind == EV_NONE) return;                 /* idle: update key only */
-    if (kind == EV_IRQ_DELIVER) { event_ring_record(EV_IRQ_DELIVER, detail); return; }
+    /* IRQ_DELIVER: aux carries the architectural TAKE-PC (the resume PC), so the
+     * interrupt-take point can be compared across backends at the SAME guest
+     * cycle — native takes the IRQ at a basic-block boundary, the dirty-interp
+     * per-instruction. A take-PC that diverges at identical cycle is the
+     * take-point-granularity signature (PRINCIPLES "Control Flow Semantics":
+     * model the interrupt frame explicitly; the class fix is precise event
+     * slicing). The independent Beetle oracle records the same field. */
+    if (kind == EV_IRQ_DELIVER) { event_ring_record_aux(EV_IRQ_DELIVER, detail, aux); return; }
     if (!repeat) event_ring_record(kind, detail);/* GATE: edge only */
 }
 
@@ -66,19 +87,235 @@ static void irq_record_outcome(uint8_t kind, uint8_t detail) {
 extern uint32_t i_stat;
 extern uint32_t i_mask;
 
+/* Device-event cycle ring (device_trace.c): every hardware IRQ-raise edge is
+ * recorded here with its guest cycle. */
+#include "device_trace.h"
+
+/* Central IRQ-raise choke point. All device sources call this to set their
+ * I_STAT bit so the device-event ring sees every raise from one place with the
+ * exact guest cycle. Pure addition over `i_stat |= (1<<bit)` — identical effect
+ * on i_stat, plus the trace note (no-op unless the ring is armed). */
+void psx_irq_raise(uint32_t bit, uint32_t detail)
+{
+    i_stat |= (1u << bit);
+    device_trace_note(bit, detail);
+}
+
 /* Dispatch counter for vblank scheduling. */
 #define VBLANK_INTERVAL 50000        /* legacy: dispatch-count fallback (unused for VBlank gating now) */
 #define VBLANK_CYCLES   564480u      /* 33.8688 MHz / 60 Hz — real PSX NTSC VBlank period */
+#define VBLANK_DEFER_STALE_CYCLES (VBLANK_CYCLES * 10ull)
 static uint32_t dispatch_count;
 static uint64_t total_checks;
 static uint32_t cycles_since_vblank;  /* incremented by interrupts_advance_cycles */
-
-void interrupts_advance_cycles(uint32_t cycles) {
-    cycles_since_vblank += cycles;
-}
+extern uint64_t g_vblank_raise_count;
 
 /* Reentrancy guard: prevent interrupt handler from triggering interrupts. */
 static int in_exception;
+static int post_exception_cooldown;
+
+static uint32_t last_sio_seq_seen;
+static uint64_t last_sio_progress_cycle;
+
+#ifdef PSX_COSIM
+#define COSIM_IRQ_RING_CAP 4096u
+typedef struct {
+    uint64_t seq;
+    uint64_t cycle;
+    uint32_t kind;
+    uint32_t cpu_pc;
+    uint32_t take_pc;
+    uint32_t dirty_resume_pc;
+    uint32_t compiled_resume_pc;
+    uint32_t epc;
+    uint32_t sr_before;
+    uint32_t sr_after;
+    uint32_t cause;
+    uint32_t istat;
+    uint32_t imask;
+    uint32_t func;
+    uint32_t block;
+    uint32_t native;
+    int32_t cooldown;
+    int32_t dirty_site;
+} CosimIrqEntry;
+static CosimIrqEntry s_cosim_irq_ring[COSIM_IRQ_RING_CAP];
+static uint64_t s_cosim_irq_seq;
+extern int g_cosim_dirty_pump_site;
+extern uint32_t g_debug_current_func_addr;
+extern uint32_t cosim_last_block(void);
+extern uint32_t overlay_loader_get_inprogress(void);
+
+static void cosim_irq_note(CPUState *cpu,
+                           uint32_t kind,
+                           uint32_t take_pc,
+                           uint32_t dirty_resume_pc,
+                           uint32_t compiled_resume_pc,
+                           uint32_t sr_before)
+{
+    CosimIrqEntry *e = &s_cosim_irq_ring[s_cosim_irq_seq & (COSIM_IRQ_RING_CAP - 1u)];
+    e->seq = s_cosim_irq_seq++;
+    e->cycle = psx_get_cycle_count();
+    e->kind = kind;
+    e->cpu_pc = cpu ? cpu->pc : 0;
+    e->take_pc = take_pc;
+    e->dirty_resume_pc = dirty_resume_pc;
+    e->compiled_resume_pc = compiled_resume_pc;
+    e->epc = cpu ? cpu->cop0[COP0_EPC] : 0;
+    e->sr_before = sr_before;
+    e->sr_after = cpu ? cpu->cop0[COP0_SR] : 0;
+    e->cause = cpu ? cpu->cop0[COP0_CAUSE] : 0;
+    e->istat = i_stat;
+    e->imask = i_mask;
+    e->func = g_debug_current_func_addr;
+    e->block = cosim_last_block();
+    e->native = overlay_loader_get_inprogress();
+    e->cooldown = post_exception_cooldown;
+    e->dirty_site = g_cosim_dirty_pump_site;
+}
+
+void interrupts_cosim_irq_dump(char *out, int cap)
+{
+    if (!out || cap <= 0) return;
+    char *p = out;
+    size_t rem = (size_t)cap;
+    uint64_t total = s_cosim_irq_seq < COSIM_IRQ_RING_CAP ? s_cosim_irq_seq : COSIM_IRQ_RING_CAP;
+    uint64_t count = total;
+    if (count > 16u) count = 16u;
+    int w = snprintf(p, rem, "irqtrace count %llu",
+                     (unsigned long long)count);
+    if (w < 0 || (size_t)w >= rem) { out[cap - 1] = 0; return; }
+    p += w; rem -= (size_t)w;
+    for (uint64_t i = 0; i < count && rem > 1; i++) {
+        uint64_t seq = s_cosim_irq_seq - count + i;
+        CosimIrqEntry *e = &s_cosim_irq_ring[seq & (COSIM_IRQ_RING_CAP - 1u)];
+        w = snprintf(p, rem,
+                     " ; seq %llu kind %u cyc %llu pc %08x take %08x dirty %08x compiled %08x epc %08x sr0 %08x sr1 %08x cause %08x istat %08x imask %08x func %08x block %08x native %08x cool %d site %d",
+                     (unsigned long long)e->seq,
+                     e->kind,
+                     (unsigned long long)e->cycle,
+                     e->cpu_pc, e->take_pc, e->dirty_resume_pc,
+                     e->compiled_resume_pc, e->epc, e->sr_before,
+                     e->sr_after, e->cause, e->istat, e->imask,
+                     e->func, e->block, e->native,
+                     e->cooldown, e->dirty_site);
+        if (w < 0 || (size_t)w >= rem) { break; }
+        p += w; rem -= (size_t)w;
+    }
+    w = snprintf(p, rem, " | deliveries");
+    if (w >= 0 && (size_t)w < rem) { p += w; rem -= (size_t)w; }
+    uint64_t emitted = 0;
+    for (uint64_t scanned = 0; scanned < total && emitted < 16u && rem > 1; scanned++) {
+        uint64_t seq = s_cosim_irq_seq - 1u - scanned;
+        CosimIrqEntry *e = &s_cosim_irq_ring[seq & (COSIM_IRQ_RING_CAP - 1u)];
+        if (e->kind != 1u) continue;
+        w = snprintf(p, rem,
+                     " ; seq %llu cyc %llu pc %08x take %08x dirty %08x compiled %08x epc %08x sr0 %08x sr1 %08x cause %08x istat %08x imask %08x func %08x block %08x native %08x cool %d site %d",
+                     (unsigned long long)e->seq,
+                     (unsigned long long)e->cycle,
+                     e->cpu_pc, e->take_pc, e->dirty_resume_pc,
+                     e->compiled_resume_pc, e->epc, e->sr_before,
+                     e->sr_after, e->cause, e->istat, e->imask,
+                     e->func, e->block, e->native,
+                     e->cooldown, e->dirty_site);
+        if (w < 0 || (size_t)w >= rem) { break; }
+        p += w; rem -= (size_t)w;
+        emitted++;
+    }
+    uint64_t latest_delivery = UINT64_MAX;
+    for (uint64_t scanned = 0; scanned < total; scanned++) {
+        uint64_t seq = s_cosim_irq_seq - 1u - scanned;
+        CosimIrqEntry *e = &s_cosim_irq_ring[seq & (COSIM_IRQ_RING_CAP - 1u)];
+        if (e->kind == 1u) { latest_delivery = e->seq; break; }
+    }
+    if (latest_delivery != UINT64_MAX && rem > 1) {
+        w = snprintf(p, rem, " | pre_delivery");
+        if (w >= 0 && (size_t)w < rem) { p += w; rem -= (size_t)w; }
+        uint64_t first = (latest_delivery >= 15u) ? (latest_delivery - 15u) : 0u;
+        for (uint64_t seq = first; seq <= latest_delivery && rem > 1; seq++) {
+            CosimIrqEntry *e = &s_cosim_irq_ring[seq & (COSIM_IRQ_RING_CAP - 1u)];
+            w = snprintf(p, rem,
+                         " ; seq %llu kind %u cyc %llu pc %08x take %08x dirty %08x compiled %08x epc %08x sr0 %08x sr1 %08x cause %08x istat %08x imask %08x func %08x block %08x native %08x cool %d site %d",
+                         (unsigned long long)e->seq,
+                         e->kind,
+                         (unsigned long long)e->cycle,
+                         e->cpu_pc, e->take_pc, e->dirty_resume_pc,
+                         e->compiled_resume_pc, e->epc, e->sr_before,
+                         e->sr_after, e->cause, e->istat, e->imask,
+                         e->func, e->block, e->native,
+                         e->cooldown, e->dirty_site);
+            if (w < 0 || (size_t)w >= rem) { break; }
+            p += w; rem -= (size_t)w;
+        }
+    }
+    if (rem >= 2) {
+        p[0] = '\n';
+        p[1] = 0;
+    } else if (cap == 1) {
+        out[0] = 0;
+    } else {
+        out[cap - 2] = '\n';
+        out[cap - 1] = 0;
+    }
+}
+#endif
+
+static void note_sio_progress_cycle(void) {
+    uint32_t cur_sio_seq = sio_get_seq();
+    if (cur_sio_seq != last_sio_seq_seen) {
+        last_sio_seq_seen = cur_sio_seq;
+        last_sio_progress_cycle = psx_get_cycle_count();
+    }
+}
+
+static int should_defer_vblank_for_sio(void) {
+    if (!sio_card_protocol_active()) return 0;
+    uint64_t now = psx_get_cycle_count();
+    uint64_t since_progress = now >= last_sio_progress_cycle
+                            ? now - last_sio_progress_cycle
+                            : 0;
+    return since_progress < VBLANK_DEFER_STALE_CYCLES;
+}
+
+static void fire_vblank_edge(void) {
+    /* Subtract one VBlank period rather than reset to 0 so cycle overshoot
+     * carries forward. Prevents long-running blocks from rounding multiple
+     * VBlanks together. */
+    cycles_since_vblank -= VBLANK_CYCLES;
+    dispatch_count = 0;
+    /* DEQUEUE: this VBlank fired. ENQUEUE: next VBlank scheduled one period out. */
+    event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK,
+                          (uint32_t)psx_get_cycle_count());
+    event_ring_record_aux(EV_ENQ, (uint8_t)SRC_VBLANK,
+                          (uint32_t)(psx_get_cycle_count() + VBLANK_CYCLES));
+    psx_irq_raise(IRQ_VBLANK, 0);
+    g_vblank_raise_count++;
+    event_ring_record(EV_ISTAT_RAISE, IRQ_VBLANK);
+    gpu_vblank_tick();  /* Toggle LCF (GPUSTAT bit 31) */
+#ifndef PSX_ENABLE_BLOCK_CYCLES
+    timers_tick(33868); /* ~1 NTSC frame worth of cycles */
+    cdrom_tick();      /* Process pending CDROM responses */
+#endif
+}
+
+void interrupts_service_scheduled_events(void) {
+    note_sio_progress_cycle();
+    if (in_exception) return;
+    while (cycles_since_vblank >= VBLANK_CYCLES) {
+        if (should_defer_vblank_for_sio()) return;
+        fire_vblank_edge();
+    }
+}
+
+uint32_t interrupts_cycles_to_vblank(void) {
+    if (cycles_since_vblank >= VBLANK_CYCLES) return 0;
+    return VBLANK_CYCLES - cycles_since_vblank;
+}
+
+void interrupts_advance_cycles(uint32_t cycles) {
+    cycles_since_vblank += cycles;
+    interrupts_service_scheduled_events();
+}
 
 /* Diagnostic: total times the exception handler was entered (in_exception
  * transitioned 0->1).  Diff this between two snapshots to measure handler
@@ -98,7 +335,17 @@ static uint64_t exception_reentry_blocks;
  * pending interrupt can re-fire.  Without this, unhandled interrupts cause
  * a livelock: the handler runs, doesn't clear I_STAT, returns, and the
  * very next psx_check_interrupts re-enters immediately. */
-static int post_exception_cooldown;
+/* IRQ raise/deliver/ack telemetry (Tomba 2 exception-reentry-storm diagnosis).
+ * Always-on, surfaced in the freeze heartbeat. Distinguishes:
+ *   raise≈deliver≈ack≈1/frame  → healthy
+ *   deliver≫ack                → handler runs but doesn't clear i_stat (re-delivered)
+ *   raise≫1/frame              → something keeps RE-RAISING the bit (cycle/condition bug)
+ * g_vblank_ack_count is incremented in memory.c at the I_STAT write that clears
+ * the VBLANK bit. The others are incremented here. */
+uint64_t g_vblank_raise_count   = 0;  /* bit0 set at the cycle-paced raise site */
+uint64_t g_vblank_deliver_count = 0;  /* VBLANK delivered to the guest (exception taken) */
+uint64_t g_irq_deliver_count    = 0;  /* ANY hardware interrupt delivered */
+extern uint64_t g_vblank_ack_count;   /* defined in memory.c */
 
 /* Blocks of guaranteed main-code forward progress imposed after a CLAIMED
  * non-SIO interrupt (DMA/VBLANK/timer/...). With cooldown 0 (the prior blanket
@@ -131,7 +378,82 @@ void* g_exception_owner_fiber = NULL;
 int   g_pending_exception_longjmp = 0;
 extern int g_psx_dispatch_depth;
 
+/* Set by psx_check_interrupts_at while a compiled block-leader interrupt check
+ * is in progress. If the delivered handler later RFEs to the sentinel outside
+ * the synchronous host window, dirty_ram_dispatch can resume at this guest PC
+ * instead of treating the sentinel as pc=0 termination. */
+static uint32_t s_compiled_interrupt_resume_pc = 0;
+static uint32_t s_last_interrupt_check_pc = 0;
+static uint64_t s_last_interrupt_check_cycle = UINT64_MAX;
+
+static int same_guest_pc(uint32_t a, uint32_t b) {
+    return (((a ^ b) & 0x1FFFFFFFu) == 0);
+}
+
 int psx_get_in_exception(void) { return in_exception; }
+
+/* Co-sim (COSIM_ORACLE.md): fold the GENUINE guest-timing interrupt statics into the
+ * state hash. Deliberately EXCLUDES total_checks / dispatch_count / post_exception_
+ * cooldown / s_compiled_interrupt_resume_pc — those are counted in psx_check_interrupts
+ * CALLS or are backend-internal, so they legitimately differ between the compiled and
+ * interp backends by call frequency and would be a false first-divergence. The one
+ * quantity that is a real guest-cycle timing value is cycles_since_vblank (drives the
+ * VBLANK deadline); in_exception mirrors the architectural handler-active state. */
+uint64_t interrupts_cosim_hash(uint64_t h) {
+    const uint64_t P = 1099511628211ULL;
+    uint32_t v = cycles_since_vblank;
+    for (int i = 0; i < 4; i++) { h ^= (uint8_t)(v >> (i*8)); h *= P; }
+    uint64_t sp = last_sio_progress_cycle;
+    for (int i = 0; i < 8; i++) { h ^= (uint8_t)(sp >> (i*8)); h *= P; }
+    h ^= (uint8_t)in_exception; h *= P;
+    return h;
+}
+/* Co-sim field dump: expose the exact irqctl-timing fields so a divergence can be
+ * field-diffed (is it cycles_since_vblank = VBLANK-raise-timing, or in_exception, ...). */
+void interrupts_cosim_dump(uint32_t *csv, int *inexc) {
+    if (csv)   *csv   = cycles_since_vblank;
+    if (inexc) *inexc = in_exception;
+}
+
+/* ===== Fix B: faithful exception-return escape state (see psx_runtime.h) ===== */
+int      g_rfe_escape_pending = 0;
+int      g_exc_escape_reason  = PSX_EXC_ESCAPE_NONE;
+uint32_t g_exception_real_epc = 0;
+extern void psx_exception_longjmp(void);
+
+/* Called by the recompiled `rfe` opcode (after it pops the COP0 SR stack). When we
+ * are inside the SYNCHRONOUS exception-handler window (in_exception) AND the handler
+ * is returning to a REAL EPC (not the legacy boundary-sentinel fallback), arm the
+ * host escape so the trampoline unwinds back to psx_check_interrupts after the jr
+ * commits cpu->pc = real EPC. On a fiber/thread resume (in_exception==0) this is a
+ * no-op and the real EPC is dispatched directly — that is how a suspended thread
+ * resumes at its own PC. */
+void psx_rfe_mark_escape(void) {
+    if (in_exception && g_exc_escape_reason != PSX_EXC_ESCAPE_LEGACY_SENTINEL) {
+        g_rfe_escape_pending = 1;
+        g_exc_escape_reason  = PSX_EXC_ESCAPE_RFE_RETURN;
+    }
+}
+
+/* Called in the dispatch trampoline after a function returns (cpu->pc holds the
+ * real resume EPC). If an RFE armed the escape inside the synchronous handler,
+ * longjmp back to psx_check_interrupts (cpu->pc preserved across the longjmp). */
+void psx_rfe_escape_check(CPUState* cpu) {
+    (void)cpu;
+    /* Escape ONLY when this RFE is the synchronous handler completing on the SAME
+     * fiber that set up the exception (the owner of exception_jmpbuf). in_exception
+     * is a single global, so a thread RESUMED on a different fiber (its own real EPC
+     * was restored and it later RFEs) must NOT longjmp here — that would be a
+     * cross-fiber jump to a stale jmpbuf (crash). For that case we fall through and
+     * the trampoline keeps dispatching cpu->pc = the real resume EPC, which is
+     * exactly how a suspended thread continues at its own PC. */
+    extern void* psx_fiber_current(void); /* psx_fiber.h is included further down */
+    if (g_rfe_escape_pending && in_exception &&
+        psx_fiber_current() == g_exception_owner_fiber) {
+        g_rfe_escape_pending = 0;
+        longjmp(exception_jmpbuf, 1); /* same fiber: safe; lands in psx_check_interrupts */
+    }
+}
 
 void psx_get_freeze_diag(uint64_t *out_total_checks,
                          uint32_t *out_dispatch_count,
@@ -155,6 +477,9 @@ void interrupts_init(void) {
     post_exception_cooldown = 0;
     exception_entries_total = 0;
     exception_reentry_blocks = 0;
+    cycles_since_vblank = 0;
+    last_sio_seq_seen = sio_get_seq();
+    last_sio_progress_cycle = psx_get_cycle_count();
 }
 
 /*
@@ -202,7 +527,52 @@ void psx_restore_state_escape(void) {
     /* Not in exception context — return normally, let caller's `return;` handle it. */
 }
 
+/* Cycle-budgeted precise event slicing — single source of truth.
+ *
+ * Returns the minimum guest-CPU-cycle distance to the next DELIVERABLE hardware
+ * interrupt: a source raises its I_STAT bit AND that bit is unmasked in i_mask
+ * (CPU-side SR/IE gating is checked separately at take time). UINT32_MAX means
+ * no maskable hardware event is currently scheduled.
+ *
+ * The two-tier block executor uses this at each block leader: if a whole block
+ * fits inside this distance (and the block has no IRQ-visibility side effects),
+ * it runs as fast compiled C; otherwise it runs through the per-instruction
+ * interpreter so the interrupt is taken at its exact architectural cycle (see
+ * PRECISE_IRQ_SLICE.md). Each peripheral owns its own next-IRQ query; this just
+ * takes the min. Every query is a conservative UNDER-estimate (smaller distance
+ * => slice more => never run past an event), so this is too. */
+uint32_t cycles_to_next_event(void) {
+    uint32_t best = 0xFFFFFFFFu;
+    /* VBLANK is paced here (interrupts.c owns cycles_since_vblank). The deferred
+     * card-SIO case only pushes VBlank LATER, so this estimate stays a safe
+     * under-estimate. */
+    if (i_mask & (1u << IRQ_VBLANK)) {
+        uint32_t d = (cycles_since_vblank >= VBLANK_CYCLES)
+                       ? 0u : (VBLANK_CYCLES - cycles_since_vblank);
+        if (d < best) best = d;
+    }
+    uint32_t t = timers_cycles_to_irq(i_mask); if (t < best) best = t;
+    uint32_t c = cdrom_cycles_to_irq(i_mask);  if (c < best) best = c;
+    uint32_t d = dma_cycles_to_irq(i_mask);    if (d < best) best = d;
+    uint32_t s = sio_cycles_to_irq(i_mask);    if (s < best) best = s;
+    return best;
+}
+
 void psx_check_interrupts(CPUState* cpu) {
+    extern int g_ls_suppress_record;
+#define PSX_CHECK_INTERRUPTS_RETURN() do { if (g_ls_suppress_record > 0) g_ls_suppress_record--; return; } while (0)
+#ifdef PSX_COSIM
+    extern uint32_t g_dirty_safe_resume_pc;
+#define COSIM_IRQ_TAKE_PC() (g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc : s_compiled_interrupt_resume_pc)
+#define COSIM_IRQ_NOTE(kind_) cosim_irq_note(cpu, (kind_), COSIM_IRQ_TAKE_PC(), g_dirty_safe_resume_pc, s_compiled_interrupt_resume_pc, cpu->cop0[COP0_SR])
+#endif
+    {
+        uint32_t check_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
+                                                   : s_compiled_interrupt_resume_pc;
+        s_last_interrupt_check_pc = check_pc;
+        s_last_interrupt_check_cycle = psx_get_cycle_count();
+    }
+    g_ls_suppress_record++;
     total_checks++;
     if ((total_checks & 0x3FFFu) == 0) {
         debug_server_poll();
@@ -216,25 +586,9 @@ void psx_check_interrupts(CPUState* cpu) {
      * during the delay loop BEFORE the clear, and the BIOS never
      * sees it. */
 
-    /* VBlank / timer tick — only when NOT inside the exception handler.
-     *
-     * On real hardware, VBlank is a hardware signal tied to the CRT
-     * scanline counter, not to instruction count.  The handler runs
-     * for a few hundred cycles at most.  In our model, the handler
-     * runs thousands of block leaders (each calling psx_check_interrupts),
-     * so dispatch_count can exceed VBLANK_INTERVAL during a single
-     * handler invocation, causing VBlanks to stack up and starve the
-     * main code.  Gating the tick on !in_exception prevents this. */
-    /* Track SIO byte progress at every check (not just at VBlank time). */
-    static uint32_t last_sio_seq_seen = 0;
-    static uint64_t total_checks_at_progress = 0;
-    {
-        uint32_t cur_sio_seq = sio_get_seq();
-        if (cur_sio_seq != last_sio_seq_seen) {
-            last_sio_seq_seen = cur_sio_seq;
-            total_checks_at_progress = total_checks;
-        }
-    }
+    interrupts_service_scheduled_events();
+
+    /* Dispatch-loop maintenance only when NOT inside the exception handler. */
     if (!in_exception) {
 #if SIO_MODEL_CYCLE_PACED
         /* Builds without block-cycle accounting need a small dispatch-loop
@@ -249,49 +603,6 @@ void psx_check_interrupts(CPUState* cpu) {
 #endif
 #endif
         dispatch_count++;
-        /* VBlank pacing is now cycle-based (real PSX has VBlank at
-         * VBLANK_CYCLES = 564480 = 33.8688 MHz / 60 Hz). Previously this
-         * used dispatch_count >= 50000 which fired at ~5-6 cycles per
-         * dispatch = ~300k cycles per VBlank — half of real PSX, so
-         * guest time ran at ~60% real rate. That broke FMV pacing
-         * (TombaRecomp ISSUES.md #4: FMV at 6.7 fps vs 15 fps target). */
-        if (cycles_since_vblank >= VBLANK_CYCLES) {
-            /* Defer VBlank while a card SIO transaction is mid-flight.
-             * On real hardware a 140-byte sector read finishes (~4.5ms)
-             * well before the next VBlank (16.67ms).  Our dispatch-count
-             * pacing fires VBlank during the read window, and the BIOS
-             * VBlank pad poll injects 0x01 onto the SIO bus mid-card
-             * read, aborting the transaction via CTRL.RESET.
-             *
-             * Defer as long as the card protocol is making progress
-             * (an SIO byte was exchanged in the last VBLANK_DEFER_STALE
-             * dispatch ticks).  If no byte for that long, treat the
-             * protocol as stuck and force the VBlank to prevent deadlock. */
-            #define VBLANK_DEFER_STALE 500000  /* ~10 frames; covers inter-byte gaps in card protocol */
-            int card_active = sio_card_protocol_active();
-            uint64_t since_progress = total_checks - total_checks_at_progress;
-            int progress_stale = since_progress >= VBLANK_DEFER_STALE;
-            if (!card_active || progress_stale) {
-                /* Subtract one VBlank period rather than reset to 0 so
-                 * cycle overshoot carries forward. Prevents long-running
-                 * blocks from rounding multiple VBlanks together. */
-                cycles_since_vblank -= VBLANK_CYCLES;
-                dispatch_count = 0;
-                /* DEQUEUE: this VBlank fired. ENQUEUE: next VBlank scheduled
-                 * one period out. */
-                event_ring_record_aux(EV_DEQ, (uint8_t)SRC_VBLANK,
-                                      (uint32_t)psx_get_cycle_count());
-                event_ring_record_aux(EV_ENQ, (uint8_t)SRC_VBLANK,
-                                      (uint32_t)(psx_get_cycle_count() + VBLANK_CYCLES));
-                i_stat |= (1 << IRQ_VBLANK);
-                event_ring_record(EV_ISTAT_RAISE, IRQ_VBLANK);
-                gpu_vblank_tick();  /* Toggle LCF (GPUSTAT bit 31) */
-#ifndef PSX_ENABLE_BLOCK_CYCLES
-                timers_tick(33868); /* ~1 NTSC frame worth of cycles */
-                cdrom_tick();      /* Process pending CDROM responses */
-#endif
-            }
-        }
     }
 
     /* Event ring: generic i_stat-edge backstop. Catches raises from sites we
@@ -306,26 +617,77 @@ void psx_check_interrupts(CPUState* cpu) {
     }
 
     /* Check if any interrupts are pending. */
-    if ((i_stat & i_mask) == 0) { irq_record_outcome(EV_NONE, 0); return; }
+    if ((i_stat & i_mask) == 0) { irq_record_outcome(EV_NONE, 0, 0); PSX_CHECK_INTERRUPTS_RETURN(); }
     if (in_exception) {
         exception_reentry_blocks++;
-        irq_record_outcome(EV_IRQ_GATE, GATE_IN_EXCEPTION);
-        return;
+        irq_record_outcome(EV_IRQ_GATE, GATE_IN_EXCEPTION, 0);
+#ifdef PSX_COSIM
+        COSIM_IRQ_NOTE(2u);
+#endif
+        PSX_CHECK_INTERRUPTS_RETURN();
     }
 
     /* Post-exception cooldown: let at least one block execute after RFE. */
     if (post_exception_cooldown > 0) {
         post_exception_cooldown--;
-        irq_record_outcome(EV_IRQ_GATE, GATE_COOLDOWN);
-        return;
+        irq_record_outcome(EV_IRQ_GATE, GATE_COOLDOWN, 0);
+#ifdef PSX_COSIM
+        COSIM_IRQ_NOTE(3u);
+#endif
+        PSX_CHECK_INTERRUPTS_RETURN();
     }
 
     /* Check COP0 SR: IEc (bit 0) must be set, and IM2 (bit 10) must be set. */
     uint32_t sr = cpu->cop0[COP0_SR];
-    if (!(sr & 0x01)) { irq_record_outcome(EV_IRQ_GATE, GATE_SR_IE); return; }   /* Interrupts globally disabled */
-    if (!(sr & (1 << 10))) { irq_record_outcome(EV_IRQ_GATE, GATE_SR_IM2); return; } /* Hardware interrupt bit not enabled */
+    if (!(sr & 0x01)) {
+        irq_record_outcome(EV_IRQ_GATE, GATE_SR_IE, 0);
+#ifdef PSX_COSIM
+        COSIM_IRQ_NOTE(4u);
+#endif
+        PSX_CHECK_INTERRUPTS_RETURN();
+    }   /* Interrupts globally disabled */
+    if (!(sr & (1 << 10))) {
+        irq_record_outcome(EV_IRQ_GATE, GATE_SR_IM2, 0);
+#ifdef PSX_COSIM
+        COSIM_IRQ_NOTE(5u);
+#endif
+        PSX_CHECK_INTERRUPTS_RETURN();
+    } /* Hardware interrupt bit not enabled */
 
-    irq_record_outcome(EV_IRQ_DELIVER, 0);
+    /* Architectural take-PC = the resume PC (same selection the async-RFE block
+     * below uses): the dirty-interp commits the exact interrupted instruction in
+     * g_dirty_safe_resume_pc; compiled code passes its block-entry PC via
+     * psx_check_interrupts_at -> s_compiled_interrupt_resume_pc. Combined with the
+     * event's `mode`, this is the take-point for the cross-backend diff. */
+    {
+        extern uint32_t g_dirty_safe_resume_pc;
+        uint32_t take_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
+                                                  : s_compiled_interrupt_resume_pc;
+        irq_record_outcome(EV_IRQ_DELIVER, 0, take_pc);
+    }
+    g_irq_deliver_count++;
+    if ((i_stat & i_mask) & (1u << IRQ_VBLANK)) g_vblank_deliver_count++;
+    /* IRQ-delivery context ring (MMX6 VSync-vs-CD-DMA hunt). Capture, at every IRQ
+     * delivery, whether the kernel VSync callback-block word at 0x80079D44 is the
+     * clobbered game value AND whether a CD DMA (ch3) is mid-transfer / a DMA is
+     * executing. If VBlank gets delivered with d44 already==0x016F0110 while the CD
+     * DMA is active, that is ChatGPT's class (c)+(#2): IRQ delivered in the DMA
+     * clobber window because the CPU isn't stalled / the event wasn't torn down. */
+    {
+        extern int dma_cdrom_transfer_active(void);
+        extern int g_dma_exec_depth;
+        extern uint64_t s_frame_count;
+        g_irqctx_ring[g_irqctx_seq & (IRQCTX_RING_CAP - 1u)] = (IrqCtxEntry){
+            .seq = g_irqctx_seq, .cycle = psx_get_cycle_count(),
+            .frame = (uint32_t)s_frame_count, .istat = i_stat, .imask = i_mask,
+            .sr = cpu->cop0[COP0_SR], .d44 = cpu->read_word(0x80079D44u),
+            .cdrom_active = (uint32_t)dma_cdrom_transfer_active(),
+            .dma_depth = g_dma_exec_depth,
+            .is_vblank = (uint32_t)(((i_stat & i_mask) & (1u << IRQ_VBLANK)) != 0),
+        };
+        g_irqctx_seq++;
+    }
+    ls_note_exception_entry();
     in_exception = 1;
     exception_entries_total++;
     uint32_t pre_handler_istat = i_stat;  /* snapshot for cooldown decision */
@@ -341,10 +703,47 @@ void psx_check_interrupts(CPUState* cpu) {
      * memory at [EPC] to check for COP2 branch delay. We use a dedicated
      * address in the kernel scratch area.  Address 0x80000048 is chosen
      * because it's between the exception vectors (0x80-0xBF) and the
-     * kernel data pointer area (0x100+), and not used by the BIOS. */
-    uint32_t sentinel = 0x80000048u;
-    cpu->write_word(sentinel, 0x00000000u); /* NOP */
-    cpu->cop0[COP0_EPC] = sentinel;
+     * kernel data pointer area (0x100+), and not used by the BIOS.
+     *
+     * The sentinel is the HOST escape token for the SYNCHRONOUS handler: when the
+     * recompiled handler RFEs to it while in_exception, psx_unknown_dispatch /
+     * dirty_ram_dispatch longjmp back here and resume the interrupted code via the
+     * host-GPR-restore below. This is unchanged (Tomba 1 / MMX6 / Ape rely on it). */
+    /* Fix B: COP0.EPC = the REAL interrupted resume PC, NOT a sentinel. The recompiled
+     * BIOS exception handler saves COP0.EPC into the interrupted thread's TCB EPC slot,
+     * so a thread suspended here (ChangeThread) resumes at its OWN real PC — never via a
+     * single global that the next thread's IRQs overwrite (the MMX6 cooperative-thread
+     * freeze). The host escape out of the nested synchronous handler is keyed on the
+     * RFE-pending flag (psx_rfe_mark_escape / psx_rfe_escape_check), not on pc==sentinel.
+     *
+     * real_pc = the committed interrupted PC, latched by the delivery site (the dirty
+     * pump exposes g_dirty_safe_resume_pc; a compiled block-leader check exposes
+     * s_compiled_interrupt_resume_pc). When BOTH are 0 the IRQ was taken at a clean
+     * trampoline boundary (the interrupted function already returned, pc was 0) — there
+     * is no mid-function resume PC, so fall back to the legacy sentinel + saved_gpr path
+     * for THIS delivery only (reason = LEGACY_SENTINEL gates the saved_gpr restore and
+     * disarms the RFE-flag escape). */
+    g_rfe_escape_pending = 0;
+    {
+        uint32_t real_pc = g_dirty_safe_resume_pc ? g_dirty_safe_resume_pc
+                                                  : s_compiled_interrupt_resume_pc;
+        if (real_pc != 0u && (real_pc & 0x3u) == 0u &&
+            (real_pc & 0x1FFFFFFFu) < 0x00200000u) {
+            cpu->cop0[COP0_EPC]  = real_pc;     /* architectural: the real resume PC */
+            g_exception_real_epc = real_pc;
+            g_exc_escape_reason  = PSX_EXC_ESCAPE_NONE; /* set at the actual RFE/SYSCALL return */
+        } else {
+            uint32_t sentinel = PSX_EXC_SENTINEL_PC;
+            cpu->write_word(sentinel, 0x00000000u); /* NOP, read by the handler's BD check */
+            cpu->cop0[COP0_EPC]  = sentinel;
+            g_exception_real_epc = sentinel;
+            g_exc_escape_reason  = PSX_EXC_ESCAPE_LEGACY_SENTINEL;
+        }
+#ifdef PSX_COSIM
+        cosim_irq_note(cpu, 1u, real_pc, g_dirty_safe_resume_pc,
+                       s_compiled_interrupt_resume_pc, sr);
+#endif
+    }
 
     /* Save the interrupted code's full register state.
      *
@@ -413,6 +812,18 @@ void psx_check_interrupts(CPUState* cpu) {
      * so the EPC-sentinel longjmp can't leave the flag wrong. */
     int prev_interp_active = g_dirty_interp_active;
     g_dirty_interp_active = 0;
+    /* Dispatch-depth contract across the async handler (Tomba 2 splash, post
+     * overlay-floor fix). The interrupt can be delivered from a NESTED dispatch
+     * (the local-flow pump runs inside dirty_ram_dispatch at depth > 0). The
+     * handler must run as its OWN outermost context (so its tail-call trampoline
+     * flattens), and a ReturnFromException longjmp skips the handler frames'
+     * `--g_psx_dispatch_depth` decrements — so we cannot leave the counter at 0.
+     * Save the interrupted code's nesting here and RESTORE it after the handler;
+     * otherwise the outer frames unwind below zero (dispatch_depth -> -1), the
+     * `outermost` test misfires, and the top-level dispatch returns to PC=0
+     * ("execution completed" abnormal exit). */
+    int saved_dispatch_depth = g_psx_dispatch_depth;
+    g_psx_dispatch_depth = 0;
     for (;;) {
         int jmp_val = setjmp(exception_jmpbuf);
         if (jmp_val == 2) {
@@ -440,6 +851,10 @@ void psx_check_interrupts(CPUState* cpu) {
     g_exception_owner_fiber = prev_owner_fiber;
     g_pending_exception_longjmp = prev_pending;
     g_dirty_interp_active = prev_interp_active;
+    /* Restore the interrupted code's dispatch nesting (see save above). The
+     * handler's frames were unwound by longjmp without decrementing, so the
+     * live counter is meaningless here — overwrite, don't decrement. */
+    g_psx_dispatch_depth = saved_dispatch_depth;
 
     /* Restore the interrupted code's registers.
      *
@@ -451,10 +866,20 @@ void psx_check_interrupts(CPUState* cpu) {
      * For SR: if the handler did ReturnFromException (RFE already
      * applied, IEc restored), we keep that.  If the handler exited
      * normally (jmpbuf path, no RFE), IEc is still 0 from the
-     * exception push — we do RFE to pop the SR stack. */
-    for (int i = 0; i < 32; i++) cpu->gpr[i] = saved_gpr[i];
-    cpu->hi = saved_hi;
-    cpu->lo = saved_lo;
+     * exception push — we do RFE to pop the SR stack.
+     *
+     * Fix B: only restore saved_gpr on the LEGACY (jmpbuf / boundary-sentinel)
+     * exit. On a real RFE/ReturnFromException the recompiled BIOS handler already
+     * restored the RESUMED thread's GPRs from its TCB; overwriting them with our
+     * saved_gpr would clobber the resumed thread with the state of the thread that
+     * ENTERED the exception (the cross-thread corruption fix B exists to prevent). */
+    if (g_exc_escape_reason == PSX_EXC_ESCAPE_LEGACY_SENTINEL) {
+        for (int i = 0; i < 32; i++) cpu->gpr[i] = saved_gpr[i];
+        cpu->hi = saved_hi;
+        cpu->lo = saved_lo;
+    }
+    g_rfe_escape_pending = 0;
+    g_exc_escape_reason  = PSX_EXC_ESCAPE_NONE;
 
     if (!(cpu->cop0[COP0_SR] & 0x01)) {
         uint32_t sr2 = cpu->cop0[COP0_SR];
@@ -486,6 +911,12 @@ void psx_check_interrupts(CPUState* cpu) {
         uint32_t sio_active = (claimed | (i_stat & i_mask)) & (1u << IRQ_SIO0);
         post_exception_cooldown = sio_active ? 0 : CLAIMED_PROGRESS_QUANTUM;
     }
+    if (g_ls_suppress_record > 0) g_ls_suppress_record--;
+#ifdef PSX_COSIM
+#undef COSIM_IRQ_NOTE
+#undef COSIM_IRQ_TAKE_PC
+#endif
+#undef PSX_CHECK_INTERRUPTS_RETURN
 }
 
 /* Compatibility shim: the ape-flavored generated code calls
@@ -494,6 +925,20 @@ void psx_check_interrupts(CPUState* cpu) {
  * here gives the mmx6 baseline interrupt behavior — sufficient to build+run the
  * current generated code on the good baseline for instrumented comparison. */
 void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
-    (void)resume_pc;
+    uint32_t prev = s_compiled_interrupt_resume_pc;
+    s_compiled_interrupt_resume_pc = resume_pc;
     psx_check_interrupts(cpu);
+    s_compiled_interrupt_resume_pc = prev;
+}
+
+int psx_interrupts_checked_at_current_cycle(uint32_t resume_pc) {
+    return s_last_interrupt_check_cycle == psx_get_cycle_count() &&
+           same_guest_pc(s_last_interrupt_check_pc, resume_pc);
+}
+
+void psx_check_interrupts_dispatch_entry(CPUState* cpu, uint32_t resume_pc) {
+    if (psx_interrupts_checked_at_current_cycle(resume_pc)) {
+        return;
+    }
+    psx_check_interrupts_at(cpu, resume_pc);
 }

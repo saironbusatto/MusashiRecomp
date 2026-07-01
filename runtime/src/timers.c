@@ -49,8 +49,26 @@ typedef struct {
 static Timer timers[3];
 static uint32_t timer_frac[3];
 
+/* Always-on RootCounter/Timer IRQ-fire telemetry (Tomba 2 RCnt-wait diag):
+ * counts how many times each timer raised its IRQ. If a game spins on an
+ * RCnt-based wait that never completes, the matching counter here stays flat
+ * (timer never reaches target / IRQ never fires) — visible in the freeze
+ * heartbeat even when the main thread is saturated. */
+uint64_t g_timer_irq_fired[3] = { 0, 0, 0 };
+
+void timers_get_debug(int t, uint16_t *counter, uint16_t *target,
+                      uint32_t *mode, uint64_t *irq_fired) {
+    if (t < 0 || t > 2) return;
+    if (counter)   *counter   = timers[t].counter;
+    if (target)    *target    = timers[t].target;
+    if (mode)      *mode      = timers[t].mode;
+    if (irq_fired) *irq_fired = g_timer_irq_fired[t];
+}
+
 /* I_STAT is owned by memory.c — we poke it directly via this extern. */
 extern uint32_t i_stat;
+/* Central IRQ-raise choke point (interrupts.c) — also records the device ring. */
+extern void psx_irq_raise(uint32_t bit, uint32_t detail);
 
 void timers_init(void) {
     memset(timers, 0, sizeof(timers));
@@ -97,18 +115,20 @@ static int timer_uses_sysclk(int t) {
 static void timer_fire_irq(int t) {
     Timer* tm = &timers[t];
 
+    g_timer_irq_fired[t]++;
+
     if (tm->mode & MODE_IRQ_TOGGLE) {
         tm->irq_line ^= 1;
         if (tm->irq_line) {
             tm->mode &= ~MODE_IRQ_REQUEST;
-            i_stat |= (1 << timer_irq[t]);
+            psx_irq_raise(timer_irq[t], t); /* detail = timer index */
         } else {
             tm->mode |= MODE_IRQ_REQUEST;
         }
     } else {
         /* Pulse mode */
         tm->mode &= ~MODE_IRQ_REQUEST;
-        i_stat |= (1 << timer_irq[t]);
+        psx_irq_raise(timer_irq[t], t); /* detail = timer index */
         tm->mode |= MODE_IRQ_REQUEST;
     }
 
@@ -196,6 +216,56 @@ void timers_advance(uint32_t cycles) {
             timer_advance_divided(t, cycles, 5);
         }
     }
+}
+
+/* Cycles until this timer's clock advances by one count, given its source. */
+static uint32_t timer_divisor(int t) {
+    int src = (timers[t].mode >> 8) & 3;
+    if (t == 2 && (src == 2 || src == 3)) return 8;   /* sysclk/8 */
+    if (timer_uses_sysclk(t))             return 1;   /* 1 cycle = 1 tick */
+    if (t == 1)                           return 2146; /* HBlank approximation */
+    if (t == 0)                           return 5;    /* dotclock approximation */
+    return 1;
+}
+
+/* Cycle-budgeted precise event slicing: distance (in guest CPU cycles) to the
+ * next moment this timer block would raise a DELIVERABLE IRQ — i.e. its I_STAT
+ * bit is unmasked in i_mask AND the relevant mode IRQ (target/overflow) is
+ * armed. Returns UINT32_MAX if no deliverable timer IRQ is scheduled. Mirrors
+ * timer_advance_counts() exactly so the slice trigger never lets a native block
+ * run past a timer interrupt's architectural take cycle. Conservative: rounds
+ * toward smaller distances. See PRECISE_IRQ_SLICE.md. */
+uint32_t timers_cycles_to_irq(uint32_t i_mask) {
+    uint32_t best = 0xFFFFFFFFu;
+    for (int t = 0; t < 3; t++) {
+        if (!(i_mask & (1u << timer_irq[t]))) continue;   /* IRQ masked: not deliverable */
+        const Timer* tm = &timers[t];
+        int want_target   = (tm->mode & MODE_IRQ_TARGET)   != 0;
+        int want_overflow = (tm->mode & MODE_IRQ_OVERFLOW) != 0;
+        if (!want_target && !want_overflow) continue;     /* IRQ not armed in mode */
+
+        uint32_t ticks = 0xFFFFFFFFu;
+        if (want_target) {
+            uint32_t d = ((uint32_t)tm->target - (uint32_t)tm->counter) & 0xFFFFu;
+            if (d == 0) d = 0x10000u;                     /* matches timer_advance_counts */
+            if (d < ticks) ticks = d;
+        }
+        if (want_overflow) {
+            uint32_t d = 0x10000u - (uint32_t)tm->counter; /* fires on 0xFFFF->0 wrap */
+            if (d < ticks) ticks = d;
+        }
+        if (ticks == 0xFFFFFFFFu) continue;
+
+        uint32_t div = timer_divisor(t);
+        /* cycles = ticks*div - frac (frac cycles already accumulated toward the
+         * next tick on divided timers; 0 on sysclk timers). Clamp on overflow. */
+        uint64_t cyc = (uint64_t)ticks * (uint64_t)div;
+        if (cyc > (uint64_t)timer_frac[t]) cyc -= (uint64_t)timer_frac[t];
+        else cyc = 0;
+        if (cyc > 0xFFFFFFFFu) cyc = 0xFFFFFFFFu;
+        if ((uint32_t)cyc < best) best = (uint32_t)cyc;
+    }
+    return best;
 }
 
 uint32_t timers_read(uint32_t addr) {

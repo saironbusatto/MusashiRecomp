@@ -41,6 +41,23 @@ extern int      sio_get_tx_writes(void);
  * would only fail at link time and is easy to catch. */
 extern uint64_t g_dirty_ram_blocks_run;
 extern uint64_t g_dirty_ram_insns_run;
+extern uint64_t g_dirty_pump_max_gap_insns;  /* largest insn gap between IRQ pumps */
+extern uint64_t g_dirty_pump_count;          /* region-independent dirty IRQ pumps */
+/* Timer/RootCounter debug accessor (timers.c) — Tomba 2 RCnt-wait diagnosis. */
+extern void timers_get_debug(int t, uint16_t *counter, uint16_t *target,
+                             uint32_t *mode, uint64_t *irq_fired);
+/* Bail-source ledger (traps.c) — Tomba 2 wild-return / splash-spin diagnosis. */
+extern void psx_bail_ledger_top(uint32_t *site_ra, uint32_t *wild_pc,
+                                uint32_t *site_sp, uint32_t *guest_sp,
+                                uint64_t *count, uint32_t *unique);
+extern uint32_t g_bail_first_site_ra, g_bail_first_wild_pc, g_bail_first_frame;
+extern uint32_t g_bail_first_in_exc;  /* was the trigger bail during an exception? */
+/* IRQ raise/deliver/ack telemetry (interrupts.c + memory.c) — exception-reentry. */
+extern uint64_t g_vblank_raise_count, g_vblank_deliver_count, g_irq_deliver_count;
+extern uint64_t g_vblank_ack_count;
+/* $ra->1 corruption tripwire (traps.c) — pins the clobber site. */
+extern uint32_t g_ra_tw_latched, g_ra_tw_site, g_ra_tw_pc, g_ra_tw_prev_ra;
+extern uint32_t g_ra_tw_frame, g_ra_tw_in_exc, g_ra_tw_sp;
 
 /* Vsync self-heal counters — defined in main.cpp. Included in the dump
  * so a slow_frames wedge can be attributed to driver present
@@ -139,6 +156,8 @@ typedef struct {
     uint8_t  mc_max_state;
     long long wall_clock;
     uint64_t tcp_stall_ms;
+    uint16_t t1_count;        /* Timer1/RCnt1 counter — must advance if the wait is to complete */
+    uint64_t t1_irq_fired;    /* Timer1 IRQ-fire count — flat == RCnt IRQ never fires */
 } HbRingEntry;
 static HbRingEntry s_ring[RING_CAP];
 static uint32_t    s_ring_head = 0;
@@ -251,6 +270,13 @@ static void freeze_dump_main_stack_json(FILE *f) {
         }
         if (got_mod && mod.ModuleName[0]) {
             fprintf(f, ",\"module\":\"%s\"", mod.ModuleName);
+            /* Emit module-relative RVA. DbgHelp/SymFromAddr can't resolve mingw
+             * DWARF symbols for the main module (the symbol field stays absent),
+             * but addr2line CAN — given the RVA. addr - BaseOfImage is the input
+             * for `addr2line -e psx-runtime.exe -f <rva>`. Always present so any
+             * frame is offline-resolvable regardless of the DbgHelp gap. */
+            fprintf(f, ",\"rva\":\"0x%llX\"",
+                    (unsigned long long)(addr - (DWORD64)mod.BaseOfImage));
         }
         fputc('}', f);
         first = 0;
@@ -386,6 +412,8 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         "  \"tx_writes\":%d,\n"
         "  \"dirty_ram_blocks\":%llu,\n"
         "  \"dirty_ram_insns\":%llu,\n"
+        "  \"dirty_pump_max_gap_insns\":%llu,\n"
+        "  \"dirty_pump_count\":%llu,\n"
         "  \"tcp_send_stall_ms\":%llu,\n"
         "  \"tcp_clients_dropped\":%u,\n"
         "  \"bail_first\":%llu,\n"
@@ -412,6 +440,8 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
         mc_max, tx_writes,
         (unsigned long long)g_dirty_ram_blocks_run,
         (unsigned long long)g_dirty_ram_insns_run,
+        (unsigned long long)g_dirty_pump_max_gap_insns,
+        (unsigned long long)g_dirty_pump_count,
         (unsigned long long)debug_server_get_tcp_stall_ms(),
         debug_server_get_tcp_drops(),
         (unsigned long long)g_psx_bail_first,
@@ -446,6 +476,7 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
             "\"cur_fn\":\"0x%08X\",\"store_pc\":\"0x%08X\","
             "\"i_stat\":\"0x%08X\",\"sio_stat\":\"0x%04X\","
             "\"sio_ctrl\":\"0x%04X\",\"in_exc\":%u,\"mc_max\":%u,"
+            "\"t1_count\":%u,\"t1_irq_fired\":%llu,"
             "\"tcp_ms\":%llu}%s\n",
             e->wall_clock,
             (unsigned long long)e->frame_count,
@@ -455,6 +486,7 @@ static void freeze_dump_write(long long wall, uint64_t frame, uint64_t cyc,
             e->current_func, e->last_store_pc,
             e->i_stat, (unsigned)e->sio_stat, (unsigned)e->sio_ctrl,
             (unsigned)e->in_exception, (unsigned)e->mc_max_state,
+            (unsigned)e->t1_count, (unsigned long long)e->t1_irq_fired,
             (unsigned long long)e->tcp_stall_ms,
             (i + 1 < avail) ? "," : "");
     }
@@ -617,6 +649,9 @@ static void heartbeat_write(void) {
     re->mc_max_state    = (uint8_t)mc_max;
     re->wall_clock      = wall;
     re->tcp_stall_ms    = debug_server_get_tcp_stall_ms();
+    { uint16_t _t1c = 0; uint64_t _t1f = 0;
+      timers_get_debug(1, &_t1c, NULL, NULL, &_t1f);
+      re->t1_count = _t1c; re->t1_irq_fired = _t1f; }
     s_ring_head = (s_ring_head + 1) % RING_CAP;
     if (s_ring_count < RING_CAP) s_ring_count++;
 
@@ -681,6 +716,21 @@ static void heartbeat_write(void) {
         s_dump_armed = 1;
     }
 
+    /* Timer1/RootCounter1 decode (Tomba 2 RCnt-wait diagnosis): if the game
+     * spins on an RCnt1-based wait that never completes, t1_irq_fired stays
+     * flat and/or t1_count never reaches t1_target. clock-source (mode bits
+     * 8-9) is decoded because a bad clock-source would make T1 never tick. */
+    uint16_t t1_count = 0, t1_target = 0; uint32_t t1_mode = 0; uint64_t t1_irq_fired = 0;
+    timers_get_debug(1, &t1_count, &t1_target, &t1_mode, &t1_irq_fired);
+    unsigned t1_clk = (unsigned)((t1_mode >> 8) & 3u);
+    unsigned t1_irq_on_target = (unsigned)((t1_mode >> 4) & 1u);
+
+    /* Bail-source ledger: the dominant wild-return source (= the game wait-site
+     * spinning into the kernel) + how many distinct sites bail. */
+    uint32_t bl_site_ra = 0, bl_wild = 0, bl_ssp = 0, bl_gsp = 0, bl_uniq = 0;
+    uint64_t bl_count = 0;
+    psx_bail_ledger_top(&bl_site_ra, &bl_wild, &bl_ssp, &bl_gsp, &bl_count, &bl_uniq);
+
     /* Buffer sized for current-state JSON + ring (~256B per ring entry). */
     static char buf[64 * 1024];
     int n = snprintf(buf, sizeof(buf),
@@ -708,6 +758,35 @@ static void heartbeat_write(void) {
         "  \"tx_writes\":%d,\n"
         "  \"dirty_ram_blocks\":%llu,\n"
         "  \"dirty_ram_insns\":%llu,\n"
+        "  \"dirty_pump_max_gap_insns\":%llu,\n"
+        "  \"dirty_pump_count\":%llu,\n"
+        "  \"t1_count\":%u,\n"
+        "  \"t1_target\":%u,\n"
+        "  \"t1_mode\":\"0x%04X\",\n"
+        "  \"t1_clock_src\":%u,\n"
+        "  \"t1_irq_on_target\":%u,\n"
+        "  \"t1_irq_fired\":%llu,\n"
+        "  \"bail_top_site_ra\":\"0x%08X\",\n"
+        "  \"bail_top_wild_pc\":\"0x%08X\",\n"
+        "  \"bail_top_site_sp\":\"0x%08X\",\n"
+        "  \"bail_top_guest_sp\":\"0x%08X\",\n"
+        "  \"bail_top_count\":%llu,\n"
+        "  \"bail_unique_keys\":%u,\n"
+        "  \"bail_first_site_ra\":\"0x%08X\",\n"
+        "  \"bail_first_wild_pc\":\"0x%08X\",\n"
+        "  \"bail_first_frame\":%u,\n"
+        "  \"bail_first_in_exc\":%u,\n"
+        "  \"ra_tw_latched\":%u,\n"
+        "  \"ra_tw_site\":%u,\n"
+        "  \"ra_tw_pc\":\"0x%08X\",\n"
+        "  \"ra_tw_prev_ra\":\"0x%08X\",\n"
+        "  \"ra_tw_frame\":%u,\n"
+        "  \"ra_tw_in_exc\":%u,\n"
+        "  \"ra_tw_sp\":\"0x%08X\",\n"
+        "  \"vblank_raise_count\":%llu,\n"
+        "  \"vblank_deliver_count\":%llu,\n"
+        "  \"vblank_ack_count\":%llu,\n"
+        "  \"irq_deliver_count\":%llu,\n"
         "  \"tcp_send_stall_ms\":%llu,\n"
         "  \"tcp_clients_dropped\":%u,\n"
         "  \"bail_first\":%llu,\n"
@@ -738,6 +817,35 @@ static void heartbeat_write(void) {
         tx_writes,
         (unsigned long long)g_dirty_ram_blocks_run,
         (unsigned long long)g_dirty_ram_insns_run,
+        (unsigned long long)g_dirty_pump_max_gap_insns,
+        (unsigned long long)g_dirty_pump_count,
+        (unsigned)t1_count,
+        (unsigned)t1_target,
+        (unsigned)t1_mode,
+        t1_clk,
+        t1_irq_on_target,
+        (unsigned long long)t1_irq_fired,
+        bl_site_ra,
+        bl_wild,
+        bl_ssp,
+        bl_gsp,
+        (unsigned long long)bl_count,
+        bl_uniq,
+        g_bail_first_site_ra,
+        g_bail_first_wild_pc,
+        g_bail_first_frame,
+        g_bail_first_in_exc,
+        g_ra_tw_latched,
+        g_ra_tw_site,
+        g_ra_tw_pc,
+        g_ra_tw_prev_ra,
+        g_ra_tw_frame,
+        g_ra_tw_in_exc,
+        g_ra_tw_sp,
+        (unsigned long long)g_vblank_raise_count,
+        (unsigned long long)g_vblank_deliver_count,
+        (unsigned long long)g_vblank_ack_count,
+        (unsigned long long)g_irq_deliver_count,
         (unsigned long long)debug_server_get_tcp_stall_ms(),
         debug_server_get_tcp_drops(),
         (unsigned long long)g_psx_bail_first,
@@ -772,6 +880,7 @@ static void heartbeat_write(void) {
             "\"cur_fn\":\"0x%08X\",\"store_pc\":\"0x%08X\","
             "\"i_stat\":\"0x%08X\",\"sio_stat\":\"0x%04X\","
             "\"sio_ctrl\":\"0x%04X\",\"in_exc\":%u,\"mc_max\":%u,"
+            "\"t1_count\":%u,\"t1_irq_fired\":%llu,"
             "\"tcp_ms\":%llu}%s\n",
             e->wall_clock,
             (unsigned long long)e->frame_count,
@@ -781,6 +890,7 @@ static void heartbeat_write(void) {
             e->current_func, e->last_store_pc,
             e->i_stat, (unsigned)e->sio_stat, (unsigned)e->sio_ctrl,
             (unsigned)e->in_exception, (unsigned)e->mc_max_state,
+            (unsigned)e->t1_count, (unsigned long long)e->t1_irq_fired,
             (unsigned long long)e->tcp_stall_ms,
             (i + 1 < avail) ? "," : "");
         if (m <= 0 || (size_t)(n + m) >= sizeof(buf)) break;

@@ -31,7 +31,15 @@
  *     DLLs (which lack both the emit and a host that supplies the callback). */
 /*   v5: psx_syscall callback return type void->int (CPS, RECURSION_BUG.md §25);
  *       overlays compiled under CPS emit `if (psx_syscall(...)) return;`. */
-#define PSX_OVERLAY_ABI_VERSION 6
+/*   v7: advance_cycles callback added; overlays now built with
+ *       PSX_ENABLE_BLOCK_CYCLES and charge the shared host cycle/timer timeline.
+ *       Bumping rejects stale DLLs that charged no cycles (Tomba2 Timer1 fork). */
+/*   v8: check_interrupts_at callback added so generated native overlay block
+ *       checks can provide the real guest resume PC for async RFE recovery.
+ *   v9: faithful-timing callbacks (cyc_load, icache_fetch, muldiv, mult_latency,
+ *       gte, slice_block) so overlay code built with PSX_ENABLE_BLOCK_CYCLES links
+ *       against the runtime's real timing impls (the cycle-accuracy rearchitecture). */
+#define PSX_OVERLAY_ABI_VERSION 9
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -96,6 +104,14 @@ typedef struct {
     void (*dispatch_call)(CPUState *cpu, uint32_t addr, uint32_t ra);
     /* Interrupt check: called after every function return in overlay */
     void (*check_interrupts)(CPUState *cpu);
+    /* Interrupt check with the guest PC that should resume if a game-installed
+     * handler later RFEs to the sentinel outside the synchronous host window. */
+    void (*check_interrupts_at)(CPUState *cpu, uint32_t resume_pc);
+    /* Guest-cycle accounting (ABI v7): block-cycle charge. Overlay code built
+     * with PSX_ENABLE_BLOCK_CYCLES must charge the SAME shared host cycle/timer
+     * timeline as the dirty-RAM interpreter and the BIOS, or timer-sensitive
+     * code reads different values per backend (Tomba2 logo Timer1 fork). */
+    void (*advance_cycles)(uint32_t cycles);
     /* GTE coprocessor 2 execution */
     void (*gte_execute)(CPUState *cpu, uint32_t cmd);
     /* MIPS syscall (break/syscall instructions). Returns 1 if control
@@ -143,6 +159,25 @@ typedef struct {
      * sanctioned dirty-RAM interpreter. Appended LAST (struct grows back-
      * compatibly); may be NULL on a host that predates it. */
     void (*psx_native_bad_entry)(CPUState *cpu, uint32_t owner, uint32_t pc);
+    /* Faithful-timing functions (ABI v9). The cycle-accuracy + due-cycle-scheduler
+     * rearchitecture made the recompiler emit these into OVERLAY code too (block-cycle
+     * mode). They touch shared runtime state (guest RAM, the global cycle counter, the
+     * I-cache tag array, the mul/div & GTE completion deadlines, the precise-slice
+     * interp), so the DLL MUST forward them to the runtime — a local copy would diverge
+     * from the interp/BIOS timeline (the exact class the cosim guards). Appended LAST
+     * (struct grows back-compatibly); the ABI bump to 9 rejects any pre-timing cache. */
+    uint32_t (*cyc_load_word)(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
+    uint16_t (*cyc_load_half)(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
+    uint8_t  (*cyc_load_byte)(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
+    uint32_t (*cyc_lwc2_read)(CPUState *cpu, uint32_t addr);
+    void     (*icache_fetch)(CPUState *cpu, uint32_t addr);
+    void     (*muldiv_set)(CPUState *cpu, uint32_t latency);
+    void     (*muldiv_stall)(CPUState *cpu);
+    uint32_t (*mult_latency_s)(uint32_t rs);
+    uint32_t (*mult_latency_u)(uint32_t rs);
+    void     (*gte_stall)(CPUState *cpu);
+    void     (*gte_read)(CPUState *cpu, uint32_t rt);
+    int      (*slice_block)(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

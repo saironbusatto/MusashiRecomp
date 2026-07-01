@@ -146,6 +146,7 @@ struct LauncherModel {
     int  p1_mode      = 0;
     int  p2_mode      = 0;
     bool allow_hybrid = true;  // game.allow_hybrid: when false the Hybrid segment is hidden
+    bool mode_selectable = true; // game.lock_mode == false: when false the whole pad-mode selector is hidden
     int  deadzone_pct = 37;    // analog-stick deadzone 0-100% (raw = pct*32767/100)
     Rml::String p1_dev_label = "Keyboard";
     Rml::String p2_dev_label = "None";
@@ -688,6 +689,14 @@ Result run(SDL_Window* window, void* gl_context,
         if (m.p1_mode == PSXRecompV4::PAD_MODE_HYBRID) m.p1_mode = PSXRecompV4::PAD_MODE_ANALOG;
         if (m.p2_mode == PSXRecompV4::PAD_MODE_HYBRID) m.p2_mode = PSXRecompV4::PAD_MODE_ANALOG;
     }
+    // lock_mode: a single-pad-type game (e.g. Tomba 2, digital-only). Hide the
+    // whole pad-mode selector and force both ports to the game's locked mode,
+    // overriding any stale settings.toml so a broken mode can't be selected.
+    m.mode_selectable = !game.lock_mode;
+    if (game.lock_mode) {
+        m.p1_mode = game.locked_mode;
+        m.p2_mode = game.locked_mode;
+    }
     m.deadzone_pct = io.has_deadzone ? (io.deadzone * 100 / 32767) : 37;
     if (io.has_p1_device) {
         m.p1_dev_index = find_or_add_device_index(dev_opts, io.p1_device);
@@ -739,6 +748,7 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("p1_mode",        &m.p1_mode);
     c.Bind("p2_mode",        &m.p2_mode);
     c.Bind("allow_hybrid",   &m.allow_hybrid);
+    c.Bind("mode_selectable",&m.mode_selectable);
     c.Bind("deadzone_pct",   &m.deadzone_pct);
     c.Bind("p1_dev_label",   &m.p1_dev_label);
     c.Bind("p2_dev_label",   &m.p2_dev_label);

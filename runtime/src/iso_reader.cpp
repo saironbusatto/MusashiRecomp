@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 
 namespace PS1 {
 
@@ -43,40 +44,68 @@ bool ISOReader::Open(const std::string& filename) {
                s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
     };
     if (ends_with(filename, ".cue") || ends_with(filename, ".CUE")) {
-        // Simple .cue parsing - look for FILE "..." BINARY line
+        // Parse the .cue: resolve the FILE, AND build the track TOC from the
+        // TRACK/INDEX lines. A bare .bin/.iso (no .cue) falls through to the
+        // single-track synthesis below; a multi-track disc (data + CD-DA audio)
+        // gets each track so the CD model's GetTN/GetTD report them correctly.
         std::ifstream cue_file(filename);
         if (!cue_file.is_open()) {
             return false;
         }
 
         std::string line;
+        int  cur_track_num   = -1;
+        bool cur_track_audio = false;
         while (std::getline(cue_file, line)) {
-            // Look for: FILE "filename.bin" BINARY
+            // FILE "filename.bin" BINARY
             size_t file_pos = line.find("FILE");
             size_t binary_pos = line.find("BINARY");
-
             if (file_pos != std::string::npos && binary_pos != std::string::npos) {
-                // Extract filename between quotes
                 size_t quote1 = line.find('"', file_pos);
                 size_t quote2 = line.find('"', quote1 + 1);
-
                 if (quote1 != std::string::npos && quote2 != std::string::npos) {
                     std::string bin_name = line.substr(quote1 + 1, quote2 - quote1 - 1);
-
-                    // If it's a relative path, combine with .cue directory
                     std::filesystem::path cue_path(filename);
                     std::filesystem::path bin_path(bin_name);
-
                     if (bin_path.is_relative()) {
                         bin_filename = (cue_path.parent_path() / bin_name).string();
                     } else {
                         bin_filename = bin_name;
                     }
-                    break;
                 }
+                continue;
+            }
+
+            // TRACK NN MODE2/2352 | TRACK NN AUDIO
+            int  tn = 0;
+            char type[32] = {0};
+            if (std::sscanf(line.c_str(), " TRACK %d %31s", &tn, type) == 2) {
+                cur_track_num   = tn;
+                cur_track_audio = (std::strstr(type, "AUDIO") != nullptr);
+                continue;
+            }
+
+            // INDEX 01 MM:SS:FF — the track's start (INDEX 00 is its pregap).
+            int idx = 0, mm = 0, ss = 0, ff = 0;
+            if (std::sscanf(line.c_str(), " INDEX %d %d:%d:%d", &idx, &mm, &ss, &ff) == 4
+                && idx == 1 && cur_track_num >= 1) {
+                CDTrack t;
+                t.number    = cur_track_num;
+                t.is_audio  = cur_track_audio;
+                t.start_lba = (uint32_t)(((mm * 60 + ss) * 75) + ff);  // .bin-relative LBA
+                tracks_.push_back(t);
+                cur_track_num = -1;
             }
         }
         cue_file.close();
+    }
+
+    // Synthesize a single data track for a bare .bin/.iso or a .cue with no
+    // parseable TRACK entries, so TrackCount() is always >= 1.
+    if (tracks_.empty()) {
+        CDTrack t;
+        t.number = 1; t.is_audio = false; t.start_lba = 0;
+        tracks_.push_back(t);
     }
 
     // Store the resolved bin path for callers (e.g. xa_audio)
@@ -219,6 +248,24 @@ uint32_t ISOReader::GetSectorCount() {
         return static_cast<uint32_t>(size / RAW_SECTOR_SIZE);
     }
     return static_cast<uint32_t>(size / SECTOR_SIZE);
+}
+
+int ISOReader::TrackCount() const {
+    return static_cast<int>(tracks_.size());
+}
+
+uint32_t ISOReader::TrackStartLBA(int track) const {
+    for (const auto& t : tracks_) {
+        if (t.number == track) return t.start_lba;
+    }
+    return 0;
+}
+
+bool ISOReader::TrackIsAudio(int track) const {
+    for (const auto& t : tracks_) {
+        if (t.number == track) return t.is_audio;
+    }
+    return false;
 }
 
 RootDirectoryInfo ISOReader::GetRootDirectory() const {

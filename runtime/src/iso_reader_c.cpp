@@ -37,6 +37,22 @@ uint32_t iso_sector_count(void* handle) {
     return reader->GetSectorCount();
 }
 
+/* CD-track TOC accessors (multi-track / CD-DA support). track is 1-based. */
+int iso_track_count(void* handle) {
+    if (!handle) return 1;
+    return static_cast<PS1::ISOReader*>(handle)->TrackCount();
+}
+
+uint32_t iso_track_start_lba(void* handle, int track) {
+    if (!handle) return 0;
+    return static_cast<PS1::ISOReader*>(handle)->TrackStartLBA(track);
+}
+
+int iso_track_is_audio(void* handle, int track) {
+    if (!handle) return 0;
+    return static_cast<PS1::ISOReader*>(handle)->TrackIsAudio(track) ? 1 : 0;
+}
+
 void iso_close(void* handle) {
     if (!handle) return;
     auto* reader = static_cast<PS1::ISOReader*>(handle);

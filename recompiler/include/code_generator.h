@@ -208,6 +208,17 @@ private:
     // continuation into its function's entry-switch.
     std::map<uint32_t, uint32_t> cps_continuation_owner_;
 
+    // Cycle accounting for legal entries that land inside an already-emitted
+    // block instead of at its leader. Block leaders charge the whole block; an
+    // entry-switch or jump-table target that bypasses the leader must charge the
+    // remaining instructions from the interior label to the end of that block.
+    uint32_t partial_block_cycle_count(uint32_t addr, const ControlFlowGraph& cfg) const;
+    std::string emit_mid_block_cycle_charge(uint32_t addr, const ControlFlowGraph& cfg,
+                                            const std::string& indent) const;
+    std::string emit_interrupt_check(uint32_t resume_pc, const std::string& indent) const;
+    std::string emit_interrupt_check_expr(const std::string& resume_pc_expr,
+                                          const std::string& indent) const;
+
 public:
     bool cps_enabled() const { return cps_enabled_; }
     // continuation_addr -> owning function entry (CPS dispatch routing).

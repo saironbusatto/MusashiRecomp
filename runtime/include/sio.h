@@ -49,6 +49,10 @@ extern volatile int g_sio_timing_active;
  * g_sio_timing_active is 0. */
 void sio_advance(uint32_t cycles);
 
+/* Cycle-budgeted precise event slicing: guest CPU cycles until a DELIVERABLE
+ * SIO IRQ (bit7 unmasked in i_mask). UINT32_MAX if none. */
+uint32_t sio_cycles_to_irq(uint32_t i_mask);
+
 /* Telemetry counters for sio_advance. */
 uint64_t sio_get_advance_called(void);
 uint64_t sio_get_advance_with_work(void);
@@ -79,6 +83,16 @@ void sio_request_pad_type(int slot, int analog);
  * are connected during initial BIOS boot. */
 void sio_connect_pad(int slot);
 void sio_set_pad_connected(int slot, int connected);
+
+/* Declare whether the pad on a slot is a config-capable DualShock (1) or a
+ * plain digital controller (0). A real digital controller (SCPH-1080, poll id
+ * 0x41) does NOT answer the config-mode commands (0x43/0x44/0x45/0x46/0x47/
+ * 0x4C/0x4D/0x4F) — it returns hi-z / no ACK, so a game's pad driver classifies
+ * it as digital-only and just polls with 0x42. A DualShock answers them. Set
+ * from the per-player pad mode (DIGITAL => 0, ANALOG/HYBRID => 1) at boot/
+ * hotplug. Default is 1 (config-capable) so existing analog/hybrid behaviour is
+ * unchanged. */
+void sio_set_pad_config_capable(int slot, int capable);
 
 /* Return current pad button state (for debug server). _slot targets either. */
 uint16_t sio_get_pad_buttons(void);

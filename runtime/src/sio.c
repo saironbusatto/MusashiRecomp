@@ -20,6 +20,8 @@
 
 /* I_STAT is owned by memory.c */
 extern uint32_t i_stat;
+/* Central IRQ-raise choke point (interrupts.c) — also records the device ring. */
+extern void psx_irq_raise(uint32_t bit, uint32_t detail);
 
 /* IRQ bit for SIO0 */
 #define IRQ_SIO0 7
@@ -48,6 +50,15 @@ static uint8_t pad_analog[2]    = { 0, 0 };
 static uint8_t pad_stick[2][4]  = { { 0x80, 0x80, 0x80, 0x80 },
                                     { 0x80, 0x80, 0x80, 0x80 } }; /* lx,ly,rx,ry */
 
+/* Analog-mode lock, per slot. A real DualShock's config command 0x44 0x..02/0x03
+ * locks/unlocks the mode (dualshock.cpp:714-725); a locked pad ignores the
+ * physical analog button (dualshock.cpp:203). We emulate the analog button via
+ * the host hybrid heuristic (pad_type_req), so when a game LOCKS the mode the
+ * hybrid auto-flip must not override it — else the type flips underneath a game
+ * that pinned DualShock, the exact desync the deferred-request machinery cannot
+ * otherwise prevent. */
+static uint8_t analog_mode_locked[2] = { 0, 0 };
+
 /* Which slots have devices connected */
 static uint8_t pad_connected = 0;
 
@@ -73,6 +84,18 @@ static uint8_t pad_current_cmd = 0;
  * 0x43 before polling — e.g. Mega Man X6 loops 01 43 00 00 forever and never
  * reaches 0x42. (MMX6 ISSUES.md #2.) */
 static uint8_t pad_in_config[2] = { 0, 0 };
+
+/* Whether the pad on a slot is a config-capable DualShock (1) or a plain
+ * digital controller (0). A real SCPH-1080 digital pad (poll id 0x41) does NOT
+ * answer the config-mode commands (0x43/0x44/.../0x4F): it returns hi-z and the
+ * transaction ends. A game's pad driver that probes with 0x43 to detect a
+ * DualShock therefore classifies a digital pad as digital-only and just polls
+ * it with 0x42. Tomba 2's driver probes this way every frame; when the SM
+ * (wrongly) answered 0x43 for its digital pad it went down the DualShock config
+ * path and read the 0x00 config-response bytes as buttons -> phantom "all
+ * pressed" input. Default 1 keeps analog/hybrid pads unchanged; main.cpp sets 0
+ * for PAD_MODE_DIGITAL. */
+static uint8_t pad_supports_config[2] = { 1, 1 };
 
 /* Coherent-DualShock model (Tomba phantom-input fix). A real controller never
  * changes its reported type (0x41 digital <-> 0x73 analog) in the middle of a
@@ -520,6 +543,7 @@ void sio_init(void) {
     pad_buttons[0] = pad_buttons[1] = 0xFFFF;
     pad_in_config[0] = pad_in_config[1] = 0;   /* clear stale config latch on reset */
     pad_type_req[0]  = pad_type_req[1]  = -1;  /* no pending host type change */
+    analog_mode_locked[0] = analog_mode_locked[1] = 0;  /* unlocked on reset */
     pad_connected = 0;
     mc_state = MC_IDLE;
     for (int i = 0; i < 2; i++) {
@@ -556,6 +580,26 @@ void sio_init(void) {
      * transactions. Boot path zero-inits them via BSS. */
 }
 
+/* Cycle-budgeted precise event slicing: guest CPU cycles until SIO raises a
+ * DELIVERABLE IRQ (bit7 unmasked in i_mask). UINT32_MAX if none. Returns the
+ * nearest armed countdown: shift-complete, pending ack, or the pad/card IRQ
+ * delivery countdown. See PRECISE_IRQ_SLICE.md. */
+uint32_t sio_cycles_to_irq(uint32_t i_mask) {
+    if (!(i_mask & (1u << 7))) return 0xFFFFFFFFu;   /* IRQ_SIO0 masked */
+    uint32_t best = 0xFFFFFFFFu;
+    if (sio_irq_pending && sio_irq_countdown > 0 && (uint32_t)sio_irq_countdown < best)
+        best = (uint32_t)sio_irq_countdown;
+#if SIO_MODEL_CYCLE_PACED
+    if (g_sio_timing_active) {
+        if (sio_pending_ack && sio_ack_remaining > 0 && (uint32_t)sio_ack_remaining < best)
+            best = (uint32_t)sio_ack_remaining;
+        if (sio_shift_active && sio_shift_remaining > 0 && (uint32_t)sio_shift_remaining < best)
+            best = (uint32_t)sio_shift_remaining;
+    }
+#endif
+    return best;
+}
+
 void sio_connect_pad(int slot) {
     if (slot >= 0 && slot <= 1)
         pad_connected |= (1 << slot);
@@ -565,6 +609,14 @@ void sio_set_pad_connected(int slot, int connected) {
     if (slot < 0 || slot > 1) return;
     if (connected) pad_connected |=  (uint8_t)(1 << slot);
     else           pad_connected &= (uint8_t)~(1 << slot);
+}
+
+void sio_set_pad_config_capable(int slot, int capable) {
+    if (slot < 0 || slot > 1) return;
+    pad_supports_config[slot] = capable ? 1 : 0;
+    /* A plain digital pad can never be in config mode; clear any stale latch so
+     * the next poll reports the digital id (0x41), not the config id (0xF3). */
+    if (!capable) pad_in_config[slot] = 0;
 }
 
 void sio_set_pad_state(uint16_t buttons) {
@@ -692,7 +744,10 @@ static void pad_process_byte(uint8_t tx_byte) {
      * mid-transaction. A request raised during config stays pending until exit. */
     if (pad_state == PAD_IDLE) {
         for (int s = 0; s < 2; s++) {
-            if (pad_type_req[s] >= 0 && !pad_in_config[s]) {
+            /* A game-LOCKED analog mode (0x44 ..03) ignores the physical analog
+             * button — and our hybrid auto-flip IS that button — so a locked slot
+             * drops the pending host request instead of applying it. */
+            if (pad_type_req[s] >= 0 && !pad_in_config[s] && !analog_mode_locked[s]) {
                 pad_analog[s] = (uint8_t)pad_type_req[s];
                 pad_type_req[s] = -1;
             }
@@ -718,6 +773,12 @@ static void pad_process_byte(uint8_t tx_byte) {
         {
         const uint8_t cur_id = pad_in_config[selected_slot] ? 0xF3
                                : (pad_analog[selected_slot] ? 0x73 : 0x41);
+        /* A plain digital controller (SCPH-1080) answers ONLY the 0x42 poll; it
+         * ignores every config-mode command (returns hi-z, no ACK). A driver
+         * that probes with 0x43 to detect a DualShock then classifies it as
+         * digital-only and just polls. Gate all config branches on this so a
+         * digital-mode pad behaves like real hardware (see pad_supports_config). */
+        const int ds = pad_supports_config[selected_slot];
         if (tx_byte == 0x42) {
             /* Read poll. Analog (or in-config) uses the 8-byte format with the
              * four stick axes; a plain digital pad uses the 4-byte format. */
@@ -738,22 +799,53 @@ static void pad_process_byte(uint8_t tx_byte) {
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;
-        } else if (tx_byte == 0x43) {
+        } else if (ds && tx_byte == 0x43) {
             /* Enter/exit config mode. The ID byte reflects the CURRENT mode; the
              * enter(0x01)/exit(0x00) flag is the second data byte, latched in
-             * PAD_SEND_RESPONSE so it takes effect after this transaction.
-             * LEGACY (pre-98aa688): 0x43 always answered with the config ID 0xF3
-             * and did NOT track enter/exit state. */
-            pad_response[0] = g_pad_legacy_cfg ? 0xF3 : cur_id;
+             * PAD_SEND_RESPONSE so it takes effect after this transaction. */
+            const uint16_t btn = pad_buttons[selected_slot];
             pad_response[1] = 0x5A;
-            pad_response[2] = 0x00; pad_response[3] = 0x00;
-            pad_response[4] = 0x00; pad_response[5] = 0x00;
-            pad_response[6] = 0x00; pad_response[7] = 0x00;
-            pad_response_len = 8;
+            if (g_pad_legacy_cfg) {
+                /* LEGACY (pre-98aa688): always config ID 0xF3, zero frame, no
+                 * enter/exit tracking. */
+                pad_response[0] = 0xF3;
+                pad_response[2] = 0x00; pad_response[3] = 0x00;
+                pad_response[4] = 0x00; pad_response[5] = 0x00;
+                pad_response[6] = 0x00; pad_response[7] = 0x00;
+                pad_response_len = 8;
+            } else if (!pad_in_config[selected_slot]) {
+                /* ENTER attempt (normal mode): a real DualShock transmits the LIVE
+                 * poll frame here — identical framing to 0x42 (dualshock.cpp:471-490)
+                 * — and only latches config entry from the 0x01 data byte AFTERWARD.
+                 * The old all-zero frame fed any driver that reads the 0x43 frame as
+                 * input (most do; 0x43-with-data is a poll on the wire) a phantom
+                 * "all pressed"/centered-stick garbage — the hybrid phantom-input
+                 * mechanism (axis5_sio_controller.md D4). */
+                pad_response[0] = cur_id;
+                pad_response[2] = (uint8_t)(btn & 0xFF);
+                pad_response[3] = (uint8_t)(btn >> 8);
+                if (pad_analog[selected_slot]) {
+                    pad_response[4] = pad_stick[selected_slot][2]; /* right X */
+                    pad_response[5] = pad_stick[selected_slot][3]; /* right Y */
+                    pad_response[6] = pad_stick[selected_slot][0]; /* left X */
+                    pad_response[7] = pad_stick[selected_slot][1]; /* left Y */
+                    pad_response_len = 8;
+                } else {
+                    pad_response_len = 4;
+                }
+            } else {
+                /* EXIT attempt (in config): config-mode 0x43 returns the zero frame
+                 * (dualshock.cpp:660-674); cur_id is 0xF3 while in config. */
+                pad_response[0] = cur_id;
+                pad_response[2] = 0x00; pad_response[3] = 0x00;
+                pad_response[4] = 0x00; pad_response[5] = 0x00;
+                pad_response[6] = 0x00; pad_response[7] = 0x00;
+                pad_response_len = 8;
+            }
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;
-        } else if (g_pad_legacy_cfg &&
+        } else if (ds && g_pad_legacy_cfg &&
                    (tx_byte == 0x45 || tx_byte == 0x46 || tx_byte == 0x47 ||
                     tx_byte == 0x4C || tx_byte == 0x4D)) {
             /* LEGACY config answers (pre-98aa688): canned 0xF3 responses given
@@ -770,11 +862,15 @@ static void pad_process_byte(uint8_t tx_byte) {
             else if (tx_byte == 0x47) r = r_47;
             else if (tx_byte == 0x4C) r = r_4c;
             memcpy(pad_response, r, 8);
+            /* 0x45 status byte must report the LIVE analog mode, not a fixed
+             * analog-on (dualshock.cpp:743) — see fix below for the modern path. */
+            if (tx_byte == 0x45)
+                pad_response[3] = pad_analog[selected_slot] ? 0x01 : 0x00;
             pad_response_len = 8;
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
             sio_stat |= SIO_STAT_ACK;
-        } else if (!g_pad_legacy_cfg && pad_in_config[selected_slot] &&
+        } else if (ds && !g_pad_legacy_cfg && pad_in_config[selected_slot] &&
                    (tx_byte == 0x44 || tx_byte == 0x45 || tx_byte == 0x46 ||
                     tx_byte == 0x47 || tx_byte == 0x4C || tx_byte == 0x4D ||
                     tx_byte == 0x4F)) {
@@ -792,6 +888,14 @@ static void pad_process_byte(uint8_t tx_byte) {
             else if (tx_byte == 0x47) r = r_47;
             else if (tx_byte == 0x4C) r = r_4c;
             memcpy(pad_response, r, 8);
+            /* 0x45 reports the analog-status byte: a driver polling 0x45 to learn
+             * the live mode must read the CURRENT analog state, not a hard-coded
+             * analog-on (dualshock.cpp:743 transmit_buffer[1]=analog_mode?1:0).
+             * Reporting "analog" while we present digital (or vice-versa) makes the
+             * driver mis-parse the poll frame length → off-by-frame garbage buttons
+             * (axis5_sio_controller.md D8). */
+            if (tx_byte == 0x45)
+                pad_response[3] = pad_analog[selected_slot] ? 0x01 : 0x00;
             pad_response_len = 8;
             pad_state = PAD_SEND_RESPONSE;
             sio_rx_data = pad_response[0];
@@ -824,6 +928,13 @@ static void pad_process_byte(uint8_t tx_byte) {
         if (!g_pad_legacy_cfg && pad_current_cmd == 0x44 && pad_response_idx == 2) {
             pad_analog[selected_slot] = (tx_byte == 0x01) ? 1 : 0;
             pad_type_req[selected_slot] = -1;
+        }
+        /* 0x44 lock byte (data position 4, the byte after the mode byte): 0x03 =>
+         * lock analog mode, 0x02 => unlock (dualshock.cpp:714-725). A locked slot
+         * ignores the host hybrid auto-flip (see analog_mode_locked). */
+        if (!g_pad_legacy_cfg && pad_current_cmd == 0x44 && pad_response_idx == 3) {
+            if      (tx_byte == 0x03) analog_mode_locked[selected_slot] = 1;
+            else if (tx_byte == 0x02) analog_mode_locked[selected_slot] = 0;
         }
         if (pad_response_idx < pad_response_len) {
             sio_rx_data = pad_response[pad_response_idx++];
@@ -1364,12 +1475,27 @@ void sio_write(uint32_t addr, uint32_t value) {
                 int armed_now = 0;
                 if ((sio_stat & SIO_STAT_ACK) && (sio_ctrl & SIO_CTRL_ACK_IRQ_EN)) {
                     sio_stat &= ~(SIO_STAT_ACK | SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY);
-                    sio_irq_pending = 1;
-                    sio_irq_countdown = SIO_IRQ_DELAY_PAD;
-                    event_ring_record_aux(EV_ENQ, (uint8_t)SRC_SIO, (uint32_t)sio_irq_countdown);
+                    /* FAITHFUL pad ACK timing (faithful-core, replaces the
+                     * access-paced sio_irq_countdown=SIO_IRQ_DELAY_PAD hack).
+                     * On real hardware the controller's DSR/ACK pulse arrives
+                     * ~one byte-shift (baud) + ack-pulse after the TX byte —
+                     * a GUEST-CYCLE delay, independent of how many SIO register
+                     * reads the CPU manages to issue while it waits. The old
+                     * countdown decremented once per SIO register access
+                     * (sio_tick(0)), so a faithful/faster CPU (load=4) fired the
+                     * pad IRQ at the wrong guest-cycle phase relative to the
+                     * cycle-paced timers/VBLANK, diverging the BIOS pad-detect
+                     * state machine (load=4 Tomba2 boot wedge). Route through the
+                     * same cycle-paced ack scheduler the card path uses, driven
+                     * by sio_advance() from psx_advance_cycles(). */
+                    sio_pending_ack        = 1;
+                    sio_ack_remaining      = SIO_BAUD_CYCLES_DEFAULT + SIO_ACK_CYCLES_DEFAULT;
+                    sio_pending_ack_irq_en = 1;
+                    g_sio_timing_active    = 1;
+                    event_ring_record_aux(EV_ENQ, (uint8_t)SRC_SIO, (uint32_t)sio_ack_remaining);
                     sio_irq_pending_source = SIO_IRQ_SRC_PAD_ACK;
                     sio_irq_pending_slot = (uint8_t)selected_slot;
-                    sio_irq_pending_delay = (uint8_t)sio_irq_countdown;
+                    sio_irq_pending_delay = (uint8_t)SIO_ACK_CYCLES_DEFAULT;
                     sio_irq_pending_mc_state = (uint8_t)mc_state;
                     sio_irq_pending_byte_seq = sio_trace_seq;
                     armed_now = 1;
@@ -1748,7 +1874,7 @@ static void sio_fire_ack_irq(void) {
     sio_stat |= SIO_STAT_IRQ;
 
     uint32_t i_stat_before = i_stat;
-    i_stat |= (1 << IRQ_SIO0);
+    psx_irq_raise(IRQ_SIO0, 0); /* SIO ACK IRQ */
     event_ring_record_aux(EV_DEQ, (uint8_t)SRC_SIO, 0u); /* SIO ACK IRQ fired */
 
     extern uint32_t g_debug_current_func_addr;
@@ -1946,7 +2072,7 @@ void sio_tick(int cycles) {
              * on TX_RDY before writing the next byte. */
             sio_stat |= SIO_STAT_TX_RDY | SIO_STAT_TX_EMPTY;
             uint32_t i_stat_before = i_stat;
-            i_stat |= (1 << IRQ_SIO0);
+            psx_irq_raise(IRQ_SIO0, 1); /* SIO shift IRQ */
             event_ring_record_aux(EV_DEQ, (uint8_t)SRC_SIO, 1u); /* SIO shift IRQ fired */
 
             /* SIO IRQ ring capture. */

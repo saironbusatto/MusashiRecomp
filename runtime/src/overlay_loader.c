@@ -7,6 +7,7 @@
 #include "dirty_ram_interp.h"
 #include "interrupts.h"
 #include "debug_server.h"
+#include "psx_cycles.h"
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -125,13 +126,14 @@ static int s_active_depth = 0;
  * interest — never "arm a trace then hope". s_native_inprogress holds the entry
  * currently executing (nonzero at dump => a native fn was entered and never
  * returned: a freeze INSIDE native code, the strongest single suspect). */
-#define NRING_CAP 1024
-typedef struct { uint32_t addr; uint32_t crc; uint64_t seq; int returned; } NRingEnt;
+#define NRING_CAP 16384
+typedef struct { uint32_t addr; uint32_t crc; uint32_t frame; uint64_t seq; int returned; } NRingEnt;
 static NRingEnt s_nring[NRING_CAP];
 static uint32_t s_nring_pos = 0;
 static uint64_t s_nring_seq = 0;
 static uint32_t s_native_inprogress = 0;   /* addr of fn currently in native, 0 = none */
 static uint64_t s_native_calls_total = 0;
+extern uint64_t s_frame_count;
 
 /* Runtime A/B: when 0, candidates are still hashed/validated and recorded, but
  * NEVER executed native — execution falls to the interpreter. Lets us prove
@@ -168,6 +170,77 @@ void overlay_loader_bad_entry_stats(uint32_t *owner, uint32_t *pc, uint64_t *cou
     if (pc)    *pc    = s_bad_entry_pc;
     if (count) *count = s_bad_entry_count;
 }
+
+/* Per-function native-disable (bisection). Functions whose ENTRY phys address is
+ * listed here are forced through the sanctioned dirty-RAM interpreter instead of
+ * their native shard — exactly as if s_native_exec were off, but for that one
+ * function only. This is a DIAGNOSTIC localization knob (not skip/stub/HLE): the
+ * function still runs, just via the interpreter. Used to binary-search which
+ * compiled overlay function's native execution causes a native-vs-interp
+ * divergence. Keyed by phys (addr & 0x1FFFFFFF) so KSEG bits don't matter. */
+#define NATIVE_BLOCK_CAP 64
+static uint32_t s_native_block[NATIVE_BLOCK_CAP];
+static int      s_native_block_n = 0;
+static uint64_t s_native_block_hits = 0;
+static int overlay_native_blocked(uint32_t addr) {
+    if (s_native_block_n == 0) return 0;
+    uint32_t p = addr & 0x1FFFFFFFu;
+    for (int i = 0; i < s_native_block_n; i++)
+        if (s_native_block[i] == p) { s_native_block_hits++; return 1; }
+    return 0;
+}
+int overlay_loader_native_block_add(uint32_t addr) {
+    uint32_t p = addr & 0x1FFFFFFFu;
+    for (int i = 0; i < s_native_block_n; i++) if (s_native_block[i] == p) return s_native_block_n;
+    if (s_native_block_n >= NATIVE_BLOCK_CAP) return -1;
+    s_native_block[s_native_block_n++] = p;
+    return s_native_block_n;
+}
+void overlay_loader_native_block_clear(void) { s_native_block_n = 0; s_native_block_hits = 0; }
+int  overlay_loader_native_block_list(uint32_t *out, int cap) {
+    int n = s_native_block_n < cap ? s_native_block_n : cap;
+    for (int i = 0; i < n; i++) out[i] = s_native_block[i];
+    return s_native_block_n;
+}
+uint64_t overlay_loader_native_block_hits(void) { return s_native_block_hits; }
+
+/* CPS interior-continuation dispatch probe (diagnostic, always-on when armed).
+ * Records, for a watched interior PC, what the CPS continuation re-entry path
+ * (overlay_find_by_range + validate) decides: chosen candidate entry, range
+ * count, crc match, and outcome. Used to confirm the wrong-candidate / escape
+ * hypothesis for the Tomba 2 FMV freeze (pc=0x50B30). */
+static uint32_t s_cps_probe_pc = 0;        /* phys, 0 = disarmed */
+static uint64_t s_cps_probe_count = 0;
+static uint32_t s_cps_probe_found = 0;     /* chosen c->addr (0 if none) */
+static int      s_cps_probe_ci = -2;       /* overlay_find_by_range result */
+static int      s_cps_probe_nrange = -1;
+static int      s_cps_probe_matched = -1;  /* crc match */
+static int      s_cps_probe_outcome = -1;  /* 0=find<0,1=crc-miss->interp,2=native,3=device,4=blocked */
+static int      s_cps_probe_ncand_inrange = 0; /* how many candidates' range contains the PC */
+void overlay_loader_cps_probe_set(uint32_t pc) {
+    s_cps_probe_pc = pc & 0x1FFFFFFFu; s_cps_probe_count = 0;
+    s_cps_probe_found = 0; s_cps_probe_ci = -2; s_cps_probe_nrange = -1;
+    s_cps_probe_matched = -1; s_cps_probe_outcome = -1; s_cps_probe_ncand_inrange = 0;
+}
+void overlay_loader_cps_probe_get(uint32_t *pc, uint64_t *cnt, uint32_t *found,
+                                  int *ci, int *nrange, int *matched, int *outcome,
+                                  int *ncand) {
+    if (pc) *pc = s_cps_probe_pc; if (cnt) *cnt = s_cps_probe_count;
+    if (found) *found = s_cps_probe_found; if (ci) *ci = s_cps_probe_ci;
+    if (nrange) *nrange = s_cps_probe_nrange; if (matched) *matched = s_cps_probe_matched;
+    if (outcome) *outcome = s_cps_probe_outcome; if (ncand) *ncand = s_cps_probe_ncand_inrange;
+}
+/* count how many live candidates have a range containing phys (multi-variant check) */
+static int overlay_count_by_range(uint32_t phys) {
+    int n = 0;
+    for (int i = 0; i < s_cand_n; i++) {
+        const Candidate *c = &s_cand[i];
+        if (c->state == ENTRY_BLACKLIST) continue;
+        for (int r = 0; r < c->nranges; r++)
+            if (phys >= c->range_lo[r] && phys < c->range_lo[r] + c->range_len[r]) { n++; break; }
+    }
+    return n;
+}
 /* Address of the native overlay function currently executing (0 if none).
  * Used by the event-timeline ring to tag an event's execution mode. */
 uint32_t overlay_loader_get_inprogress(void) { return s_native_inprogress; }
@@ -196,6 +269,9 @@ static uint32_t s_invalidations  = 0;   /* VALID -> INVALID transitions       */
 static uint32_t s_revalidations  = 0;   /* INVALID -> VALID (reload-on-return) */
 static uint32_t s_rehashes       = 0;   /* code-range hashes computed         */
 static uint32_t s_rehash_miss    = 0;   /* hashes that didn't match crc_code  */
+static uint64_t s_gen_fastpath   = 0;   /* dispatches that skipped the crc32   */
+                                        /* via the unchanged page-generation   */
+                                        /* fast path (overlay-cache v2 P2)      */
 static uint32_t s_last_crc       = 0;
 static uint32_t s_no_manifest    = 0;   /* exports skipped (no manifest range)*/
 static uint32_t s_selfmod        = 0;   /* entries blacklisted (self-mod)     */
@@ -584,6 +660,48 @@ static void scan_one_cache_dir(const char *dir) {
  * The sljit/<arch-abi>/ namespace is reserved (no on-disk blobs: sljit re-JITs
  * from the coverage manifest; see SLJIT.md §5.3). (Pre-1.0: no legacy fallback —
  * older flat / unversioned caches are simply ignored and regenerated.) */
+/* Hardening (never-again for the silent cg-tag read≠write drift): when the loader
+ * finds ZERO shards under its OWN cg-tag, check whether a SIBLING cg<...> folder in
+ * the same tier holds shards. If so, the autocompile wrote to a different codegen
+ * hash than this build reads — every overlay will silently fall to the interpreter
+ * ("why is it slow"). This is USUALLY a mismatched overlay_autocompile_cmd
+ * --recompiler / --runtime-include (e.g. a cross-build: runtime from one framework
+ * checkout, autocompile pointed at another). Shout it once, loudly, with both tags,
+ * so it can never again be diagnosed as generic slowness. */
+static void warn_on_cgtag_mismatch(const char *tier) {
+#ifdef _WIN32
+    char base[768], pattern[900];
+    snprintf(base, sizeof base, "%s/%s/%s/%s",
+             s_cache_dir, s_game_id, tier, PSX_OVERLAY_ARCH_ABI);
+    char expect[64];
+    snprintf(expect, sizeof expect, "cg%d_%08x",
+             PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+    snprintf(pattern, sizeof pattern, "%s/cg*", base);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (strcmp(fd.cFileName, expect) == 0) continue;     /* our own tag */
+        char dllpat[900]; WIN32_FIND_DATAA fd2;
+        snprintf(dllpat, sizeof dllpat, "%s/%s/*_*.dll", base, fd.cFileName);
+        HANDLE h2 = FindFirstFileA(dllpat, &fd2);
+        if (h2 != INVALID_HANDLE_VALUE) {          /* sibling tag HAS shards */
+            FindClose(h2);
+            loader_log("*** OVERLAY CACHE HASH MISMATCH: this build reads %s/%s but "
+                       "shards exist under %s/%s. The autocompile is writing to a "
+                       "DIFFERENT codegen hash than this runtime reads -> ALL overlays "
+                       "run INTERPRETED (slow). Fix overlay_autocompile_cmd's "
+                       "--recompiler/--runtime-include to match THIS build's framework.",
+                       tier, expect, tier, fd.cFileName);
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    (void)tier;
+#endif
+}
+
 static void scan_cache_dir(void) {
     char dir[768];
     /* Tier order: scan gcc/ FIRST (highest native priority — the dev/production
@@ -598,6 +716,12 @@ static void scan_cache_dir(void) {
              s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
              (unsigned)PSX_OVERLAY_CODEGEN_HASH);
     scan_one_cache_dir(dir);
+
+    /* Never-again guard: if we loaded NOTHING but wrong-hash shards exist, shout. */
+    if (s_cache_idx_count == 0) {
+        warn_on_cgtag_mismatch("gcc");
+        warn_on_cgtag_mismatch("tcc");
+    }
 }
 
 /* ---- Persisted sljit shard cache (Stage 2, SLJIT_PERSIST_CACHE.md) -------- */
@@ -808,6 +932,7 @@ int overlay_loader_has_cached_crc(uint32_t region_start, uint32_t crc) {
 
 extern void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra);
 extern void psx_check_interrupts(CPUState *cpu);
+extern void psx_check_interrupts_at(CPUState *cpu, uint32_t resume_pc);
 extern void gte_execute(CPUState *cpu, uint32_t cmd);
 extern int psx_syscall(CPUState *cpu, uint32_t code);
 extern void psx_unknown_dispatch(CPUState *cpu, uint32_t addr, uint32_t phys);
@@ -833,6 +958,14 @@ static int      s_suppress_irq = 0;
 static uint32_t s_irq_ratelimit = 0;   /* 0 = full suppress; N = every Nth call */
 static uint32_t s_irq_callcount = 0;
 static uint64_t s_irq_suppressed = 0;
+static uint32_t s_irq_budget_cycles = 0; /* 0 = off; otherwise guest cycles/check */
+static uint64_t s_irq_last_check_cycle = UINT64_MAX;
+static int      s_irq_suppress_cdrom_only = 0;
+static int      s_irq_post_dispatch_pump = 0;
+static int      s_irq_defer_cdrom = 0;
+
+extern uint32_t i_stat;
+extern uint32_t i_mask;
 
 void overlay_loader_set_irq_suppress(int mode, uint32_t ratelimit) {
     s_suppress_irq  = mode ? 1 : 0;
@@ -848,18 +981,80 @@ void overlay_loader_get_irq_suppress(int *mode, uint32_t *rl, uint64_t *supp) {
     if (supp) *supp = s_irq_suppressed;
 }
 
-static void overlay_ci_wrapper(CPUState *cpu) {
+static int overlay_irq_suppressed_now(void) {
     if (s_suppress_irq) {
-        if (s_irq_ratelimit == 0) { s_irq_suppressed++; return; }
-        if ((++s_irq_callcount % s_irq_ratelimit) != 0) { s_irq_suppressed++; return; }
+        if (s_irq_ratelimit == 0) { s_irq_suppressed++; return 1; }
+        if ((++s_irq_callcount % s_irq_ratelimit) != 0) { s_irq_suppressed++; return 1; }
+    }
+    if (s_irq_suppress_cdrom_only) {
+        uint32_t pending = i_stat & i_mask;
+        if (pending == (1u << IRQ_CDROM)) {
+            s_irq_suppressed++;
+            return 1;
+        }
+    }
+    if (s_irq_budget_cycles != 0) {
+        uint64_t now = psx_get_cycle_count();
+        if (s_irq_last_check_cycle != UINT64_MAX &&
+            now - s_irq_last_check_cycle < (uint64_t)s_irq_budget_cycles) {
+            s_irq_suppressed++;
+            return 1;
+        }
+        s_irq_last_check_cycle = now;
+    }
+    return 0;
+}
+
+static void overlay_ci_wrapper(CPUState *cpu) {
+    if (overlay_irq_suppressed_now()) return;
+    if (s_irq_defer_cdrom && (i_stat & (1u << IRQ_CDROM))) {
+        uint32_t saved_cd = i_stat & (1u << IRQ_CDROM);
+        i_stat &= ~(1u << IRQ_CDROM);
+        psx_check_interrupts(cpu);
+        i_stat |= saved_cd;
+        return;
     }
     psx_check_interrupts(cpu);
+}
+
+static void overlay_ci_at_wrapper(CPUState *cpu, uint32_t resume_pc) {
+    if (overlay_irq_suppressed_now()) return;
+    if (s_irq_defer_cdrom && (i_stat & (1u << IRQ_CDROM))) {
+        uint32_t saved_cd = i_stat & (1u << IRQ_CDROM);
+        i_stat &= ~(1u << IRQ_CDROM);
+        psx_check_interrupts_at(cpu, resume_pc);
+        i_stat |= saved_cd;
+        return;
+    }
+    psx_check_interrupts_at(cpu, resume_pc);
+}
+
+static int overlay_irq_budget_blocks_now(void) {
+    if (s_irq_budget_cycles == 0) return 0;
+    uint64_t now = psx_get_cycle_count();
+    if (s_irq_last_check_cycle != UINT64_MAX &&
+        now - s_irq_last_check_cycle < (uint64_t)s_irq_budget_cycles) {
+        s_irq_suppressed++;
+        return 1;
+    }
+    s_irq_last_check_cycle = now;
+    return 0;
+}
+
+static void overlay_post_dispatch_irq_pump(CPUState *cpu) {
+    if (!s_irq_post_dispatch_pump) return;
+    if (overlay_irq_budget_blocks_now()) return;
+    if (cpu->pc != 0u) psx_check_interrupts_at(cpu, cpu->pc);
+    else psx_check_interrupts(cpu);
 }
 
 static void init_callbacks(void) {
     extern void psx_restore_state_escape(void);
     s_callbacks.dispatch_call        = psx_dispatch_call;
     s_callbacks.check_interrupts     = overlay_ci_wrapper;
+    s_callbacks.check_interrupts_at  = overlay_ci_at_wrapper;
+    { extern void psx_advance_cycles(uint32_t cycles);
+      s_callbacks.advance_cycles     = psx_advance_cycles; }
     s_callbacks.gte_execute          = gte_execute;
     s_callbacks.psx_syscall          = psx_syscall;
     s_callbacks.psx_native_bad_entry = psx_native_bad_entry;
@@ -882,6 +1077,35 @@ static void init_callbacks(void) {
         s_callbacks.ws_x_margin      = psx_ws_x_margin;
         s_callbacks.ws_sprite_tag    = psx_ws_sprite_tag;
         s_callbacks.ws_backdrop_value = psx_ws_backdrop_value;
+    }
+    /* Faithful-timing functions (ABI v9): overlay code built with
+     * PSX_ENABLE_BLOCK_CYCLES emits these; forward to the runtime's real impls so
+     * native overlays charge cycles on the SAME timeline as the interp/BIOS. */
+    {
+        extern uint32_t psx_cyc_load_word(CPUState*, uint32_t, uint32_t, uint32_t);
+        extern uint16_t psx_cyc_load_half(CPUState*, uint32_t, uint32_t, uint32_t);
+        extern uint8_t  psx_cyc_load_byte(CPUState*, uint32_t, uint32_t, uint32_t);
+        extern uint32_t psx_cyc_lwc2_read(CPUState*, uint32_t);
+        extern void     psx_icache_fetch(CPUState*, uint32_t);
+        extern void     psx_muldiv_set(CPUState*, uint32_t);
+        extern void     psx_muldiv_stall(CPUState*);
+        extern uint32_t psx_mult_latency_s(uint32_t);
+        extern uint32_t psx_mult_latency_u(uint32_t);
+        extern void     psx_gte_stall(CPUState*);
+        extern void     psx_gte_read(CPUState*, uint32_t);
+        extern int      psx_slice_block(CPUState*, uint32_t, uint32_t, int);
+        s_callbacks.cyc_load_word  = psx_cyc_load_word;
+        s_callbacks.cyc_load_half  = psx_cyc_load_half;
+        s_callbacks.cyc_load_byte  = psx_cyc_load_byte;
+        s_callbacks.cyc_lwc2_read  = psx_cyc_lwc2_read;
+        s_callbacks.icache_fetch   = psx_icache_fetch;
+        s_callbacks.muldiv_set     = psx_muldiv_set;
+        s_callbacks.muldiv_stall   = psx_muldiv_stall;
+        s_callbacks.mult_latency_s = psx_mult_latency_s;
+        s_callbacks.mult_latency_u = psx_mult_latency_u;
+        s_callbacks.gte_stall      = psx_gte_stall;
+        s_callbacks.gte_read       = psx_gte_read;
+        s_callbacks.slice_block    = psx_slice_block;
     }
 }
 
@@ -1009,6 +1233,88 @@ void overlay_loader_init(const char *cache_dir, const char *game_id) {
         s_sljit_persist = 0;
         loader_log("sljit tier DISABLED (emitter bug; gcc>interp). PSX_SLJIT_ENABLE=1 to re-enable");
     }
+    /* Pre-seed native-block bisection list from PSX_NATIVE_BLOCK (comma/space
+     * separated hex addrs). Lets us route init-time overlay functions through the
+     * sanctioned dirty-RAM interpreter from the FIRST boot instruction — the
+     * runtime overlay_native_block cmd can only be set post-boot, too late for
+     * once-only init functions. Same diagnostic knob, just seedable at launch. */
+    {
+        const char *nb = getenv("PSX_NATIVE_BLOCK");
+        if (nb && *nb) {
+            const char *p = nb;
+            while (*p) {
+                while (*p == ' ' || *p == ',' || *p == '\t') p++;
+                if (!*p) break;
+                uint32_t a = (uint32_t)strtoul(p, NULL, 0);
+                if (a) overlay_loader_native_block_add(a);
+                while (*p && *p != ' ' && *p != ',' && *p != '\t') p++;
+            }
+            loader_log("PSX_NATIVE_BLOCK seeded %d native-block entr%s from '%s'",
+                       s_native_block_n, s_native_block_n == 1 ? "y" : "ies", nb);
+        }
+    }
+    /* Boot-time full-interp override (diagnostic): PSX_OVERLAY_NATIVE_OFF=1 forces
+     * native overlay execution off from the first instruction, so a pristine
+     * interpreter reference can be captured without racing post-boot cmds. Same
+     * effect as the overlay_native_off cmd, but seeded at launch. */
+    {
+        const char *no = getenv("PSX_OVERLAY_NATIVE_OFF");
+        if (no && *no && *no != '0') {
+            s_native_exec = 0;
+            loader_log("PSX_OVERLAY_NATIVE_OFF set: native overlay exec OFF from boot");
+        }
+    }
+    {
+        const char *sup = getenv("PSX_OVERLAY_IRQ_SUPPRESS");
+        const char *rl  = getenv("PSX_OVERLAY_IRQ_RATELIMIT");
+        if (sup && *sup && *sup != '0') {
+            overlay_loader_set_irq_suppress(1, 0);
+            loader_log("PSX_OVERLAY_IRQ_SUPPRESS set: native overlay IRQ checks suppressed from boot");
+        } else if (rl && *rl) {
+            uint32_t n = (uint32_t)strtoul(rl, NULL, 0);
+            if (n == 0) n = 1;
+            overlay_loader_set_irq_suppress(1, n);
+            loader_log("PSX_OVERLAY_IRQ_RATELIMIT set: native overlay IRQ checks every %u call(s)", n);
+        }
+    }
+    {
+        const char *budget = getenv("PSX_OVERLAY_IRQ_BUDGET");
+        if (budget && *budget) {
+            uint32_t n = (uint32_t)strtoul(budget, NULL, 0);
+            s_irq_budget_cycles = n;
+            s_irq_last_check_cycle = UINT64_MAX;
+            loader_log("PSX_OVERLAY_IRQ_BUDGET set: native overlay IRQ checks every %u guest cycle(s)", n);
+        }
+    }
+    {
+        const char *no_cd = getenv("PSX_OVERLAY_IRQ_NO_CDROM");
+        if (no_cd && *no_cd && *no_cd != '0') {
+            s_irq_suppress_cdrom_only = 1;
+            loader_log("PSX_OVERLAY_IRQ_NO_CDROM set: native overlay CDROM-only IRQ checks suppressed");
+        }
+    }
+    {
+        const char *defer_cd = getenv("PSX_OVERLAY_IRQ_DEFER_CDROM");
+        if (defer_cd && *defer_cd && *defer_cd != '0') {
+            s_irq_defer_cdrom = 1;
+            loader_log("PSX_OVERLAY_IRQ_DEFER_CDROM set: native overlay CDROM IRQ delivery deferred");
+        }
+    }
+    {
+        const char *post = getenv("PSX_OVERLAY_IRQ_POST_PUMP");
+        if (post && *post && *post != '0') {
+            s_irq_post_dispatch_pump = 1;
+            s_irq_last_check_cycle = UINT64_MAX;
+            loader_log("PSX_OVERLAY_IRQ_POST_PUMP set: native overlay dispatch-return IRQ pump enabled");
+        }
+    }
+    {
+        const char *diff = getenv("PSX_OVERLAY_DIFF");
+        if (diff && *diff && *diff != '0') {
+            s_diff_mode = 1;
+            loader_log("PSX_OVERLAY_DIFF set: native/interp shadow diff ON from boot");
+        }
+    }
     /* Live-mode policy is applied later via overlay_loader_apply_live_policy(),
      * AFTER code_provider_init resolves the backend (the default depends on it). */
     s_active = 1;
@@ -1130,9 +1436,23 @@ static void try_load_region(uint32_t phys) {
     uint32_t page_sz = 4096u;
 
     /* Walk back over the contiguous dirty run to recover region_start — cache
-     * DLLs are keyed by this start address in their filename. */
+     * DLLs are keyed by this start address in their filename.
+     *
+     * CRITICAL: the capture clamps each region to its WINDOW — kernel
+     * [0, DIRTY_RAM_KERNEL_WINDOW_END) or overlay [OVERLAY_REGION_FLOOR, end) —
+     * so a DLL's region_start is the first dirty page AT OR ABOVE the window
+     * floor. But the dirty run is contiguous ACROSS the static-EXE gap between
+     * those windows: the boot EXE image (0x10000..floor) was written at load
+     * time, so its pages are dirty too. Walking back without the same floor
+     * clamp overshoots through the EXE region and yields a region_start (e.g.
+     * 0x10000) that NO DLL filename matches — so the overlay's DLLs never load
+     * and its functions interpret forever (the dominant slowness). Clamp the
+     * walkback to the window floor so region_start matches the capture. */
+    uint32_t floor_pg = (phys < DIRTY_RAM_KERNEL_WINDOW_END)
+                      ? 0u
+                      : (OVERLAY_REGION_FLOOR / page_sz);
     uint32_t pg = phys / page_sz;
-    while (pg > 0) {
+    while (pg > floor_pg) {
         uint32_t pp = pg - 1;
         if (!((dirty_ram_get_bitmap_word(pp >> 5) >> (pp & 31u)) & 1u)) break;
         pg = pp;
@@ -1231,18 +1551,44 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
      * so they run native directly here; device-touch funcs still go to interp. */
     if (head < 0 && g_psx_cps_mode) {
         int ci = overlay_find_by_range(phys);
+        int _probe = (s_cps_probe_pc && phys == s_cps_probe_pc);
+        if (_probe) {
+            s_cps_probe_count++;
+            s_cps_probe_ci = ci;
+            s_cps_probe_ncand_inrange = overlay_count_by_range(phys);
+            s_cps_probe_found = (ci >= 0) ? s_cand[ci].addr : 0;
+            s_cps_probe_nrange = (ci >= 0) ? s_cand[ci].nranges : -1;
+            s_cps_probe_matched = -1;
+            s_cps_probe_outcome = (ci < 0) ? 0 : -1;
+        }
         if (ci >= 0) {
             Candidate *c = &s_cand[ci];
-            uint32_t live = cand_crc(c);
-            s_rehashes++;
-            s_last_crc = live;
-            if (live == c->crc_code) {
+            /* Generation-gated validation (overlay-cache v2 P2) — same contract
+             * as the main chain: skip the crc32 when no watched code page changed
+             * since this entry was last confirmed VALID. */
+            uint32_t gen = cand_gensum(c);
+            int matched;
+            if (c->state == ENTRY_VALID && gen == c->val_gen) {
+                matched = 1;
+                s_gen_fastpath++;
+            } else {
+                uint32_t live = cand_crc(c);
+                s_rehashes++;
+                s_last_crc = live;
+                c->val_gen = gen;
+                matched = (live == c->crc_code);
+            }
+            if (_probe) s_cps_probe_matched = matched;
+            if (matched) {
                 if (c->state != ENTRY_VALID) { c->state = ENTRY_VALID; s_valid_count++; }
-                if (c->device_touch)   { s_disp_interp++; return 0; }
-                if (!s_native_exec)    { s_would_run_native++; s_disp_interp++; return 0; }
+                if (c->device_touch)   { if (_probe) s_cps_probe_outcome = 3; s_disp_interp++; return 0; }
+                if (!s_native_exec || overlay_native_blocked(c->addr) || overlay_native_blocked(addr))
+                                       { if (_probe) s_cps_probe_outcome = 4; s_would_run_native++; s_disp_interp++; return 0; }
+                if (_probe) s_cps_probe_outcome = 2;
                 uint32_t slot = s_nring_pos++ & (NRING_CAP - 1u);
                 s_nring[slot].addr = addr;
                 s_nring[slot].crc  = c->crc_code;
+                s_nring[slot].frame = (uint32_t)s_frame_count;
                 s_nring[slot].seq  = ++s_nring_seq;
                 s_nring[slot].returned = 0;
                 uint32_t prev_inprogress = s_native_inprogress;
@@ -1253,6 +1599,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
                 s_disp_native++;
                 cpu->pc = addr;          /* route the func's entry-switch to the block */
                 c->fn(cpu);
+                overlay_post_dispatch_irq_pump(cpu);
                 if (s_active_depth > 0) s_active_depth--;
                 s_nring[slot].returned = 1;
                 s_native_inprogress = prev_inprogress;
@@ -1263,6 +1610,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
                 }
                 return 1;
             }
+            if (_probe) s_cps_probe_outcome = 1;
             /* stale code bytes: fall through to the interpreter */
         }
     }
@@ -1271,18 +1619,32 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
         Candidate *c = &s_cand[i];
         if (c->state == ENTRY_BLACKLIST) continue;
 
-        /* CORRECTNESS-FIRST — parity (native == interpreter) is not yet proven,
-         * so we verify the live code bytes match what we compiled on EVERY
-         * dispatch, immediately before running native. This is the safe stance
-         * AND the decisive test: if a stale-native blue screen still occurs when
-         * we PROVABLY only run native on byte-exact matches, the fault is the
-         * native translation itself (parity), not the validity tracking. The
-         * generation counter is retained only as a diagnostic (cand_gensum). */
-        uint32_t live = cand_crc(c);
-        s_rehashes++;
-        s_last_crc = live;
-        c->val_gen = cand_gensum(c);
-        if (live == c->crc_code) {
+        /* Generation-gated validation (overlay-cache v2 P2). The ONLY way this
+         * entry's compiled code bytes can change is a write to one of its watched
+         * code pages — and every CPU/DMA store funnels through the single store
+         * chokepoint, which bumps overlay_page_gen for watched pages (memory.c).
+         * So if the page-generation sum is unchanged since we last confirmed this
+         * entry VALID, the bytes are PROVABLY unchanged and we run native without
+         * re-hashing. We fall back to the full crc32 only when the generation
+         * moved (or the entry isn't known-valid) — which also covers
+         * reload-on-return: a write-away-then-back bumps the gen, forcing a
+         * re-hash that re-confirms the byte-exact match before any native call.
+         * This removes the per-dispatch crc32 of the whole function body from the
+         * hot path for stable code (the warm-cache common case). Correctness is
+         * identical to the old unconditional hash; only redundant hashing is cut. */
+        uint32_t gen = cand_gensum(c);
+        int matched;
+        if (c->state == ENTRY_VALID && gen == c->val_gen) {
+            matched = 1;                 /* no watched write since validation */
+            s_gen_fastpath++;
+        } else {
+            uint32_t live = cand_crc(c);
+            s_rehashes++;
+            s_last_crc = live;
+            c->val_gen = gen;
+            matched = (live == c->crc_code);
+        }
+        if (matched) {
             if (c->state != ENTRY_VALID) {
                 c->state = ENTRY_VALID;
                 s_revalidations++;              /* reload-on-return */
@@ -1315,14 +1677,17 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
 
             /* A/B: prove whether native EXECUTION is the cause. When off, the
              * candidate matched (byte-exact) but we DON'T run native — interp
-             * handles it. */
-            if (!s_native_exec) { s_would_run_native++; s_disp_interp++; return 0; }
+             * handles it. The per-function blocklist forces the same interp
+             * routing for one function only (bisection localization). */
+            if (!s_native_exec || overlay_native_blocked(c->addr))
+                { s_would_run_native++; s_disp_interp++; return 0; }
 
             /* Record into the always-on ring BEFORE the call; mark in-progress
              * so a freeze inside this fn is visible at dump time. */
             uint32_t slot = s_nring_pos++ & (NRING_CAP - 1u);
             s_nring[slot].addr = c->addr;
             s_nring[slot].crc  = c->crc_code;
+            s_nring[slot].frame = (uint32_t)s_frame_count;
             s_nring[slot].seq  = ++s_nring_seq;
             s_nring[slot].returned = 0;
             uint32_t prev_inprogress = s_native_inprogress;
@@ -1338,6 +1703,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
             uint32_t mtag = (uint32_t)s_nring[slot].seq;  /* stable across nesting */
             dirty_ram_log_marker(c->addr, mtag, 0);
             c->fn(cpu);
+            overlay_post_dispatch_irq_pump(cpu);
             dirty_ram_log_marker(c->addr, mtag, 1);
             if (s_active_depth > 0) s_active_depth--;
 
@@ -1450,6 +1816,11 @@ int overlay_loader_registered_count(void) { return s_valid_count; }
 /* sljit Tier-2 shards registered as candidates this session (diagnostics). */
 uint32_t overlay_loader_sljit_registered(void) { return s_sljit_registered; }
 
+/* Dispatches that ran native via the unchanged-page-generation fast path,
+ * i.e. skipped the per-dispatch code-range crc32 (overlay-cache v2 P2). High
+ * values relative to reval_attempts mean the warm-cache hot path is cheap. */
+uint64_t overlay_loader_gen_fastpath(void) { return s_gen_fastpath; }
+
 /* sljit shards superseded by a higher-priority gcc DLL (same content). */
 uint32_t overlay_loader_sljit_obsoleted(void) { return s_sljit_obsoleted; }
 
@@ -1542,6 +1913,7 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
     extern uint8_t *memory_get_ram_ptr(void);
     extern uint8_t *memory_get_scratchpad_ptr(void);
     extern int dirty_ram_dispatch(CPUState *cpu, uint32_t addr, uint32_t stop_addr);
+    extern void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t return_addr);
     extern int      g_shadow_mmio_watch;   /* memory.c — device-access detector */
     extern uint64_t g_shadow_mmio_hits;
     uint8_t *ram  = memory_get_ram_ptr();
@@ -1603,16 +1975,18 @@ static void run_shadow_diff(CPUState *cpu, Candidate *c, uint32_t addr) {
 
     uint32_t stop_ra = cpu->gpr[31];   /* entry $ra = the function's return point */
     c->fn(cpu);
-    /* A shard that ends in a computed `jr rX` (jump table) exits with cpu->pc =
-     * target rather than running to the return; chain through tail-transfers to
-     * the same stop the interp used, so we compare FULL native vs FULL interp. */
+    /* CPS shards exit with cpu->pc set to the next tail target. Chain through
+     * the normal dispatcher to the original caller return, with s_native_exec=0
+     * above so nested overlay calls still run through the interpreter on both
+     * passes. dirty_ram_dispatch alone cannot follow clean/static BIOS targets
+     * and creates false shadow divergences for tail-transfer-heavy functions. */
     {
         int guard = 0;
         while (cpu->pc != 0 && !g_psx_call_bail && guard++ < 8192) {
             uint32_t tv = cpu->pc;
             if ((tv & 0x1FFFFFFFu) == (stop_ra & 0x1FFFFFFFu)) break;  /* returned */
             cpu->pc = 0;
-            if (!dirty_ram_dispatch(cpu, tv, stop_ra)) { cpu->pc = tv; break; }
+            psx_dispatch_call(cpu, tv, stop_ra);
         }
     }
     CPUState cpuN = *cpu;
@@ -1790,7 +2164,10 @@ int psx_sljit_call(CPUState *cpu, uint32_t target, uint32_t return_pc,
                    int check_contract) {
     uint32_t site_sp = cpu->gpr[29];   /* sp at the call (after the delay slot) */
 #ifdef PSX_HAS_GAME_DISPATCH
-    {
+    /* Skip the compiled game function if its page is dirty (an overlay overwrote it
+     * after the game-start baseline -> compiled code is stale); fall through to the
+     * native/interp paths which run the live overlay. Clean pages run compiled. */
+    if (!dirty_ram_is_dirty(target & 0x1FFFFFFFu)) {
         extern int psx_dispatch_game_compiled(CPUState *cpu, uint32_t addr);
         cpu->pc = 0;
         if (psx_dispatch_game_compiled(cpu, target)) {
@@ -1914,14 +2291,14 @@ int overlay_loader_dump_native_ring(char *out, int cap) {
         "\"in_progress\":\"0x%08X\",\"recent\":[",
         s_native_exec, (unsigned long long)s_native_calls_total,
         (unsigned long long)s_would_run_native, s_native_inprogress);
-    /* Walk backward from the most recent up to 64 entries. */
+    /* Walk backward from the most recent entries kept in the diagnostic ring. */
     int shown = 0;
-    for (uint32_t k = 0; k < NRING_CAP && shown < 64 && n < cap - 120; k++) {
+    for (uint32_t k = 0; k < NRING_CAP && n < cap - 140; k++) {
         uint32_t idx = (s_nring_pos - 1u - k) & (NRING_CAP - 1u);
         if (s_nring[idx].seq == 0) break;
         n += snprintf(out + n, cap - n,
-            "%s{\"addr\":\"0x%08X\",\"crc\":\"0x%08X\",\"seq\":%llu,\"returned\":%d}",
-            shown ? "," : "", s_nring[idx].addr, s_nring[idx].crc,
+            "%s{\"addr\":\"0x%08X\",\"crc\":\"0x%08X\",\"frame\":%u,\"seq\":%llu,\"returned\":%d}",
+            shown ? "," : "", s_nring[idx].addr, s_nring[idx].crc, s_nring[idx].frame,
             (unsigned long long)s_nring[idx].seq, s_nring[idx].returned);
         shown++;
     }

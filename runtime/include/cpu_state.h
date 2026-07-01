@@ -55,7 +55,63 @@ typedef struct CPUState {
      * precompiled gcc overlay DLLs (which bake field offsets) are unaffected;
      * only the sljit JIT reads it. Populated once at startup. */
     void *sljit_helpers[SLJIT_HLP_COUNT];
+
+    /* Mult/div completion deadline (absolute guest cycle). Set by MULT/MULTU/
+     * DIV/DIVU to psx_cycle_count()+latency; a later MFLO/MFHI stalls (advances
+     * cycles) until this deadline — faithful R3000A behavior (Beetle
+     * muldiv_ts_done). Appended at END so prior field offsets are unchanged. */
+    uint64_t muldiv_ts_done;
+
+    /* GTE (COP2) command completion deadline (absolute guest cycle). A GTE
+     * command sets this to psx_cycle_count()+(cost-1) (cost from gte.cpp per-op
+     * returns; -1 because the COP2 instruction's own +1 base is charged
+     * separately). Back-to-back commands serialize (set stalls to the prior
+     * deadline first); any COP2 register access (MFC2/CFC2/MTC2/CTC2/LWC2/SWC2)
+     * stalls until it — faithful R3000A behavior (Beetle gte_ts_done).
+     * Appended at END so prior field offsets are unchanged. */
+    uint64_t gte_ts_done;
+
+    /* ---- R3000A load-delay pipeline interlock (Beetle ReadAbsorb/ReadFudge/
+     * LDAbsorb/LDWhich) — TIMING ONLY; the load VALUE delay is handled by the
+     * existing load-delay correctness path. See psx_cyc.h + accuracy/
+     * load_readfudge_ldabsorb.md. Models: a load's data-access cost becomes a
+     * per-register "give-back" (read_absorb) that following instructions consume
+     * instead of charging their own +1 base; plus the +2 "fudge" charged on a
+     * load whose predecessor committed no load. Appended at END so prior field
+     * offsets are unchanged (precompiled overlay DLLs bake offsets). */
+    uint8_t  read_absorb[33];   /* ReadAbsorb[0..31] + [32]=0x20 DO_LDS dummy slot */
+    uint8_t  read_absorb_which; /* ReadAbsorbWhich: GPR the last committed load wrote */
+    uint8_t  read_fudge;        /* ReadFudge: last committed load's dest reg, or 0x20 = none */
+    uint8_t  ld_which_t;        /* LDWhich (timing): pending load dest reg, 0x20 = none */
+    uint32_t ld_absorb;         /* LDAbsorb: pending load's give-back (region+completion) */
 } CPUState;
+
+/* Faithful exception-return (fix B) — defined in runtime/src/interrupts.c. The
+ * interrupted-thread resume PC is the REAL guest PC, stored in COP0.EPC and (by the
+ * BIOS handler) in the thread's TCB EPC slot — never a sentinel, never a single
+ * global — so a thread suspended mid-exception (ChangeThread) resumes at its OWN PC.
+ * The host longjmp escape out of the NESTED synchronous handler is keyed on "RFE
+ * while in_exception" (psx_rfe_mark_escape, called by the recompiled `rfe` op;
+ * psx_rfe_escape_check, called in the dispatch trampoline), not on pc==sentinel.
+ * Declared here (not psx_runtime.h) because the generated BIOS includes only this. */
+typedef enum {
+    PSX_EXC_ESCAPE_NONE = 0,
+    PSX_EXC_ESCAPE_RFE_RETURN,
+    PSX_EXC_ESCAPE_SYSCALL_RETURN,
+    PSX_EXC_ESCAPE_LEGACY_SENTINEL,
+} psx_exc_escape_reason_t;
+
+/* The host escape token for the SYNCHRONOUS (nested) exception handler. It is a
+ * pure HOST control-flow marker — it must NEVER be persisted into a guest TCB as a
+ * thread's resume PC. If it does, that thread will resume by resolving the sentinel
+ * through host escape state (the multi-thread bug fix B repaired), not at its own
+ * code. The save/restore/fiber-entry guards in traps.c are fail-closed on this. */
+#define PSX_EXC_SENTINEL_PC 0x80000048u
+extern int      g_rfe_escape_pending;
+extern int      g_exc_escape_reason;     /* psx_exc_escape_reason_t */
+extern uint32_t g_exception_real_epc;
+void psx_rfe_mark_escape(void);
+void psx_rfe_escape_check(CPUState* cpu);
 
 /* Trap trampolines — defined in runtime/src/traps.c */
 /* psx_syscall returns 1 if control transfers (cpu->pc set to a dispatch target;
@@ -66,6 +122,36 @@ typedef struct CPUState {
  * value and rely on cpu->pc (0 = handled, resume at caller). */
 extern int psx_syscall(CPUState* cpu, uint32_t code);
 extern void psx_arith_overflow(CPUState* cpu);
+/* Mult/div completion-stall timing (psx_cycles.c). MULT/MULTU/DIV/DIVU call
+ * psx_muldiv_set with their latency (DIV/DIVU = 37; MULT/MULTU via the latency
+ * helpers, indexed on the first operand magnitude). MFLO/MFHI call
+ * psx_muldiv_stall, which advances guest cycles to the deadline if not yet
+ * reached. Faithful only with per-instruction cycle charging. */
+extern void     psx_muldiv_set(CPUState* cpu, uint32_t latency);
+extern void     psx_muldiv_stall(CPUState* cpu);
+extern uint32_t psx_mult_latency_s(uint32_t rs);   /* MULT  (signed)   */
+extern uint32_t psx_mult_latency_u(uint32_t rs);   /* MULTU (unsigned) */
+
+/* GTE (COP2) per-command completion-stall timing (psx_cycles.c). gte_execute()
+ * calls psx_gte_set with the command's added latency (cost-1, from
+ * psx_gte_cmd_latency); it serializes back-to-back ops by stalling to the prior
+ * deadline first. Every COP2 register access calls psx_gte_stall, which advances
+ * guest cycles to the deadline if the op is still in flight. Faithful only with
+ * per-instruction cycle charging. */
+/* R3000A I-cache instruction-FETCH cost (psx_icache.c). Faithful direct-mapped
+ * model: HIT +0, KSEG1/uncached +4, cached miss +3 + refill. Shared by interp
+ * (per-instruction) and the compiled emitters (per-cache-line leader). */
+extern void     psx_icache_fetch(CPUState* cpu, uint32_t addr);
+extern void     psx_icache_reset(void);
+extern int      psx_icache_enabled(void);   /* opt-in (PSX_ICACHE=1) until both backends charge it */
+
+extern void     psx_gte_set(CPUState* cpu, uint32_t latency);
+extern void     psx_gte_stall(CPUState* cpu);
+/* MFC2/CFC2 GTE register read: stall to the deadline AND arm the load-delay
+ * give-back (ld_absorb=gte_ts_done-now, ld_which_t=rt) — Beetle MFC2/CFC2. */
+extern void     psx_gte_read(CPUState* cpu, uint32_t rt);
+extern uint32_t psx_gte_cmd_latency(uint32_t cmd);  /* cost-1 for the 6-bit op  */
+
 extern void psx_unaligned_access(CPUState* cpu, uint32_t addr, uint32_t pc);
 extern void psx_break(CPUState* cpu, uint32_t code, uint32_t pc);
 /* Fail-closed native entry guard: a function's CPS entry-switch calls this when
@@ -77,6 +163,14 @@ extern void psx_native_bad_entry(CPUState* cpu, uint32_t owner, uint32_t pc);
 /* Dispatch — defined in generated/SCPH1001_dispatch.c */
 extern void psx_dispatch(CPUState* cpu, uint32_t target_addr);
 extern void psx_dispatch_call(CPUState* cpu, uint32_t target_addr, uint32_t return_addr);
+
+/* Cycle-budgeted precise event slicing — defined in runtime/src/dirty_ram_interp.c.
+ * Emitted at each compiled block leader: if it returns nonzero the block ran
+ * through the per-instruction interpreter (interrupt taken at the exact
+ * architectural instruction) and cpu->pc holds a dispatchable resume point, so
+ * the caller must `return` without executing its compiled body. See
+ * PRECISE_IRQ_SLICE.md. */
+extern int psx_slice_block(CPUState* cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
 
 /* Unknown dispatch — defined in runtime/src/traps.c */
 extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);
@@ -136,6 +230,13 @@ extern uint64_t g_psx_bail_flattened;  /* unwinds flattened at outermost    */
 extern uint64_t g_psx_bail_anomaly;    /* bail flag seen where impossible   */
 #endif
 
+/* Deduped wild-return source ledger (traps.c). Not present in overlay DLLs
+ * (they share runtime bail state via pointers, not this recorder). */
+#ifndef PSX_OVERLAY_DLL_BUILD
+extern void psx_bail_record(uint32_t site_ra, uint32_t site_sp,
+                            uint32_t wild_pc, uint32_t guest_sp);
+#endif
+
 /* Validate a direct call site after the callee's C return.
  * Returns 1 if the caller must `return;` immediately (bail in progress),
  * 0 if the continuation is valid.  site_ra = the call's return address,
@@ -162,6 +263,9 @@ static inline int psx_call_contract(CPUState* cpu, uint32_t site_ra,
          * which is the same value). */
         g_psx_call_bail = 1;
         g_psx_bail_first++;
+#ifndef PSX_OVERLAY_DLL_BUILD
+        psx_bail_record(site_ra, site_sp, cpu->gpr[31], cpu->gpr[29]);
+#endif
         cpu->pc = cpu->gpr[31];
         return 1;
     }
@@ -171,5 +275,11 @@ static inline int psx_call_contract(CPUState* cpu, uint32_t site_ra,
 #ifdef __cplusplus
 }
 #endif
+
+/* R3000A load-delay interlock helpers (psx_cyc.h). Included LAST so CPUState is
+ * fully defined first; psx_cyc.h's own #include "cpu_state.h" is a guarded no-op.
+ * This makes the per-instruction timing API visible to EVERY generated file and
+ * runtime TU that includes cpu_state.h. */
+#include "psx_cyc.h"
 
 #endif /* PSXRECOMP_CPU_STATE_H */

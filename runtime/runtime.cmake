@@ -132,7 +132,11 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/debug_server.c
     ${PSXRECOMP_ROOT}/runtime/src/dirty_ram_interp.c
     ${PSXRECOMP_ROOT}/runtime/src/fntrace.c
+    ${PSXRECOMP_ROOT}/runtime/src/parity_trace.c
+    ${PSXRECOMP_ROOT}/runtime/src/device_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/boot_state.c
+    ${PSXRECOMP_ROOT}/runtime/src/cosim_state.c
+    ${PSXRECOMP_ROOT}/runtime/src/cosim.c
     ${PSXRECOMP_ROOT}/runtime/src/traps.c
     ${PSXRECOMP_ROOT}/runtime/src/crash_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/freeze_heartbeat.c
@@ -147,6 +151,7 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/iso_reader.cpp
     ${PSXRECOMP_ROOT}/runtime/src/iso_reader_c.cpp
     ${PSXRECOMP_ROOT}/runtime/src/psx_cycles.c
+    ${PSXRECOMP_ROOT}/runtime/src/psx_icache.c
     ${PSXRECOMP_ROOT}/runtime/src/starvation_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/latency_ring.c
     ${PSXRECOMP_ROOT}/runtime/src/card_read_summary.c
@@ -179,8 +184,45 @@ set(PSXRECOMP_BIOS_GENERATED
     ${PSXRECOMP_ROOT}/generated/SCPH1001_dispatch.c
 )
 
+# --- BIOS generated/ staleness check (hygiene) -----------------------------------
+# generated/SCPH1001_*.c is gitignored build output produced by a SEPARATE build
+# (recompiler/ -> psxrecomp-bios). Editing the BIOS emitter without re-running
+# tools/regen_bios.sh leaves the runtime linking a stale BIOS that no longer matches
+# the emitter (this caused a 4439-vs-4406 drift). regen_bios.sh records an emitter
+# fingerprint in generated/SCPH1001.emitter.sha; recompute it here and WARN on a
+# mismatch so the staleness is impossible to miss. Non-fatal: a stale-but-consistent
+# BIOS still builds; opt out with -DPSXRECOMP_SKIP_BIOS_STALE_CHECK=ON.
+if(NOT PSXRECOMP_SKIP_BIOS_STALE_CHECK)
+    find_program(_psxrt_bash NAMES bash)
+    set(_psxrt_stamp "${PSXRECOMP_ROOT}/generated/SCPH1001.emitter.sha")
+    if(_psxrt_bash AND EXISTS "${PSXRECOMP_ROOT}/tools/bios_emitter_fingerprint.sh")
+        execute_process(
+            COMMAND "${_psxrt_bash}" "${PSXRECOMP_ROOT}/tools/bios_emitter_fingerprint.sh"
+            WORKING_DIRECTORY "${PSXRECOMP_ROOT}"
+            OUTPUT_VARIABLE _psxrt_cur_fp OUTPUT_STRIP_TRAILING_WHITESPACE
+            RESULT_VARIABLE _psxrt_fp_rc ERROR_QUIET)
+        if(_psxrt_fp_rc EQUAL 0 AND _psxrt_cur_fp)
+            set(_psxrt_saved_fp "")
+            if(EXISTS "${_psxrt_stamp}")
+                file(READ "${_psxrt_stamp}" _psxrt_saved_fp)
+                string(STRIP "${_psxrt_saved_fp}" _psxrt_saved_fp)
+            endif()
+            if(NOT _psxrt_saved_fp STREQUAL _psxrt_cur_fp)
+                message(WARNING
+                    "BIOS generated/ is STALE vs the recompiler emitter "
+                    "(fingerprint mismatch).\n"
+                    "  Linking generated/SCPH1001_*.c that may not match the current "
+                    "emitter source.\n"
+                    "  Fix:  tools/regen_bios.sh   (rebuilds psxrecomp-bios + "
+                    "regenerates the BIOS)\n"
+                    "  (Suppress: -DPSXRECOMP_SKIP_BIOS_STALE_CHECK=ON)")
+            endif()
+        endif()
+    endif()
+endif()
+
 function(psxrecomp_add_runtime_target target)
-    set(options ORACLE)
+    set(options ORACLE COSIM)
     set(oneValueArgs
         GAME_GENERATED_FULL_C
         GAME_GENERATED_DISPATCH_C
@@ -345,6 +387,15 @@ function(psxrecomp_add_runtime_target target)
     # also visible to psx-beetle / non-runtime-helper targets.
     if(NOT PSX_DEBUG_TOOLS)
         target_compile_definitions(${target} PRIVATE PSX_NO_DEBUG_TOOLS=1)
+    endif()
+
+    # First-divergence co-sim oracle (COSIM_ORACLE.md): the clean, deterministic build.
+    # PSX_COSIM activates the cosim engine/hooks; PSX_NO_DEBUG_TOOLS strips ALL the laggy
+    # diagnostic tooling (the debug server thread, per-block recording, rings) so the run
+    # is single-threaded + fast + deterministic. The two instances (this + a FORCE_INTERP
+    # run) are driven in cycle-lockstep by tools/cosim.py.
+    if(PSXRT_COSIM)
+        target_compile_definitions(${target} PRIVATE PSX_COSIM=1 PSX_NO_DEBUG_TOOLS=1)
     endif()
 
     # Integrated RmlUi launcher (not in the oracle build — that's headless).

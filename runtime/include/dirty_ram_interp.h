@@ -60,7 +60,22 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr);
  * verified per-block dispatch cadence is preserved. Native coverage for the
  * kernel window comes from the overlay loader, not from interp chaining. */
 #define DIRTY_RAM_KERNEL_WINDOW_END 0x00010000u
-#define OVERLAY_REGION_FLOOR        0x00098000u
+
+/* The overlay-region floor is the END of THIS game's statically-recompiled
+ * main-EXE text (phys). Everything at/above it is runtime-loaded overlay code,
+ * eligible for in-interpreter local-flow chaining and overlay-cache capture.
+ *
+ * It is a RUNTIME value (g_overlay_region_floor), NOT a compile-time constant,
+ * because it differs per game: Tomba 1's text ends at 0x98000 (0x10000+0x88000)
+ * but Tomba 2's boot EXE is only 0x28800 (text ends at 0x38800). A hardcoded
+ * 0x98000 misclassified Tomba 2's overlays (loaded at 0x85000+) as main-EXE
+ * text, forcing them onto the slow block-by-block dispatch path AND through the
+ * bail-prone non-local-call contract — the Whoopee-Camp splash freeze. main.cpp
+ * sets g_overlay_region_floor = (load_address + text_size) & 0x1FFFFFFF at game
+ * load; OVERLAY_REGION_FLOOR_DEFAULT applies for BIOS-only runs. */
+#define OVERLAY_REGION_FLOOR_DEFAULT 0x00098000u
+extern uint32_t g_overlay_region_floor;
+#define OVERLAY_REGION_FLOOR (g_overlay_region_floor)
 static inline int overlay_cache_window_contains(uint32_t phys) {
     return phys < DIRTY_RAM_KERNEL_WINDOW_END || phys >= OVERLAY_REGION_FLOOR;
 }

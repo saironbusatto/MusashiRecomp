@@ -6,6 +6,9 @@
  */
 
 #include "cpu_state.h"
+#include "psx_scheduler.h"   /* psx_scheduler_run — deterministic TCB scheduler */
+#include "parity_trace.h"    /* general two-process control-flow parity ring */
+#include "device_trace.h"    /* general two-process device-event cycle ring */
 #include "psx_interpreter.h"
 #include "cdrom.h"
 #include "fntrace.h"
@@ -91,6 +94,9 @@ extern "C" void timers_init(void);
 
 /* interrupts.c */
 extern "C" void interrupts_init(void);
+#ifdef PSX_COSIM
+extern "C" void cosim_init(void);  /* first-divergence oracle server (cosim.c) */
+#endif
 extern "C" uint32_t psx_read_word(uint32_t addr);
 extern "C" void     psx_write_word(uint32_t addr, uint32_t val);
 extern "C" uint16_t psx_read_half(uint32_t addr);
@@ -140,6 +146,7 @@ static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitr
 static int           g_video_win_w    = 1280; /* window width (height follows aspect) */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
 static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
+static int           g_headless       = 0;   /* debug/CI frontend: no SDL window/audio */
 /* FMV instant-skip via the game's OWN end-of-movie path. Tomba's MDEC player
  * (FUN_8001efe8) tears a movie down when the streamed frame number reaches that
  * movie's per-movie total minus 3; writing the current movie's total down to
@@ -1037,6 +1044,11 @@ static void refresh_player_devices(void) {
         else open_player(p, g_players[s ^ 1]);
         sio_set_pad_connected(s, p.kind != 0 ? 1 : 0);
         sio_set_pad_analog(s, pad_mode_boot_analog(p.mode), 0x80, 0x80, 0x80, 0x80);
+        /* DIGITAL mode == a plain digital controller that ignores the DualShock
+         * config-mode commands (real SCPH-1080 behaviour); ANALOG/HYBRID == a
+         * config-capable DualShock. A digital pad that wrongly answered 0x43
+         * sent Tomba 2's pad driver down the config path -> phantom 0x00 reads. */
+        sio_set_pad_config_capable(s, p.mode != PSXRecompV4::PAD_MODE_DIGITAL);
     }
 }
 
@@ -1285,6 +1297,26 @@ static void sample_pad_into_sio(int override) {
     }
 }
 
+static void sample_headless_pad_into_sio(int override) {
+    if (override >= 0) {
+        sio_set_pad_state_slot(0, (uint16_t)override);
+        return;
+    }
+#ifdef PSX_COSIM
+    /* Input-driven cosim (EXPERIMENTAL): the coordinator sets a HELD pad state via the
+     * `setpad` TCP command; the headless sampler applies it every frame so the same
+     * button input is fed to BOTH lockstep instances at the same guest cycle. If the
+     * two instances desync under input, this path is proven nondeterministic and gets
+     * stubbed out (see cosim.c). Default 0xFFFF = all released (PSX pad is active-low). */
+    { extern volatile int g_cosim_pad_hold[2];
+      sio_set_pad_state_slot(0, (uint16_t)g_cosim_pad_hold[0]);
+      sio_set_pad_state_slot(1, (uint16_t)g_cosim_pad_hold[1]);
+      return; }
+#endif
+    sio_set_pad_state_slot(0, 0xFFFFu);
+    sio_set_pad_state_slot(1, 0xFFFFu);
+}
+
 /* PSX native vblank cadence: NTSC ≈ 59.94 Hz. Wall-clock target keeps
  * audio sample generation (735 samples/vblank * 60 = 44100/sec) matched
  * to the SDL audio device drain rate, eliminating queue overflow drops
@@ -1395,33 +1427,35 @@ static void sdl_vblank_present(void) {
         if (cp->poll_main) cp->poll_main();
     }
 
-    /* Pump SDL events to prevent window freeze. */
-    SDL_Event ev;
-    while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) {
-            psx_crash_trace_set_exit_origin("sdl_window_close");
-            shutdown_runtime();
-            std::exit(0);
-        } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
-            refresh_player_devices();
-        } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
-            if (ev.cdevice.which == g_players[0].instance ||
-                ev.cdevice.which == g_players[1].instance) {
-                close_controller();
+    if (!g_headless) {
+        /* Pump SDL events to prevent window freeze. */
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                psx_crash_trace_set_exit_origin("sdl_window_close");
+                shutdown_runtime();
+                std::exit(0);
+            } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
                 refresh_player_devices();
-            }
-        } else if (ev.type == SDL_KEYDOWN) {
-            /* Fullscreen toggle: F11, Alt+Enter, or Cmd/Ctrl+F.
-             * FULLSCREEN_DESKTOP keeps the desktop resolution; the
-             * renderer's logical size letterboxes the 640x480 image. */
-            const Uint16 mod = ev.key.keysym.mod;
-            if (ev.key.keysym.sym == SDLK_F11 ||
-                (ev.key.keysym.sym == SDLK_RETURN && (mod & KMOD_ALT)) ||
-                (ev.key.keysym.sym == SDLK_f && (mod & (KMOD_GUI | KMOD_CTRL)))) {
-                Uint32 is_fs = SDL_GetWindowFlags(sdl_window) &
-                               SDL_WINDOW_FULLSCREEN_DESKTOP;
-                SDL_SetWindowFullscreen(sdl_window,
-                    is_fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+            } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+                if (ev.cdevice.which == g_players[0].instance ||
+                    ev.cdevice.which == g_players[1].instance) {
+                    close_controller();
+                    refresh_player_devices();
+                }
+            } else if (ev.type == SDL_KEYDOWN) {
+                /* Fullscreen toggle: F11, Alt+Enter, or Cmd/Ctrl+F.
+                 * FULLSCREEN_DESKTOP keeps the desktop resolution; the
+                 * renderer's logical size letterboxes the 640x480 image. */
+                const Uint16 mod = ev.key.keysym.mod;
+                if (ev.key.keysym.sym == SDLK_F11 ||
+                    (ev.key.keysym.sym == SDLK_RETURN && (mod & KMOD_ALT)) ||
+                    (ev.key.keysym.sym == SDLK_f && (mod & (KMOD_GUI | KMOD_CTRL)))) {
+                    Uint32 is_fs = SDL_GetWindowFlags(sdl_window) &
+                                   SDL_WINDOW_FULLSCREEN_DESKTOP;
+                    SDL_SetWindowFullscreen(sdl_window,
+                        is_fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+                }
             }
         }
     }
@@ -1431,7 +1465,8 @@ static void sdl_vblank_present(void) {
      * g_low_latency_input this early sample is re-done after the pacer wait
      * (below) for the interactive present path; it still covers the turbo /
      * FMV-skip paths that early-return before pacing. */
-    sample_pad_into_sio(override);
+    if (g_headless) sample_headless_pad_into_sio(override);
+    else            sample_pad_into_sio(override);
 
     /* Latency ring: open this present cycle's slot, stamping when input was
      * sampled into SIO.  Always-on; queried via the debug server "latency". */
@@ -1507,6 +1542,8 @@ static void sdl_vblank_present(void) {
      * where rendering the time-compressed audio would be pure noise. */
     sdl_audio_update(fmv_skip_active);
 #endif
+
+    if (g_headless) return;
 
     /* TCP turbo is for automated validation and trace capture. It keeps the
      * simulation advancing and the debug server polling, but removes frontend
@@ -1829,6 +1866,7 @@ int main(int argc, char** argv) {
      *   --renderer <name>   override the renderer: software|opengl|vulkan
      *   --launcher          force the GUI launcher (overrides skip_launcher)
      *   --no-launcher       skip the GUI launcher (boot straight in)
+     *   --headless          skip SDL window/audio; use TCP screenshots/state
      *   <positional>        deprecated alias for --bios
      * No --memcard-dir / --game-root flags: those are config-driven. */
     for (int i = 1; i < argc; i++) {
@@ -1852,9 +1890,18 @@ int main(int argc, char** argv) {
             force_launcher = true;
         } else if (std::strcmp(argv[i], "--no-launcher") == 0) {
             force_no_launcher = true;
+        } else if (std::strcmp(argv[i], "--headless") == 0) {
+            g_headless = 1;
+            force_no_launcher = true;
         } else if (argv[i][0] != '-') {
             bios_path = argv[i];
             bios_from_cli = true;
+        }
+    }
+    if (const char *e = std::getenv("PSX_HEADLESS")) {
+        if (e[0] && e[0] != '0') {
+            g_headless = 1;
+            force_no_launcher = true;
         }
     }
 
@@ -1888,6 +1935,7 @@ int main(int argc, char** argv) {
     int  p1_mode = PSXRecompV4::PAD_MODE_HYBRID;
     int  p2_mode = PSXRecompV4::PAD_MODE_HYBRID;
     bool ctrl_allow_hybrid = true;  /* game.toml [controller] allow_hybrid; false hides Hybrid in the launcher */
+    bool ctrl_lock_mode    = false; /* game.toml [controller] lock_mode; true hides the whole pad-mode selector */
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
     std::filesystem::path resolved_disc;
     std::string window_title = PSX_WINDOW_TITLE;
@@ -1954,6 +2002,7 @@ int main(int argc, char** argv) {
                 p2_mode = gc.runtime.default_p2_mode;
             }
             ctrl_allow_hybrid = gc.runtime.controller_allow_hybrid;
+            ctrl_lock_mode    = gc.runtime.controller_lock_mode;
             if (gc.runtime.has_deadzone) resolved_deadzone = gc.runtime.deadzone;
             /* LEGACY per-game pad-config opt-in (default modern). Only Tomba sets
              * it, so its launcher Hybrid mode's analog<->digital flip doesn't make
@@ -1965,6 +2014,21 @@ int main(int argc, char** argv) {
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
+            /* Pin the overlay-region floor to THIS game's main-EXE text end so
+             * runtime-loaded overlays (which load just above it) are dispatched
+             * via in-interpreter local-flow chaining, NOT the slow block-by-block
+             * + bail-prone non-local-call path. Hardcoding the floor to Tomba 1's
+             * text end (0x98000) wedged Tomba 2 (text ends 0x38800, overlays at
+             * 0x85000+) at the Whoopee-Camp splash. See dirty_ram_interp.h. */
+            {
+                extern uint32_t g_overlay_region_floor;
+                uint32_t text_end = (gc.load_address + gc.text_size) & 0x1FFFFFFFu;
+                if (text_end > 0x00010000u /* DIRTY_RAM_KERNEL_WINDOW_END */)
+                    g_overlay_region_floor = text_end;
+                std::fprintf(stdout,
+                    "psxrecomp: overlay_region_floor = 0x%05X (game text end)\n",
+                    g_overlay_region_floor);
+            }
             /* Overlay DLL cache (Layer A). Off unless enabled in [runtime];
              * when on, capture overlay bytes and scan cache/<game_id>/ for
              * precompiled overlay DLLs. */
@@ -1974,6 +2038,15 @@ int main(int argc, char** argv) {
                 overlay_capture_set_out_dir(exe_dir.string().c_str());
                 overlay_capture_set_enabled(1);
                 overlay_loader_init(cache_dir.c_str(), game_id.c_str());
+                for (uint32_t addr : gc.runtime.overlay_native_block) {
+                    overlay_loader_native_block_add(addr);
+                }
+                if (!gc.runtime.overlay_native_block.empty()) {
+                    std::fprintf(stdout,
+                        "psxrecomp: overlay native blocklist seeded with %zu entr%s\n",
+                        gc.runtime.overlay_native_block.size(),
+                        gc.runtime.overlay_native_block.size() == 1 ? "y" : "ies");
+                }
                 /* Step 2.8 variant-capture automation. Autocapture is ON
                  * whenever the cache is on: it writes the player-shareable
                  * overlay_captures.json (the contribution file the README
@@ -2243,6 +2316,8 @@ int main(int argc, char** argv) {
                     ginfo.expected_crc     = game_disc_crc;
                     ginfo.has_expected_crc = game_has_disc_crc;
                     ginfo.allow_hybrid     = ctrl_allow_hybrid;
+                    ginfo.lock_mode        = ctrl_lock_mode;
+                    ginfo.locked_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
                     lr = psx_launcher::run(lwin, lctx, seed, ginfo, assets.c_str());
                     SDL_GL_DeleteContext(lctx);
                 }
@@ -2421,6 +2496,9 @@ int main(int argc, char** argv) {
 #else
     (void)debug_port;
 #endif
+#ifdef PSX_COSIM
+    cosim_init();  /* first-divergence oracle server */
+#endif
     /* Heartbeat always on — see freeze_heartbeat.c rationale. */
     freeze_heartbeat_start("psx-runtime");
     /* Register game entry_pc for post-BIOS disc speed switch. Fires once when
@@ -2428,6 +2506,9 @@ int main(int argc, char** argv) {
     if (game_entry_pc != 0)
         fntrace_set_game_range(game_entry_pc, 0);
 
+  if (g_headless) {
+    std::fprintf(stdout, "psxrecomp: headless frontend enabled\n");
+  } else {
     /* ---- SDL init ---- */
     /* Scale quality governs SDL's logical-size -> window scaling. Linear when
      * antialiasing is on so the (super)sampled frame stays smooth when the
@@ -2602,6 +2683,7 @@ int main(int argc, char** argv) {
     SDL_SetTextureScaleMode(sdl_texture,
                             g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
   }
+  }
 
     /* Register vblank presentation callback. */
     gpu_set_vblank_callback(sdl_vblank_present);
@@ -2609,13 +2691,20 @@ int main(int argc, char** argv) {
     /* Initialize CPU state. */
     CPUState cpu;
     std::memset(&cpu, 0, sizeof(cpu));
+    /* R3000A load-delay interlock init (Beetle: BACKED_LDWhich=0x20 = no pending
+     * load; ReadFudge=0 so the first load gets no fudge). Rest is correctly 0. */
+    cpu.ld_which_t = 0x20;
+    psx_icache_reset();   /* all I-cache lines cold at reset */
 
-    /* Wire memory function pointers. */
-    cpu.read_word  = psx_guest_read_word;  /* +6cyc main-RAM read wait states */
+    /* Wire memory function pointers. Guest data loads now route their CPU cycle
+     * cost through the faithful load-delay interlock (psx_cyc_load_* in memory.c),
+     * so these VALUE accessors are the UNCHARGED psx_read_* — the data-access
+     * wait-state is charged once, inside the interlock, never here. */
+    cpu.read_word  = psx_read_word;
     cpu.write_word = psx_write_word;
-    cpu.read_half  = psx_guest_read_half;
+    cpu.read_half  = psx_read_half;
     cpu.write_half = psx_write_half;
-    cpu.read_byte  = psx_guest_read_byte;
+    cpu.read_byte  = psx_read_byte;
     cpu.write_byte = psx_write_byte;
     /* Wire the sljit JIT host-helper table (cpu-relative => position-independent
      * shards; prerequisite for the persisted sljit shard cache). Harmless when
@@ -2735,7 +2824,72 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "ORACLE: VSync incrementer hit count = %u\n", vsync_hits);
     std::fflush(stderr);
 #else
-    psx_dispatch(&cpu, cpu.pc);
+    /* Deterministic TCB-scheduler trampoline (carve-out): wraps the top-level
+     * dispatch so a cooperative thread switch unwinds here and re-dispatches the
+     * target thread, instead of the old per-frame host-fiber recreate. Returns
+     * only on the abnormal top-level pc==0 exit; the diagnostic dump below runs
+     * exactly as it did for the bare psx_dispatch. (HLE_SCHEDULER_CARVEOUT_PLAN.md)
+     *
+     * Hidden toggle: PSX_HLE_SCHEDULER=0 reverts to the legacy LLE host-fiber
+     * bridge (default 1 = HLE). The trampoline is transparent in LLE mode (the
+     * fiber path never longjmps to it). */
+    std::fprintf(stdout, "psxrecomp: thread scheduler = %s (PSX_HLE_SCHEDULER)\n",
+                 psx_hle_scheduler_enabled() ? "HLE (deterministic TCB)"
+                                             : "LLE (host fibers)");
+    std::fflush(stdout);
+
+    /* General control-flow parity trace (parity_trace.h). Armed from boot via
+     * PSX_PARITY_TRACE=1 so the pre-divergence window is always covered (never
+     * arm-then-time). Watched TCB / freeze trigger / watch words are env-tunable;
+     * defaults target the MMX6 cutscene→gameplay wedge (thread1 0xA000E35C,
+     * trigger dispatch 0x800CD3F8, watch the handshake flag + state struct). */
+    if (const char* pt = std::getenv("PSX_PARITY_TRACE"); pt && pt[0] && pt[0] != '0') {
+        auto envhex = [](const char* k, uint32_t dflt) -> uint32_t {
+            const char* v = std::getenv(k);
+            return (v && v[0]) ? (uint32_t)std::strtoul(v, nullptr, 0) : dflt;
+        };
+        uint32_t tcb     = envhex("PSX_PARITY_TCB",     0xA000E35Cu);
+        uint32_t trigger = envhex("PSX_PARITY_TRIGGER", 0x800CD3F8u);
+        uint32_t watch[PARITY_WATCH_MAX] = {
+            0x801FEB78u, /* thread1 stack saved-ra slot */
+            0x8006D9ACu, /* handshake flag (setter target) */
+            0x800CD3F8u, /* cutscene state struct: outer/sub */
+            0x800CD3FCu, /* countdown */
+            0x800CD404u, /* done flag region */
+            0x800200F4u, /* func_8002000C resume point */
+        };
+        int wc = PARITY_WATCH_MAX;
+        if (const char* wl = std::getenv("PSX_PARITY_WATCH"); wl && wl[0]) {
+            wc = 0; std::string s(wl); size_t p = 0;
+            while (p < s.size() && wc < PARITY_WATCH_MAX) {
+                size_t c = s.find(',', p);
+                std::string tok = s.substr(p, c == std::string::npos ? c : c - p);
+                if (!tok.empty()) watch[wc++] = (uint32_t)std::strtoul(tok.c_str(), nullptr, 0);
+                if (c == std::string::npos) break; p = c + 1;
+            }
+        }
+        parity_trace_config(tcb, trigger, 0x88u, 0x00u, watch, wc);
+        parity_trace_arm(1);
+        std::fprintf(stdout, "psxrecomp: parity trace ARMED tcb=0x%08X trigger=0x%08X (%d watch)\n",
+                     tcb, trigger, wc);
+        std::fflush(stdout);
+    }
+
+    /* Device-event cycle ring (device_trace.h): armed from boot under the same
+     * PSX_PARITY_TRACE gate, or PSX_DEVTRACE=1 standalone. Captures every
+     * CD/DMA/timer/VBlank/SIO/SPU IRQ raise with its guest cycle for the
+     * cross-process device-timing diff (tools/devtrace_diff.py). */
+    {
+        const char* pt = std::getenv("PSX_PARITY_TRACE");
+        const char* dt = std::getenv("PSX_DEVTRACE");
+        if ((pt && pt[0] && pt[0] != '0') || (dt && dt[0] && dt[0] != '0')) {
+            device_trace_arm(1);
+            std::fprintf(stdout, "psxrecomp: device-event trace ARMED\n");
+            std::fflush(stdout);
+        }
+    }
+
+    psx_scheduler_run(&cpu);
 #endif
 
     /* If we reach here, all execution completed without MMIO abort.
@@ -2777,7 +2931,25 @@ int main(int argc, char** argv) {
         }
     }
 
+    /* Diagnostic: the guest published a null PC at the top level (abnormal). With
+     * PSX_EXIT_HALT set, halt-and-serve here instead of shutting down so the
+     * still-loaded overlays + full guest state are live-inspectable over TCP. */
+    { const char *e = std::getenv("PSX_EXIT_HALT");
+      if (e && e[0] && e[0] != '0') {
+          extern void psx_fatal_halt(const char *reason);
+          psx_fatal_halt("top-level dispatch returned PC=0 (abnormal boot exit — inspect live)");
+      }
+    }
+
     std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
+    { extern uint64_t g_slice_fired, g_slice_irq_taken, g_dirty_ram_insns_run;
+      extern uint32_t g_slice_exit_pc, g_slice_exit_reason, g_slice_exit_iter;
+      extern uint32_t g_slice_exit_dispatchable, g_slice_exit_dirty, g_slice_exit_in_text, g_slice_exit_want;
+      std::fprintf(stdout, "psxrecomp runtime: [slice diag] slice_fired=%llu slice_irq_taken=%llu dirty_insns=%llu exit_pc=0x%08X reason=%u iter=%u dispatchable=%u dirty=%u in_text=%u want=%u\n",
+                   (unsigned long long)g_slice_fired, (unsigned long long)g_slice_irq_taken,
+                   (unsigned long long)g_dirty_ram_insns_run, g_slice_exit_pc, g_slice_exit_reason,
+                   g_slice_exit_iter, g_slice_exit_dispatchable, g_slice_exit_dirty,
+                   g_slice_exit_in_text, g_slice_exit_want); }
 
     shutdown_runtime();
     if (g_gl_active) gl_renderer_shutdown();
