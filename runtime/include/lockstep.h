@@ -32,6 +32,26 @@ void     ls_write_hook(uint32_t addr, int size, uint32_t val);
 /* Per-basic-block-leader entry, called from debug_server_cyc_observe. */
 void     ls_at_leader(uint32_t leader_phys, CPUState *cpu);
 
+/* Dispatch-segment comparator: wraps one clean psx_dispatch_game_compiled()
+ * invocation and replays the same callable through exec_one until it reaches
+ * the same returned cpu->pc. This measures the native CPS unit, not just one
+ * basic block. */
+void     ls_func_enter(uint32_t entry_pc, CPUState *cpu);
+void     ls_func_exit(uint32_t entry_pc, CPUState *cpu, int handled);
+void     ls_func_set_window(uint32_t frame_lo, uint32_t frame_hi);
+void     ls_func_set_record_only(int on);
+
+/* Called at real IRQ exception entry. Function-scope comparisons skip segments
+ * that delivered an interrupt, keeping codegen/tooling checks separate from
+ * event-phase behavior. */
+void     ls_note_exception_entry(void);
+
+/* Suppress lockstep memory recording while runtime/debug observers read guest
+ * RAM for diagnostics. These reads are not guest instructions and must not
+ * become part of the compiled-vs-interp trace. */
+void     ls_suppress_begin(void);
+void     ls_suppress_end(void);
+
 /* Arm the comparator over a guest-frame window [lo,hi]. hi==0 => disabled. */
 void     ls_set_window(uint32_t frame_lo, uint32_t frame_hi);
 
@@ -41,6 +61,7 @@ void     ls_set_record_only(int on);
 
 /* Drain the first-divergence record as JSON into buf. Returns bytes written. */
 int      ls_get_diverge_json(char *buf, int buflen);
+int      ls_get_func_json(char *buf, int buflen);
 
 #ifdef __cplusplus
 }

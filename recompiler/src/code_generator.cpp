@@ -1121,7 +1121,11 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                             code = gte_read + fmt::format("{} = cpu->gte_data[{}];  /* mfc2 */", reg_name(rt), rd);
                         }
                     } else if (cop_op == 0x02) { // CFC2 - move from COP2 control
-                        code = gte_read + fmt::format("{} = cpu->gte_ctrl[{}];  /* cfc2 */", reg_name(rt), rd);
+                        if (rd == 26 || rd == 27 || rd == 29 || rd == 30 || rd == 31) {
+                            code = gte_read + fmt::format("{} = gte_read_ctrl(cpu, {});  /* cfc2 */", reg_name(rt), rd);
+                        } else {
+                            code = gte_read + fmt::format("{} = cpu->gte_ctrl[{}];  /* cfc2 */", reg_name(rt), rd);
+                        }
                     } else if (cop_op == 0x04) { // MTC2 - move to COP2 data
                         if (rd == 7 || (rd >= 8 && rd <= 11) || rd == 14 || rd == 15 || rd == 28 || rd == 30) {
                             code = gte_stall + fmt::format("gte_write_data(cpu, {}, {});  /* mtc2 */", rd, reg_name(rt));
@@ -1129,7 +1133,11 @@ std::string CodeGenerator::translate_instruction(uint32_t addr, uint32_t instr) 
                             code = gte_stall + fmt::format("cpu->gte_data[{}] = {};  /* mtc2 */", rd, reg_name(rt));
                         }
                     } else if (cop_op == 0x06) { // CTC2 - move to COP2 control
-                        code = gte_stall + fmt::format("cpu->gte_ctrl[{}] = {};  /* ctc2 */", rd, reg_name(rt));
+                        if (rd == 26 || rd == 27 || rd == 29 || rd == 30 || rd == 31) {
+                            code = gte_stall + fmt::format("gte_write_ctrl(cpu, {}, {});  /* ctc2 */", rd, reg_name(rt));
+                        } else {
+                            code = gte_stall + fmt::format("cpu->gte_ctrl[{}] = {};  /* ctc2 */", rd, reg_name(rt));
+                        }
                     } else if ((cop_op & 0x10) != 0) { // GTE command (bit 25 set)
                         uint32_t gte_cmd = instr & 0x1FFFFFF;
                         // Route ALL GTE commands through gte_execute() for correct behavior
@@ -1230,6 +1238,12 @@ std::string CodeGenerator::translate_basic_block(
     ss << "#ifndef PSX_NO_DEBUG_TOOLS\n";
     ss << config_.indent
        << fmt::format("debug_server_cyc_observe(0x{:08X}u);\n", block.start_addr);
+    ss << "#endif\n";
+    // First-divergence co-sim oracle (COSIM_ORACLE.md): lean per-block-leader hook,
+    // present only in the clean PSX_COSIM build (independent of the debug tools).
+    ss << "#ifdef PSX_COSIM\n";
+    ss << config_.indent
+       << fmt::format("cosim_block(0x{:08X}u);\n", block.start_addr);
     ss << "#endif\n";
 
     // Cycle-budgeted precise event slicing (PRECISE_IRQ_SLICE.md). At the block
@@ -1337,6 +1351,11 @@ std::string CodeGenerator::translate_basic_block(
         ss << indent << fmt::format("psx_icache_fetch(cpu, 0x{:08X}u);\n", insn_addr);
         ss << "#endif\n";
     };
+    auto emit_cosim_instr = [&](uint32_t insn_addr, const std::string& indent) {
+        ss << "#ifdef PSX_COSIM\n";
+        ss << indent << fmt::format("cosim_instr(0x{:08X}u);\n", insn_addr);
+        ss << "#endif\n";
+    };
     if (!cycle_per_insn && block_exec_cycles > 0) {
         ss << "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
         ss << config_.indent << fmt::format("psx_advance_cycles({}u);\n",
@@ -1398,6 +1417,7 @@ std::string CodeGenerator::translate_basic_block(
             if (cycle_per_insn) emit_pre_icache(addr, config_.indent);
             if (cycle_per_insn) emit_pre_timing(instr, config_.indent);
             ss << translate_instruction(addr, instr) << "\n";
+            emit_cosim_instr(addr, config_.indent);
         } else {
             // Control flow is handled at block exit
             if (addr == exit_branch_addr) {
@@ -1409,6 +1429,28 @@ std::string CodeGenerator::translate_basic_block(
                     emit_pre_icache(exit_branch_addr, config_.indent);
                 if (cycle_per_insn)
                     emit_pre_timing(block.exit_instr.instruction, config_.indent);
+
+                if (block.exit_instr.type == ControlFlowType::JumpLink) {
+                    ss << config_.indent
+                       << fmt::format("cpu->gpr[31] = 0x{:08X}u;  /* jal link before delay slot */\n",
+                                      addr + 8);
+                } else if (block.exit_instr.type == ControlFlowType::JumpLinkReg) {
+                    uint32_t rd = get_rd(block.exit_instr.instruction);
+                    if (rd != 0) {
+                        ss << config_.indent
+                           << fmt::format("{} = 0x{:08X}u;  /* jalr link before delay slot */\n",
+                                          reg_name(rd), addr + 8);
+                    }
+                } else if (block.exit_instr.type == ControlFlowType::Branch) {
+                    uint32_t branch_instr = block.exit_instr.instruction;
+                    uint32_t b_opcode = (branch_instr >> 26) & 0x3F;
+                    uint32_t regimm_op = (branch_instr >> 16) & 0x1F;
+                    if (b_opcode == 0x01 && (regimm_op == 0x10 || regimm_op == 0x11)) {
+                        ss << config_.indent
+                           << fmt::format("cpu->gpr[31] = 0x{:08X}u;  /* branch-and-link before delay slot */\n",
+                                          addr + 8);
+                    }
+                }
 
                 // MIPS delay slot handling: emit delay slot instruction BEFORE branch/jump
                 std::string delay_saved_cond;  // non-empty if condition was pre-captured
@@ -1424,6 +1466,7 @@ std::string CodeGenerator::translate_basic_block(
                             ss << config_.indent << "/* delay slot (likely) - conditional execution */\n";
                             ss << config_.indent << "if (" << generate_branch_condition(block.exit_instr.instruction) << ") {\n";
                             ss << config_.indent << translate_instruction(delay_slot_addr, delay_instr) << "\n";
+                            emit_cosim_instr(delay_slot_addr, config_.indent + config_.indent);
                             ss << config_.indent << "}\n";
                         } else {
                             // Normal delay slot - always executes.
@@ -1442,6 +1485,7 @@ std::string CodeGenerator::translate_basic_block(
                             if (cycle_per_insn) emit_pre_icache(delay_slot_addr, config_.indent);
                             if (cycle_per_insn) emit_pre_timing(delay_instr, config_.indent);
                             ss << translate_instruction(delay_slot_addr, delay_instr) << "\n";
+                            emit_cosim_instr(delay_slot_addr, config_.indent);
                         }
                     }
                 }
@@ -1861,20 +1905,20 @@ std::string CodeGenerator::translate_basic_block(
     }
 
     // If no explicit control flow, fall through to the next block. When a
-    // mid-function seed split placed the next instruction in a different C
-    // function, tail-call that split piece so the physical fall-through is
-    // preserved.
+    // CFG split or mid-function seed split placed the next instruction behind
+    // a C label/function boundary, preserve the physical fall-through without
+    // consuming an interrupt/cooldown check at the artificial boundary.
     if (block.exit_instr.type == ControlFlowType::None && !block.successors.empty()) {
-        ss << emit_interrupt_check(block.successors[0], config_.indent);
         ss << config_.indent << fmt::format("/* fall through to block_{:08X} */\n",
                                            block.successors[0]);
     } else if (block.exit_instr.type == ControlFlowType::None) {
         uint32_t next_addr = block.end_addr + 4;
-        ss << emit_interrupt_check(next_addr, config_.indent);
         if (known_functions_.count(next_addr) > 0) {
             ss << config_.indent
                << fmt::format("func_{:08X}(cpu); return;  /* fallthrough to split piece */\n",
                               next_addr);
+        } else {
+            ss << emit_interrupt_check(next_addr, config_.indent);
         }
     }
 
@@ -2446,6 +2490,10 @@ std::string CodeGenerator::generate_file(
     ss << "#ifndef PSX_NO_DEBUG_TOOLS\n";
     ss << "extern void debug_server_cyc_observe(uint32_t block_leader_phys);\n";
     ss << "#endif\n";
+    ss << "#ifdef PSX_COSIM\n";
+    ss << "extern void cosim_block(uint32_t block_leader_phys);\n";
+    ss << "extern void cosim_instr(uint32_t pc);\n";
+    ss << "#endif\n";
     ss << "extern void psx_ws_sprite_tag(CPUState* cpu);  /* widescreen prim tag (gpu.c) */\n";
     ss << "extern int  psx_ws_x_margin(void);  /* widescreen cull-margin term (gpu.c) */\n";
     ss << "extern int  psx_ws_cull_sltiu(uint32_t sx, uint32_t imm);  /* ws auto screen-x cull (gpu.c) */\n";
@@ -2624,18 +2672,51 @@ std::string CodeGenerator::generate_file(
                 if (f.alias_walk_lo == 0) func_starts.push_back(f.start_addr);
             }
 
-            // Group targets by containing function
+            // Group targets by containing function. Some real compiler layouts
+            // branch past an early jr-ra return into the bytes before the next
+            // discovered function. Those targets are not "mid-function" by the
+            // return-scanner's range, but they are executable and must still be
+            // dispatchable CPS pieces.
             std::map<uint32_t, std::vector<uint32_t>> splits_by_func;
+            std::set<uint32_t> gap_targets;
             for (uint32_t target : mid_targets) {
                 auto it = std::upper_bound(func_starts.begin(), func_starts.end(), target);
-                if (it == func_starts.begin()) continue;
+                if (it == func_starts.begin()) {
+                    gap_targets.insert(target);
+                    continue;
+                }
                 --it;
-                splits_by_func[*it].push_back(target);
+                auto fit = std::find_if(functions_mut.begin(), functions_mut.end(),
+                    [&](const Function& f) { return f.start_addr == *it; });
+                if (fit != functions_mut.end() && target > fit->start_addr && target < fit->end_addr) {
+                    splits_by_func[*it].push_back(target);
+                } else {
+                    gap_targets.insert(target);
+                }
             }
 
             // Split each affected function
             std::vector<Function> new_funcs;
             std::set<uint32_t> affected;
+
+            for (uint32_t target : gap_targets) {
+                auto next_it = std::upper_bound(func_starts.begin(), func_starts.end(), target);
+                uint32_t gap_end = (next_it != func_starts.end()) ? *next_it : exe_end;
+                if (target >= gap_end) continue;
+
+                Function nf;
+                nf.start_addr = target;
+                nf.end_addr = gap_end;
+                nf.size = nf.end_addr - nf.start_addr;
+                nf.name = fmt::format("func_{:08X}", nf.start_addr);
+                nf.has_prologue = false;
+                nf.has_epilogue = false;
+                nf.stack_frame_size = 0;
+                nf.is_data_section = false;
+                new_funcs.push_back(nf);
+                known_addrs.insert(nf.start_addr);
+                affected.insert(nf.start_addr);
+            }
 
             for (auto& [func_start, targets] : splits_by_func) {
                 std::sort(targets.begin(), targets.end());

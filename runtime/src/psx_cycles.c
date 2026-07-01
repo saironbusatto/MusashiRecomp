@@ -8,6 +8,9 @@
 #include "sio.h"
 #include "starvation_ring.h"
 #include "timers.h"
+#ifdef PSX_COSIM
+#include "cosim_state.h"
+#endif
 
 uint64_t psx_cycle_count = 0;
 
@@ -43,13 +46,34 @@ static void advance_devices(uint32_t c) {
 void psx_advance_cycles(uint32_t cycles) {
     { extern int g_ls_replay_active; if (g_ls_replay_active) return; }  /* lockstep replay: no global cycle/device mutation */
     if (cycles == 0) return;
-    if (g_event_step_conservative && cycles > 1u) {
-        /* Fine-step so sub-block events fire in true cycle order. */
-        for (uint32_t i = 0; i < cycles; i++) advance_devices(1u);
-    } else {
-        advance_devices(cycles);
+    uint32_t charged_cycles = cycles;
+#ifdef PSX_COSIM
+    /* First-divergence oracle: the guest-cycle counter is the ONLY clock both backends
+     * share identically, so it is the alignment point for the full-state hash. */
+    cosim_tick();
+#endif
+    interrupts_service_scheduled_events();
+    while (cycles > 0) {
+        uint32_t step = cycles;
+        if (g_event_step_conservative && step > 1u) {
+            step = 1u;
+        } else {
+            uint32_t to_vblank = interrupts_cycles_to_vblank();
+            if (to_vblank > 0 && to_vblank < step) step = to_vblank;
+#ifdef PSX_COSIM
+            uint32_t to_cp = cosim_cycles_to_next_checkpoint();
+            if (to_cp > 0 && to_cp < step) step = to_cp;
+#endif
+        }
+        if (step == 0) step = cycles;
+        advance_devices(step);
+        cycles -= step;
+        interrupts_service_scheduled_events();
+#ifdef PSX_COSIM
+        cosim_tick();
+#endif
     }
-    s_watchdog_throttle += cycles;
+    s_watchdog_throttle += charged_cycles;
     if (s_watchdog_throttle >= 65536u) {
         s_watchdog_throttle = 0;
         starvation_watchdog_check();
@@ -58,7 +82,7 @@ void psx_advance_cycles(uint32_t cycles) {
      * localize a busy-wait loop, sparse enough to not flood the 16K ring
      * during normal SIO traffic (~3000 samples/sec vs >10K SIO events/sec
      * during card transactions). */
-    s_pc_sample_throttle += cycles;
+    s_pc_sample_throttle += charged_cycles;
     if (s_pc_sample_throttle >= 1048576u) {
         s_pc_sample_throttle = 0;
         starvation_ring_pc_sample();

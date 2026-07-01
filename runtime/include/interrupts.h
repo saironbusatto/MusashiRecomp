@@ -32,12 +32,17 @@ void interrupts_init(void);
 void psx_irq_raise(uint32_t bit, uint32_t detail);
 
 /* Called from the dispatch loop after each function returns.
- * Fires vblank on schedule, checks (i_stat & i_mask), and if
- * pending + COP0 allows, dispatches the exception handler. */
+ * Services due scheduled edges, checks (i_stat & i_mask), and if pending + COP0
+ * allows, dispatches the exception handler. */
 void psx_check_interrupts(struct CPUState* cpu);
 /* Interrupt check with the compiled guest PC to resume if a game-installed
  * handler later RFEs to the sentinel outside the synchronous host window. */
 void psx_check_interrupts_at(struct CPUState* cpu, uint32_t resume_pc);
+int psx_interrupts_checked_at_current_cycle(uint32_t resume_pc);
+/* Dispatch-entry check for re-enterable compiled PCs. De-dupes an immediately
+ * preceding check at the same guest PC/cycle so generated transfers can keep
+ * their explicit checks while dirty/interp-to-static entries get a boundary. */
+void psx_check_interrupts_dispatch_entry(struct CPUState* cpu, uint32_t resume_pc);
 
 /* Accumulate emitted PSX cycles toward the next VBlank trigger.
  * Called from psx_advance_cycles() so the VBlank rate is gated on
@@ -45,6 +50,8 @@ void psx_check_interrupts_at(struct CPUState* cpu, uint32_t resume_pc);
  * count (which was 5-6x too fast and squeezed game-time to ~60% of
  * real). One real-PSX VBlank = 564480 cycles (33.8688 MHz / 60). */
 void interrupts_advance_cycles(uint32_t cycles);
+void interrupts_service_scheduled_events(void);
+uint32_t interrupts_cycles_to_vblank(void);
 
 /* Cycle-budgeted precise event slicing: minimum guest-CPU-cycle distance to the
  * next DELIVERABLE hardware interrupt (source raises its I_STAT bit AND that bit

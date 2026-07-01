@@ -31,6 +31,7 @@
 #include "psx_instr_cost.h"  /* psx_instr_base_cycles — single-source cycle cost */
 #include "gpu.h"   /* psx_ws_is_backdrop_site / psx_ws_backdrop_x (interp hook) */
 #include "ws_backdrop_detect.h"  /* shared backdrop-window detector (auto_backdrop) */
+#include "lockstep.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -48,6 +49,7 @@ uint64_t g_dirty_ram_guard_yields = 0;
  * advancing cycles without surfacing to psx_check_interrupts (the softlock). */
 uint64_t g_dirty_pump_max_gap_insns = 0;
 uint64_t g_dirty_pump_count         = 0;
+static uint64_t s_last_dirty_irq_pump_insns = 0;
 
 /* EPC de-overload signal (Tomba 2 frame-1997 fix). Set to the committed guest PC
  * immediately around a dirty-pump psx_check_interrupts() call, 0 otherwise. When
@@ -73,6 +75,21 @@ int g_precise_mode = 0;
  * (g_ls_dirty_observe==0) from an interpreted per-instruction sample (==1). */
 int g_ls_dirty_observe = 0;
 extern int g_ls_replay_active;     /* defined in the lockstep section; used by exec_one's jal/jalr guard */
+
+#ifdef PSX_COSIM
+static int g_cosim_exec_one_hooked = 0;
+static void cosim_exec_one_begin(void) { g_cosim_exec_one_hooked = 0; }
+static int cosim_exec_one_did_hook(void) { return g_cosim_exec_one_hooked; }
+static void cosim_exec_one_transfer_hook(uint32_t pc) {
+    extern void cosim_instr(uint32_t);
+    cosim_instr(pc);
+    g_cosim_exec_one_hooked = 1;
+}
+#else
+static void cosim_exec_one_begin(void) {}
+static int cosim_exec_one_did_hook(void) { return 0; }
+static void cosim_exec_one_transfer_hook(uint32_t pc) { (void)pc; }
+#endif
 uint64_t g_slice_fired = 0;        /* diagnostic: slices actually run */
 uint64_t g_slice_irq_taken = 0;    /* diagnostic: IRQs taken inside precise-mode */
 /* First-divergence trace for the precise slice (PRECISE_IRQ_SLICE.md Task #4). */
@@ -84,6 +101,13 @@ uint32_t g_slice_last_istat     = 0;  /* i_stat at the take                     
 uint32_t g_slice_last_imask     = 0;  /* i_mask at the take                        */
 uint32_t g_slice_last_sr        = 0;  /* COP0 SR at the take                       */
 uint32_t g_slice_entry_deliverable = 0; /* was IRQ deliverable at slice entry?    */
+uint32_t g_slice_exit_pc        = 0;  /* PC published by the last precise slice    */
+uint32_t g_slice_exit_reason    = 0;  /* 1=safe, 2=unsupported, 3=bail, 4=guard    */
+uint32_t g_slice_exit_iter      = 0;  /* loop iteration at exit                    */
+uint32_t g_slice_exit_dispatchable = 0; /* precise_pc_dispatchable(exit_pc)        */
+uint32_t g_slice_exit_dirty     = 0;  /* dirty_ram_is_dirty(exit_pc phys)          */
+uint32_t g_slice_exit_in_text   = 0;  /* psx_game_address_in_text(exit_pc)         */
+uint32_t g_slice_exit_want      = 0;  /* want_exit value at exit                   */
 
 /* Persistent async-RFE resume PC (Tomba 2 frame-1997 fix). psx_check_interrupts latches
  * this from g_dirty_safe_resume_pc at each dirty-safe-point exception entry, so it holds
@@ -109,6 +133,7 @@ uint32_t g_sentinel_reach_async = 0;
  * than psx_unknown_dispatch (which has its own fail-fast). Captures the dispatch
  * addr + interrupt-return context so the exact producing path is identifiable
  * without printf. Surfaced in freeze_check (pczero_*). */
+int      g_cosim_dirty_pump_site = 0; /* PSX_COSIM diagnostic: current dirty IRQ pump site */
 int      g_pczero_latched     = 0;
 uint32_t g_pczero_addr        = 0;
 uint32_t g_pczero_ra          = 0;
@@ -540,6 +565,46 @@ static int dirty_ram_word_looks_decodable(uint32_t insn) {
     }
 }
 
+static int dirty_ram_same_pc(uint32_t a, uint32_t b) {
+    return (((a ^ b) & 0x1FFFFFFFu) == 0);
+}
+
+static int dirty_ram_pump_boundary(CPUState *cpu, uint32_t committed_pc, int site) {
+    uint32_t prev_safe = g_dirty_safe_resume_pc;
+    int prev_site = g_cosim_dirty_pump_site;
+
+    s_last_dirty_irq_pump_insns = g_dirty_ram_insns_run;
+    if (!psx_interrupts_checked_at_current_cycle(committed_pc)) {
+        g_dirty_safe_resume_pc = committed_pc;
+        g_cosim_dirty_pump_site = site;
+        psx_check_interrupts(cpu);
+        g_dirty_safe_resume_pc = prev_safe;
+        g_cosim_dirty_pump_site = prev_site;
+    }
+
+    if (g_psx_call_bail) return 1;
+    if (cpu->pc == 0u && committed_pc != 0u) {
+        cpu->pc = committed_pc;
+        g_async_rfe_fire_count++;
+    }
+    if (cpu->pc != 0u && !dirty_ram_same_pc(cpu->pc, committed_pc)) {
+        return 1;
+    }
+
+    cpu->pc = committed_pc;
+    return 0;
+}
+
+static int dirty_ram_finish_call_return(CPUState *cpu, uint32_t return_pc,
+                                        uint32_t *next_pc_out) {
+    uint32_t prev_pc = cpu->pc;
+    cpu->pc = return_pc;
+    if (dirty_ram_pump_boundary(cpu, return_pc, 5)) return 1;
+    cpu->pc = prev_pc;
+    *next_pc_out = return_pc;
+    return 0;
+}
+
 static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
                                   uint32_t return_pc,
                                   uint32_t *next_pc_out) {
@@ -549,8 +614,7 @@ static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
      * unwind in progress surfaces with cpu->pc = the guest's true target. */
     if (g_psx_call_bail) return 1;
     if (cpu->pc != 0) return 1;
-    *next_pc_out = return_pc;
-    return 0;
+    return dirty_ram_finish_call_return(cpu, return_pc, next_pc_out);
 }
 
 /* ── Mixed interp<->compiled dispatch owner (host-stack recursion fix) ──────
@@ -882,7 +946,9 @@ static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
         return 1;
     }
     g_mixed_depth++;
+    ls_func_enter(target, cpu);
     int r = psx_dispatch_game_compiled(cpu, target);
+    ls_func_exit(target, cpu, r);
     g_mixed_depth--;
     return r;
 }
@@ -1045,6 +1111,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         case 0x08: { /* JR rs */
             uint32_t target = cpu->gpr[rs];
             exec_delay_slot(cpu, pc + 4);
+            cosim_exec_one_transfer_hook(pc + 4);
             /* crossing (if target is compiled) is counted at the block-loop
              * tail-transfer site (interp_enter_compiled, §18) — not here, to
              * avoid double-counting J/JR-to-compiled. */
@@ -1057,6 +1124,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             cpu->gpr[rd ? rd : 31] = return_pc;
             cpu->gpr[0] = 0;
             exec_delay_slot(cpu, pc + 4);
+            cosim_exec_one_transfer_hook(pc + 4);
             uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
             xprobe_event(pc, XOP_JALR, XSITE_INTERP, target,
                          fetch_word((pc + 4) & 0x1FFFFFFFu), site_sp, cpu->gpr[31], 1);
@@ -1069,8 +1137,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                 if (rd == 0 || rd == 31) {
                     if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
                 }
-                *next_pc_out = return_pc;
-                return 0;
+                return dirty_ram_finish_call_return(cpu, return_pc, next_pc_out);
             }
 #endif
             /* Native overlay candidates get the SAME call contract as
@@ -1087,8 +1154,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                     if (rd == 0 || rd == 31) {
                         if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
                     }
-                    *next_pc_out = return_pc;
-                    return 0;
+                    return dirty_ram_finish_call_return(cpu, return_pc, next_pc_out);
                 }
             }
             if (!is_local_dirty_target(target)) {
@@ -1216,6 +1282,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     case 0x02: { /* J target */
         uint32_t target = ((pc + 4) & 0xF0000000u) | (target26(insn) << 2);
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         /* crossing counted at the block-loop tail-transfer site (§18). */
         cpu->pc = target;
         return 1;
@@ -1225,6 +1292,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         uint32_t return_pc = pc + 8;
         cpu->gpr[31] = return_pc;
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
         xprobe_event(pc, XOP_JAL, XSITE_INTERP, target,
                      fetch_word((pc + 4) & 0x1FFFFFFFu), site_sp, cpu->gpr[31], 1);
@@ -1235,8 +1303,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             if (g_psx_call_bail) return 1;  /* wild unwind: cpu->pc = true target */
             if (cpu->pc != 0) return 1;
             if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
-            *next_pc_out = return_pc;
-            return 0;
+            return dirty_ram_finish_call_return(cpu, return_pc, next_pc_out);
         }
 #endif
         /* Native overlay candidates get the SAME call contract as statically-
@@ -1252,8 +1319,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                 if (g_psx_call_bail) return 1;
                 if (cpu->pc != 0) return 1;
                 if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
-                *next_pc_out = return_pc;
-                return 0;
+                return dirty_ram_finish_call_return(cpu, return_pc, next_pc_out);
             }
         }
         if (!is_local_dirty_target(target)) {
@@ -1268,24 +1334,28 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     case 0x04: { /* BEQ rs, rt, simm */
         int taken = (cpu->gpr[rs] == cpu->gpr[rt]);
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
         return 1;
     }
     case 0x05: { /* BNE */
         int taken = (cpu->gpr[rs] != cpu->gpr[rt]);
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
         return 1;
     }
     case 0x06: { /* BLEZ */
         int taken = ((int32_t)cpu->gpr[rs] <= 0);
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
         return 1;
     }
     case 0x07: { /* BGTZ */
         int taken = ((int32_t)cpu->gpr[rs] > 0);
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
         return 1;
     }
@@ -1301,6 +1371,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         default: return abort_unsupported(pc, insn, "REGIMM rt");
         }
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
         return 1;
     }
@@ -1588,14 +1659,15 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
      * g_dirty_interp_active at its longjmp landing (same contract as the inner
      * local-flow pump), so a deliver-via-longjmp here is safe. */
     if (r == 1) {
-        static uint64_t s_last_pump_insns = 0;
         uint64_t now = g_dirty_ram_insns_run;
-        uint64_t gap = now - s_last_pump_insns;
+        uint64_t gap = now - s_last_dirty_irq_pump_insns;
         if (gap > g_dirty_pump_max_gap_insns) g_dirty_pump_max_gap_insns = gap;
         if (gap >= 4096u) {
-            s_last_pump_insns = now;
+            s_last_dirty_irq_pump_insns = now;
             g_dirty_pump_count++;
             uint32_t committed = cpu->pc;      /* block already retired; this is next PC */
+            int prev_site = g_cosim_dirty_pump_site;
+            g_cosim_dirty_pump_site = 6;
             g_dirty_safe_resume_pc = committed;
             psx_check_interrupts(cpu);   /* may exception-enter / longjmp */
             /* Frame-1997 fix: a game-driven ReturnFromException longjmp'd through the
@@ -1610,6 +1682,7 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
                 g_async_rfe_fire_count++;
             }
             g_dirty_safe_resume_pc = 0;
+            g_cosim_dirty_pump_site = prev_site;
         }
     }
 
@@ -1674,18 +1747,68 @@ static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
     g_slice_last_block    = pc;
     g_slice_last_first_pc = pc;
     g_slice_last_first_insn = fetch_word(pc & 0x1FFFFFFFu);
+    g_slice_exit_pc = pc;
+    g_slice_exit_reason = 0;
+    g_slice_exit_iter = 0;
+    g_slice_exit_dispatchable = 0;
+    g_slice_exit_dirty = dirty_ram_is_dirty(pc & 0x1FFFFFFFu) ? 1u : 0u;
+#ifdef PSX_HAS_GAME_DISPATCH
+    g_slice_exit_in_text = psx_game_address_in_text(pc) ? 1u : 0u;
+#else
+    g_slice_exit_in_text = 0;
+#endif
+    g_slice_exit_want = 0;
     int irq_taken = 0;   /* one take per slice (avoid re-taking an unacked IRQ) */
     enum { MAX_PRECISE_INSNS = 200000 };
     for (int i = 0; i < MAX_PRECISE_INSNS; i++) {
+        if (!irq_taken && precise_irq_deliverable(cpu)) {
+            uint32_t committed = pc;
+            extern uint32_t i_stat;
+            g_slice_last_committed = committed;
+            g_slice_last_istat = i_stat;
+            g_slice_last_imask = i_mask;
+            g_slice_last_sr    = cpu->cop0[12];
+            cpu->pc = committed;
+            int prev_site = g_cosim_dirty_pump_site;
+            g_cosim_dirty_pump_site = 7;
+            g_dirty_safe_resume_pc = committed;
+            s_last_dirty_irq_pump_insns = g_dirty_ram_insns_run;
+            psx_check_interrupts(cpu);
+            if (cpu->pc == 0u && committed != 0u) {
+                cpu->pc = committed;
+                g_async_rfe_fire_count++;
+            }
+            g_dirty_safe_resume_pc = 0;
+            g_cosim_dirty_pump_site = prev_site;
+            g_slice_irq_taken++;
+            irq_taken = 1;
+            pc = cpu->pc ? cpu->pc : committed;
+            cpu->pc = pc;
+            if (precise_pc_dispatchable(cpu->pc)) {
+                g_slice_exit_reason = 1;
+                g_slice_exit_iter = (uint32_t)i;
+                g_slice_exit_want = 1;
+                break;
+            }
+            continue;
+        }
+
         uint32_t next_pc = 0;
         g_unsupported_seen = 0;
+        cosim_exec_one_begin();
         int transferred = exec_one(cpu, pc, &next_pc);  /* charges its own interlock */
         g_dirty_ram_insns_run++;
+#ifdef PSX_COSIM
+        if (!cosim_exec_one_did_hook()) { extern void cosim_instr(uint32_t); cosim_instr(pc); }
+#endif
         if (g_unsupported_seen) {
             /* Valid compiled code always decodes; if not, hand the committed PC to
              * the dispatcher rather than abort the slice. */
             g_unsupported_seen = 0;
             pc = transferred ? cpu->pc : next_pc;
+            g_slice_exit_reason = 2;
+            g_slice_exit_iter = (uint32_t)i;
+            g_slice_exit_want = 0;
             break;
         }
         uint32_t committed = transferred ? cpu->pc : next_pc;
@@ -1710,34 +1833,59 @@ static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
             g_slice_last_imask = i_mask;
             g_slice_last_sr    = cpu->cop0[12];
             cpu->pc = committed;
+            int prev_site = g_cosim_dirty_pump_site;
+            g_cosim_dirty_pump_site = 7;
             g_dirty_safe_resume_pc = committed;   /* real EPC for exception entry */
+            s_last_dirty_irq_pump_insns = g_dirty_ram_insns_run;
             psx_check_interrupts(cpu);            /* takes it; runs handler; restores GPRs */
             g_dirty_safe_resume_pc = 0;
+            g_cosim_dirty_pump_site = prev_site;
             g_slice_irq_taken++;
             irq_taken = 1;
-            cpu->pc = committed;   /* resume the interrupted stream at the exact PC */
+            committed = cpu->pc ? cpu->pc : committed;
             want_exit = 1;
         }
 
         pc = committed;
         cpu->pc = committed;
 
-        if (g_psx_call_bail) break;   /* wild unwind: hand cpu->pc to the dispatcher */
+        if (g_psx_call_bail) {
+            g_slice_exit_reason = 3;
+            g_slice_exit_iter = (uint32_t)i;
+            g_slice_exit_want = want_exit ? 1u : 0u;
+            break;   /* wild unwind: hand cpu->pc to the dispatcher */
+        }
 
         if (irq_taken) {
             want_exit = 1;            /* after the take, leave as soon as it is safe */
         } else if (transferred) {
-            if (!deadline_entry) want_exit = 1;                 /* side-effect block: one block */
-            else if (cycles_to_next_event() > bcyc) want_exit = 1; /* imminent window passed */
+            want_exit = 1;
             /* else still imminent — keep slicing across this boundary */
         }
 
         /* Hand back ONLY at a dispatchable PC. Otherwise (mid-function clean text)
          * keep interpreting until one is reached. */
-        if (want_exit && precise_pc_dispatchable(cpu->pc)) break;
+        if (want_exit && precise_pc_dispatchable(cpu->pc)) {
+            g_slice_exit_reason = 1;
+            g_slice_exit_iter = (uint32_t)i;
+            g_slice_exit_want = 1;
+            break;
+        }
+    }
+    if (g_slice_exit_reason == 0) {
+        g_slice_exit_reason = 4;
+        g_slice_exit_iter = MAX_PRECISE_INSNS;
     }
 
     cpu->pc = pc;
+    g_slice_exit_pc = cpu->pc;
+    g_slice_exit_dispatchable = precise_pc_dispatchable(cpu->pc) ? 1u : 0u;
+    g_slice_exit_dirty = dirty_ram_is_dirty(cpu->pc & 0x1FFFFFFFu) ? 1u : 0u;
+#ifdef PSX_HAS_GAME_DISPATCH
+    g_slice_exit_in_text = psx_game_address_in_text(cpu->pc) ? 1u : 0u;
+#else
+    g_slice_exit_in_text = 0;
+#endif
     g_precise_mode = prev_precise;
     g_dirty_interp_active = prev_active;
 }
@@ -1770,8 +1918,23 @@ int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_
      * exception handling anyway). Keeps re-entrancy structurally impossible. */
     if (g_precise_mode || psx_get_in_exception()) return 0;
 
+    static int s_slice_always = -1;
+    static int s_slice_margin = -1;
+    if (s_slice_always < 0) {
+        const char *e = getenv("PSX_PRECISE_ALWAYS");
+        s_slice_always = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (s_slice_margin < 0) {
+        const char *e = getenv("PSX_PRECISE_MARGIN");
+        s_slice_margin = (e && *e) ? atoi(e) : 0;
+        if (s_slice_margin < 0) s_slice_margin = 0;
+    }
+
+    uint32_t deadline = cycles_to_next_event();
+    uint32_t budget = bcyc + (uint32_t)s_slice_margin;
+    if (budget < bcyc) budget = 0xFFFFFFFFu;
     int entry_deliverable = precise_irq_deliverable(cpu);
-    int has_deadline = entry_deliverable || (cycles_to_next_event() <= bcyc);
+    int has_deadline = s_slice_always || entry_deliverable || (deadline <= budget);
     if (!has_deadline && !side_effects) return 0;   /* fast path: no event in this block */
 
     g_slice_entry_deliverable = (uint32_t)entry_deliverable;
@@ -1783,6 +1946,7 @@ int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_
 
 static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
+    int clean_game_text_miss = 0;
 
     if (addr == 0x80000048u) {
         g_sentinel_reach_dirty++;
@@ -1815,7 +1979,14 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
      * unchanged for non-overlaying games once their text is baselined). */
     if (!dirty_ram_is_dirty(phys)) {
         g_mixed_depth++;
-        { int _gc = psx_dispatch_game_compiled(cpu, addr); g_mixed_depth--; if (_gc) return 1; }
+        {
+            ls_func_enter(addr, cpu);
+            int _gc = psx_dispatch_game_compiled(cpu, addr);
+            ls_func_exit(addr, cpu, _gc);
+            g_mixed_depth--;
+            if (_gc) return 1;
+        }
+        clean_game_text_miss = psx_game_address_in_text(addr) ? 1 : 0;
     }
 #endif
 
@@ -1859,7 +2030,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     }
 #define OV_FPLOG_RET1() do { if (_ovfp) overlay_fp_log(addr, _in_regs, cpu, 0); return 1; } while (0)
 
-    if (!dirty_ram_is_dirty(phys)) return 0;
+    if (!dirty_ram_is_dirty(phys) && !clean_game_text_miss) return 0;
 
     /* Interp-pressure signal for variant-capture automation (step 2.8):
      * counts dispatches the interpreter actually handles inside a capture
@@ -1931,9 +2102,13 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         debug_server_cyc_observe(pc & 0x1FFFFFFFu);
         g_ls_dirty_observe = 0;
 #endif
+#ifdef PSX_COSIM
+        { extern void cosim_block(uint32_t); cosim_block(pc); }
+#endif
         uint32_t insn = fetch_word(pc & 0x1FFFFFFFu);
         uint32_t before_s0 = cpu->gpr[16];
         uint32_t before_ra = cpu->gpr[31];
+        cosim_exec_one_begin();
         int transferred = exec_one(cpu, pc, &next_pc);
         /* $ra->1 corruption tripwire (confirm-first probe): did THIS overlay
          * instruction clobber $ra to 1? Latches once, cheap after. */
@@ -1968,6 +2143,9 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         dirty_ram_log_instruction(cpu, pc, insn, before_s0, next_pc,
                                   transferred ? cpu->pc : next_pc,
                                   transferred);
+#ifdef PSX_COSIM
+        if (!cosim_exec_one_did_hook()) { extern void cosim_instr(uint32_t); cosim_instr(pc); }
+#endif
         if (g_unsupported_seen) {
             if (insns_executed == 0) {
                 /* Couldn't decode the first instruction.  Most likely
@@ -2010,6 +2188,13 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 OV_FPLOG_RET1();
             }
             uint32_t target = cpu->pc;
+            if (target != 0u && dirty_ram_pump_boundary(cpu, target, 1)) {
+                g_dirty_ram_blocks_run++;
+                if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                g_dirty_interp_chain_target = cpu->pc;
+                OV_FPLOG_RET1();
+            }
+            target = cpu->pc;
 #ifdef PSX_HAS_GAME_DISPATCH
             if (target != 0) {
                 /* §20 FIX — the long-run idle freeze. A guest TAIL-transfer (j/jr/
@@ -2062,9 +2247,6 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 if ((insns_executed & 0xFFF) == 0) {
                     debug_server_poll();
                     debug_server_wait_if_paused();
-                    g_dirty_safe_resume_pc = cpu->pc;  /* committed (==target) -> real-EPC */
-                    psx_check_interrupts(cpu);
-                    g_dirty_safe_resume_pc = 0;
                 }
                 continue;
             }
@@ -2079,6 +2261,12 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
          * hazard as a transfer to stop_addr). */
         if (stop_addr != 0 && pc == stop_addr) {
             cpu->pc = pc;
+            if (dirty_ram_pump_boundary(cpu, pc, 2)) {
+                g_dirty_ram_blocks_run++;
+                if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                g_dirty_interp_chain_target = cpu->pc;
+                OV_FPLOG_RET1();
+            }
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
             g_dirty_interp_chain_target = pc;
@@ -2089,6 +2277,12 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         uint32_t next_phys = pc & 0x1FFFFFFFu;
         if (!dirty_ram_is_dirty(next_phys)) {
             cpu->pc = pc;
+            if (dirty_ram_pump_boundary(cpu, pc, 3)) {
+                g_dirty_ram_blocks_run++;
+                if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                g_dirty_interp_chain_target = cpu->pc;
+                OV_FPLOG_RET1();
+            }
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
             g_dirty_interp_chain_target = pc;
@@ -2104,16 +2298,23 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
     g_dirty_interp_chain_target = pc;
     {
-        uint32_t committed = cpu->pc;
-        g_dirty_safe_resume_pc = committed;
-        psx_check_interrupts(cpu);
-        /* Frame-1997 fix (see outer pump): restore the committed PC if a game RFE
-         * longjmp left cpu->pc=0, so the trampoline re-dispatches instead of exiting. */
-        if (cpu->pc == 0u && committed != 0u) {
-            cpu->pc = committed;
-            g_async_rfe_fire_count++;
+        uint64_t gap = g_dirty_ram_insns_run - s_last_dirty_irq_pump_insns;
+        if (gap >= 4096u) {
+            uint32_t committed = cpu->pc;
+            int prev_site = g_cosim_dirty_pump_site;
+            g_cosim_dirty_pump_site = 4;
+            g_dirty_safe_resume_pc = committed;
+            s_last_dirty_irq_pump_insns = g_dirty_ram_insns_run;
+            psx_check_interrupts(cpu);
+            /* Frame-1997 fix (see outer pump): restore the committed PC if a game RFE
+             * longjmp left cpu->pc=0, so the trampoline re-dispatches instead of exiting. */
+            if (cpu->pc == 0u && committed != 0u) {
+                cpu->pc = committed;
+                g_async_rfe_fire_count++;
+            }
+            g_dirty_safe_resume_pc = 0;
+            g_cosim_dirty_pump_site = prev_site;
         }
-        g_dirty_safe_resume_pc = 0;
     }
     OV_FPLOG_RET1();
 }
@@ -2127,11 +2328,12 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 
 int g_ls_mode = 0;
 int g_ls_replay_active = 0;
+int g_ls_suppress_record = 0;
 
 static uint32_t s_ls_frame_lo = 0, s_ls_frame_hi = 0;   /* hi==0 => disabled */
 
 typedef struct { uint8_t is_write, size; uint32_t addr, val; } ls_op_t;
-enum { LS_TRACE_CAP = 8192 };
+enum { LS_TRACE_CAP = 65536 };
 static ls_op_t  s_ls_trace[LS_TRACE_CAP];
 static int      s_ls_trace_n = 0, s_ls_trace_idx = 0;
 static int      s_ls_overflow = 0, s_ls_mismatch = 0;
@@ -2161,8 +2363,45 @@ static ls_op_t  s_ls_div_trace[48];
 static int      s_ls_div_trace_n = 0, s_ls_div_idx = 0;
 
 static int s_ls_record_only = 0;   /* diagnostic: record but skip inline replay (perturbation test) */
+
+static uint32_t s_lsf_frame_lo = 0, s_lsf_frame_hi = 0; /* hi==0 => disabled */
+static int      s_lsf_record_only = 0;
+static int      s_lsf_active = 0;
+static int      s_lsf_recording = 0;
+static int      s_lsf_saw_irq = 0;
+static CPUState s_lsf_R0;
+static uint32_t s_lsf_entry = 0, s_lsf_dispatch_entry = 0, s_lsf_frame = 0;
+
+static struct {
+    int      found;
+    int      kind;        /* see lsf_kind names in ls_get_func_json */
+    uint32_t frame, entry, pc, addr;
+    uint32_t exp, act;
+    int      detail;
+    uint64_t segments_checked, skipped_irq, skipped_overflow;
+    uint64_t skipped_unhandled, skipped_conflict, skipped_disabled;
+    uint32_t trace_ops, replay_ops, steps;
+} s_lsf_div = {0};
+
+static ls_op_t s_lsf_div_trace[48];
+static int     s_lsf_div_trace_n = 0, s_lsf_div_idx = 0;
+
 void ls_set_window(uint32_t lo, uint32_t hi) { s_ls_frame_lo = lo; s_ls_frame_hi = hi; }
 void ls_set_record_only(int on) { s_ls_record_only = on; }
+void ls_func_set_window(uint32_t lo, uint32_t hi) { s_lsf_frame_lo = lo; s_lsf_frame_hi = hi; }
+void ls_func_set_record_only(int on) { s_lsf_record_only = on; }
+
+void ls_note_exception_entry(void) {
+    if (s_lsf_active) s_lsf_saw_irq = 1;
+}
+
+void ls_suppress_begin(void) {
+    g_ls_suppress_record++;
+}
+
+void ls_suppress_end(void) {
+    if (g_ls_suppress_record > 0) g_ls_suppress_record--;
+}
 
 uint32_t ls_read_hook(uint32_t addr, int size, uint32_t real_val) {
     if (g_ls_mode == 2) {                 /* replay: serve from trace */
@@ -2277,7 +2516,222 @@ static void ls_replay_and_compare(CPUState *cpu, uint32_t frame, uint32_t target
     }
 }
 
+static int ls_same_phys(uint32_t a, uint32_t b) {
+    return (((a ^ b) & 0x1FFFFFFFu) == 0);
+}
+
+static void lsf_copy_div_trace(void) {
+    int n = s_ls_trace_n;
+    if (n > 48) n = 48;
+    for (int i = 0; i < n; i++) s_lsf_div_trace[i] = s_ls_trace[i];
+    s_lsf_div_trace_n = n;
+    s_lsf_div_idx = s_ls_trace_idx;
+}
+
+static void lsf_latch(int kind, uint32_t frame, uint32_t entry, uint32_t pc,
+                      uint32_t addr, uint32_t exp, uint32_t act, int detail,
+                      uint32_t steps) {
+    if (s_lsf_div.found) return;
+    s_lsf_div.found = 1;
+    s_lsf_div.kind = kind;
+    s_lsf_div.frame = frame;
+    s_lsf_div.entry = entry;
+    s_lsf_div.pc = pc;
+    s_lsf_div.addr = addr;
+    s_lsf_div.exp = exp;
+    s_lsf_div.act = act;
+    s_lsf_div.detail = detail;
+    s_lsf_div.trace_ops = (uint32_t)s_ls_trace_n;
+    s_lsf_div.replay_ops = (uint32_t)s_ls_trace_idx;
+    s_lsf_div.steps = steps;
+    lsf_copy_div_trace();
+}
+
+static void lsf_compare_regs(CPUState *rep, CPUState *nat, uint32_t frame,
+                             uint32_t entry, uint32_t steps) {
+    if (!ls_same_phys(rep->pc, nat->pc)) {
+        lsf_latch(4, frame, entry, rep->pc, 0, rep->pc, nat->pc, 0, steps);
+        return;
+    }
+    for (int i = 0; i < 32; i++) {
+        if (rep->gpr[i] != nat->gpr[i]) {
+            lsf_latch(1, frame, entry, rep->pc, 0, rep->gpr[i], nat->gpr[i], i, steps);
+            return;
+        }
+    }
+    if (rep->hi != nat->hi) {
+        lsf_latch(2, frame, entry, rep->pc, 0, rep->hi, nat->hi, 0, steps);
+        return;
+    }
+    if (rep->lo != nat->lo) {
+        lsf_latch(3, frame, entry, rep->pc, 0, rep->lo, nat->lo, 0, steps);
+        return;
+    }
+}
+
+static void lsf_replay_and_compare(CPUState *native_post, uint32_t frame,
+                                   uint32_t entry_pc) {
+    CPUState rep = s_lsf_R0;
+    uint32_t target = native_post->pc;
+    rep.pc = entry_pc;
+
+    s_ls_trace_idx = 0;
+    s_ls_mismatch = 0;
+    s_ls_m_kind = 0;
+    s_ls_replay_done = 0;
+
+    int         sav_unsup_seen   = g_unsupported_seen;
+    uint32_t    sav_unsup_pc     = g_unsupported_pc;
+    uint32_t    sav_unsup_insn   = g_unsupported_insn;
+    const char *sav_unsup_reason = g_unsupported_reason;
+    uint32_t    sav_store_pc     = g_debug_last_store_pc;
+    uint32_t    sav_func_addr    = g_debug_current_func_addr;
+
+    g_ls_replay_active = 1;
+    g_ls_mode = 2;
+
+    uint32_t pc = entry_pc;
+    uint32_t steps = 0;
+    int done = 0;
+    enum { MAX_FUNC_REPLAY_INSNS = 250000 };
+    for (;;) {
+        if (steps > 0 && target != 0 && ls_same_phys(pc, target) &&
+            s_ls_trace_idx == s_ls_trace_n) {
+            done = 1;
+            break;
+        }
+        if (steps >= MAX_FUNC_REPLAY_INSNS) {
+            lsf_latch(10, frame, entry_pc, pc, 0, target, pc, 0, steps);
+            break;
+        }
+        if (s_ls_mismatch || s_ls_replay_done) break;
+
+        uint32_t next_pc = 0;
+        s_ls_cur_pc = pc;
+        g_unsupported_seen = 0;
+        int transferred = exec_one(&rep, pc, &next_pc);
+        if (g_unsupported_seen) {
+            lsf_latch(11, frame, entry_pc, pc, 0, 0, g_unsupported_insn, 0, steps);
+            break;
+        }
+        pc = transferred ? rep.pc : next_pc;
+        rep.pc = pc;
+        steps++;
+    }
+
+    g_ls_mode = 0;
+    g_ls_replay_active = 0;
+    g_unsupported_seen   = sav_unsup_seen;
+    g_unsupported_pc     = sav_unsup_pc;
+    g_unsupported_insn   = sav_unsup_insn;
+    g_unsupported_reason = sav_unsup_reason;
+    g_debug_last_store_pc = sav_store_pc;
+    g_debug_current_func_addr = sav_func_addr;
+
+    s_lsf_div.segments_checked++;
+
+    if (s_ls_mismatch) {
+        int k = (s_ls_m_kind == 1) ? 6 : (s_ls_m_kind == 2) ? 7 :
+                (s_ls_m_kind == 3) ? 5 : 8;
+        lsf_latch(k, frame, entry_pc, s_ls_m_pc, s_ls_m_addr,
+                  s_ls_m_exp, s_ls_m_act, 0, steps);
+        return;
+    }
+    if (s_ls_replay_done) {
+        lsf_latch(8, frame, entry_pc, s_ls_cur_pc, 0, (uint32_t)s_ls_trace_n,
+                  (uint32_t)s_ls_trace_idx, 0, steps);
+        return;
+    }
+    if (!done) {
+        lsf_latch(10, frame, entry_pc, pc, 0, target, pc, 0, steps);
+        return;
+    }
+    if (s_ls_trace_idx != s_ls_trace_n) {
+        lsf_latch(9, frame, entry_pc, pc, 0, (uint32_t)s_ls_trace_n,
+                  (uint32_t)s_ls_trace_idx, 0, steps);
+        return;
+    }
+
+    lsf_compare_regs(&rep, native_post, frame, entry_pc, steps);
+}
+
+void ls_func_enter(uint32_t entry_pc, CPUState *cpu) {
+    if (s_lsf_frame_hi == 0 || s_lsf_div.found || !cpu) return;
+    if (g_ls_replay_active || g_ls_mode != 0 || s_lsf_active) {
+        s_lsf_div.skipped_conflict++;
+        return;
+    }
+    if (psx_get_in_exception()) {
+        s_lsf_div.skipped_irq++;
+        return;
+    }
+    uint32_t frame = (uint32_t)s_frame_count;
+    if (frame < s_lsf_frame_lo || frame > s_lsf_frame_hi) {
+        s_lsf_div.skipped_disabled++;
+        return;
+    }
+    uint32_t phys = entry_pc & 0x1FFFFFFFu;
+    if (phys < 0x00010000u || phys >= 0x00200000u) return;
+
+    s_lsf_dispatch_entry = entry_pc;
+    s_lsf_entry = entry_pc;
+    s_lsf_frame = frame;
+    s_lsf_saw_irq = 0;
+    s_lsf_active = 1;
+    s_lsf_recording = 0;
+}
+
+void ls_func_exit(uint32_t entry_pc, CPUState *cpu, int handled) {
+    if (!s_lsf_active) return;
+    if (s_lsf_dispatch_entry != entry_pc) {
+        g_ls_mode = 0;
+        s_lsf_active = 0;
+        s_lsf_recording = 0;
+        s_lsf_div.skipped_conflict++;
+        return;
+    }
+    g_ls_mode = 0;
+    s_lsf_active = 0;
+    if (!s_lsf_recording) {
+        s_lsf_div.skipped_unhandled++;
+        return;
+    }
+    s_lsf_recording = 0;
+
+    if (!handled || !cpu) {
+        s_lsf_div.skipped_unhandled++;
+        return;
+    }
+    if (s_lsf_saw_irq) {
+        s_lsf_div.skipped_irq++;
+        return;
+    }
+    if (s_ls_overflow) {
+        s_lsf_div.skipped_overflow++;
+        return;
+    }
+    if (s_lsf_record_only) {
+        s_lsf_div.segments_checked++;
+        return;
+    }
+    lsf_replay_and_compare(cpu, s_lsf_frame, s_lsf_entry);
+}
+
 void ls_at_leader(uint32_t leader_phys, CPUState *cpu) {
+    if (s_lsf_active) {
+        if (!s_lsf_recording && cpu && !s_lsf_div.found && g_ls_mode == 0) {
+            s_lsf_R0 = *cpu;
+            s_lsf_entry = leader_phys | 0x80000000u;
+            s_ls_trace_n = 0;
+            s_ls_trace_idx = 0;
+            s_ls_overflow = 0;
+            s_ls_mismatch = 0;
+            s_ls_m_kind = 0;
+            s_lsf_recording = 1;
+            g_ls_mode = 1;
+        }
+        return;                           /* function-scope recording owns g_ls_mode */
+    }
     if (s_ls_frame_hi == 0 || s_ls_div.found || !cpu) return;
     if (g_ls_mode == 2) return;            /* re-entrancy guard (shouldn't happen) */
     uint32_t frame = (uint32_t)s_frame_count;
@@ -2326,6 +2780,41 @@ int ls_get_diverge_json(char *buf, int buflen) {
         p += snprintf(buf + p, buflen - p, "%s\"%c%d:%08X=%08X\"",
                       i ? "," : "", s_ls_div_trace[i].is_write ? 'W' : 'R',
                       s_ls_div_trace[i].size, s_ls_div_trace[i].addr, s_ls_div_trace[i].val);
+    }
+    p += snprintf(buf + p, buflen - p, "]}");
+    return p;
+}
+
+int ls_get_func_json(char *buf, int buflen) {
+    static const char *kn[] = {
+        "none","gpr","hi","lo","pc","write-val","read-addr","write-addr",
+        "trace-exhausted","trace-leftover","path-cap","unsupported"
+    };
+    int k = (s_lsf_div.kind >= 0 && s_lsf_div.kind <= 11) ? s_lsf_div.kind : 0;
+    int p = snprintf(buf, buflen,
+        "{\"found\":%d,\"kind\":\"%s\",\"frame\":%u,\"entry\":\"0x%08X\","
+        "\"pc\":\"0x%08X\",\"addr\":\"0x%08X\","
+        "\"interp_expected\":\"0x%08X\",\"compiled_actual\":\"0x%08X\","
+        "\"reg\":%d,\"segments_checked\":%llu,\"skipped_irq\":%llu,"
+        "\"skipped_overflow\":%llu,\"skipped_unhandled\":%llu,"
+        "\"skipped_conflict\":%llu,\"skipped_disabled\":%llu,"
+        "\"window\":[%u,%u],\"trace_ops\":%u,\"replay_ops\":%u,"
+        "\"steps\":%u,\"div_idx\":%d,\"trace\":[",
+        s_lsf_div.found, kn[k], s_lsf_div.frame, s_lsf_div.entry,
+        s_lsf_div.pc, s_lsf_div.addr, s_lsf_div.exp, s_lsf_div.act,
+        s_lsf_div.detail, (unsigned long long)s_lsf_div.segments_checked,
+        (unsigned long long)s_lsf_div.skipped_irq,
+        (unsigned long long)s_lsf_div.skipped_overflow,
+        (unsigned long long)s_lsf_div.skipped_unhandled,
+        (unsigned long long)s_lsf_div.skipped_conflict,
+        (unsigned long long)s_lsf_div.skipped_disabled,
+        s_lsf_frame_lo, s_lsf_frame_hi, s_lsf_div.trace_ops,
+        s_lsf_div.replay_ops, s_lsf_div.steps, s_lsf_div_idx);
+    for (int i = 0; i < s_lsf_div_trace_n && p < buflen - 48; i++) {
+        p += snprintf(buf + p, buflen - p, "%s\"%c%d:%08X=%08X\"",
+                      i ? "," : "", s_lsf_div_trace[i].is_write ? 'W' : 'R',
+                      s_lsf_div_trace[i].size, s_lsf_div_trace[i].addr,
+                      s_lsf_div_trace[i].val);
     }
     p += snprintf(buf + p, buflen - p, "]}");
     return p;

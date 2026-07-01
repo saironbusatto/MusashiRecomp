@@ -39,6 +39,7 @@
 #include "card_data_writes.h"
 #include "crash_trace.h"
 #include "gpu_gl_renderer.h"
+#include "lockstep.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -696,7 +697,10 @@ static uint32_t trace_read_word(CPUState *cpu, uint32_t addr)
     /* Use psx_read_word directly (NOT cpu->read_word): debug instrumentation
      * must not charge guest main-RAM read wait states, and runs on the IO
      * thread where psx_advance_cycles would race the emulation thread. */
-    return psx_read_word(addr);
+    ls_suppress_begin();
+    uint32_t v = psx_read_word(addr);
+    ls_suppress_end();
+    return v;
 }
 
 static uint32_t trace_read_half(CPUState *cpu, uint32_t addr)
@@ -707,7 +711,10 @@ static uint32_t trace_read_half(CPUState *cpu, uint32_t addr)
         (phys < 0x1F800000u || phys > 0x1F8003FEu)) {
         return 0;
     }
-    return psx_read_half(addr);
+    ls_suppress_begin();
+    uint32_t v = psx_read_half(addr);
+    ls_suppress_end();
+    return v;
 }
 
 static int sreg_trace_focus_func(uint32_t func)
@@ -1938,6 +1945,7 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
 #endif
 #ifndef PSX_NO_DEBUG_TOOLS
+    ls_suppress_begin();
     if (s_synth_recurse_armed) { s_synth_recurse_armed = 0; psx_synth_recurse(0); }
     /* cyc_watch: universal compiled-function-entry hook (game AND BIOS, incl.
      * relocated BIOS-shell funcs which dispatch oddly but still log their entry
@@ -1956,13 +1964,14 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     s_fn_direct_seen++;
     if (!debug_cpu_ptr) {
         s_fn_direct_no_cpu++;
+        ls_suppress_end();
         return;
     }
     card_mgr_trace_record(func_addr, 0);
     sreg_trace_record(func_addr);
     call_focus_record(func_addr);
-    if (!s_fn_entry) return;
-    if (!fn_trace_in_filter(func_addr)) return;
+    if (!s_fn_entry) { ls_suppress_end(); return; }
+    if (!fn_trace_in_filter(func_addr)) { ls_suppress_end(); return; }
     s_fn_direct_filtered++;
     FnEntryEntry *e = &s_fn_entry[s_fn_entry_seq % FN_TRACE_CAP];
     e->seq             = s_fn_entry_seq;
@@ -1981,6 +1990,7 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     e->depth           = (uint32_t)s_fn_stack_top;
     e->frame           = (uint32_t)s_frame_count;
     s_fn_entry_seq++;
+    ls_suppress_end();
 }
 
 /* Always-on A0/B0/C0 BIOS-call ring (ported from ape-fw for good-vs-bad
@@ -2161,6 +2171,7 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
     (void)func_addr;
     return;
 #endif
+    ls_suppress_begin();
     /* cyc_watch: compiled-dispatch path. func_addr is already the physical
      * (normalized) block leader. Sampled before the block runs. */
     cyc_watch_observe(func_addr & 0x1FFFFFFFu);
@@ -2243,6 +2254,7 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
     s_dispatch_ring[s_dispatch_seq % DISPATCH_TRACE_CAP] = func_addr;
     s_dispatch_seq++;
     dispatch_unique_add(func_addr);
+    ls_suppress_end();
 }
 
 static int json_get_int(const char *json, const char *key, int def);
@@ -10410,8 +10422,25 @@ static void handle_lockstep(int id, const char *json) {
     send_fmt("{\"id\":%d,\"ok\":true,\"lockstep\":%s}", id, buf);
 }
 
+static void handle_lockstep_func(int id, const char *json) {
+    /* Dispatch-segment lockstep comparator. Same arming shape as lockstep,
+     * but the measured unit is one clean psx_dispatch_game_compiled() segment. */
+    extern void ls_func_set_window(uint32_t, uint32_t);
+    extern void ls_func_set_record_only(int);
+    extern int  ls_get_func_json(char*, int);
+    int lo = json_get_int(json, "lo", -1);
+    int hi = json_get_int(json, "hi", -1);
+    int ro = json_get_int(json, "record_only", -1);
+    if (ro >= 0) ls_func_set_record_only(ro);
+    if (lo >= 0 && hi >= 0) ls_func_set_window((uint32_t)lo, (uint32_t)hi);
+    char buf[8192];
+    ls_get_func_json(buf, (int)sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,\"lockstep_func\":%s}", id, buf);
+}
+
 static const CmdEntry s_commands[] = {
     { "lockstep",          handle_lockstep },
+    { "lockstep_func",     handle_lockstep_func },
     { "ping",              handle_ping },
     { "parity_dump",       handle_parity_dump },
     { "parity_ctl",        handle_parity_ctl },

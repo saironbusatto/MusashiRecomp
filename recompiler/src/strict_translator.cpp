@@ -1281,8 +1281,13 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         }
         if (cop_op == 0x02) { // CFC2 — move from COP2 control register
             r.supported = true;
-            r.c_code = gte_read + emit_gpr_write(rt,
-                fmt::format("cpu->gte_ctrl[{}]", static_cast<int>(rd)));
+            if (rd == 26 || rd == 27 || rd == 29 || rd == 30 || rd == 31) {
+                r.c_code = gte_read + emit_gpr_write(rt,
+                    fmt::format("gte_read_ctrl(cpu, {})", static_cast<int>(rd)));
+            } else {
+                r.c_code = gte_read + emit_gpr_write(rt,
+                    fmt::format("cpu->gte_ctrl[{}]", static_cast<int>(rd)));
+            }
             r.comment = fmt::format("cfc2 {}, gte_ctrl[{}]", gpr_name(rt), rd);
             return r;
         }
@@ -1304,9 +1309,15 @@ TranslateResult StrictTranslator::translate(const PSXRecomp::DecodedInstruction&
         }
         if (cop_op == 0x06) { // CTC2 — move to COP2 control register
             r.supported = true;
-            r.c_code = gte_stall + fmt::format(
-                "cpu->gte_ctrl[{}] = cpu->gpr[{}];",
-                static_cast<int>(rd), static_cast<int>(rt));
+            if (rd == 26 || rd == 27 || rd == 29 || rd == 30 || rd == 31) {
+                r.c_code = gte_stall + fmt::format(
+                    "gte_write_ctrl(cpu, {}, cpu->gpr[{}]);",
+                    static_cast<int>(rd), static_cast<int>(rt));
+            } else {
+                r.c_code = gte_stall + fmt::format(
+                    "cpu->gte_ctrl[{}] = cpu->gpr[{}];",
+                    static_cast<int>(rd), static_cast<int>(rt));
+            }
             r.comment = fmt::format("ctc2 {}, gte_ctrl[{}]", gpr_name(rt), rd);
             return r;
         }
