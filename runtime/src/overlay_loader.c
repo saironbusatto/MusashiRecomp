@@ -660,6 +660,48 @@ static void scan_one_cache_dir(const char *dir) {
  * The sljit/<arch-abi>/ namespace is reserved (no on-disk blobs: sljit re-JITs
  * from the coverage manifest; see SLJIT.md §5.3). (Pre-1.0: no legacy fallback —
  * older flat / unversioned caches are simply ignored and regenerated.) */
+/* Hardening (never-again for the silent cg-tag read≠write drift): when the loader
+ * finds ZERO shards under its OWN cg-tag, check whether a SIBLING cg<...> folder in
+ * the same tier holds shards. If so, the autocompile wrote to a different codegen
+ * hash than this build reads — every overlay will silently fall to the interpreter
+ * ("why is it slow"). This is USUALLY a mismatched overlay_autocompile_cmd
+ * --recompiler / --runtime-include (e.g. a cross-build: runtime from one framework
+ * checkout, autocompile pointed at another). Shout it once, loudly, with both tags,
+ * so it can never again be diagnosed as generic slowness. */
+static void warn_on_cgtag_mismatch(const char *tier) {
+#ifdef _WIN32
+    char base[768], pattern[900];
+    snprintf(base, sizeof base, "%s/%s/%s/%s",
+             s_cache_dir, s_game_id, tier, PSX_OVERLAY_ARCH_ABI);
+    char expect[64];
+    snprintf(expect, sizeof expect, "cg%d_%08x",
+             PSX_OVERLAY_CODEGEN_VER, (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+    snprintf(pattern, sizeof pattern, "%s/cg*", base);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (strcmp(fd.cFileName, expect) == 0) continue;     /* our own tag */
+        char dllpat[900]; WIN32_FIND_DATAA fd2;
+        snprintf(dllpat, sizeof dllpat, "%s/%s/*_*.dll", base, fd.cFileName);
+        HANDLE h2 = FindFirstFileA(dllpat, &fd2);
+        if (h2 != INVALID_HANDLE_VALUE) {          /* sibling tag HAS shards */
+            FindClose(h2);
+            loader_log("*** OVERLAY CACHE HASH MISMATCH: this build reads %s/%s but "
+                       "shards exist under %s/%s. The autocompile is writing to a "
+                       "DIFFERENT codegen hash than this runtime reads -> ALL overlays "
+                       "run INTERPRETED (slow). Fix overlay_autocompile_cmd's "
+                       "--recompiler/--runtime-include to match THIS build's framework.",
+                       tier, expect, tier, fd.cFileName);
+        }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    (void)tier;
+#endif
+}
+
 static void scan_cache_dir(void) {
     char dir[768];
     /* Tier order: scan gcc/ FIRST (highest native priority — the dev/production
@@ -674,6 +716,12 @@ static void scan_cache_dir(void) {
              s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
              (unsigned)PSX_OVERLAY_CODEGEN_HASH);
     scan_one_cache_dir(dir);
+
+    /* Never-again guard: if we loaded NOTHING but wrong-hash shards exist, shout. */
+    if (s_cache_idx_count == 0) {
+        warn_on_cgtag_mismatch("gcc");
+        warn_on_cgtag_mismatch("tcc");
+    }
 }
 
 /* ---- Persisted sljit shard cache (Stage 2, SLJIT_PERSIST_CACHE.md) -------- */
@@ -1029,6 +1077,35 @@ static void init_callbacks(void) {
         s_callbacks.ws_x_margin      = psx_ws_x_margin;
         s_callbacks.ws_sprite_tag    = psx_ws_sprite_tag;
         s_callbacks.ws_backdrop_value = psx_ws_backdrop_value;
+    }
+    /* Faithful-timing functions (ABI v9): overlay code built with
+     * PSX_ENABLE_BLOCK_CYCLES emits these; forward to the runtime's real impls so
+     * native overlays charge cycles on the SAME timeline as the interp/BIOS. */
+    {
+        extern uint32_t psx_cyc_load_word(CPUState*, uint32_t, uint32_t, uint32_t);
+        extern uint16_t psx_cyc_load_half(CPUState*, uint32_t, uint32_t, uint32_t);
+        extern uint8_t  psx_cyc_load_byte(CPUState*, uint32_t, uint32_t, uint32_t);
+        extern uint32_t psx_cyc_lwc2_read(CPUState*, uint32_t);
+        extern void     psx_icache_fetch(CPUState*, uint32_t);
+        extern void     psx_muldiv_set(CPUState*, uint32_t);
+        extern void     psx_muldiv_stall(CPUState*);
+        extern uint32_t psx_mult_latency_s(uint32_t);
+        extern uint32_t psx_mult_latency_u(uint32_t);
+        extern void     psx_gte_stall(CPUState*);
+        extern void     psx_gte_read(CPUState*, uint32_t);
+        extern int      psx_slice_block(CPUState*, uint32_t, uint32_t, int);
+        s_callbacks.cyc_load_word  = psx_cyc_load_word;
+        s_callbacks.cyc_load_half  = psx_cyc_load_half;
+        s_callbacks.cyc_load_byte  = psx_cyc_load_byte;
+        s_callbacks.cyc_lwc2_read  = psx_cyc_lwc2_read;
+        s_callbacks.icache_fetch   = psx_icache_fetch;
+        s_callbacks.muldiv_set     = psx_muldiv_set;
+        s_callbacks.muldiv_stall   = psx_muldiv_stall;
+        s_callbacks.mult_latency_s = psx_mult_latency_s;
+        s_callbacks.mult_latency_u = psx_mult_latency_u;
+        s_callbacks.gte_stall      = psx_gte_stall;
+        s_callbacks.gte_read       = psx_gte_read;
+        s_callbacks.slice_block    = psx_slice_block;
     }
 }
 

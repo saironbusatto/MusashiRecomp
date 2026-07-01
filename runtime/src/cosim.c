@@ -38,6 +38,11 @@ typedef int sock_t;
 extern uint32_t i_stat, i_mask;
 extern uint64_t psx_cycle_count;
 
+/* EXPERIMENTAL input-driven cosim: held pad state applied every frame by the headless
+ * sampler (main.cpp). 0xFFFF = all released (PSX pad active-low). Set via `setpad`.
+ * If two instances desync under input, this path is proven nondeterministic. */
+volatile int g_cosim_pad_hold[2] = { 0xFFFF, 0xFFFF };
+
 #define RING_N 8192u   /* bounded reporting window (power of two) */
 typedef struct { uint64_t cp; uint32_t pc; uint64_t hash; uint32_t istat, imask; uint64_t cycle; } Entry;
 static Entry    g_ring[RING_N];
@@ -335,6 +340,17 @@ static void handle_line(sock_t s, char *line) {
         char big[32768];
         interrupts_cosim_irq_dump(big, (int)sizeof big);
         send_line(s, big); return;
+    }
+    if (!strcmp(cmd, "setpad")) {
+        /* EXPERIMENTAL input-driven cosim: set the HELD pad state (applied every frame).
+         * Coordinator issues the SAME value to both instances while parked at a
+         * checkpoint, so input reaches both at the same guest cycle. `setpad <slot> <hex>`
+         * (slot 0/1; 0xFFFF = released, active-low). Desync under this => nondeterministic. */
+        unsigned slot = 0, val = 0xFFFFu;
+        if (sscanf(line, "%*s %u %x", &slot, &val) >= 1 && slot < 2) {
+            g_cosim_pad_hold[slot] = (int)(val & 0xFFFFu); send_line(s, "ok\n"); return;
+        }
+        send_line(s, "err setpad\n"); return;
     }
     if (!strcmp(cmd, "reset")) { cosim_state_reset(); send_line(s, "ok\n"); return; }
     send_line(s, "err unknown\n");

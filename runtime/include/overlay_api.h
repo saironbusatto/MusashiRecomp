@@ -35,8 +35,11 @@
  *       PSX_ENABLE_BLOCK_CYCLES and charge the shared host cycle/timer timeline.
  *       Bumping rejects stale DLLs that charged no cycles (Tomba2 Timer1 fork). */
 /*   v8: check_interrupts_at callback added so generated native overlay block
- *       checks can provide the real guest resume PC for async RFE recovery. */
-#define PSX_OVERLAY_ABI_VERSION 8
+ *       checks can provide the real guest resume PC for async RFE recovery.
+ *   v9: faithful-timing callbacks (cyc_load, icache_fetch, muldiv, mult_latency,
+ *       gte, slice_block) so overlay code built with PSX_ENABLE_BLOCK_CYCLES links
+ *       against the runtime's real timing impls (the cycle-accuracy rearchitecture). */
+#define PSX_OVERLAY_ABI_VERSION 9
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -156,6 +159,25 @@ typedef struct {
      * sanctioned dirty-RAM interpreter. Appended LAST (struct grows back-
      * compatibly); may be NULL on a host that predates it. */
     void (*psx_native_bad_entry)(CPUState *cpu, uint32_t owner, uint32_t pc);
+    /* Faithful-timing functions (ABI v9). The cycle-accuracy + due-cycle-scheduler
+     * rearchitecture made the recompiler emit these into OVERLAY code too (block-cycle
+     * mode). They touch shared runtime state (guest RAM, the global cycle counter, the
+     * I-cache tag array, the mul/div & GTE completion deadlines, the precise-slice
+     * interp), so the DLL MUST forward them to the runtime — a local copy would diverge
+     * from the interp/BIOS timeline (the exact class the cosim guards). Appended LAST
+     * (struct grows back-compatibly); the ABI bump to 9 rejects any pre-timing cache. */
+    uint32_t (*cyc_load_word)(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
+    uint16_t (*cyc_load_half)(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
+    uint8_t  (*cyc_load_byte)(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask);
+    uint32_t (*cyc_lwc2_read)(CPUState *cpu, uint32_t addr);
+    void     (*icache_fetch)(CPUState *cpu, uint32_t addr);
+    void     (*muldiv_set)(CPUState *cpu, uint32_t latency);
+    void     (*muldiv_stall)(CPUState *cpu);
+    uint32_t (*mult_latency_s)(uint32_t rs);
+    uint32_t (*mult_latency_u)(uint32_t rs);
+    void     (*gte_stall)(CPUState *cpu);
+    void     (*gte_read)(CPUState *cpu, uint32_t rt);
+    int      (*slice_block)(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
 } OverlayCallbacks;
 
 #ifdef __cplusplus
