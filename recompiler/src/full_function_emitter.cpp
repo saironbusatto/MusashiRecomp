@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <set>
@@ -15,8 +16,19 @@
 #include "fmt/format.h"
 #include "mips_decoder.h"
 #include "strict_translator.h"
+#include "../../runtime/include/psx_instr_cost.h"  /* single-source CPU cycle cost (shared with interp + game emitter) */
 
 namespace PSXRecompV4 {
+
+// Per-instruction cycle charging (mirrors code_generator.cpp). DEFAULT ON for
+// the faithful-timing branch so the running cycle count is accurate mid-block —
+// required for the mult/div completion-stall (mflo/mfhi wait for muldiv_ts_done)
+// to absorb correctly. Set PSX_CODEGEN_CYCLE_PER_INSN=0 to force block-up-front.
+static bool bios_cycle_per_insn() {
+    const char* e = std::getenv("PSX_CODEGEN_CYCLE_PER_INSN");
+    if (e != nullptr && e[0] != '\0') return e[0] != '0';
+    return true;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -44,6 +56,21 @@ static uint32_t ram_alias_to_rom(uint32_t addr) {
         return 0xBFC18000u + (phys - 0x00030000u);
     }
     return addr;
+}
+
+/* Map a BIOS ROM PC to the address the PSX CPU actually executes from after the
+ * BIOS copies kernel/shell code into RAM. Literal interrupt resume PCs must use
+ * this runtime address; otherwise psx_check_interrupts rejects ROM-shell EPCs
+ * and falls back to the legacy sentinel path. */
+static uint32_t bios_runtime_pc(uint32_t rom_pc) {
+    uint32_t phys = rom_pc & 0x1FFFFFFFu;
+    if (phys >= 0x1FC18000u && phys <= 0x1FC42FFFu) {
+        return 0x80030000u + (phys - 0x1FC18000u);
+    }
+    if (phys >= 0x1FC10000u && phys <= 0x1FC17FFFu) {
+        return phys - 0x1FC10000u + 0x00000500u;
+    }
+    return rom_pc;
 }
 
 uint32_t FullFunctionEmitter::read_u32_le(const std::vector<uint8_t>& rom, uint32_t offset) {
@@ -105,6 +132,19 @@ bool FullFunctionEmitter::emit_function(
         const char* e = std::getenv("PSX_CPS");
         return e == nullptr || e[0] != '0';
     }();
+    auto emit_irq_check = [](uint32_t resume_pc, const std::string& indent = "    ") {
+        return indent + fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n",
+                                    bios_runtime_pc(resume_pc));
+    };
+    auto emit_irq_check_expr = [](const std::string& resume_pc_expr,
+                                  const std::string& indent = "    ") {
+        return indent + fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+    };
+    auto emit_cosim_instr = [](uint32_t pc, const std::string& indent = "    ") {
+        return "#ifdef PSX_COSIM\n" + indent +
+               fmt::format("cosim_instr(0x{:08X}u);\n", bios_runtime_pc(pc)) +
+               "#endif\n";
+    };
 
     // Build sorted instruction list and a set for O(1) membership test.
     // sfr.instructions is already sorted by address.
@@ -251,19 +291,7 @@ bool FullFunctionEmitter::emit_function(
      * Without this, handler/callback tables get ROM addresses instead of
      * RAM addresses, breaking pointer comparisons in the BIOS. */
     auto relocate_ra = [](uint32_t rom_ra) -> uint32_t {
-        uint32_t phys = rom_ra & 0x1FFFFFFFu;
-        /* Shell relocation upper bound matches the runtime dispatcher's
-         * normalize() in SCPH1001_dispatch.c: shell covers RAM 0x30000-0x5AFFF
-         * (= ROM 0x1FC18000-0x1FC42FFF inclusive). Previously this was
-         * 0x1FC427FF, which left BFC42800-BFC42FFF JAL targets un-relocated
-         * (target kept ROM PC[31:28]=0xB instead of RAM PC[31:28]=0x8). */
-        if (phys >= 0x1FC18000u && phys <= 0x1FC42FFFu) {
-            return 0x80030000u + (phys - 0x1FC18000u);
-        }
-        if (phys >= 0x1FC10000u && phys <= 0x1FC17FFFu) {
-            return phys - 0x1FC10000u + 0x00000500u;
-        }
-        return rom_ra;
+        return bios_runtime_pc(rom_ra);
     };
 
     // First pass: identify terminators and their delay slots.
@@ -310,7 +338,11 @@ bool FullFunctionEmitter::emit_function(
         uint32_t count = 0;
         auto walker = it;
         while (walker != addr_to_raw.end()) {
-            count++;
+            /* Single-source per-instruction cost (psx_instr_cost.h), summed over
+             * the block — identical for all backends. Identity (1/insn) today, so
+             * this equals the old instruction count; Stage-2 real costs land in
+             * that one function and every backend updates together. */
+            count += psx_instr_base_cycles(walker->second);
             ++walker;
             if (walker == addr_to_raw.end()) break;
             if (block_leaders.count(walker->first)) break;
@@ -350,6 +382,41 @@ bool FullFunctionEmitter::emit_function(
         }
     };
 
+    const bool per_insn_cycles = bios_cycle_per_insn();
+
+    // Per-instruction R3000A load-delay interlock (cycle_per_insn mode): §1 base +
+    // GPR_DEPRES + DO_LDS for one instruction, emitted BEFORE its body so §1 precedes
+    // any muldiv/GTE deadline stall (Beetle order). CPU loads (op 0x20-0x26) are
+    // SKIPPED — psx_cyc_load_* runs their full interlock inside the body. The dep/res
+    // mask is a gen-time literal. Replaces the old flat per-instruction +1.
+    auto emit_insn_interlock = [&](uint32_t w) {
+        if (!per_insn_cycles) return;
+        uint32_t op = w >> 26;
+        if (op >= 0x20u && op <= 0x26u) return;   // CPU load: interlock inside psx_cyc_load_*
+        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_cyc_step(cpu, 0x{:X}u);\n#endif\n",
+                           psx_cyc_dep_res_mask(w));
+    };
+
+    // I-cache FETCH cost (faithful R3000A), emitted BEFORE the per-instruction
+    // interlock/load — like Beetle ReadInstruction precedes the base, so a fetch MISS
+    // clears any pending load give-back before the next load arms one. Only emitted at
+    // cache-line LEADERS: a block leader (any branch/dispatch entry — a possibly-cold
+    // cache entry; cross-function targets are inserted into block_leaders above) OR a
+    // 16-byte-line start (addr&0xC==0, a sequential line crossing). Intra-line followers
+    // reached by fall-through are guaranteed hits (the leader refilled the line to its
+    // end) → no call (+0). `rom_addr` is the ROM/compile-time address; relocate_ra maps
+    // it to the RUNTIME guest PC the CPU actually fetches from (BIOS main stays in-place
+    // KSEG1 0xBFC..; relocated kernel Part 2 → 0x500+, shell → 0x80030000+), so the
+    // shared I-cache evolves identically to the dirty-RAM interp (cpu->pc) and Beetle —
+    // and the KSEG1 uncached test (>=0xA0000000) sees the true virtual address. The
+    // relocation preserves bits[3:0], so the line-leader test is space-independent.
+    auto emit_icache_fetch = [&](uint32_t rom_addr) {
+        if (!per_insn_cycles) return;
+        if (!(block_leaders.count(rom_addr) || (rom_addr & 0xCu) == 0)) return;
+        out += fmt::format("#ifdef PSX_ENABLE_BLOCK_CYCLES\n    psx_icache_fetch(cpu, 0x{:08X}u);\n#endif\n",
+                           relocate_ra(rom_addr));
+    };
+
     for (auto it = addr_to_raw.begin(); it != addr_to_raw.end(); ++it) {
         uint32_t addr = it->first;
         uint32_t raw = it->second;
@@ -359,21 +426,50 @@ bool FullFunctionEmitter::emit_function(
         // can service vblank and other hardware interrupts.
         if (block_leaders.count(addr)) {
             out += fmt::format("label_{:08X}:\n", addr);
+            // Per-block-leader cycle observe (cyc_watch ruler). Sampled BEFORE
+            // this block's cycle advance, so it reports cumulative cycles for
+            // all PRIOR blocks — matching Beetle's before-instruction sample
+            // and the cycle_compare.py anchor semantics. Debug-only: prod
+            // (PSX_NO_DEBUG_TOOLS) emits nothing → zero overhead.
+            out += "#ifndef PSX_NO_DEBUG_TOOLS\n";
+            // Use the NORMALIZED (runtime) phys so anchors match the address
+            // space the entry hook + cyc_watch use — relocated kernel funcs
+            // (ROM 0x1FC10000+) run at RAM 0x500+, so the raw ROM addr would
+            // never match a RAM anchor.
+            out += fmt::format("    debug_server_cyc_observe(0x{:08X}u);\n",
+                               normalize_address(addr));
+            out += "#endif\n";
+            // First-divergence co-sim oracle (COSIM_ORACLE.md): lean block-leader hook.
+            out += "#ifdef PSX_COSIM\n";
+            out += fmt::format("    cosim_block(0x{:08X}u);\n", normalize_address(addr));
+            out += "#endif\n";
             // Phase 1.0e-d: advance guest cycles for this block. Macro-
             // gated; when off, generated code matches pre-1.0e-d output.
-            uint32_t bcyc = 0;
-            auto bcit = block_cycles.find(addr);
-            if (bcit != block_cycles.end()) bcyc = bcit->second;
-            if (bcyc > 0) {
-                out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
-                out += fmt::format("    psx_advance_cycles({}u);\n", bcyc);
-                out += "#endif\n";
+            // In per-instruction mode the charge is emitted per instruction
+            // below (so muldiv/GTE stalls absorb correctly), NOT block-up-front.
+            if (!per_insn_cycles) {
+                uint32_t bcyc = 0;
+                auto bcit = block_cycles.find(addr);
+                if (bcit != block_cycles.end()) bcyc = bcit->second;
+                if (bcyc > 0) {
+                    out += "#ifdef PSX_ENABLE_BLOCK_CYCLES\n";
+                    out += fmt::format("    psx_advance_cycles({}u);\n", bcyc);
+                    out += "#endif\n";
+                }
             }
-            out += "    psx_check_interrupts(cpu);\n";
             if (should_probe_pc(addr)) {
                 out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n", addr);
             }
         }
+
+        // Per-instruction cycle charge (faithful-timing mode). Emitted for EVERY
+        // in-function instruction (terminators, non-terminators, in-block delay
+        // slots are all separate addr_to_raw entries) in execution order, so the
+        // running cycle count is exact at MULT/DIV/MFLO/MFHI (and later GTE) for
+        // the completion-stall to absorb correctly. Orphaned (out-of-function)
+        // delay slots are inlined elsewhere and charged at those sites.
+        emit_icache_fetch(addr);
+        emit_insn_interlock(raw);
 
         // Decode and translate.
         PSXRecomp::DecodedInstruction d = PSXRecomp::MipsDecoder::decode(raw, addr);
@@ -391,6 +487,16 @@ bool FullFunctionEmitter::emit_function(
             out += fmt::format("    /* 0x{:08X}: {:08X}  {} */\n", addr, raw, tr.comment);
 
             const std::string kind = tr.terminator_kind ? tr.terminator_kind : "";
+            if (kind == "jal") {
+                out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;  /* jal link before delay slot */\n",
+                                   relocate_ra(addr + 8));
+            } else if (kind == "jalr") {
+                uint8_t rd = (raw >> 11) & 0x1F;
+                if (rd != 0) {
+                    out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;  /* jalr link before delay slot */\n",
+                                       static_cast<int>(rd), relocate_ra(addr + 8));
+                }
+            }
 
             if (is_branch_kind(tr.terminator_kind)) {
                 // Emit pre-delay snapshot using a unique flag.
@@ -423,16 +529,25 @@ bool FullFunctionEmitter::emit_function(
                         // Emit RFE SR pop without return.
                         out += "    { uint32_t sr = cpu->cop0[12]; "
                                "cpu->cop0[12] = (sr & 0xFFFFFFC0u) | ((sr >> 2) & 0x0Fu); } /* rfe */\n";
+                        // Fix B: arm the host exception-return escape (the jr below sets
+                        // cpu->pc = real EPC; the trampoline's psx_rfe_escape_check then
+                        // unwinds to psx_check_interrupts iff we're in the synchronous
+                        // handler — a fiber/thread resume just dispatches the real EPC).
+                        out += "    psx_rfe_mark_escape();\n";
                         // Emit JR resolution.
                         uint8_t rs = (pb.raw >> 21) & 0x1F;
                         if (rs == 31) {
                             if (ra_loaded_from_non_sp)
-                                out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
+                                out += emit_irq_check_expr("cpu->gpr[31]") +
+                                       "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
                             else if (cps)
-                                out += "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra */\n";
+                                out += emit_irq_check_expr("cpu->gpr[31]") +
+                                       "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra */\n";
                             else
-                                out += "    return;\n";
+                                out += emit_irq_check_expr("cpu->gpr[31]") +
+                                       "    return;\n";
                         } else {
+                            out += emit_irq_check_expr(fmt::format("cpu->gpr[{}]", static_cast<int>(rs)));
                             out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
                                                static_cast<int>(rs));
                         }
@@ -466,12 +581,16 @@ bool FullFunctionEmitter::emit_function(
                     uint8_t rs = (raw >> 21) & 0x1F;
                     if (rs == 31) {
                         if (ra_loaded_from_non_sp)
-                            out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
+                            out += emit_irq_check_expr("cpu->gpr[31]") +
+                                   "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
                         else if (cps)
-                            out += "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra */\n";
+                            out += emit_irq_check_expr("cpu->gpr[31]") +
+                                   "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra */\n";
                         else
-                            out += "    return;\n";
+                            out += emit_irq_check_expr("cpu->gpr[31]") +
+                                   "    return;\n";
                     } else {
+                        out += emit_irq_check_expr(fmt::format("cpu->gpr[{}]", static_cast<int>(rs)));
                         out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
                                            static_cast<int>(rs));
                     }
@@ -488,20 +607,28 @@ bool FullFunctionEmitter::emit_function(
                         if (ds_tr.supported && !ds_tr.is_terminator) {
                             out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
                                                ds_addr, ds_raw, ds_tr.comment);
+                            // Orphaned delay slot is inlined here (not an addr_to_raw
+                            // entry), so charge its interlock directly, BEFORE its body
+                            // (block mode already counts it in the owning block_cycles).
+                            emit_icache_fetch(ds_addr);
+                            emit_insn_interlock(ds_raw);
                             out += fmt::format("    {}\n", ds_tr.c_code);
                         }
                     }
                     // Resolve branch.  Target was decoded as absolute virtual addr.
                     uint32_t target = tr.terminator_target;
                     register_cross_function_target(target);
-                    out += fmt::format("    if (psx_taken_{:08X}) {{ cpu->pc = 0x{:08X}u; return; }}\n",
-                                       addr, target);
+                    out += fmt::format("    if (psx_taken_{:08X}) {{\n", addr);
+                    out += emit_irq_check(target, "        ");
+                    out += fmt::format("        cpu->pc = 0x{:08X}u; return;\n", target);
+                    out += "    }\n";
                     // Not-taken: dispatch to delay-slot address (next function's entry).
                     // The next function's prologue will re-execute the delay slot — that's
                     // a duplicate side effect we accept for correctness on the not-taken
                     // path. (For unconditional branches like beq $zero,$zero this path
                     // is structurally dead.)
                     register_cross_function_target(ds_addr);
+                    out += emit_irq_check(ds_addr);
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", ds_addr);
                 } else if (kind == "j") {
                     // Inline orphaned delay slot, then unconditional jump.
@@ -516,11 +643,17 @@ bool FullFunctionEmitter::emit_function(
                         if (ds_tr.supported && !ds_tr.is_terminator) {
                             out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
                                                ds_addr, ds_raw, ds_tr.comment);
+                            // Orphaned delay slot is inlined here (not an addr_to_raw
+                            // entry), so charge its interlock directly, BEFORE its body
+                            // (block mode already counts it in the owning block_cycles).
+                            emit_icache_fetch(ds_addr);
+                            emit_insn_interlock(ds_raw);
                             out += fmt::format("    {}\n", ds_tr.c_code);
                         }
                     }
                     uint32_t target = relocate_j_target(addr, tr.terminator_target);
                     register_cross_function_target(target);
+                    out += emit_irq_check(target);
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", target);
                 } else if (kind == "jal") {
                     // Inline orphaned delay slot, set $ra, dispatch to target.
@@ -535,6 +668,11 @@ bool FullFunctionEmitter::emit_function(
                         if (ds_tr.supported && !ds_tr.is_terminator) {
                             out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
                                                ds_addr, ds_raw, ds_tr.comment);
+                            // Orphaned delay slot is inlined here (not an addr_to_raw
+                            // entry), so charge its interlock directly, BEFORE its body
+                            // (block mode already counts it in the owning block_cycles).
+                            emit_icache_fetch(ds_addr);
+                            emit_insn_interlock(ds_raw);
                             out += fmt::format("    {}\n", ds_tr.c_code);
                         }
                     }
@@ -549,10 +687,12 @@ bool FullFunctionEmitter::emit_function(
                             register_cross_function_target(addr + 8);
                         }
                         out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
+                        out += emit_irq_check(target);
                         out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", target);
                     } else {
                         out += "    { uint32_t _csp = cpu->gpr[29];\n";
                         out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
+                        out += emit_irq_check(target);
                         out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
                         out += fmt::format("    if (psx_call_contract(cpu, 0x{:08X}u, _csp)) return; }}\n",
                                            return_addr);
@@ -570,6 +710,11 @@ bool FullFunctionEmitter::emit_function(
                         if (ds_tr.supported && !ds_tr.is_terminator) {
                             out += fmt::format("    /* DELAY (orphaned) 0x{:08X}: {:08X}  {} */\n",
                                                ds_addr, ds_raw, ds_tr.comment);
+                            // Orphaned delay slot is inlined here (not an addr_to_raw
+                            // entry), so charge its interlock directly, BEFORE its body
+                            // (block mode already counts it in the owning block_cycles).
+                            emit_icache_fetch(ds_addr);
+                            emit_insn_interlock(ds_raw);
                             out += fmt::format("    {}\n", ds_tr.c_code);
                         }
                     }
@@ -590,6 +735,7 @@ bool FullFunctionEmitter::emit_function(
                             out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
                                                static_cast<int>(rd), return_addr);
                         }
+                        out += emit_irq_check_expr("_t");
                         out += "    cpu->pc = _t; return; }\n";
                     } else {
                         out += "    { uint32_t _csp = cpu->gpr[29];\n";
@@ -597,6 +743,7 @@ bool FullFunctionEmitter::emit_function(
                             out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
                                                static_cast<int>(rd), return_addr);
                         }
+                        out += emit_irq_check_expr(fmt::format("cpu->gpr[{}]", static_cast<int>(rs)));
                         out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
                                            static_cast<int>(rs));
                         if (rd == 31) {
@@ -666,14 +813,16 @@ bool FullFunctionEmitter::emit_function(
                 "     * After the stub's jalr returns, ra=RAM 0x{:08X} routes\n"
                 "     * back here as a registered continuation target. */\n"
                 "    if (cpu->read_word(0x{:08X}u) != 0u) {{\n"
+                "        psx_check_interrupts_at(cpu, 0x{:08X}u);\n"
                 "        cpu->pc = 0x{:08X}u; return;\n"
                 "    }}\n",
-                addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc);
+                addr, ram_pc, ram_pc + 0x10u, ram_pc, ram_pc, ram_pc);
         }
 
         // Non-terminator: emit normally.
         out += fmt::format("    /* 0x{:08X}: {:08X}  {} */\n", addr, raw, tr.comment);
         out += fmt::format("    {}\n", tr.c_code);
+        out += emit_cosim_instr(addr);
 
         // Check if this instruction is a delay slot with pending resolution.
         if (pending_at.count(addr)) {
@@ -685,27 +834,35 @@ bool FullFunctionEmitter::emit_function(
             if (is_branch_kind(kind.c_str())) {
                 // Conditional branch resolution.
                 uint32_t target = pb.target;
+                uint32_t fallthrough = pb.terminator_addr + 8;
                 bool target_in_function = addr_to_raw.count(target) != 0;
                 if (target_in_function) {
-                    out += fmt::format("    if (psx_taken_{:08X}) goto label_{:08X};\n",
-                                       pb.terminator_addr, target);
+                    out += fmt::format("    if (psx_taken_{:08X}) {{\n", pb.terminator_addr);
+                    out += emit_irq_check(target, "        ");
+                    out += fmt::format("        goto label_{:08X};\n", target);
+                    out += "    }\n";
                 } else {
                     // Tail call: set cpu->pc and return; dispatch loop re-dispatches.
                     // Register the cross-function target as a continuation so
                     // the dispatch table can route to it (otherwise mid-function
                     // targets miss the table — root cause of card-read failure).
                     register_cross_function_target(target);
-                    out += fmt::format("    if (psx_taken_{:08X}) {{ cpu->pc = 0x{:08X}u; return; }}\n",
-                                       pb.terminator_addr, target);
+                    out += fmt::format("    if (psx_taken_{:08X}) {{\n", pb.terminator_addr);
+                    out += emit_irq_check(target, "        ");
+                    out += fmt::format("        cpu->pc = 0x{:08X}u; return;\n", target);
+                    out += "    }\n";
                 }
+                out += emit_irq_check(fallthrough);
             } else if (kind == "j") {
                 uint32_t target = pb.target;
                 bool target_in_function = addr_to_raw.count(target) != 0;
                 if (target_in_function) {
+                    out += emit_irq_check(target);
                     out += fmt::format("    goto label_{:08X};\n", target);
                 } else {
                     // Tail call: set cpu->pc and return; dispatch loop re-dispatches.
                     register_cross_function_target(target);
+                    out += emit_irq_check(target);
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", target);
                 }
             } else if (kind == "jal") {
@@ -734,6 +891,7 @@ bool FullFunctionEmitter::emit_function(
                                            pb.terminator_addr);
                     }
                     out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;\n", return_addr);
+                    out += emit_irq_check(target);
                     out += fmt::format("    cpu->pc = 0x{:08X}u; return;\n", target);
                 } else {
                     out += "    { uint32_t _csp = cpu->gpr[29];\n";
@@ -743,6 +901,7 @@ bool FullFunctionEmitter::emit_function(
                         out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
                                            pb.terminator_addr);
                     }
+                    out += emit_irq_check(target);
                     out += fmt::format("    psx_dispatch(cpu, 0x{:08X}u);\n", target);
                     if (target == 0x00006380u) {
                         out += fmt::format("    debug_server_log_probe(0x{:08X}u, cpu);\n",
@@ -778,6 +937,7 @@ bool FullFunctionEmitter::emit_function(
                         out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
                                            static_cast<int>(rd), return_addr);
                     }
+                    out += emit_irq_check_expr("_t");
                     out += "    cpu->pc = _t; return; }\n";
                 } else {
                     out += "    { uint32_t _csp = cpu->gpr[29];\n";
@@ -785,6 +945,7 @@ bool FullFunctionEmitter::emit_function(
                         out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;\n",
                                            static_cast<int>(rd), return_addr);
                     }
+                    out += emit_irq_check_expr(fmt::format("cpu->gpr[{}]", static_cast<int>(rs)));
                     out += fmt::format("    psx_dispatch(cpu, cpu->gpr[{}]);\n",
                                        static_cast<int>(rs));
                     if (rd == 31) {
@@ -803,11 +964,14 @@ bool FullFunctionEmitter::emit_function(
                 uint8_t rs = (pb.raw >> 21) & 0x1F;
                 if (rs == 31) {
                     if (ra_loaded_from_non_sp)
-                        out += "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
+                        out += emit_irq_check_expr("cpu->gpr[31]") +
+                               "    cpu->pc = cpu->gpr[31]; psx_restore_state_escape(); return;  /* longjmp-return */\n";
                     else if (cps)
-                        out += "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra for trampoline dispatch */\n";
+                        out += emit_irq_check_expr("cpu->gpr[31]") +
+                               "    cpu->pc = cpu->gpr[31]; return;  /* CPS: publish $ra for trampoline dispatch */\n";
                     else
-                        out += "    return;\n";
+                        out += emit_irq_check_expr("cpu->gpr[31]") +
+                               "    return;\n";
                 } else {
                     // Attempt jump table resolution: scan backward from the
                     // jr instruction to find SLTIU/SLL/LUI/ADDU/LW pattern.
@@ -884,10 +1048,14 @@ bool FullFunctionEmitter::emit_function(
                                 out += fmt::format("    switch (cpu->gpr[{}]) {{\n",
                                                    static_cast<int>(jr_rs));
                                 for (auto& [rt, rom_t] : targets) {
-                                    out += fmt::format("        case 0x{:08X}u: goto label_{:08X};\n",
-                                                       rt, rom_t);
+                                    out += fmt::format("        case 0x{:08X}u:\n", rt);
+                                    out += emit_irq_check(rom_t, "            ");
+                                    out += fmt::format("            goto label_{:08X};\n", rom_t);
                                 }
-                                out += fmt::format("        default: cpu->pc = cpu->gpr[{}]; return;\n",
+                                out += "        default:\n";
+                                out += emit_irq_check_expr(fmt::format("cpu->gpr[{}]", static_cast<int>(jr_rs)),
+                                                           "            ");
+                                out += fmt::format("            cpu->pc = cpu->gpr[{}]; return;\n",
                                                    static_cast<int>(jr_rs));
                                 out += "    }\n";
                                 emitted_switch = true;
@@ -896,6 +1064,7 @@ bool FullFunctionEmitter::emit_function(
                     }
                     if (!emitted_switch) {
                         // Tail call: set cpu->pc and return; dispatch loop re-dispatches.
+                        out += emit_irq_check_expr(fmt::format("cpu->gpr[{}]", static_cast<int>(rs)));
                         out += fmt::format("    cpu->pc = cpu->gpr[{}]; return;\n",
                                            static_cast<int>(rs));
                     }
@@ -933,6 +1102,7 @@ bool FullFunctionEmitter::emit_function(
         if (!has_control_flow) {
             // Fallthrough tail call: set cpu->pc and return; dispatch loop re-dispatches.
             uint32_t next_addr = last_addr + 4;
+            out += emit_irq_check(next_addr);
             out += fmt::format("    cpu->pc = 0x{:08X}u; return;  /* fallthrough */\n", next_addr);
         }
     }
@@ -1041,6 +1211,7 @@ void FullFunctionEmitter::emit_dispatch(
     // Extern declarations for runtime-provided functions.
     out += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
     out += "extern void psx_check_interrupts(CPUState* cpu);\n";
+    out += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     out += "extern void psx_restore_state_escape(void);\n";
     out += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     out += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
@@ -1210,6 +1381,14 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern uint64_t g_dispatch_static_hits;\n";
     out += "\n";
     out += "int g_psx_dispatch_depth = 0;\n\n";
+    out += "static void psx_dispatch_check_return_boundary(CPUState* cpu, uint32_t stop_addr) {\n";
+    out += "    if (stop_addr != 0u) {\n";
+    out += "        psx_check_interrupts_at(cpu, stop_addr);\n";
+    out += "        if (((cpu->pc ^ stop_addr) & 0x1FFFFFFFu) == 0) cpu->pc = 0;\n";
+    out += "    } else {\n";
+    out += "        psx_check_interrupts(cpu);\n";
+    out += "    }\n";
+    out += "}\n\n";
     out += "static void psx_dispatch_impl(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {\n";
     out += "    /* Tail-call trampoline: functions signal tail calls by setting\n";
     out += "     * cpu->pc to the target and returning. We loop here to re-dispatch\n";
@@ -1235,7 +1414,20 @@ void FullFunctionEmitter::emit_dispatch(
     out += "         * active game text range, route it through the game/dirty-RAM\n";
     out += "         * path before normalizing it to shell ROM. */\n";
     out += "        uint32_t game_phys = addr & 0x1FFFFFFFu;\n";
-    out += "        if (psx_game_address_in_text(addr) && dirty_ram_is_dirty(game_phys)) {\n";
+    out += "        /* Class-A shell-window collision fix: post-game-start the BIOS shell\n";
+    out += "         * copy at RAM 0x30000-0x5AFFF is DEAD (overwritten by the game EXE),\n";
+    out += "         * so normalize()->shell ROM for a shell-window game address is stale\n";
+    out += "         * and runs dead shell code (func_1FC42090 -> null jalr -> pc=0, the\n";
+    out += "         * MMX6 boot wedge class A). Once the game has started, route the\n";
+    out += "         * shell-overlap window to the GAME image BEFORE normalize() can shadow\n";
+    out += "         * it to the shell. dirty_ram_dispatch -> psx_dispatch_game_compiled\n";
+    out += "         * returns 0 for a non-game PC, so a genuine pre-start shell address\n";
+    out += "         * (game not started) still falls through to normalize(). */\n";
+    out += "        extern int fntrace_is_game_started(void);\n";
+    out += "        int game_shell_overlap = fntrace_is_game_started() &&\n";
+    out += "            game_phys >= 0x00030000u && game_phys <= 0x0005AFFFu;\n";
+    out += "        if (psx_game_address_in_text(addr) &&\n";
+    out += "            (dirty_ram_is_dirty(game_phys) || game_shell_overlap)) {\n";
     out += "            found = dirty_ram_dispatch(cpu, addr, stop_addr);\n";
     out += "        }\n";
     out += "#endif\n";
@@ -1269,6 +1461,12 @@ void FullFunctionEmitter::emit_dispatch(
     out += "                psx_unknown_dispatch(cpu, addr, phys);\n";
     out += "            }\n";
     out += "        }\n";
+    out += "        /* Fix B: if the function just RETURNED via the recompiled exception\n";
+    out += "         * return (jr $k0; rfe) inside the synchronous handler, cpu->pc now holds\n";
+    out += "         * the real resume EPC and the RFE armed the escape — unwind to\n";
+    out += "         * psx_check_interrupts here. A fiber/thread resume (in_exception==0) is a\n";
+    out += "         * no-op, so the real EPC keeps dispatching. */\n";
+    out += "        psx_rfe_escape_check(cpu);\n";
     out += "        if (g_psx_call_bail) {\n";
     out += "            /* A nested generated frame began a bail unwind; cpu->pc\n";
     out += "             * holds the guest's true target.  Resolve here iff the\n";
@@ -1281,7 +1479,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "                cpu->pc = 0;\n";
     out += "                --g_psx_dispatch_depth;\n";
     out += "                if (outermost) {\n";
-    out += "                    psx_check_interrupts(cpu);\n";
+    out += "                    psx_dispatch_check_return_boundary(cpu, stop_addr);\n";
     out += "                }\n";
     out += "                return;\n";
     out += "            }\n";
@@ -1318,7 +1516,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "            }\n";
     out += "            --g_psx_dispatch_depth;\n";
     out += "            if (outermost) {\n";
-    out += "                psx_check_interrupts(cpu);\n";
+    out += "                psx_dispatch_check_return_boundary(cpu, stop_addr);\n";
     out += "            }\n";
     out += "            return;\n";
     out += "        }\n";
@@ -1333,7 +1531,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "            cpu->pc = 0;\n";
     out += "            --g_psx_dispatch_depth;\n";
     out += "            if (outermost) {\n";
-    out += "                psx_check_interrupts(cpu);\n";
+    out += "                psx_dispatch_check_return_boundary(cpu, stop_addr);\n";
     out += "            }\n";
     out += "            return;\n";
     out += "        }\n";
@@ -1416,12 +1614,20 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern void psx_dispatch(CPUState* cpu, uint32_t addr);\n";
     full_c += "extern void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys);\n";
     full_c += "extern void psx_check_interrupts(CPUState* cpu);\n";
+    full_c += "extern void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc);\n";
     full_c += "extern void psx_restore_state_escape(void);\n";
     full_c += "extern void gte_execute(CPUState* cpu, uint32_t cmd);\n";
     full_c += "extern void gte_write_data(CPUState* cpu, uint8_t reg, uint32_t val);\n";
     full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
     full_c += "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
     full_c += "extern void debug_server_log_probe(uint32_t pc, CPUState *cpu);\n";
+    full_c += "#ifdef PSX_COSIM\n";
+    full_c += "extern void cosim_block(uint32_t block_leader_phys);\n";
+    full_c += "extern void cosim_instr(uint32_t pc);\n";
+    full_c += "#endif\n";
+    full_c += "#ifndef PSX_NO_DEBUG_TOOLS\n";
+    full_c += "extern void debug_server_cyc_observe(uint32_t block_leader_phys);\n";
+    full_c += "#endif\n";
     full_c += "extern uint32_t g_debug_last_store_pc;\n";
     full_c += "/* Phase 1.0e-d: per-block guest cycle accounting.\n";
     full_c += " * Compile generated code with -DPSX_ENABLE_BLOCK_CYCLES=1 to\n";

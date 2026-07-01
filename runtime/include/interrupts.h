@@ -24,12 +24,25 @@ struct CPUState;
 
 void interrupts_init(void);
 
+/* Central IRQ-raise choke point: sets the I_STAT bit AND records the raise edge
+ * into the always-on device-event ring (device_trace) with the guest cycle.
+ * Every hardware source (VBLANK/GPU/CDROM/DMA/timers/SIO/SPU) funnels its raise
+ * through here so the device-timing audit sees every event from one place.
+ * `detail` is source-specific (DMA channel, timer index) or 0. */
+void psx_irq_raise(uint32_t bit, uint32_t detail);
+
 /* Called from the dispatch loop after each function returns.
- * Fires vblank on schedule, checks (i_stat & i_mask), and if
- * pending + COP0 allows, dispatches the exception handler. */
+ * Services due scheduled edges, checks (i_stat & i_mask), and if pending + COP0
+ * allows, dispatches the exception handler. */
 void psx_check_interrupts(struct CPUState* cpu);
-/* Compat shim for ape-flavored generated code (forwards to psx_check_interrupts). */
+/* Interrupt check with the compiled guest PC to resume if a game-installed
+ * handler later RFEs to the sentinel outside the synchronous host window. */
 void psx_check_interrupts_at(struct CPUState* cpu, uint32_t resume_pc);
+int psx_interrupts_checked_at_current_cycle(uint32_t resume_pc);
+/* Dispatch-entry check for re-enterable compiled PCs. De-dupes an immediately
+ * preceding check at the same guest PC/cycle so generated transfers can keep
+ * their explicit checks while dirty/interp-to-static entries get a boundary. */
+void psx_check_interrupts_dispatch_entry(struct CPUState* cpu, uint32_t resume_pc);
 
 /* Accumulate emitted PSX cycles toward the next VBlank trigger.
  * Called from psx_advance_cycles() so the VBlank rate is gated on
@@ -37,6 +50,14 @@ void psx_check_interrupts_at(struct CPUState* cpu, uint32_t resume_pc);
  * count (which was 5-6x too fast and squeezed game-time to ~60% of
  * real). One real-PSX VBlank = 564480 cycles (33.8688 MHz / 60). */
 void interrupts_advance_cycles(uint32_t cycles);
+void interrupts_service_scheduled_events(void);
+uint32_t interrupts_cycles_to_vblank(void);
+
+/* Cycle-budgeted precise event slicing: minimum guest-CPU-cycle distance to the
+ * next DELIVERABLE hardware interrupt (source raises its I_STAT bit AND that bit
+ * is unmasked in i_mask). UINT32_MAX if none scheduled. Single source of truth
+ * for the two-tier block executor's fast/slice decision. See PRECISE_IRQ_SLICE.md. */
+uint32_t cycles_to_next_event(void);
 
 /* Query whether we are currently inside an exception handler dispatch. */
 int psx_get_in_exception(void);

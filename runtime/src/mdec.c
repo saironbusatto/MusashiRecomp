@@ -43,15 +43,20 @@ enum {
     MDEC_STOP_Y3 = 7
 };
 
+/* Zig-zag scatter table — Beetle ZigZag[64] (mdec.cpp:115), the column-major
+ * order that pairs with Beetle's IDCT matrix transpose + IDCT_1D_Multi below.
+ * (Our old table was the row-major transpose of this; it only decoded correctly
+ * because our old IDCT was correspondingly transposed. The faithful pipeline
+ * uses Beetle's table + matrix + IDCT together so the result is byte-exact.) */
 static const uint8_t zigzag_to_linear[64] = {
-     0,  1,  8, 16,  9,  2,  3, 10,
-    17, 24, 32, 25, 18, 11,  4,  5,
-    12, 19, 26, 33, 40, 48, 41, 34,
-    27, 20, 13,  6,  7, 14, 21, 28,
-    35, 42, 49, 56, 57, 50, 43, 36,
-    29, 22, 15, 23, 30, 37, 44, 51,
-    58, 59, 52, 45, 38, 31, 39, 46,
-    53, 60, 61, 54, 47, 55, 62, 63
+    0x00, 0x08, 0x01, 0x02, 0x09, 0x10, 0x18, 0x11,
+    0x0a, 0x03, 0x04, 0x0b, 0x12, 0x19, 0x20, 0x28,
+    0x21, 0x1a, 0x13, 0x0c, 0x05, 0x06, 0x0d, 0x14,
+    0x1b, 0x22, 0x29, 0x30, 0x38, 0x31, 0x2a, 0x23,
+    0x1c, 0x15, 0x0e, 0x07, 0x0f, 0x16, 0x1d, 0x24,
+    0x2b, 0x32, 0x39, 0x3a, 0x33, 0x2c, 0x25, 0x1e,
+    0x17, 0x1f, 0x26, 0x2d, 0x34, 0x3b, 0x3c, 0x35,
+    0x2e, 0x27, 0x2f, 0x36, 0x3d, 0x3e, 0x37, 0x3f
 };
 
 typedef struct MDECState {
@@ -195,25 +200,47 @@ static void soft_reset(void) {
     mdec.current_block = 4;
 }
 
+/* Sign-extend the low `bits` of v to a full int (Beetle sign_x_to_s32). */
+static int sign_x_to_s32(int bits, int v) {
+    int shift = 32 - bits;
+    return (int)(((int32_t)((uint32_t)v << shift)) >> shift);
+}
+
+/* 9-bit mask then clamp to int8 (Beetle Mask9ClampS8, mdec.cpp:230). The MDEC
+ * keeps intermediate samples to 9 bits before the ±127 clamp, so a value outside
+ * the 9-bit window WRAPS before clamping — reproducing the hardware ringing. */
+static int mask9_clamp_s8(int v) {
+    v = sign_x_to_s32(9, v);
+    if (v < -128) v = -128;
+    if (v >  127) v =  127;
+    return v;
+}
+
+/* Faithful R3000A MDEC IDCT (Beetle IDCT/IDCT_1D_Multi, mdec.cpp:243-291).
+ * Two separable 1-D passes over the >>3 scale matrix: pass 1 keeps int16 and
+ * transposes (out[x*8+col]); pass 2 clamps to int8 via Mask9ClampS8. Rounding
+ * is (sum + 0x4000) >> 15 (vs the old (sum+0xFFF)/0x2000 + per-tap /8, whose
+ * bias differed from hardware → the washed/wrong-contrast FMV). The block buffer
+ * holds int8-range samples on return. */
 static void idct_block(int16_t *block) {
     int16_t tmp[64];
-    int16_t *src = block;
-    int16_t *dst = tmp;
-
-    for (int pass = 0; pass < 2; pass++) {
-        for (int y = 0; y < 8; y++) {
-            for (int x = 0; x < 8; x++) {
-                int sum = 0;
-                for (int z = 0; z < 8; z++) {
-                    sum += (int)src[y + z * 8] * ((int)mdec.scale[x + z * 8] / 8);
-                }
-                dst[x + y * 8] = (int16_t)((sum + 0xFFF) / 0x2000);
-            }
+    /* pass 1 — int16 out, transposed */
+    for (int col = 0; col < 8; col++) {
+        for (int x = 0; x < 8; x++) {
+            int sum = 0;
+            for (int u = 0; u < 8; u++)
+                sum += (int)block[col * 8 + u] * (int)mdec.scale[x * 8 + u];
+            tmp[x * 8 + col] = (int16_t)((sum + 0x4000) >> 15);
         }
-
-        int16_t *swap = src;
-        src = dst;
-        dst = swap;
+    }
+    /* pass 2 — int8 out (Mask9ClampS8), no transpose */
+    for (int col = 0; col < 8; col++) {
+        for (int x = 0; x < 8; x++) {
+            int sum = 0;
+            for (int u = 0; u < 8; u++)
+                sum += (int)tmp[col * 8 + u] * (int)mdec.scale[x * 8 + u];
+            block[col * 8 + x] = (int16_t)mask9_clamp_s8((sum + 0x4000) >> 15);
+        }
     }
 }
 
@@ -228,11 +255,17 @@ static int decode_rle_block(int16_t *block, const uint8_t *quant,
         word = mdec.input[(*pos)++];
     }
 
+    /* Dequant in Beetle's <<4 fixed-point domain (mdec.cpp:439-485), clamp
+     * ±0x4000. DC uses quant[0] with no qscale; AC uses qscale*quant[k]. Each
+     * nonzero coeff gets the sign-magnitude rounding bias (ci<0 ? +8 : -8) the
+     * old +4/÷8 model omitted, and the <<4 domain feeds the >>3 IDCT matrix. */
     uint32_t qscale = (word >> 10) & 0x3Fu;
     uint32_t k = 0;
-    int coeff = sign_extend_10(word & 0x03FFu);
-    coeff = (qscale == 0) ? (coeff * 2) : (coeff * (int)quant[0]);
-    block[0] = (int16_t)clamp_int(coeff, -0x400, 0x3FF);
+    int ci = sign_extend_10(word & 0x03FFu);
+    int q  = (int)quant[0];
+    int tmp = (q != 0) ? (((ci * q) << 4) + (ci ? (ci < 0 ? 8 : -8) : 0))
+                       : ((ci * 2) << 4);
+    block[0] = (int16_t)clamp_int(tmp, -0x4000, 0x3FFF);
 
     while (*pos < end && k < 63u) {
         word = mdec.input[(*pos)++];
@@ -241,13 +274,11 @@ static int decode_rle_block(int16_t *block, const uint8_t *quant,
         k += ((word >> 10) & 0x3Fu) + 1u;
         if (k >= 64u) break;
 
-        coeff = sign_extend_10(word & 0x03FFu);
-        if (qscale == 0) {
-            coeff *= 2;
-        } else {
-            coeff = (coeff * (int)quant[k] * (int)qscale + 4) / 8;
-        }
-        block[zigzag_to_linear[k]] = (int16_t)clamp_int(coeff, -0x400, 0x3FF);
+        ci = sign_extend_10(word & 0x03FFu);
+        q  = (int)qscale * (int)quant[k];
+        tmp = (q != 0) ? ((((ci * q) >> 3) << 4) + (ci ? (ci < 0 ? 8 : -8) : 0))
+                       : ((ci * 2) << 4);
+        block[zigzag_to_linear[k]] = (int16_t)clamp_int(tmp, -0x4000, 0x3FFF);
     }
 
     idct_block(block);
@@ -260,24 +291,42 @@ static uint8_t to_output_u8(int value) {
     return (uint8_t)(value + 128);
 }
 
-static void append_rgb_pixel(int y, int cr, int cb) {
-    int r = y + ((1436 * cr) >> 10);
-    int g = y - ((352 * cb + 731 * cr) >> 10);
-    int b = y + ((1815 * cb) >> 10);
+/* 8-bit unsigned channel → 5-bit, Beetle RGB_to_RGB555 rounding (mdec.cpp:306).
+ * Beetle's RGB_to_RGB555 takes uint8 params, so the ^0x80 result is truncated to
+ * 0..255 BEFORE the round/shift — `c` here is already that uint8. */
+static int rgb_to_555_chan(uint8_t c) {
+    int v = (c + 4) >> 3;
+    if (v > 0x1F) v = 0x1F;
+    return v;
+}
 
-    uint8_t ru = to_output_u8(r);
-    uint8_t gu = to_output_u8(g);
-    uint8_t bu = to_output_u8(b);
+static void append_rgb_pixel(int y, int cr, int cb) {
+    /* Beetle YCbCr_to_RGB (mdec.cpp:293-304): /256 coeffs (359,-88/-183,454),
+     * +0x80 rounding, the reduced-precision GREEN mask (-88*cb &~0x1F, -183*cr
+     * &~0x07) — the hardware quirk our old /1024 path lacked, the main green-hue
+     * error — Mask9ClampS8, then ^0x80 to unsigned 0..255. */
+    int r = mask9_clamp_s8(y + (((359 * cr) + 0x80) >> 8));
+    int g = mask9_clamp_s8(y + ((((-88 * cb) & ~0x1F) + ((-183 * cr) & ~0x07) + 0x80) >> 8));
+    int b = mask9_clamp_s8(y + (((454 * cb) + 0x80) >> 8));
+    int ru = r ^ 0x80, gu = g ^ 0x80, bu = b ^ 0x80;   /* signed → unsigned */
 
     if (mdec.output_depth == 3) {
-        uint16_t packed = (uint16_t)(((bu >> 3) << 10) | ((gu >> 3) << 5) | (ru >> 3));
-        if (mdec.output_bit15) packed |= 0x8000u;
+        /* 16bpp (mdec.cpp:397-418): RGB555 then pixel_xor = bit15(0x8000) |
+         * signed(0x4210 = MSB of each 5-bit channel). */
+        uint16_t packed = (uint16_t)(rgb_to_555_chan(ru)
+                                     | (rgb_to_555_chan(gu) << 5)
+                                     | (rgb_to_555_chan(bu) << 10));
+        uint16_t pixel_xor = (uint16_t)((mdec.output_bit15 ? 0x8000u : 0u)
+                                        | (mdec.output_signed ? 0x4210u : 0u));
+        packed ^= pixel_xor;
         append_byte((uint8_t)packed);
         append_byte((uint8_t)(packed >> 8));
     } else {
-        append_byte(ru);
-        append_byte(gu);
-        append_byte(bu);
+        /* 24bpp (mdec.cpp:370-393): rgb_xor = signed ? 0x80 : 0x00. */
+        uint8_t rgb_xor = mdec.output_signed ? 0x80u : 0x00u;
+        append_byte((uint8_t)(ru ^ rgb_xor));
+        append_byte((uint8_t)(gu ^ rgb_xor));
+        append_byte((uint8_t)(bu ^ rgb_xor));
     }
 }
 
@@ -368,8 +417,12 @@ static void execute_command(void) {
             memcpy(mdec.uv_quant, mdec.y_quant, sizeof(mdec.uv_quant));
         }
     } else if (op == MDEC_CMD_SET_SCALE) {
+        /* Load the IDCT matrix exactly as Beetle (mdec.cpp:647): store each entry
+         * TRANSPOSED ([(i&7)<<3 | (i>>3)&7]) and pre-shifted >>3 (arithmetic), so
+         * IDCT_1D_Multi above can index it [x*8+u] directly with no per-tap /8. */
         for (uint32_t i = 0; i < 64u; i++) {
-            mdec.scale[i] = (int16_t)mdec.input[i];
+            uint32_t t = ((i & 7u) << 3) | ((i >> 3) & 7u);
+            mdec.scale[t] = (int16_t)((int16_t)mdec.input[i] >> 3);
         }
     } else if (op == MDEC_CMD_DECODE) {
         execute_decode();

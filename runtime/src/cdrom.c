@@ -29,9 +29,15 @@ extern int iso_read_sector(void* handle, uint32_t lba, uint8_t* buffer, int size
 extern int iso_read_raw_sector(void* handle, uint32_t lba, uint8_t* buffer, int size);
 extern uint32_t iso_sector_count(void* handle);
 extern void iso_close(void* handle);
+/* Multi-track TOC accessors (CD-DA / multi-track discs). track is 1-based. */
+extern int iso_track_count(void* handle);
+extern uint32_t iso_track_start_lba(void* handle, int track);
+extern int iso_track_is_audio(void* handle, int track);
 
 /* I_STAT owned by memory.c — set bit 2 for CDROM IRQ */
 extern uint32_t i_stat;
+/* Central IRQ-raise choke point (interrupts.c) — also records the device ring. */
+extern void psx_irq_raise(uint32_t bit, uint32_t detail);
 extern uint32_t g_debug_current_func_addr;
 extern uint32_t g_debug_last_store_pc;
 extern uint64_t s_frame_count;
@@ -532,7 +538,7 @@ static void present_cdrom_irq(void) {
      * own trailing INTC ack. */
     if (cdrom_irq_present_delay > 0) return;
     if (irq_flag && (irq_enable & (1 << (irq_flag - 1))) && !cdrom_intc_request_latched) {
-        i_stat |= (1u << 2); /* IRQ_CDROM */
+        psx_irq_raise(2, irq_flag); /* IRQ_CDROM; detail = CD response/IRQ type */
         cdrom_intc_request_latched = 1;
         cdrom_intc_latched_generation = cdrom_irq_generation;
         event_ring_record(EV_ISTAT_RAISE, 2 /* IRQ_CDROM bit */);
@@ -1092,14 +1098,18 @@ static void exec_command(uint8_t cmd) {
         break;
     }
 
-    case 0x13: /* GetTN */
+    case 0x13: /* GetTN — first + last track numbers (BCD) */
         response_push(stat_reg);
-        response_push(0x01);
-        response_push(0x01);
+        response_push(0x01); /* first track is always 1 */
+        {
+            int last = iso_handle ? iso_track_count(iso_handle) : 1;
+            if (last < 1) last = 1;
+            response_push(bin_to_bcd(last));
+        }
         set_irq(CDIRQ_ACK);
         break;
 
-    case 0x14: { /* GetTD */
+    case 0x14: { /* GetTD — start MSF (BCD) of a track; track 0/0xAA = lead-out */
         if (!has_disc()) {
             response_push(stat_reg | CDSTAT_ERROR);
             response_push(0x80);
@@ -1107,13 +1117,17 @@ static void exec_command(uint8_t cmd) {
             break;
         }
 
-        int track = (param_count >= 1) ? bcd_to_bin(param_fifo[0]) : 0;
-        int lba = 0;
-        if (track == 0 || track == 0xAA) {
+        int raw = (param_count >= 1) ? param_fifo[0] : 0;
+        int track = bcd_to_bin(raw);
+        int lba;
+        if (raw == 0xAA || track == 0) {
+            /* Lead-out: end of the whole image. */
             uint32_t sectors = iso_sector_count(iso_handle);
             lba = sectors ? (int)sectors : 0;
         } else {
-            lba = 0; /* Single data track starts at absolute MSF 00:02:00. */
+            /* .bin-relative start LBA of the requested track (0 for track 1
+             * data; the CD-DA audio track's real start for multi-track discs). */
+            lba = iso_handle ? (int)iso_track_start_lba(iso_handle, track) : 0;
         }
 
         int m, s, f;
@@ -1126,7 +1140,28 @@ static void exec_command(uint8_t cmd) {
         break;
     }
 
-    case 0x15: /* SeekL */
+    case 0x03: /* Play — start CD-DA audio playback (from SetLoc, or optional
+                * param[0] = BCD track). Multi-track / CD-DA discs (Tomba 2's
+                * Whoopee Camp jingle) issue this; an unhandled Play (default ->
+                * ERROR) stalls the boot. Ack + enter PLAY state so the game's
+                * audio sequence proceeds. (Red Book sample output is not yet
+                * decoded -- silent for now -- but the flow no longer stalls.) */
+        if (!has_disc()) {
+            response_push(stat_reg | CDSTAT_ERROR);
+            set_irq(CDIRQ_ERROR);
+            break;
+        }
+        stat_reg = (stat_reg & ~(CDSTAT_SEEK | CDSTAT_READ)) | CDSTAT_MOTOR | CDSTAT_PLAY;
+        response_push(stat_reg);
+        set_irq(CDIRQ_ACK);
+        break;
+
+    case 0x15: /* SeekL (data-mode seek, uses sector headers) */
+    case 0x16: /* SeekP (audio-mode seek, uses subchannel Q) — our hw-sim seeks
+                * to the SetLoc position the same way for both. Needed for
+                * multi-track / CD-DA discs (Tomba 2): the game seeks the audio
+                * track with SeekP, and an unhandled SeekP (default -> ERROR)
+                * makes its CD setup loop forever. */
         if (!has_disc()) {
             response_push(stat_reg | CDSTAT_ERROR | CDSTAT_SEEKERR);
             set_irq(CDIRQ_ERROR);
@@ -1137,7 +1172,7 @@ static void exec_command(uint8_t cmd) {
         stat_reg |= CDSTAT_SEEK;
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
-        pending.cmd = 0x15;
+        pending.cmd = cmd;   /* 0x15 or 0x16 — completed in process_pending */
         pending.pending = 1;
         pending.delay = apply_speed(20000);
         pending.phase = 1;
@@ -1245,6 +1280,7 @@ static void process_pending(uint32_t cycles) {
         break;
 
     case 0x15: /* SeekL complete */
+    case 0x16: /* SeekP complete */
         stat_reg &= ~CDSTAT_SEEK;
         response_push(stat_reg);
         set_irq(CDIRQ_COMPLETE);
@@ -1483,6 +1519,29 @@ void cdrom_write(uint32_t addr, uint32_t value) {
     }
 }
 
+/* Cycle-budgeted precise event slicing: guest CPU cycles until the CD-ROM
+ * raises a DELIVERABLE IRQ (bit2 unmasked in i_mask). UINT32_MAX if none.
+ * Conservative under-estimate (smaller => slice more => safe): returns the
+ * nearest in-flight countdown that leads to an i_stat bit2 raise — the
+ * presentation delay of an already-armed response, a pending second response,
+ * or the next sector data-ready. See PRECISE_IRQ_SLICE.md. */
+uint32_t cdrom_cycles_to_irq(uint32_t i_mask) {
+    if (!(i_mask & (1u << 2))) return 0xFFFFFFFFu;   /* IRQ_CDROM masked */
+    uint32_t best = 0xFFFFFFFFu;
+    /* Armed response awaiting presentation (will raise bit2 when delay hits 0). */
+    if (irq_flag && (irq_enable & (1u << (irq_flag - 1)))) {
+        uint32_t d = cdrom_irq_present_delay > 0 ? (uint32_t)cdrom_irq_present_delay : 0u;
+        if (d < best) best = d;
+    }
+    /* Pending second response: fires set_irq in pending.delay cycles. */
+    if (pending.pending && pending.delay > 0 && (uint32_t)pending.delay < best)
+        best = (uint32_t)pending.delay;
+    /* Active sector read: next data-ready in read_delay cycles. */
+    if (reading && read_delay > 0 && (uint32_t)read_delay < best)
+        best = (uint32_t)read_delay;
+    return best;
+}
+
 void cdrom_advance(uint32_t cycles) {
     /* Age the response presentation latency. Once it elapses, the following
      * refresh_cdrom_irq_line() presents the held response to INTC — at this
@@ -1505,6 +1564,7 @@ void cdrom_tick(void) {
 
 uint32_t cdrom_dma_read(void) {
     uint32_t val = 0;
+    int got = 0;
     if ((request_reg & CDROM_REQUEST_BFRD) && sector_available &&
         sector_read_pos + 4 <= sector_size) {
         memcpy(&val, sector_buffer + sector_read_pos, 4);
@@ -1512,8 +1572,20 @@ uint32_t cdrom_dma_read(void) {
         if (sector_read_pos >= sector_size) {
             sector_available = 0;
         }
+        got = 1;
     }
-    trace_cdrom('D', 0, val, 4);
+    /* Per-word DMA data reads flood the CD trace ring (hundreds per sector) and
+     * evict the command/IRQ/seek/play history we actually need to read the
+     * streaming/audio flow (Rule 15). Gate them OFF by default; opt in with
+     * PSX_CD_DMA_TRACE=1 when specifically inspecting the data path. */
+    if (got) {
+        static int s_dma_trace = -1;
+        if (s_dma_trace < 0) {
+            const char *e = getenv("PSX_CD_DMA_TRACE");
+            s_dma_trace = (e && e[0] && e[0] != '0') ? 1 : 0;
+        }
+        if (s_dma_trace) trace_cdrom('D', 0, val, 4);
+    }
     return val;
 }
 

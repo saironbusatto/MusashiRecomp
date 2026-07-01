@@ -116,6 +116,12 @@ struct RuntimeConfig {
     // gcc shards still load). The env var PSX_OVERLAY_BACKEND overrides at runtime.
     std::string           overlay_backend;
 
+    // overlay_native_block: per-game overlay function entries that must stay on
+    // the dirty-RAM interpreter even when a matching native DLL exists. Intended
+    // for small timing-sensitive setup/task routines while the rest of the
+    // overlay runs native.
+    std::vector<uint32_t> overlay_native_block;
+
     // ---- [video] block — visual enhancement options ----
     // supersampling: internal-resolution SSAA factor (per axis). 1 = native
     // (default, behaves exactly as before). 2..4 render geometry/shading into
@@ -210,6 +216,14 @@ struct RuntimeConfig {
     // analog/digital choice (e.g. one that hard-requires a DualShock) can set
     // [controller] allow_hybrid = false to drop Hybrid from the selector.
     bool                  controller_allow_hybrid = true;
+
+    // lock_mode: when true the launcher HIDES the whole pad-mode selector
+    // (Hybrid | Analog | D-Pad) and forces every port to default_p1_mode. For a
+    // game that supports exactly one pad type — e.g. Tomba 2, whose driver only
+    // works as a plain digital pad because the DualShock config-mode handshake
+    // is unhandled — so the player can't pick a broken mode. Supersedes
+    // allow_hybrid (which only hides the Hybrid segment). Default false.
+    bool                  controller_lock_mode = false;
 
     // deadzone: default analog-stick deadzone in raw SDL axis units (0..32767).
     // Applied both to the stick->d-pad press threshold and the analog-axis centre

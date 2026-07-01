@@ -829,6 +829,13 @@ void psx_dispatch_call(CPUState *cpu, uint32_t addr, uint32_t ra) {
 void psx_check_interrupts(CPUState *cpu) {
     g_cbs.check_interrupts(cpu);
 }
+void psx_check_interrupts_at(CPUState *cpu, uint32_t resume_pc) {
+    if (g_cbs.check_interrupts_at) g_cbs.check_interrupts_at(cpu, resume_pc);
+    else g_cbs.check_interrupts(cpu);
+}
+void psx_advance_cycles(uint32_t cycles) {
+    if (g_cbs.advance_cycles) g_cbs.advance_cycles(cycles);
+}
 void gte_execute(CPUState *cpu, uint32_t cmd) {
     g_cbs.gte_execute(cpu, cmd);
 }
@@ -847,6 +854,51 @@ void debug_server_log_call_entry(uint32_t func_addr) {
 void psx_restore_state_escape(void) {
     if (g_cbs.psx_restore_state_escape) g_cbs.psx_restore_state_escape();
 }
+/* Faithful-timing functions (ABI v9): overlay code built with PSX_ENABLE_BLOCK_CYCLES
+ * emits these; forward to the runtime's real impls so native overlays charge cycles on
+ * the SAME timeline as the interp/BIOS (a local copy would diverge). NULL-guarded so a
+ * v9 DLL stays safe on a host that predates a given callback. */
+uint32_t psx_cyc_load_word(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    return g_cbs.cyc_load_word ? g_cbs.cyc_load_word(cpu, addr, rt, reg_mask) : cpu->read_word(addr);
+}
+uint16_t psx_cyc_load_half(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    return g_cbs.cyc_load_half ? g_cbs.cyc_load_half(cpu, addr, rt, reg_mask) : cpu->read_half(addr);
+}
+uint8_t psx_cyc_load_byte(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    return g_cbs.cyc_load_byte ? g_cbs.cyc_load_byte(cpu, addr, rt, reg_mask) : cpu->read_byte(addr);
+}
+uint32_t psx_cyc_lwc2_read(CPUState *cpu, uint32_t addr) {
+    return g_cbs.cyc_lwc2_read ? g_cbs.cyc_lwc2_read(cpu, addr) : cpu->read_word(addr);
+}
+void psx_icache_fetch(CPUState *cpu, uint32_t addr) {
+    if (g_cbs.icache_fetch) g_cbs.icache_fetch(cpu, addr);
+}
+void psx_muldiv_set(CPUState *cpu, uint32_t latency) {
+    if (g_cbs.muldiv_set) g_cbs.muldiv_set(cpu, latency);
+}
+void psx_muldiv_stall(CPUState *cpu) {
+    if (g_cbs.muldiv_stall) g_cbs.muldiv_stall(cpu);
+}
+uint32_t psx_mult_latency_s(uint32_t rs) {
+    return g_cbs.mult_latency_s ? g_cbs.mult_latency_s(rs) : 0u;
+}
+uint32_t psx_mult_latency_u(uint32_t rs) {
+    return g_cbs.mult_latency_u ? g_cbs.mult_latency_u(rs) : 0u;
+}
+void psx_gte_stall(CPUState *cpu) {
+    if (g_cbs.gte_stall) g_cbs.gte_stall(cpu);
+}
+void psx_gte_read(CPUState *cpu, uint32_t rt) {
+    if (g_cbs.gte_read) g_cbs.gte_read(cpu, rt);
+}
+int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
+    return g_cbs.slice_block ? g_cbs.slice_block(cpu, block_addr, bcyc, side_effects) : 0;
+}
+/* g_debug_last_store_pc: a provenance breadcrumb the emitter writes before stores.
+ * Overlays are built PSX_NO_DEBUG_TOOLS (the runtime's only consumer is debug tooling),
+ * so a local definition satisfies the link; overlay-store provenance is simply not
+ * tracked in a no-debug-tools build (by design). */
+uint32_t g_debug_last_store_pc;
 /* Widescreen hooks (ABI v3): forward to the runtime's live widescreen state.
  * Identity fallback if the host predates the callbacks (NULL) — so a v3 DLL
  * stays correct (4:3) on an older host. */
@@ -1028,18 +1080,17 @@ def generate_overlay_dispatch(all_virt_addrs: list) -> str:
 # DLL compilation
 # ---------------------------------------------------------------------------
 
-def write_overlay_ranges(src_path: str, out_path: str,
-                         data: bytes, load_addr: int, size: int) -> int:
-    """Filter the recompiler's _full.ranges manifest to in-overlay functions,
-    compute each function's AUTHORITATIVE code hash from the captured bytes (the
-    exact bytes the recompiler compiled from), and write {phys}_{crc}.ranges
-    beside the DLL. The loader marks a compiled entry callable iff live RAM
-    matches this hash — making per-entry validity timing-independent and
-    reload-on-return correct (design §8). Returns the number of functions written.
+def parse_overlay_func_ids(src_path: str, data: bytes, load_addr: int,
+                           size: int) -> list:
+    """Parse the recompiler's _full.ranges manifest and return the list of
+    in-overlay function identities as (ev, code_crc, ranges) tuples, where
+    ev = virtual entry, code_crc = AUTHORITATIVE hash of the captured code-range
+    bytes (the exact bytes the recompiler compiled from), and ranges is the
+    coalesced [(lo, len), ...] code-range list.
 
-    Manifest v2 line format:
-      F <entry_hex> <code_crc_hex>     one per function
-      R <lo_hex> <len_hex>             one per coalesced code range
+    This (entry, code_crc) pair is the per-function IDENTITY: the loader marks a
+    compiled entry callable iff live RAM matches code_crc, and overlay-cache v2
+    keys build/dedup decisions on this set rather than on the whole-region CRC.
 
     binascii.crc32 (zlib, poly 0xEDB88320, init/final 0xFFFFFFFF) is bit-identical
     to the runtime's crc32_compute, and `data` is the raw little-endian RAM image,
@@ -1076,8 +1127,7 @@ def write_overlay_ranges(src_path: str, out_path: str,
                     continue
                 cur[1].append((lo, length))
 
-    out_lines = ['# psxrecomp overlay code-range manifest v2 (entry+code_crc)\n']
-    n = 0
+    out = []
     for entry, ranges in funcs:
         if not ranges:
             continue
@@ -1092,13 +1142,179 @@ def write_overlay_ranges(src_path: str, out_path: str,
         if not ok:
             continue
         ev = (entry & 0x1FFFFFFF) | 0x80000000
+        out.append((ev, crc & 0xFFFFFFFF, ranges))
+    return out
+
+
+def write_overlay_ranges_from(func_ids: list, out_path: str) -> int:
+    """Write the {phys}_{key}.ranges manifest (v2) from a func-id list produced by
+    parse_overlay_func_ids. Returns the number of functions written.
+
+    Manifest v2 line format:
+      F <entry_hex> <code_crc_hex>     one per function
+      R <lo_hex> <len_hex>             one per coalesced code range"""
+    out_lines = ['# psxrecomp overlay code-range manifest v2 (entry+code_crc)\n']
+    for ev, crc, ranges in func_ids:
         out_lines.append(f'F {ev:08X} {crc & 0xFFFFFFFF:08X}\n')
         for lo, length in ranges:
             out_lines.append(f'R {(lo & 0x1FFFFFFF) | 0x80000000:08X} {length:X}\n')
-        n += 1
     with open(out_path, 'w') as f:
         f.writelines(out_lines)
-    return n
+    return len(func_ids)
+
+
+def write_overlay_ranges(src_path: str, out_path: str,
+                         data: bytes, load_addr: int, size: int) -> int:
+    """Back-compat wrapper: parse the recompiler manifest and write the v2 .ranges.
+    See parse_overlay_func_ids / write_overlay_ranges_from."""
+    return write_overlay_ranges_from(
+        parse_overlay_func_ids(src_path, data, load_addr, size), out_path)
+
+
+def load_region_coverage(cache_dir: str, phys_addr: int) -> set:
+    """Set of (ev, code_crc) function identities already provided by built DLLs
+    for this region_start. The loader content-matches per function across ALL
+    DLLs sharing a region_start, so a function is "covered" as soon as ANY
+    existing .ranges for that region_start lists it with a matching code_crc.
+    overlay-cache v2 uses this to skip the (expensive) gcc compile when a capture
+    would add no new function identity (the volatile-data redundant-build case)."""
+    covered = set()
+    prefix = f'{phys_addr:08X}_'
+    try:
+        names = os.listdir(cache_dir)
+    except OSError:
+        return covered
+    for name in names:
+        if not (name.startswith(prefix) and name.endswith('.ranges')):
+            continue
+        try:
+            with open(os.path.join(cache_dir, name)) as f:
+                for ln in f:
+                    p = ln.split()
+                    if len(p) >= 3 and p[0] == 'F':
+                        try:
+                            covered.add((int(p[1], 16), int(p[2], 16)))
+                        except ValueError:
+                            pass
+        except OSError:
+            pass
+    return covered
+
+
+def _addr_in_func_ids(addr: int, func_ids: list) -> bool:
+    """True if addr falls inside any code range of the given func-id list."""
+    a = addr & 0x1FFFFFFF
+    for _ev, _crc, ranges in func_ids:
+        for lo, length in ranges:
+            lo &= 0x1FFFFFFF
+            if lo <= a < lo + length:
+                return True
+    return False
+
+
+def load_region_covered_ranges(cache_dir: str, phys_addr: int) -> list:
+    """List of (lo_phys, length) code ranges already provided by ALL built DLLs
+    (region + fragment) for this region_start, from their .ranges manifests. Used
+    to decide whether an executed orphan interior is already covered (so we don't
+    mint a redundant island fragment for it)."""
+    out = []
+    prefix = f'{phys_addr:08X}_'
+    try:
+        names = os.listdir(cache_dir)
+    except OSError:
+        return out
+    for name in names:
+        if not (name.startswith(prefix) and name.endswith('.ranges')):
+            continue
+        try:
+            with open(os.path.join(cache_dir, name)) as f:
+                for ln in f:
+                    p = ln.split()
+                    if len(p) >= 3 and p[0] == 'R':
+                        try:
+                            out.append((int(p[1], 16) & 0x1FFFFFFF, int(p[2], 16)))
+                        except ValueError:
+                            pass
+        except OSError:
+            pass
+    return out
+
+
+def compile_interior_fragment(interior: int, data: bytes, load_addr: int,
+                              size: int, phys_addr: int, cache_dir: str,
+                              args, sub_env: dict):
+    """Compile an ISOLATED interior-entry 'island' fragment that ENTERS at an
+    executed orphan DISPATCH_INTERIOR PC (a host that static analysis never
+    discovered, e.g. an FMV driver reached via a computed jump) and covers the
+    recompiler's worklist-discovered reachable CFG from that PC — a single
+    `dispatch_root` seed; out-of-island branches become dispatcher exits.
+
+    Emitted as its OWN <region>_<key>.dll so a fragment that fails the
+    generated-C audit is dropped ALONE and never poisons the region's trusted DLL
+    (separate failure domain — the invariant the earlier host-recovery attempt
+    violated). Safe because: dispatch_root is exempt from the boundary re-check
+    that would reject a mid-function start; the recompiler translates mid-function
+    code literally (regs from CPU state, no synthesized stack frame — the caller
+    already set up the frame); and the loader's per-function live-RAM CRC gate
+    rejects any fragment whose bytes don't match. Returns the fragment func-id
+    list, or None on failure/skip."""
+    with tempfile.TemporaryDirectory() as tmp:
+        psx = os.path.join(tmp, 'frag.psx')
+        with open(psx, 'wb') as f:
+            f.write(make_psxexe(load_addr, interior, data))
+        seeds_path = os.path.join(tmp, 'seeds.txt')
+        with open(seeds_path, 'w') as f:
+            f.write(f'dispatch_root 0x{interior:08X}\n')
+        out_dir_tmp = os.path.join(tmp, 'out')
+        os.makedirs(out_dir_tmp)
+        cmd = [args.recompiler, psx, '--seeds', seeds_path,
+               '--out-dir', out_dir_tmp, '--overlay',
+               '--ws-config', os.path.abspath(args.game_toml)]
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           cwd=os.path.dirname(os.path.abspath(args.game_toml)),
+                           env=sub_env)
+        if r.returncode != 0:
+            return None
+        full_c = ranges_src = None
+        for fn in os.listdir(out_dir_tmp):
+            if fn.endswith('_full.c'):
+                full_c = os.path.join(out_dir_tmp, fn)
+            elif fn.endswith('_full.ranges'):
+                ranges_src = os.path.join(out_dir_tmp, fn)
+        if not full_c or not ranges_src:
+            return None
+        with open(full_c) as f:
+            src = patch_generated_c(f.read(), load_addr, size)
+        c_audit = audit_generated_c(src, load_addr, size,
+                                    binascii.crc32(data) & 0xFFFFFFFF, {})
+        if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
+            return None   # isolated audit failure — drop THIS fragment only
+        frag_ids = parse_overlay_func_ids(ranges_src, data, load_addr, size)
+        if not frag_ids:
+            return None
+        # Key the fragment DLL by its func-identity SET (dedup like a region
+        # bundle); the loader keys DLLs by the region_start filename prefix and
+        # content-matches each function, so a fragment is just another DLL for
+        # this region_start.
+        key = binascii.crc32(b''.join(
+            struct.pack('<II', ev, crc)
+            for ev, crc, _ in sorted(frag_ids))) & 0xFFFFFFFF
+        dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{key:08X}.dll')
+        if os.path.exists(dll_path) and not args.force:
+            return frag_ids   # already built
+        patched_c = os.path.join(tmp, 'frag_patched.c')
+        with open(patched_c, 'w') as f:
+            f.write(src)
+        include_dirs = [args.runtime_include]
+        recomp_root = os.path.dirname(os.path.dirname(args.recompiler))
+        p = os.path.join(recomp_root, 'lib/fmt/include')
+        if os.path.isdir(p):
+            include_dirs.append(p)
+        if not compile_dll(patched_c, dll_path, include_dirs,
+                           gcc=args.gcc, flavor=args.flavor):
+            return None
+        write_overlay_ranges_from(frag_ids, dll_path[:-4] + '.ranges')
+        return frag_ids
 
 
 def _toolchain_env(gcc: str):
@@ -1197,6 +1413,19 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
     cmd = [
         gcc, '-shared', *pic_flag, '-O2',
         '-DPSX_OVERLAY_DLL_BUILD',
+        # Overlays mirror the runtime's no-debug-tools build: the emitter guards
+        # debug_server_cyc_observe (and friends) behind PSX_NO_DEBUG_TOOLS, and the
+        # shipped/native runtime is built without debug tools, so define it here too or
+        # the overlay emits calls to symbols the runtime doesn't have (undefined ref).
+        '-DPSX_NO_DEBUG_TOOLS',
+        # CYCLE MODEL UNIFICATION (Tomba2 logo Timer1 fork): compiled-overlay code
+        # MUST charge guest cycles exactly like the dirty-RAM interpreter and the
+        # BIOS (both built with PSX_ENABLE_BLOCK_CYCLES=1). Without this flag every
+        # psx_advance_cycles() in overlay code is #ifdef'd out, so a function run as
+        # a native overlay charges ~0 cycles while the same function run via the
+        # interp charges per-instruction -> timer-sensitive code (e.g. a Timer1
+        # debounce) reads different values per backend and the game forks.
+        '-DPSX_ENABLE_BLOCK_CYCLES=1',
         # Codegen-flavor tag baked into overlay_abi() (base=0). The loader
         # rejects DLLs whose flavor differs from the runtime's, so a widescreen
         # cache and a base cache can never cross-contaminate even if they share
@@ -1329,6 +1558,17 @@ def main():
     # B-2 static mode: accumulate all overlay C into one file
     static_parts = []   # list of (patched_src, func_virt_addrs)
 
+    # overlay-cache v2: per-region_start function-identity coverage, so a capture
+    # that adds no NEW (entry, code_crc) skips the gcc compile (volatile-data
+    # redundant-build elimination). Lazily loaded from existing .ranges, kept warm
+    # in-memory and updated as we build, so repeats within one run also dedup.
+    region_coverage_cache = {}   # phys_addr -> set((ev, code_crc))
+    # Per-region info for the post-loop interior-entry fragment pass (decoupled
+    # from region-compile success): (phys, load_addr, size, data, interior_pcs,
+    # executed_pcs). Collected right after classification so it survives a region
+    # whose own compile is skipped or audit-fails.
+    interior_frag_jobs = []
+
     for cap in captures:
         load_addr = int(cap['load_addr'], 16)
         size      = int(cap['size'])
@@ -1373,6 +1613,17 @@ def main():
 
         seeds, seed_audit = classify_overlay_seeds(cap, data, load_addr, size,
                                                    crc32, toml)
+        this_ids = None   # region func-ids once recompiled (None if skipped early)
+
+        # Record this region's executed interiors for the decoupled fragment pass
+        # (runs after the loop, regardless of this region's compile outcome).
+        if not args.static:
+            _interiors = {a for a, r in seed_audit['included_reasons'].items()
+                          if r == 'DISPATCH_INTERIOR'}
+            _executed = seed_audit.get('executed_pcs', set())
+            if _interiors and _executed:
+                interior_frag_jobs.append((phys_addr, load_addr, size, data,
+                                           _interiors, _executed))
 
         if not args.static:
             dll_path = os.path.join(cache_dir, f'{phys_addr:08X}_{crc32:08X}.dll')
@@ -1479,6 +1730,34 @@ def main():
                 with open(patched_c, 'w') as f:
                     f.write(src)
 
+                # overlay-cache v2 dedup: compute this capture's per-function
+                # identity set BEFORE the (expensive) gcc compile. The loader
+                # content-matches each function by (entry, code_crc) across ALL
+                # DLLs at this region_start, so if every function we'd produce is
+                # already provided by an existing DLL, a new DLL adds nothing —
+                # skip the build. This is what stops volatile-data regions (a
+                # changing whole-region CRC over byte-identical code) from minting
+                # an endless pile of redundant DLLs.
+                ranges_src = None
+                for fn in os.listdir(out_dir_tmp):
+                    if fn.endswith('_full.ranges'):
+                        ranges_src = os.path.join(out_dir_tmp, fn)
+                        break
+                this_ids = (parse_overlay_func_ids(ranges_src, data, load_addr, size)
+                            if ranges_src else [])
+                this_set = {(ev, crc) for ev, crc, _ in this_ids}
+
+                covered = region_coverage_cache.get(phys_addr)
+                if covered is None:
+                    covered = load_region_coverage(cache_dir, phys_addr)
+                    region_coverage_cache[phys_addr] = covered
+
+                if this_set and this_set <= covered and not args.force:
+                    print(f'  SKIP: all {len(this_set)} function(s) already '
+                          f'covered by existing DLL(s) at this region — no new '
+                          f'native code to build\n')
+                    continue
+
                 # Compile to DLL
                 include_dirs = [args.runtime_include]
                 recomp_root = os.path.dirname(os.path.dirname(args.recompiler))
@@ -1491,26 +1770,59 @@ def main():
                                       gcc=args.gcc, flavor=args.flavor,
                                       compiler=args.compiler, tcc=args.tcc)
                 if success:
-                    # Emit the per-entry code-range manifest beside the DLL.
-                    # The loader keys it by the same filename stem with .ranges
-                    # (replacing .dll). Without it the loader leaves the region
-                    # to the interpreter (precision-first), so warn loudly.
-                    ranges_src = None
-                    for fn in os.listdir(out_dir_tmp):
-                        if fn.endswith('_full.ranges'):
-                            ranges_src = os.path.join(out_dir_tmp, fn)
-                            break
+                    # Emit the per-entry code-range manifest beside the DLL from
+                    # the same func-id list we keyed the dedup on. The loader keys
+                    # it by the same filename stem with .ranges (replacing .dll).
                     ranges_out = dll_path[:-4] + '.ranges'
-                    if ranges_src:
-                        nfn = write_overlay_ranges(ranges_src, ranges_out,
-                                                   data, load_addr, size)
+                    if this_ids:
+                        nfn = write_overlay_ranges_from(this_ids, ranges_out)
                         print(f'  ranges: {nfn} functions -> {ranges_out}')
+                        # New identities are now available for this region_start;
+                        # keep the warm coverage set current so later captures in
+                        # this same run dedup against them.
+                        covered |= this_set
                     else:
                         print('  WARNING: recompiler emitted no _full.ranges — '
                               'loader will leave this region to the interpreter')
                     print(f'  OK -> {dll_path}\n')
                 else:
                     print(f'  FAILED\n')
+
+    # Interior-entry "island" fragments (overlay-cache v2): the FMV-driver class.
+    # Run as a SEPARATE pass AFTER all region compiles, so it is DECOUPLED from
+    # region success — an executed orphan interior gets its isolated island shard
+    # even if its region's trusted compile failed/audit-failed (that is the whole
+    # point of the separate failure domain). For each region, find DISPATCH_INTERIOR
+    # PCs that ACTUALLY EXECUTED this session but that NO built DLL covers (orphan
+    # interiors — host never discovered, so the region can't alias them), and
+    # compile each as its OWN isolated <region>_<key>.dll that ENTERS at the
+    # interior PC (recovers no host). Isolated => a bad fragment fails alone and
+    # never poisons a region's trusted DLL.
+    if not args.static:
+        frag_env = dict(os.environ)
+        if args.cps:
+            frag_env['PSX_CPS'] = '1'
+        for job in interior_frag_jobs:
+            phys_addr, load_addr, size, data, interior_pcs, executed = job
+            covered = load_region_covered_ranges(cache_dir, phys_addr)
+            def _is_covered(a):
+                a &= 0x1FFFFFFF
+                return any(lo <= a < lo + length for lo, length in covered)
+            orphans = sorted(a for a in interior_pcs
+                             if a in executed and not _is_covered(a))
+            if not orphans:
+                continue
+            built = 0
+            for a in orphans:
+                frag_ids = compile_interior_fragment(a, data, load_addr, size,
+                                                     phys_addr, cache_dir, args,
+                                                     frag_env)
+                if frag_ids:
+                    built += 1
+                    for ev, _cc, ranges in frag_ids:
+                        covered.extend((lo & 0x1FFFFFFF, L) for lo, L in ranges)
+            print(f'  interior fragments @0x{phys_addr:08X}: {built}/{len(orphans)} '
+                  f'executed orphan interior(s) -> isolated island shards')
 
     # B-2: write combined static C file
     if args.static and static_parts:

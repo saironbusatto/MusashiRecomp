@@ -39,6 +39,7 @@
 #include "card_data_writes.h"
 #include "crash_trace.h"
 #include "gpu_gl_renderer.h"
+#include "lockstep.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,6 +125,142 @@ static int    io_thread_main(void *arg);   /* defined near debug_server_poll    
 /* Non-static so other instrumentation (e.g. dirty_ram_interp.c) can stamp
  * ring-buffer entries with the current frame for cross-correlation. */
 uint64_t s_frame_count = 0;
+
+/* ---- Layer-1 first-divergence per-frame fingerprint ----------------------
+ * Cumulative, ORDER-DEPENDENT rolling hashes over MAIN-RAM guest writes.
+ * The point: native and dirty-interp are the SAME deterministic program run
+ * two ways; they must produce an identical sequence of (addr,val,store_pc)
+ * guest-RAM writes until a codegen/timing bug forks them. A guest RAM write
+ * (and the PC issuing it) is pure guest semantics — granularity-invariant
+ * across native vs interp (unlike host block/dispatch counts). We accumulate
+ * two rolling hashes and snapshot them once per guest frame. Diff two runs'
+ * per-frame columns: the FIRST frame whose hash differs is the first-divergence
+ * frame, found in O(1) instead of O(n) function guesses. wr_hash vs pc_hash
+ * classifies the fork: pc differs but wr matches => same writes via a different
+ * control path; wr differs => actual state divergence. Reusable for any title.
+ * Hashed over main RAM (phys < 0x200000) only — game state lives there; MMIO/
+ * scratchpad churn (device polling) would add benign cross-backend noise. */
+uint64_t g_fp_wr_hash    = 1469598103934665603ULL;  /* FNV-1a-style seed (main RAM) */
+uint64_t g_fp_pc_hash    = 1469598103934665603ULL;  /* store-PC path sig (main RAM)  */
+uint64_t g_fp_write_count = 0;
+uint64_t g_fp_mmio_hash  = 1469598103934665603ULL;  /* SEPARATE: device-register writes */
+uint64_t g_fp_mmio_count = 0;
+uint64_t g_fp_sp_hash    = 1469598103934665603ULL;  /* SEPARATE: scratchpad (0x1F8000xx) writes */
+uint64_t g_fp_sp_count   = 0;
+#define FP_RING_CAP 32768
+typedef struct { uint32_t frame; uint64_t wr_hash; uint64_t pc_hash; uint64_t wcount;
+                 uint64_t mmio_hash; uint64_t mmio_count;
+                 uint64_t sp_hash; uint64_t sp_count; uint64_t cyc; } FpEntry;
+static FpEntry  s_fp_ring[FP_RING_CAP];
+static uint32_t s_fp_head  = 0;
+static uint64_t s_fp_total = 0;
+
+/* Record a guest WRITE into the per-frame fingerprint. Main RAM (phys<0x200000)
+ * feeds the proven wr/pc hashes. Scratchpad (0x1F800000..0x1F8003FF) feeds a
+ * SEPARATE sp_hash — it was previously dropped entirely (the blind spot that
+ * hid a possible pre-1823 scratchpad-state fork), but folding it into wr_hash
+ * would pollute the main-RAM signal with benign device-poll churn, so it gets
+ * its own classified column instead. */
+static inline void fp_record_write(uint32_t phys, uint32_t val, uint32_t pc)
+{
+    if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {   /* scratchpad — separate hash */
+        uint64_t s = g_fp_sp_hash;
+        s = (s ^ (uint64_t)phys) * 1099511628211ULL;
+        s = (s ^ (uint64_t)val)  * 1099511628211ULL;
+        s = (s ^ (uint64_t)pc)   * 1099511628211ULL;
+        g_fp_sp_hash = s;
+        g_fp_sp_count++;
+        return;
+    }
+    if (phys >= 0x200000u) return;                  /* main RAM only */
+    uint64_t h = g_fp_wr_hash;
+    h = (h ^ (uint64_t)phys) * 1099511628211ULL;
+    h = (h ^ (uint64_t)val)  * 1099511628211ULL;
+    g_fp_wr_hash = h;
+    g_fp_pc_hash = (g_fp_pc_hash ^ (uint64_t)pc) * 1099511628211ULL;
+    g_fp_write_count++;
+}
+
+/* MMIO/device-register write signature — separate hash so the diff can tell a
+ * RAM-state fork from a device-interaction fork (CD command, IRQ ack/mask, GPU).
+ * This is the gap that hid the true first divergence: the main-RAM fingerprint
+ * only sees the RAM AFTERMATH of a CD/IRQ-register divergence. */
+static inline void fp_record_mmio(uint32_t addr, uint32_t val, uint32_t pc)
+{
+    uint64_t h = g_fp_mmio_hash;
+    h = (h ^ (uint64_t)addr) * 1099511628211ULL;
+    h = (h ^ (uint64_t)val)  * 1099511628211ULL;
+    h = (h ^ (uint64_t)pc)   * 1099511628211ULL;
+    g_fp_mmio_hash = h;
+    g_fp_mmio_count++;
+}
+
+static void fp_snapshot(uint32_t frame)
+{
+    FpEntry *e = &s_fp_ring[s_fp_head];
+    e->frame      = frame;
+    e->wr_hash    = g_fp_wr_hash;
+    e->pc_hash    = g_fp_pc_hash;
+    e->wcount     = g_fp_write_count;
+    e->mmio_hash  = g_fp_mmio_hash;
+    e->mmio_count = g_fp_mmio_count;
+    e->sp_hash    = g_fp_sp_hash;
+    e->sp_count   = g_fp_sp_count;
+    { extern uint64_t psx_get_cycle_count(void); e->cyc = psx_get_cycle_count(); }
+    s_fp_head  = (s_fp_head + 1) % FP_RING_CAP;
+    s_fp_total++;
+}
+
+/* ---- Layer-2 frame-gated ordered write recorder -------------------------
+ * Once Layer-1 names the first-divergence frame N, arm `record_frame N` to
+ * capture the full ORDERED list of main-RAM writes for that one frame in both
+ * runs. Bounded (one frame), so it dumps in clean pages with no eviction race.
+ * Diff the two ordered logs by index (longest common prefix) -> the first
+ * differing (addr,val,pc) is the exact instruction where execution forks. */
+/* UNIFIED ordered access recorder. One buffer, so the array index IS the true
+ * execution order across writes AND device reads — no separate-indices problem.
+ * Each entry carries `kind` so the diff can interleave and classify. Captures,
+ * in execution order for the one gated frame: main-RAM writes, scratchpad
+ * writes (previously the blind spot), MMIO writes, and MMIO reads. The literal
+ * first divergent ACCESS (read or write) is the first index whose tuple differs
+ * between two runs. */
+#define REC_CAP 400000
+#define REC_KIND_RAM_W   0   /* main-RAM write   */
+#define REC_KIND_SP_W    1   /* scratchpad write */
+#define REC_KIND_MMIO_W  2   /* device-register write */
+#define REC_KIND_MMIO_R  3   /* device-register read  */
+#define REC_KIND_RAM_R   4   /* main-RAM read (targeted watch range only) */
+typedef struct { uint8_t kind; uint32_t addr; uint32_t val; uint32_t pc; uint32_t ra; uint64_t cyc; } RecEntry;
+static RecEntry  s_rec_buf[REC_CAP];
+static uint32_t  s_rec_count = 0;
+static int64_t   s_rec_frame = -1;       /* target guest frame, -1 = off */
+static uint32_t  s_rec_overflow = 0;
+
+/* Targeted main-RAM READ watch. Main-RAM data loads are far too hot to trace
+ * wholesale, but a narrow watched range answers the decisive question for a
+ * value-fork-with-no-write-divergence: what value does each backend actually
+ * load from the suspect address, and does it even read that address (proving
+ * pointer/register equality)? Reads in [lo,hi) land in the unified buffer as
+ * REC_KIND_RAM_R, interleaved in execution order with the writes. The hot read
+ * path checks only the int flag g_ram_read_watch_active (0 = no cost). */
+int             g_ram_read_watch_active = 0;
+static uint32_t s_rwatch_lo = 0, s_rwatch_hi = 0;
+
+static inline void rec_event(uint8_t kind, uint32_t addr, uint32_t val,
+                             uint32_t pc, uint32_t ra)
+{
+    if (s_rec_frame < 0 || (int64_t)s_frame_count != s_rec_frame) return;
+    if (s_rec_count >= REC_CAP) { s_rec_overflow++; return; }
+    RecEntry *e = &s_rec_buf[s_rec_count++];
+    e->kind = kind; e->addr = addr; e->val = val; e->pc = pc; e->ra = ra;
+    { extern uint64_t psx_get_cycle_count(void); e->cyc = psx_get_cycle_count(); }
+}
+
+void debug_server_trace_ram_read_watch(uint32_t phys, uint32_t val)
+{
+    if (phys >= s_rwatch_lo && phys < s_rwatch_hi)
+        rec_event(REC_KIND_RAM_R, phys, val, 0, 0);
+}
 
 /* ---- CPU state pointer (set at init) ---- */
 static CPUState *s_cpu = NULL;
@@ -560,7 +697,10 @@ static uint32_t trace_read_word(CPUState *cpu, uint32_t addr)
     /* Use psx_read_word directly (NOT cpu->read_word): debug instrumentation
      * must not charge guest main-RAM read wait states, and runs on the IO
      * thread where psx_advance_cycles would race the emulation thread. */
-    return psx_read_word(addr);
+    ls_suppress_begin();
+    uint32_t v = psx_read_word(addr);
+    ls_suppress_end();
+    return v;
 }
 
 static uint32_t trace_read_half(CPUState *cpu, uint32_t addr)
@@ -571,7 +711,10 @@ static uint32_t trace_read_half(CPUState *cpu, uint32_t addr)
         (phys < 0x1F800000u || phys > 0x1F8003FEu)) {
         return 0;
     }
-    return psx_read_half(addr);
+    ls_suppress_begin();
+    uint32_t v = psx_read_half(addr);
+    ls_suppress_end();
+    return v;
 }
 
 static int sreg_trace_focus_func(uint32_t func)
@@ -1795,13 +1938,21 @@ static int psx_synth_recurse(volatile int n) {
 void debug_server_synth_recurse_arm(void) { s_synth_recurse_armed = 1; }
 #endif
 
+static inline void cyc_watch_observe(uint32_t block_leader_phys);  /* defined below; used at fn-entry */
 void debug_server_log_call_entry(uint32_t func_addr) {
 #ifdef PSX_STACK_GUARD
     g_psx_recent_fn[g_psx_recent_fn_i++ & (PSX_RECENT_FN_CAP - 1u)] = func_addr;
     psx_native_stack_guard(func_addr);   /* runs in debug AND release (before the early-return) */
 #endif
 #ifndef PSX_NO_DEBUG_TOOLS
+    ls_suppress_begin();
     if (s_synth_recurse_armed) { s_synth_recurse_armed = 0; psx_synth_recurse(0); }
+    /* cyc_watch: universal compiled-function-entry hook (game AND BIOS, incl.
+     * relocated BIOS-shell funcs which dispatch oddly but still log their entry
+     * here). Sampled at function entry, before the body runs — matches the
+     * Beetle side (PC==anchor, before execute). Covers the game-dispatch path
+     * that debug_server_trace_dispatch misses. */
+    cyc_watch_observe(func_addr & 0x1FFFFFFFu);
 #endif
 #ifdef PSX_NO_DEBUG_TOOLS
     /* Hottest call site in the binary — called at the top of every
@@ -1813,13 +1964,14 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     s_fn_direct_seen++;
     if (!debug_cpu_ptr) {
         s_fn_direct_no_cpu++;
+        ls_suppress_end();
         return;
     }
     card_mgr_trace_record(func_addr, 0);
     sreg_trace_record(func_addr);
     call_focus_record(func_addr);
-    if (!s_fn_entry) return;
-    if (!fn_trace_in_filter(func_addr)) return;
+    if (!s_fn_entry) { ls_suppress_end(); return; }
+    if (!fn_trace_in_filter(func_addr)) { ls_suppress_end(); return; }
     s_fn_direct_filtered++;
     FnEntryEntry *e = &s_fn_entry[s_fn_entry_seq % FN_TRACE_CAP];
     e->seq             = s_fn_entry_seq;
@@ -1838,6 +1990,7 @@ void debug_server_log_call_entry(uint32_t func_addr) {
     e->depth           = (uint32_t)s_fn_stack_top;
     e->frame           = (uint32_t)s_frame_count;
     s_fn_entry_seq++;
+    ls_suppress_end();
 }
 
 /* Always-on A0/B0/C0 BIOS-call ring (ported from ape-fw for good-vs-bad
@@ -1850,6 +2003,11 @@ typedef struct {
 } BiosCallEntry;
 static BiosCallEntry s_bioscall_ring[BIOSCALL_RING_CAP];
 static uint64_t s_bioscall_seq = 0;
+/* Arm flag for the B0 event/thread-op capture in debug_server_trace_dispatch.
+ * OFF by default: recording every IRQ-context DeliverEvent per dispatch floods the
+ * ring and starves the poll-based command path at a freeze. Arm via `event_hook`
+ * only for the window of interest. */
+int g_event_hook_armed = 0;
 #define BIOSCALL_UNIQUE_CAP 2048
 typedef struct { uint32_t table_base; uint32_t index; uint64_t count; } BiosCallUnique;
 static BiosCallUnique s_bioscall_unique[BIOSCALL_UNIQUE_CAP];
@@ -1876,11 +2034,148 @@ void psx_bioscall_record(uint32_t table_base, uint32_t index, uint32_t func_ptr,
     }
 }
 
+/* ---- cyc_watch: native↔Beetle per-anchor cycle comparator ----
+ *
+ * Arms a single guest-PC anchor and records, into an always-on ring, the
+ * tuple (hit_index, psx_cycle_count, pc) the first N times the guest's
+ * executing block leader equals that anchor.  The companion tool
+ * tools/cycle_compare.py arms the SAME anchor on psx-beetle (matching
+ * command, added parent-side) and diffs elapsed cycles per hit_index to
+ * localize fine per-instruction cycle drift (e.g. the -8 class) that the
+ * gross per-frame rate already hides.
+ *
+ * CAPTURE SEMANTICS (the Beetle side must match EXACTLY):
+ *   - The anchor is sampled at BLOCK ENTRY, BEFORE the anchor instruction
+ *     (the block leader at the anchor PC) executes.
+ *   - psx_cycle_count at that instant = absolute guest cycles charged for
+ *     ALL prior blocks, NOT including any cycle of the anchor block.
+ *   - The anchor matches a basic-block *leader* PC (the address handed to
+ *     the dispatcher). A PC that is only ever reached mid-block (never a
+ *     dispatch/interp block leader) will not fire — anchor on a function
+ *     entry or branch target.
+ *
+ * ANCHOR NORMALIZATION: the armed PC is masked to a physical address
+ * (pc & 0x1FFFFFFF) and compared against the physical block leader on both
+ * the compiled-dispatch path (already-physical `phys`) and the dirty-RAM
+ * interpreter path (`target & 0x1FFFFFFF`). Caveat: BIOS-shell functions
+ * relocated into RAM 0x30000-0x5AFFF are dispatched at physical 0x1FC18xxx;
+ * to anchor one of those, arm its relocated physical PC. Game/BIOS-ROM
+ * anchors are a plain mask and need no special handling.
+ *
+ * Default-off, additive: when g_cyc_watch_armed == 0 the observe hook is a
+ * single load + compare and records nothing — zero behavior change. */
+#define CYC_WATCH_RING_CAP 1024
+typedef struct {
+    uint32_t hit_index;       /* 0-based ordinal of this anchor hit */
+    uint32_t pc;              /* matched physical block-leader PC */
+    uint64_t psx_cycle_count; /* absolute guest cycles at block entry */
+} CycWatchEntry;
+static CycWatchEntry s_cyc_watch_ring[CYC_WATCH_RING_CAP];
+static volatile int s_cyc_watch_armed = 0; /* 1 = recording active */
+static uint32_t s_cyc_watch_anchor_phys = 0; /* armed anchor (A / start), masked to phys */
+static uint32_t s_cyc_watch_anchor_raw = 0;  /* armed anchor as supplied (for echo) */
+static uint32_t s_cyc_watch_max_hits = 16;   /* stop after this many hits */
+static uint32_t s_cyc_watch_hits = 0;        /* hits recorded so far */
+/* Two-anchor REGION mode (FAITHFUL_TIMING_PLAN.md §3c): when end_phys != 0, each
+ * recorded entry is the Δcycles of one A->B pass (cycles at B minus cycles at A),
+ * i.e. the cost of the KNOWN code path between two dispatch points (e.g. a function
+ * entry -> its exit-transfer target). end_phys == 0 keeps the single-anchor mode
+ * (entry stores absolute cycles at A). Both anchors must be dispatch points (the
+ * native observer only fires at function entries / compiled-dispatch / dirty
+ * blocks). */
+static uint32_t s_cyc_watch_end_phys = 0;    /* B / end anchor (0 = single-anchor) */
+static uint32_t s_cyc_watch_end_raw  = 0;
+static int      s_cyc_watch_in_region = 0;   /* 1 = saw A, awaiting B */
+static uint64_t s_cyc_watch_region_start = 0;
+
+/* Hot-path block-entry observer. Called from the compiled-dispatch path
+ * (debug_server_trace_dispatch), the universal function-entry hook
+ * (debug_server_log_call_entry), and the dirty-RAM path
+ * (debug_server_dirty_break_maybe_pause). `block_leader_phys` is physical. */
+/* Dedupe state for the dispatch+prologue double-fire (see below). */
+static uint32_t s_cyc_watch_last_phys  = 0xFFFFFFFFu;
+static uint64_t s_cyc_watch_last_cycle = 0xFFFFFFFFFFFFFFFFull;
+
+static inline void cyc_watch_observe(uint32_t block_leader_phys)
+{
+    if (!s_cyc_watch_armed) return;                 /* disarmed: no cost */
+
+    /* DEDUPE the double-fire: a block reached via the dispatcher is observed
+     * BOTH by debug_server_trace_dispatch (routing) AND by the function's own
+     * debug_server_log_call_entry (prologue) — same phys, same cycle, 0 cycles
+     * apart. That double-records every dispatched entry (a function reached by a
+     * direct jal fires only the prologue, so it looked like alternating pairs in
+     * the ring). A genuine re-entry of the same PC is always ≥1 cycle later, so
+     * keying on (phys,cycle) drops ONLY the spurious double, never a real hit. */
+    uint64_t cyc_now = psx_get_cycle_count();
+    if (block_leader_phys == s_cyc_watch_last_phys &&
+        cyc_now           == s_cyc_watch_last_cycle) {
+        return;
+    }
+    s_cyc_watch_last_phys  = block_leader_phys;
+    s_cyc_watch_last_cycle = cyc_now;
+
+    if (s_cyc_watch_end_phys != 0u) {               /* ── REGION mode (A..B Δ) ── */
+        if (!s_cyc_watch_in_region) {
+            if (block_leader_phys == s_cyc_watch_anchor_phys) {
+                s_cyc_watch_region_start = cyc_now;
+                s_cyc_watch_in_region = 1;
+            }
+        } else if (block_leader_phys == s_cyc_watch_end_phys) {
+            CycWatchEntry *e = &s_cyc_watch_ring[s_cyc_watch_hits];
+            e->hit_index       = s_cyc_watch_hits;
+            e->pc              = block_leader_phys;
+            e->psx_cycle_count = cyc_now - s_cyc_watch_region_start;  /* Δ(B-A) */
+            s_cyc_watch_hits++;
+            s_cyc_watch_in_region = 0;
+            if (s_cyc_watch_hits >= s_cyc_watch_max_hits) s_cyc_watch_armed = 0;
+        }
+        return;
+    }
+
+    if (block_leader_phys != s_cyc_watch_anchor_phys) return;  /* ── single-anchor ── */
+    if (s_cyc_watch_hits >= s_cyc_watch_max_hits) {
+        s_cyc_watch_armed = 0;                      /* full: stop sampling */
+        return;
+    }
+    CycWatchEntry *e = &s_cyc_watch_ring[s_cyc_watch_hits];
+    e->hit_index       = s_cyc_watch_hits;
+    e->pc              = block_leader_phys;
+    e->psx_cycle_count = cyc_now;
+    s_cyc_watch_hits++;
+    if (s_cyc_watch_hits >= s_cyc_watch_max_hits) s_cyc_watch_armed = 0;
+}
+
+/* Exported per-basic-block-leader cycle observer. Emitted by the recompiler at
+ * EVERY compiled block leader (under #ifndef PSX_NO_DEBUG_TOOLS, so prod builds
+ * emit nothing — zero overhead) so native's cycle observation matches Beetle's
+ * (which samples before every instruction). This lets cyc_watch anchor ANY
+ * block-leader PC — interior loop tops, prologue exits — not just function
+ * entries, which is required for a clean, KNOWN-instruction-sequence ruler.
+ * Disarmed cost = one volatile load + return (see cyc_watch_observe). */
+void debug_server_cyc_observe(uint32_t block_leader_phys) {
+#ifdef PSX_NO_DEBUG_TOOLS
+    (void)block_leader_phys;
+    return;
+#else
+    cyc_watch_observe(block_leader_phys & 0x1FFFFFFFu);
+    /* #2 lockstep comparator: per-basic-block compiled-vs-interp check. Self-gates
+     * on the armed frame window; ~free (one branch) when disarmed. */
+    { extern void ls_at_leader(uint32_t, CPUState*); extern CPUState *debug_cpu_ptr;
+      ls_at_leader(block_leader_phys & 0x1FFFFFFFu, debug_cpu_ptr); }
+#endif
+}
+
 void debug_server_trace_dispatch(uint32_t func_addr) {
 #ifdef PSX_NO_DEBUG_TOOLS
     (void)func_addr;
     return;
 #endif
+    ls_suppress_begin();
+    /* cyc_watch: compiled-dispatch path. func_addr is already the physical
+     * (normalized) block leader. Sampled before the block runs. */
+    cyc_watch_observe(func_addr & 0x1FFFFFFFu);
+
     card_mgr_trace_record(func_addr, 1);
 
     {
@@ -1890,6 +2185,35 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
                                 debug_cpu_ptr->gpr[4], debug_cpu_ptr->gpr[5],
                                 debug_cpu_ptr->gpr[6], debug_cpu_ptr->gpr[7],
                                 debug_cpu_ptr->gpr[31]);
+        }
+        /* Event/thread-op stream (ChatGPT-conferred blocked-main-thread hunt,
+         * MMX6 cutscene->gameplay freeze). The recompiler resolves B0 event calls
+         * to DIRECT compiled-function calls, so they bypass the 0xB0 vector above
+         * (the vector ring stays empty). But the event functions ARE dispatched as
+         * compiled funcs (they appear in dispatch_tail), so capture them HERE keyed
+         * on their SCPH1001 RAM entry addresses (from B0_table @ 0x874), recorded
+         * with a synthetic table_base=0xB0 + the real B0 index so bioscall_dump
+         * surfaces the full OpenEvent/WaitEvent/DeliverEvent/EnableEvent/... stream.
+         * in_exception distinguishes IRQ-context DeliverEvent from main-thread calls. */
+        else if (debug_cpu_ptr && g_event_hook_armed) {
+            int evi = -1;
+            switch (vphys) {
+                case 0x1B44u: evi = 0x07; break; /* DeliverEvent(class,spec) */
+                case 0x1D8Cu: evi = 0x08; break; /* OpenEvent(class,spec,mode,func) */
+                case 0x1E1Cu: evi = 0x09; break; /* CloseEvent(event) */
+                case 0x1E44u: evi = 0x0A; break; /* WaitEvent(event) */
+                case 0x1EC8u: evi = 0x0B; break; /* TestEvent(event) */
+                case 0x1F10u: evi = 0x0C; break; /* EnableEvent(event) */
+                case 0x1F4Cu: evi = 0x0D; break; /* DisableEvent(event) */
+                case 0x20D4u: evi = 0x10; break; /* ChangeTh(pcb,tcb) */
+                default: break;
+            }
+            if (evi >= 0) {
+                psx_bioscall_record(0xB0u, (uint32_t)evi, vphys,
+                                    debug_cpu_ptr->gpr[4], debug_cpu_ptr->gpr[5],
+                                    debug_cpu_ptr->gpr[6], debug_cpu_ptr->gpr[7],
+                                    debug_cpu_ptr->gpr[31]);
+            }
         }
     }
 
@@ -1930,6 +2254,7 @@ void debug_server_trace_dispatch(uint32_t func_addr) {
     s_dispatch_ring[s_dispatch_seq % DISPATCH_TRACE_CAP] = func_addr;
     s_dispatch_seq++;
     dispatch_unique_add(func_addr);
+    ls_suppress_end();
 }
 
 static int json_get_int(const char *json, const char *key, int def);
@@ -2296,6 +2621,147 @@ static void handle_dirty_insn_dump_file(int id, const char *json)
  * argument-passing chains, and answer "who called X with what args"
  * across processes (psx-runtime port 4370, psx-beetle port 4380). */
 #include "fntrace.h"
+#include "parity_trace.h"
+#include "device_trace.h"
+
+/* ---- parity_dump / parity_ctl: general two-process control-flow parity ring.
+ * Mirrors the IDENTICAL command on psx-beetle so tools/parity_diff.py can pull
+ * both timelines and align by logical sequence (PRINCIPLES.md first-divergence). */
+/* Two rows have the same watched-STATE iff their watch words + epc + tcb_state
+ * match (pc/ra/sp ignored). Used by the `transitions` dump filter to collapse
+ * runs of identical-state dispatch rows into one (with a `reps` count), so a
+ * 130k-row cutscene dump trims to the handful of rows where state changed. */
+static int parity_same_state(const ParityEntry *a, const ParityEntry *b)
+{
+    if (a->kind != b->kind) return 0;
+    if (a->epc != b->epc || a->tcb_state != b->tcb_state) return 0;
+    for (int k = 0; k < PARITY_WATCH_MAX; k++)
+        if (a->watch[k] != b->watch[k]) return 0;
+    return 1;
+}
+
+static void handle_parity_dump(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 131072);
+    /* transitions=1: emit only state-change rows (collapse identical-state dispatch
+     * runs), each with reps=run length. The decisive trim for cross-process diff. */
+    int trans = json_get_int(json, "transitions", 0);
+    if (count < 1) count = 1;
+    if (count > 131072) count = 131072;
+    ParityEntry *e = (ParityEntry *)malloc(sizeof(ParityEntry) * (size_t)count);
+    if (!e) { send_err(id, "oom"); return; }
+    uint32_t got = parity_trace_get(e, (uint32_t)count);
+    const size_t BUF_SZ = 12 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) { free(e); send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+        "{\"id\":%d,\"ok\":true,\"total\":%llu,\"armed\":%d,\"frozen\":%d,\"count\":%u,\"entries\":[",
+        id, (unsigned long long)parity_trace_total(), parity_trace_is_armed(),
+        parity_trace_is_frozen(), got);
+    uint32_t run = 1, emitted = 0;
+    for (uint32_t i = 0; i < got; i++) {
+        if (pos > BUF_SZ - 2048) break;
+        /* In transitions mode, advance through identical-state dispatch rows until
+         * a boundary (next row differs, is a control event, or end of buffer). */
+        if (trans) {
+            int boundary = (i + 1 >= got) || !parity_same_state(&e[i], &e[i + 1])
+                           || e[i].kind != PARITY_KIND_DISPATCH;
+            if (!boundary) { run++; continue; }
+        }
+        ParityEntry *r = &e[i];
+        pos += snprintf(out + pos, BUF_SZ - pos,
+            "%s{\"seq\":%llu,\"frame\":%u,\"cycle\":%llu,\"reps\":%u,\"kind\":\"%s\",\"cur_tcb\":\"0x%08X\","
+            "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"sp\":\"0x%08X\",\"epc\":\"0x%08X\","
+            "\"state\":\"0x%08X\",\"target\":\"0x%08X\","
+            "\"w\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"],"
+            "\"wwpc\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"],"
+            "\"wwcy\":[%llu,%llu,%llu,%llu,%llu,%llu],"
+            "\"wwf\":[%u,%u,%u,%u,%u,%u],"
+            "\"wwt\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\"]}",
+            emitted ? "," : "", (unsigned long long)r->seq, r->frame,
+            (unsigned long long)r->cycle, trans ? run : 1u, parity_kind_str(r->kind),
+            r->current_tcb, r->pc, r->ra, r->sp, r->epc, r->tcb_state, r->target,
+            r->watch[0], r->watch[1], r->watch[2], r->watch[3], r->watch[4], r->watch[5],
+            r->watch_wpc[0], r->watch_wpc[1], r->watch_wpc[2], r->watch_wpc[3], r->watch_wpc[4], r->watch_wpc[5],
+            (unsigned long long)r->watch_wcycle[0], (unsigned long long)r->watch_wcycle[1],
+            (unsigned long long)r->watch_wcycle[2], (unsigned long long)r->watch_wcycle[3],
+            (unsigned long long)r->watch_wcycle[4], (unsigned long long)r->watch_wcycle[5],
+            r->watch_wframe[0], r->watch_wframe[1], r->watch_wframe[2], r->watch_wframe[3], r->watch_wframe[4], r->watch_wframe[5],
+            r->watch_wtcb[0], r->watch_wtcb[1], r->watch_wtcb[2], r->watch_wtcb[3], r->watch_wtcb[4], r->watch_wtcb[5]);
+        emitted++; run = 1;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%u}\n", emitted);
+    debug_server_send_line(out); free(out); free(e);
+}
+
+static void handle_parity_ctl(int id, const char *json)
+{
+    if (json_get_int(json, "reset", 0)) parity_trace_reset();
+    long armv = json_get_int(json, "arm", -1);
+    if (armv == 0 || armv == 1) parity_trace_arm((int)armv);
+    char buf[160];
+    snprintf(buf, sizeof buf,
+        "{\"id\":%d,\"ok\":true,\"armed\":%d,\"frozen\":%d,\"total\":%llu}\n",
+        id, parity_trace_is_armed(), parity_trace_is_frozen(),
+        (unsigned long long)parity_trace_total());
+    debug_server_send_line(buf);
+}
+
+/* ---- devtrace_dump / devtrace_ctl: general two-process device-event ring.
+ * Identical command + JSON on psx-beetle so tools/devtrace_diff.py pulls both
+ * device-IRQ timelines and aligns them by guest cycle. Optional filters:
+ *   count           max newest events to return (default 65536, cap = ring)
+ *   cyc_lo / cyc_hi half-open guest-cycle window (decimal) — slice the load
+ *   src             only this I_STAT source bit (0..10); omit/negative = all */
+static void handle_devtrace_dump(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 65536);
+    if (count < 1) count = 1;
+    if (count > (1 << 20)) count = (1 << 20);
+    char buf[32];
+    uint64_t cyc_lo = 0, cyc_hi = ~0ull;
+    if (json_get_str(json, "cyc_lo", buf, sizeof buf)) cyc_lo = strtoull(buf, NULL, 0);
+    if (json_get_str(json, "cyc_hi", buf, sizeof buf)) cyc_hi = strtoull(buf, NULL, 0);
+    int src = json_get_int(json, "src", -1);
+
+    DevEvent *e = (DevEvent *)malloc(sizeof(DevEvent) * (size_t)count);
+    if (!e) { send_err(id, "oom"); return; }
+    uint32_t got = device_trace_get(e, (uint32_t)count);
+    const size_t BUF_SZ = 12 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ);
+    if (!out) { free(e); send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+        "{\"id\":%d,\"ok\":true,\"total\":%llu,\"armed\":%d,\"count\":%u,\"events\":[",
+        id, (unsigned long long)device_trace_total(), device_trace_is_armed(), got);
+    uint32_t emitted = 0;
+    for (uint32_t i = 0; i < got; i++) {
+        if (pos > BUF_SZ - 256) break;
+        DevEvent *r = &e[i];
+        if (r->cycle < cyc_lo || r->cycle >= cyc_hi) continue;
+        if (src >= 0 && (int)r->source != src) continue;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+            "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,\"srcn\":%u,\"src\":\"%s\",\"detail\":%u}",
+            emitted ? "," : "", (unsigned long long)r->seq, (unsigned long long)r->cycle,
+            r->frame, r->source, device_source_str(r->source), r->detail);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "],\"emitted\":%u}\n", emitted);
+    debug_server_send_line(out); free(out); free(e);
+}
+
+static void handle_devtrace_ctl(int id, const char *json)
+{
+    if (json_get_int(json, "reset", 0)) device_trace_reset();
+    long armv = json_get_int(json, "arm", -1);
+    if (armv == 0 || armv == 1) device_trace_arm((int)armv);
+    char buf[128];
+    snprintf(buf, sizeof buf,
+        "{\"id\":%d,\"ok\":true,\"armed\":%d,\"total\":%llu}\n",
+        id, device_trace_is_armed(), (unsigned long long)device_trace_total());
+    debug_server_send_line(buf);
+}
 
 static void handle_fntrace_arm(int id, const char *json)
 {
@@ -2866,6 +3332,10 @@ static const char *thread_kind_name(uint32_t kind)
         case 10: return "fiber_entry";
         case 11: return "fiber_done";
         case 12: return "fiber_return_restore";
+        case 13: return "fiber_dispatch_exit";        /* fiber's psx_dispatch returned, in_exc==0 */
+        case 20: return "syscall3_enter";             /* ChangeThread/RFE syscall, in_exc==0 (switch-eligible) */
+        case 24: return "syscall3_enter_in_exc";      /* ChangeThread/RFE syscall, in_exc==1 (forced manual-RFE) */
+        case 26: return "fiber_dispatch_exit_in_exc"; /* fiber's psx_dispatch returned, in_exc==1 */
         default: return "unknown";
     }
 }
@@ -3634,6 +4104,13 @@ void debug_server_send_fmt(const char *fmt, ...)
 
 int debug_server_dirty_break_maybe_pause(uint32_t target, CPUState *cpu)
 {
+    /* cyc_watch: dirty-RAM interpreter path. `target` is the virtual block
+     * leader about to be interpreted; mask to physical and sample before
+     * the block runs (same instant as the compiled path). This hook is
+     * invoked unconditionally at every interp block entry, so the anchor
+     * is observed even when no dirty-break range is set. */
+    cyc_watch_observe(target & 0x1FFFFFFFu);
+
     if (!s_dirty_break_active) return 0;
     if (target < s_dirty_break_lo || target >= s_dirty_break_hi) return 0;
 
@@ -3686,6 +4163,145 @@ static void handle_frame(int id, const char *json)
     (void)json;
     send_fmt("{\"id\":%d,\"ok\":true,\"frame\":%llu}",
              id, (unsigned long long)s_frame_count);
+}
+
+/* Layer-1 first-divergence: dump the per-frame write fingerprint ring.
+ * Params: count (default 1024), frame_lo / frame_hi (optional inclusive
+ * filter). Entries are oldest-first within the window. Diff the wr/pc columns
+ * of two runs (native vs interp/oracle): the first frame whose wr or pc differs
+ * is the first-divergence frame. Small integer fields only — no large/ragged
+ * payload, so it never trips the trace-dump JSON/eviction problems. */
+static void handle_frame_fingerprint(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 1024);
+    if (count < 1) count = 1;
+    if (count > FP_RING_CAP) count = FP_RING_CAP;
+    int flo = json_get_int(json, "frame_lo", -1);
+    int fhi = json_get_int(json, "frame_hi", -1);
+
+    uint32_t avail = (s_fp_total < FP_RING_CAP) ? (uint32_t)s_fp_total : FP_RING_CAP;
+    uint32_t start = (s_fp_total < FP_RING_CAP) ? 0 : s_fp_head;
+
+    size_t BUF = 512 + (size_t)count * 224;
+    char *out = (char *)malloc(BUF);
+    if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"available\":%u,\"entries\":[",
+                    id, (unsigned long long)s_fp_total, avail);
+    int emitted = 0;
+    for (uint32_t i = 0; i < avail && emitted < count; i++) {
+        FpEntry *e = &s_fp_ring[(start + i) % FP_RING_CAP];
+        if (flo >= 0 && (int)e->frame < flo) continue;
+        if (fhi >= 0 && (int)e->frame > fhi) continue;
+        pos += snprintf(out + pos, BUF - pos,
+                        "%s{\"frame\":%u,\"wr\":\"0x%016llx\",\"pc\":\"0x%016llx\",\"wc\":%llu,"
+                        "\"mmio\":\"0x%016llx\",\"mc\":%llu,"
+                        "\"sp\":\"0x%016llx\",\"sc\":%llu,\"cyc\":%llu}",
+                        emitted ? "," : "", e->frame,
+                        (unsigned long long)e->wr_hash,
+                        (unsigned long long)e->pc_hash,
+                        (unsigned long long)e->wcount,
+                        (unsigned long long)e->mmio_hash,
+                        (unsigned long long)e->mmio_count,
+                        (unsigned long long)e->sp_hash,
+                        (unsigned long long)e->sp_count,
+                        (unsigned long long)e->cyc);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF - pos, "]}\n");
+    debug_server_send_line(out);
+    free(out);
+}
+
+/* Layer-2: arm the frame-gated write recorder for a guest frame. */
+static void handle_record_frame(int id, const char *json)
+{
+    int f = json_get_int(json, "frame", -1);
+    s_rec_count = 0; s_rec_overflow = 0;
+    s_rec_frame = (f < 0) ? -1 : (int64_t)f;
+    send_fmt("{\"id\":%d,\"ok\":true,\"armed_frame\":%lld,\"cur_frame\":%llu}",
+             id, (long long)s_rec_frame, (unsigned long long)s_frame_count);
+}
+
+static const char *rec_kind_str(uint8_t k)
+{
+    switch (k) {
+        case REC_KIND_RAM_W:  return "ramw";
+        case REC_KIND_SP_W:   return "spw";
+        case REC_KIND_MMIO_W: return "mmiow";
+        case REC_KIND_MMIO_R: return "mmior";
+        case REC_KIND_RAM_R:  return "ramr";
+        default:              return "?";
+    }
+}
+
+/* Layer-2: dump the recorded frame's UNIFIED ordered access log (paged). The
+ * array index `i` is the true execution order across writes and reads; `kind`
+ * classifies each. Optional "kind" param (0..3) filters to one class; default
+ * (omitted/-1) emits everything. Diff two runs by `i` — the first differing
+ * (kind,addr,val,pc) tuple is the literal first divergent access. */
+static void handle_record_frame_dump(int id, const char *json)
+{
+    int offset = json_get_int(json, "offset", 0);
+    int count  = json_get_int(json, "count", 1500);
+    int kfilt  = json_get_int(json, "kind", -1);
+    if (offset < 0) offset = 0;
+    if (count < 1) count = 1;
+    if (count > 4000) count = 4000;
+    size_t BUF = 512 + (size_t)count * 160;
+    char *out = (char *)malloc(BUF);
+    if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF - pos,
+        "{\"id\":%d,\"ok\":true,\"frame\":%lld,\"total\":%u,\"overflow\":%u,\"offset\":%d,\"entries\":[",
+        id, (long long)s_rec_frame, s_rec_count, s_rec_overflow, offset);
+    int emitted = 0;
+    for (int i = offset; i < (int)s_rec_count && emitted < count; i++) {
+        RecEntry *e = &s_rec_buf[i];
+        if (kfilt >= 0 && (int)e->kind != kfilt) continue;
+        pos += snprintf(out + pos, BUF - pos,
+            "%s{\"i\":%d,\"kind\":\"%s\",\"addr\":\"0x%08X\",\"val\":\"0x%08X\",\"pc\":\"0x%08X\",\"ra\":\"0x%08X\",\"cyc\":%llu}",
+            emitted ? "," : "", i, rec_kind_str(e->kind), e->addr, e->val, e->pc, e->ra,
+            (unsigned long long)e->cyc);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF - pos, "]}\n");
+    debug_server_send_line(out);
+    free(out);
+}
+
+/* Layer-2 companion: dump only the device-register READS from the unified log,
+ * preserving their execution-order index `i`. (Thin wrapper over the unified
+ * buffer filtered to MMIO reads — retained for the existing read-diff tools.) */
+static void handle_record_reads_dump(int id, const char *json)
+{
+    int offset = json_get_int(json, "offset", 0);
+    int count  = json_get_int(json, "count", 1500);
+    if (offset < 0) offset = 0;
+    if (count < 1) count = 1;
+    if (count > 4000) count = 4000;
+    size_t BUF = 512 + (size_t)count * 112;
+    char *out = (char *)malloc(BUF);
+    if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF - pos,
+        "{\"id\":%d,\"ok\":true,\"frame\":%lld,\"total\":%u,\"offset\":%d,\"entries\":[",
+        id, (long long)s_rec_frame, s_rec_count, offset);
+    int emitted = 0;
+    int seen = 0;
+    for (int i = 0; i < (int)s_rec_count && emitted < count; i++) {
+        RecEntry *e = &s_rec_buf[i];
+        if (e->kind != REC_KIND_MMIO_R) continue;
+        if (seen++ < offset) continue;          /* page over reads only */
+        pos += snprintf(out + pos, BUF - pos,
+            "%s{\"i\":%d,\"addr\":\"0x%08X\",\"val\":\"0x%08X\",\"pc\":\"0x%08X\"}",
+            emitted ? "," : "", i, e->addr, e->val, e->pc);
+        emitted++;
+    }
+    pos += snprintf(out + pos, BUF - pos, "]}\n");
+    debug_server_send_line(out);
+    free(out);
 }
 
 static void handle_get_registers(int id, const char *json)
@@ -3852,6 +4468,26 @@ static void handle_mem_words(int id, const char *json)
     pos += snprintf(buf + pos, bufsz - pos, "]}");
     debug_server_send_line(buf);
     free(buf);
+}
+
+/* Precise-event-slicing validation: report the cycle distance to the next
+ * deliverable interrupt, broken down per source. Compare against the live timer
+ * counters / VBLANK pacing (timers_state, freeze_check) to validate
+ * cycles_to_next_event before wiring it into the two-tier executor. UINT32_MAX
+ * (4294967295) for a source means "no deliverable IRQ scheduled". */
+static void handle_cycles_to_next_event(int id, const char *json)
+{
+    (void)json;
+    uint32_t agg = cycles_to_next_event();
+    uint32_t t = timers_cycles_to_irq(i_mask);
+    uint32_t c = cdrom_cycles_to_irq(i_mask);
+    uint32_t d = dma_cycles_to_irq(i_mask);
+    uint32_t s = sio_cycles_to_irq(i_mask);
+    send_fmt("{\"id\":%d,\"ok\":true,"
+             "\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\","
+             "\"cycles_to_next_event\":%u,"
+             "\"timers\":%u,\"cdrom\":%u,\"dma\":%u,\"sio\":%u}",
+             id, i_stat, i_mask, agg, t, c, d, s);
 }
 
 static void handle_irq_state(int id, const char *json)
@@ -6651,6 +7287,14 @@ void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
     return;
 #endif
     if (is_card_critical_addr(phys)) card_trace_record(phys, old_val, new_val, width);
+    fp_record_write(phys, new_val, g_debug_last_store_pc);
+    {
+        uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
+        if (phys < 0x200000u)
+            rec_event(REC_KIND_RAM_W, phys, new_val, g_debug_last_store_pc, ra);
+        else if (phys >= 0x1F800000u && phys <= 0x1F8003FFu)
+            rec_event(REC_KIND_SP_W, phys, new_val, g_debug_last_store_pc, ra);
+    }
     wtrace_all_record(phys, new_val, width);
     wtrace_transition_record(phys, old_val, new_val, width);
     wtrace_boot_record(phys, old_val, new_val, width);
@@ -6670,6 +7314,10 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
     (void)addr; (void)val; (void)width;
     return;
 #endif
+    /* First-divergence fingerprint + frame recorder also see device writes. */
+    fp_record_mmio(addr, val, g_debug_last_store_pc);
+    rec_event(REC_KIND_MMIO_W, addr, val, g_debug_last_store_pc,
+              debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0);
     if (!s_mmio_trace) return;
     MmioTraceEntry *e = &s_mmio_trace[s_mmio_trace_head];
     e->seq       = s_mmio_trace_seq++;
@@ -6708,6 +7356,8 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
  * livelock that polls them. `val` is the value the CPU actually loaded. */
 void debug_server_trace_mmio_read(uint32_t addr, uint32_t val, uint8_t width)
 {
+    rec_event(REC_KIND_MMIO_R, addr, val, g_debug_last_store_pc,
+              debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0);
 #ifdef PSX_NO_DEBUG_TOOLS
     (void)addr; (void)val; (void)width;
     return;
@@ -6815,6 +7465,93 @@ static void handle_wtrace_ranges(int id, const char *json)
     free(buf);
 }
 
+/* ---- cyc_watch command handlers (see cyc_watch_observe above) ---- */
+
+/* cyc_watch — arm an anchor PC. {"pc":"0x...","n":16}. Clears the ring,
+ * masks the anchor to physical, and starts recording. The Beetle side
+ * (psx-beetle, added parent-side) implements the SAME command/spec. */
+static void handle_cyc_watch(int id, const char *json)
+{
+    char pcbuf[64];
+    if (!json_get_str(json, "pc", pcbuf, sizeof(pcbuf))) {
+        send_err(id, "cyc_watch requires pc");
+        return;
+    }
+    uint32_t raw = hex_to_u32(pcbuf);
+    int n = json_get_int(json, "n", 16);
+    if (n < 1) n = 1;
+    if (n > CYC_WATCH_RING_CAP) n = CYC_WATCH_RING_CAP;
+    /* Optional second anchor -> REGION mode: each entry = Δcycles of one A->B pass. */
+    char endbuf[64];
+    uint32_t end_raw = json_get_str(json, "end", endbuf, sizeof(endbuf)) ? hex_to_u32(endbuf) : 0u;
+
+    /* Disarm first so the hot path can't sample mid-reset. */
+    s_cyc_watch_armed = 0;
+    s_cyc_watch_anchor_raw  = raw;
+    s_cyc_watch_anchor_phys = raw & 0x1FFFFFFFu;
+    s_cyc_watch_end_raw     = end_raw;
+    s_cyc_watch_end_phys    = end_raw & 0x1FFFFFFFu;
+    s_cyc_watch_in_region   = 0;
+    s_cyc_watch_region_start= 0;
+    s_cyc_watch_max_hits    = (uint32_t)n;
+    s_cyc_watch_hits        = 0;
+    s_cyc_watch_last_phys   = 0xFFFFFFFFu;   /* reset dedupe state per arm */
+    s_cyc_watch_last_cycle  = 0xFFFFFFFFFFFFFFFFull;
+    memset(s_cyc_watch_ring, 0, sizeof(s_cyc_watch_ring));
+    s_cyc_watch_armed = 1;
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"anchor\":\"0x%08X\","
+             "\"anchor_phys\":\"0x%08X\",\"end\":\"0x%08X\",\"end_phys\":\"0x%08X\","
+             "\"region\":%d,\"max_hits\":%u}",
+             id, s_cyc_watch_anchor_raw, s_cyc_watch_anchor_phys,
+             s_cyc_watch_end_raw, s_cyc_watch_end_phys,
+             (s_cyc_watch_end_phys != 0u) ? 1 : 0, s_cyc_watch_max_hits);
+}
+
+/* cyc_watch_dump — return the recorded ring as JSON. */
+static void handle_cyc_watch_dump(int id, const char *json)
+{
+    (void)json;
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "{\"id\":%d,\"ok\":true,\"anchor\":\"0x%08X\","
+             "\"anchor_phys\":\"0x%08X\",\"end\":\"0x%08X\",\"end_phys\":\"0x%08X\","
+             "\"region\":%d,\"armed\":%d,\"max_hits\":%u,"
+             "\"hits\":%u,\"entries\":[",
+             id, s_cyc_watch_anchor_raw, s_cyc_watch_anchor_phys,
+             s_cyc_watch_end_raw, s_cyc_watch_end_phys,
+             (s_cyc_watch_end_phys != 0u) ? 1 : 0,
+             s_cyc_watch_armed ? 1 : 0, s_cyc_watch_max_hits,
+             s_cyc_watch_hits);
+    send_line(buf);
+    for (uint32_t i = 0; i < s_cyc_watch_hits; i++) {
+        CycWatchEntry *e = &s_cyc_watch_ring[i];
+        snprintf(buf, sizeof(buf),
+                 "%s{\"hit_index\":%u,\"pc\":\"0x%08X\",\"cycles\":%llu}",
+                 (i == 0) ? "" : ",",
+                 e->hit_index, e->pc,
+                 (unsigned long long)e->psx_cycle_count);
+        send_line(buf);
+    }
+    send_line("]}");
+}
+
+/* cyc_watch_clear — disarm and zero the ring. */
+static void handle_cyc_watch_clear(int id, const char *json)
+{
+    (void)json;
+    s_cyc_watch_armed = 0;
+    s_cyc_watch_hits  = 0;
+    s_cyc_watch_anchor_phys = 0;
+    s_cyc_watch_anchor_raw  = 0;
+    s_cyc_watch_end_phys = 0;
+    s_cyc_watch_end_raw  = 0;
+    s_cyc_watch_in_region = 0;
+    s_cyc_watch_region_start = 0;
+    memset(s_cyc_watch_ring, 0, sizeof(s_cyc_watch_ring));
+    send_ok(id);
+}
+
 /* Liveness/freeze diagnostic: returns a single snapshot of every counter
  * that distinguishes "stuck in a tight handler loop" from "just slow" or
  * "starved on TCP poll".  Pass {"window":N} (default 256) to also include
@@ -6830,6 +7567,69 @@ static void handle_wtrace_ranges(int id, const char *json)
  *   - fn_entry histogram dominance               → stuck-in-N-functions loop
  *   - dispatch_count change between calls       → recompiled code progressing
  *   - sio.irq_pending + countdown stuck         → IRQ pacing breakdown */
+/* Dump the VSync callback-pointer (0x80079D44) write-provenance ring (memory.c).
+ * Each entry = one write to that word with its real source: store_pc (accurate for
+ * CPU/dirty-interp stores; stale for DMA), and dma_depth/ch/madr/bcr (set in dma.c
+ * while a DMA moves data). Lets the corrupting 0x016F0110 write be attributed to the
+ * exact channel + destination instead of a stale per-instruction store PC. */
+static void handle_d44_ring(int id, const char *json)
+{
+    (void)json;
+    typedef struct { uint64_t seq; uint32_t val, old, store_pc;
+                     int32_t dma_depth, dma_ch; uint32_t dma_madr, dma_bcr, frame; } D44E;
+    extern D44E g_d44_ring[]; extern uint64_t g_d44_seq;
+    uint64_t total = g_d44_seq;
+    uint32_t cap = 32u;
+    uint32_t n = total < cap ? (uint32_t)total : cap;
+    char buf[8192]; size_t pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
+                    id, (unsigned long long)total);
+    for (uint32_t i = 0; i < n && pos < sizeof(buf) - 256; i++) {
+        uint64_t idx = total - n + i;
+        D44E *e = &g_d44_ring[idx & (cap - 1u)];
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"seq\":%llu,\"frame\":%u,\"old\":\"0x%08X\",\"new\":\"0x%08X\","
+            "\"store_pc\":\"0x%08X\",\"dma_depth\":%d,\"dma_ch\":%d,"
+            "\"dma_madr\":\"0x%08X\",\"dma_bcr\":\"0x%08X\"}",
+            i ? "," : "", (unsigned long long)e->seq, e->frame, e->old, e->val,
+            e->store_pc, e->dma_depth, e->dma_ch, e->dma_madr, e->dma_bcr);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    debug_server_send_line(buf);
+}
+
+/* Dump the IRQ-delivery context ring (interrupts.c): per IRQ delivery, the VSync
+ * callback word [0x80079D44], CD-DMA-active + dma-depth, and COP0/IRQ state. Shows
+ * whether VBlank was delivered while 0x80079D44 was the clobbered 0x016F0110 AND a
+ * CD DMA was mid-transfer (the VSync-in-DMA-window bug). */
+static void handle_irqctx_ring(int id, const char *json)
+{
+    (void)json;
+    typedef struct { uint64_t seq, cycle; uint32_t frame, istat, imask, sr, d44,
+                     cdrom_active, is_vblank; int dma_depth; } E;
+    extern E g_irqctx_ring[]; extern uint64_t g_irqctx_seq;
+    uint64_t total = g_irqctx_seq; uint32_t cap = 64u;
+    uint32_t n = total < cap ? (uint32_t)total : cap;
+    char buf[16384]; size_t pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
+                    id, (unsigned long long)total);
+    for (uint32_t i = 0; i < n && pos < sizeof(buf) - 256; i++) {
+        uint64_t idx = total - n + i;
+        E *e = &g_irqctx_ring[idx & (cap - 1u)];
+        pos += snprintf(buf + pos, sizeof(buf) - pos,
+            "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,\"vblank\":%u,"
+            "\"d44\":\"0x%08X\",\"cdrom_active\":%u,\"dma_depth\":%d,"
+            "\"sr\":\"0x%08X\",\"istat\":\"0x%08X\",\"imask\":\"0x%08X\"}",
+            i ? "," : "", (unsigned long long)e->seq, (unsigned long long)e->cycle,
+            e->frame, e->is_vblank, e->d44, e->cdrom_active, e->dma_depth,
+            e->sr, e->istat, e->imask);
+    }
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
+    debug_server_send_line(buf);
+}
+
 static void handle_freeze_check(int id, const char *json)
 {
     int window = json_get_int(json, "window", 256);
@@ -6861,6 +7661,20 @@ static void handle_freeze_check(int id, const char *json)
     extern uint64_t g_dirty_ram_blocks_run;
     extern uint64_t g_dirty_ram_insns_run;
     extern uint64_t g_dirty_ram_aborts;
+    extern uint32_t g_async_rfe_resume_pc;
+    extern uint32_t g_dirty_safe_resume_pc;
+    extern uint64_t g_async_rfe_set_count;
+    extern uint64_t g_async_rfe_fire_count;
+    extern uint64_t g_slice_fired, g_slice_irq_taken;
+    extern uint64_t g_pczero_count;
+    extern uint32_t g_pczero_addr, g_pczero_ra, g_pczero_in_exc,
+                    g_pczero_async_rfe, g_pczero_dirty_safe;
+    extern uint32_t g_slice_last_block, g_slice_last_first_pc, g_slice_last_first_insn;
+    extern uint32_t g_slice_last_committed, g_slice_last_istat, g_slice_last_imask, g_slice_last_sr;
+    extern uint32_t g_slice_entry_deliverable;
+    extern uint64_t g_sentinel_reach_dirty;
+    extern uint64_t g_sentinel_reach_traps;
+    extern uint32_t g_sentinel_reach_async;
 
     /* Top-K fn_entry histogram over the last `window` slots. */
     typedef struct { uint32_t func; uint32_t count; } HistBucket;
@@ -6937,10 +7751,27 @@ static void handle_freeze_check(int id, const char *json)
                     "\"sio_card_active\":%d,"
                     "\"i_stat\":\"0x%08X\","
                     "\"i_mask\":\"0x%08X\","
+                    "\"async_rfe_resume_pc\":\"0x%08X\","
+                    "\"dirty_safe_resume_pc\":\"0x%08X\","
+                    "\"async_rfe_set\":%llu,"
+                    "\"async_rfe_fire\":%llu,"
+                    "\"reach_dirty\":%llu,"
+                    "\"reach_traps\":%llu,"
+                    "\"reach_async\":\"0x%08X\","
                     "\"dirty_ram_blocks\":%llu,"
                     "\"dirty_ram_insns\":%llu,"
                     "\"dirty_ram_aborts\":%llu,"
                     "\"dirty_ram_guard_yields\":%llu,"
+                    "\"slice_fired\":%llu,"
+                    "\"slice_irq_taken\":%llu,"
+                    "\"slice_block\":\"0x%08X\","
+                    "\"slice_first_pc\":\"0x%08X\","
+                    "\"slice_first_insn\":\"0x%08X\","
+                    "\"slice_committed\":\"0x%08X\","
+                    "\"slice_istat\":\"0x%08X\","
+                    "\"slice_imask\":\"0x%08X\","
+                    "\"slice_sr\":\"0x%08X\","
+                    "\"slice_entry_deliverable\":%u,"
                     "\"fn_entry_total\":%llu,"
                     "\"sio_irq_total\":%u,"
                     "\"sio_byte_seq\":%u,"
@@ -6958,6 +7789,12 @@ static void handle_freeze_check(int id, const char *json)
                     "\"recent_func_min\":\"0x%08X\","
                     "\"recent_func_max\":\"0x%08X\","
                     "\"recent_total\":%u,"
+                    "\"pczero_count\":%llu,"
+                    "\"pczero_addr\":\"0x%08X\","
+                    "\"pczero_ra\":\"0x%08X\","
+                    "\"pczero_in_exc\":%u,"
+                    "\"pczero_async_rfe\":\"0x%08X\","
+                    "\"pczero_dirty_safe\":\"0x%08X\","
                     "\"hist\":[",
                     id,
                     g_debug_current_func_addr,
@@ -6974,10 +7811,26 @@ static void handle_freeze_check(int id, const char *json)
                     (unsigned)sio_ctrl,
                     card_active,
                     i_stat, i_mask,
+                    g_async_rfe_resume_pc, g_dirty_safe_resume_pc,
+                    (unsigned long long)g_async_rfe_set_count,
+                    (unsigned long long)g_async_rfe_fire_count,
+                    (unsigned long long)g_sentinel_reach_dirty,
+                    (unsigned long long)g_sentinel_reach_traps,
+                    g_sentinel_reach_async,
                     (unsigned long long)g_dirty_ram_blocks_run,
                     (unsigned long long)g_dirty_ram_insns_run,
                     (unsigned long long)g_dirty_ram_aborts,
                     (unsigned long long)g_dirty_ram_guard_yields,
+                    (unsigned long long)g_slice_fired,
+                    (unsigned long long)g_slice_irq_taken,
+                    g_slice_last_block,
+                    g_slice_last_first_pc,
+                    g_slice_last_first_insn,
+                    g_slice_last_committed,
+                    g_slice_last_istat,
+                    g_slice_last_imask,
+                    g_slice_last_sr,
+                    g_slice_entry_deliverable,
                     (unsigned long long)s_fn_entry_seq,
                     irq_total,
                     sio_get_seq(),
@@ -6994,7 +7847,13 @@ static void handle_freeze_check(int id, const char *json)
                     window,
                     (recent_total ? recent_min_func : 0),
                     recent_max_func,
-                    recent_total);
+                    recent_total,
+                    (unsigned long long)g_pczero_count,
+                    g_pczero_addr,
+                    g_pczero_ra,
+                    g_pczero_in_exc,
+                    g_pczero_async_rfe,
+                    g_pczero_dirty_safe);
     for (int i = 0; i < hist_n && pos < sizeof(buf) - 64; i++) {
         pos += snprintf(buf + pos, sizeof(buf) - pos,
                         "%s{\"func\":\"0x%08X\",\"count\":%u}",
@@ -8707,8 +9566,10 @@ static void handle_overlay_loader_status(int id, const char *json)
         n += snprintf(buf + n, sizeof(buf) - n,
             ",\"r0_valid\":%d,\"r0_writes_since_invalid\":%u,"
             "\"r0_fn_lo\":\"0x%08X\",\"r0_fn_hi\":\"0x%08X\",\"r0_crc_live\":\"0x%08X\","
-            "\"reval_attempts\":%u,\"reval_crc_miss\":%u,\"last_reval_crc\":\"0x%08X\"",
-            r0v, r0w, r0lo, r0hi, r0crc, ratt, rmiss, rlast);
+            "\"reval_attempts\":%u,\"reval_crc_miss\":%u,\"last_reval_crc\":\"0x%08X\","
+            "\"gen_fastpath\":%llu",
+            r0v, r0w, r0lo, r0hi, r0crc, ratt, rmiss, rlast,
+            (unsigned long long)overlay_loader_gen_fastpath());
     }
     snprintf(buf + n, sizeof(buf) - n, "}\n");
     send_fmt("%s", buf);
@@ -8733,10 +9594,15 @@ static void handle_overlay_native_ring(int id, const char *json)
 {
     (void)json;
     extern int overlay_loader_dump_native_ring(char *out, int cap);
-    static char rbuf[16384];
+    static char rbuf[2 * 1024 * 1024];
     int len = overlay_loader_dump_native_ring(rbuf, (int)sizeof(rbuf));
     if (len < 0) len = 0;
-    send_fmt("{\"id\":%d,\"ok\":true,\"ring\":%s}\n", id, rbuf);
+    int cap = len + 128;
+    char *out = (char *)malloc((size_t)cap);
+    if (!out) { send_fmt("{\"id\":%d,\"ok\":false,\"error\":\"oom\"}\n", id); return; }
+    snprintf(out, (size_t)cap, "{\"id\":%d,\"ok\":true,\"ring\":%s}", id, rbuf);
+    debug_server_send_line(out);
+    free(out);
 }
 
 /* overlay_diff_on/off: same-state native↔interp differential. With it on, each
@@ -8884,6 +9750,86 @@ static void handle_insn_freeze_status(int id, const char *json)
              g_insn_log_frozen, (unsigned long long)g_dirty_ram_insn_log_seq);
 }
 
+/* insn_freeze_target <target>: freeze the insn ring the instant an interpreted
+ * instruction transfers to (or falls through to) <target>. Used to capture the
+ * Tomba2 worker wild-jump to 0x49422E54 with the offending jr's register
+ * snapshot as the ring tail. target=0 disarms. */
+static void handle_insn_freeze_target(int id, const char *json)
+{
+    extern uint32_t g_insn_freeze_on_target;
+    extern int g_insn_log_frozen, g_freeze_snap_valid;
+    char buf[32];
+    if (json_get_str(json, "target", buf, sizeof(buf)))
+        g_insn_freeze_on_target = hex_to_u32(buf);
+    g_insn_log_frozen   = 0;
+    g_freeze_snap_valid = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"freeze_on_target\":\"0x%08X\"}\n",
+             id, g_insn_freeze_on_target);
+}
+
+/* insn_freeze_snapshot: report the register file captured at the jr/jalr that
+ * hit the watched wild target (g_insn_freeze_on_target). Reveals the source
+ * register (scan for the reg whose value == the target) -> ra=stack/sp bug,
+ * t9/v0/v1=filename-ptr-as-fn-ptr, etc. */
+static void handle_insn_freeze_snapshot(int id, const char *json)
+{
+    (void)json;
+    extern int g_freeze_snap_valid;
+    extern uint32_t g_freeze_snap_pc, g_freeze_snap_insn, g_freeze_snap_tcb;
+    extern uint32_t g_freeze_snap_gpr[32];
+    extern uint32_t g_insn_freeze_on_target;
+    static const char *RN[32] = {
+        "zero","at","v0","v1","a0","a1","a2","a3","t0","t1","t2","t3",
+        "t4","t5","t6","t7","s0","s1","s2","s3","s4","s5","s6","s7",
+        "t8","t9","k0","k1","gp","sp","fp","ra" };
+    char buf[2048];
+    size_t pos = 0;
+    pos += snprintf(buf+pos, sizeof(buf)-pos,
+        "{\"id\":%d,\"ok\":true,\"valid\":%d,\"pc\":\"0x%08X\",\"insn\":\"0x%08X\","
+        "\"tcb\":\"0x%08X\",\"target\":\"0x%08X\",\"regs\":{",
+        id, g_freeze_snap_valid, g_freeze_snap_pc, g_freeze_snap_insn,
+        g_freeze_snap_tcb, g_insn_freeze_on_target);
+    for (int r = 0; r < 32; r++)
+        pos += snprintf(buf+pos, sizeof(buf)-pos, "%s\"%s\":\"0x%08X\"",
+                        r ? "," : "", RN[r], g_freeze_snap_gpr[r]);
+    pos += snprintf(buf+pos, sizeof(buf)-pos, "}}\n");
+    (void)pos;
+    send_fmt("%s", buf);
+}
+
+/* ra_load_watch <value>: arm/read capture of the instruction that sets $ra to
+ * <value> (the wild target). With no "value" arg, reports the captured snapshot:
+ * the loading pc/insn, the source stack address (for an lw), and the full GPR
+ * file. value=0 disarms+clears. */
+static void handle_ra_load_watch(int id, const char *json)
+{
+    extern uint32_t g_ra_load_watch, g_ra_load_snap_pc, g_ra_load_snap_insn;
+    extern uint32_t g_ra_load_snap_before_ra, g_ra_load_snap_srcaddr;
+    extern uint32_t g_ra_load_snap_gpr[32];
+    extern int g_ra_load_snap_valid;
+    char vbuf[32];
+    if (json_get_str(json, "value", vbuf, sizeof(vbuf))) {
+        g_ra_load_watch = hex_to_u32(vbuf);
+        g_ra_load_snap_valid = 0;
+    }
+    static const char *RN[32] = {
+        "zero","at","v0","v1","a0","a1","a2","a3","t0","t1","t2","t3",
+        "t4","t5","t6","t7","s0","s1","s2","s3","s4","s5","s6","s7",
+        "t8","t9","k0","k1","gp","sp","fp","ra" };
+    char buf[2048]; size_t pos = 0;
+    pos += snprintf(buf+pos, sizeof(buf)-pos,
+        "{\"id\":%d,\"ok\":true,\"watch\":\"0x%08X\",\"valid\":%d,\"load_pc\":\"0x%08X\","
+        "\"insn\":\"0x%08X\",\"before_ra\":\"0x%08X\",\"src_addr\":\"0x%08X\",\"regs\":{",
+        id, g_ra_load_watch, g_ra_load_snap_valid, g_ra_load_snap_pc,
+        g_ra_load_snap_insn, g_ra_load_snap_before_ra, g_ra_load_snap_srcaddr);
+    for (int r = 0; r < 32; r++)
+        pos += snprintf(buf+pos, sizeof(buf)-pos, "%s\"%s\":\"0x%08X\"",
+                        r ? "," : "", RN[r], g_ra_load_snap_gpr[r]);
+    pos += snprintf(buf+pos, sizeof(buf)-pos, "}}\n");
+    (void)pos;
+    send_fmt("%s", buf);
+}
+
 /* event_ring_dump: write the whole live event-timeline ring (IRQ deliver/gate,
  * I_STAT raises/changes, DMA kick/done, each tagged cycle/pc/func/mode/overlay)
  * to a JSON file for offline diffing of native-OFF vs native-ON runs. Optional
@@ -8941,6 +9887,57 @@ static void handle_overlay_native_off(int id, const char *json)
     extern void overlay_loader_set_native_exec(int on);
     overlay_loader_set_native_exec(0);
     send_fmt("{\"id\":%d,\"ok\":true,\"native_exec\":0}\n", id);
+}
+
+/* overlay_native_block: per-function native-disable for bisection. Forces the
+ * named overlay function(s) through the sanctioned dirty-RAM interpreter (the
+ * function still runs — NOT skipped/stubbed), so you can binary-search which
+ * compiled function's native execution causes a divergence without rebuilding.
+ *   {"cmd":"overlay_native_block","addr":"0x80050B08"}  -> add (keyed by phys)
+ *   {"cmd":"overlay_native_block","clear":1}            -> clear all
+ *   {"cmd":"overlay_native_block"}                      -> just report state */
+static void handle_overlay_native_block(int id, const char *json)
+{
+    extern int      overlay_loader_native_block_add(uint32_t addr);
+    extern void     overlay_loader_native_block_clear(void);
+    extern int      overlay_loader_native_block_list(uint32_t *out, int cap);
+    extern uint64_t overlay_loader_native_block_hits(void);
+    char abuf[32];
+    if (json_get_int(json, "clear", 0)) overlay_loader_native_block_clear();
+    if (json_get_str(json, "addr", abuf, sizeof(abuf)))
+        overlay_loader_native_block_add(hex_to_u32(abuf));
+    uint32_t list[64];
+    int n = overlay_loader_native_block_list(list, 64);
+    char buf[1200]; size_t pos = 0;
+    pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
+        "{\"id\":%d,\"ok\":true,\"count\":%d,\"hits\":%llu,\"blocked\":[",
+        id, n, (unsigned long long)overlay_loader_native_block_hits());
+    for (int i = 0; i < n && i < 64; i++)
+        pos += (size_t)snprintf(buf + pos, sizeof(buf) - pos,
+            "%s\"0x%08X\"", i ? "," : "", list[i]);
+    snprintf(buf + pos, sizeof(buf) - pos, "]}\n");
+    send_fmt("%s", buf);
+}
+
+/* overlay_cps_probe: arm/dump the CPS interior-continuation dispatch probe.
+ *   {"cmd":"overlay_cps_probe","addr":"0x80050B30"} -> arm for that PC
+ *   {"cmd":"overlay_cps_probe"}                     -> dump last decision
+ * outcome: 0=find<0, 1=crc-miss->interp, 2=ran native, 3=device->interp, 4=blocked */
+static void handle_overlay_cps_probe(int id, const char *json)
+{
+    extern void overlay_loader_cps_probe_set(uint32_t pc);
+    extern void overlay_loader_cps_probe_get(uint32_t *pc, uint64_t *cnt,
+        uint32_t *found, int *ci, int *nrange, int *matched, int *outcome, int *ncand);
+    char abuf[32];
+    if (json_get_str(json, "addr", abuf, sizeof(abuf)))
+        overlay_loader_cps_probe_set(hex_to_u32(abuf));
+    uint32_t pc = 0, found = 0; uint64_t cnt = 0;
+    int ci = 0, nrange = 0, matched = 0, outcome = 0, ncand = 0;
+    overlay_loader_cps_probe_get(&pc, &cnt, &found, &ci, &nrange, &matched, &outcome, &ncand);
+    send_fmt("{\"id\":%d,\"ok\":true,\"probe_pc\":\"0x%08X\",\"count\":%llu,"
+             "\"chosen_addr\":\"0x%08X\",\"ci\":%d,\"chosen_nranges\":%d,"
+             "\"cands_in_range\":%d,\"crc_matched\":%d,\"outcome\":%d}\n",
+             id, pc, cnt, found, ci, nrange, ncand, matched, outcome);
 }
 
 /* overlay_dump: extract RAM regions that dirty_ram has marked executable
@@ -9409,8 +10406,46 @@ static void handle_vk_perf(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"vk_perf\":%s}", id, buf);
 }
 
+static void handle_lockstep(int id, const char *json) {
+    /* #2 lockstep comparator. {"lo":N,"hi":M} arms the frame window; the reply
+     * reports the first compiled-vs-interp block divergence (if any) so far. */
+    extern void ls_set_window(uint32_t, uint32_t);
+    extern void ls_set_record_only(int);
+    extern int  ls_get_diverge_json(char*, int);
+    int lo = json_get_int(json, "lo", -1);
+    int hi = json_get_int(json, "hi", -1);
+    int ro = json_get_int(json, "record_only", -1);
+    if (ro >= 0) ls_set_record_only(ro);
+    if (lo >= 0 && hi >= 0) ls_set_window((uint32_t)lo, (uint32_t)hi);
+    char buf[4096];
+    ls_get_diverge_json(buf, (int)sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,\"lockstep\":%s}", id, buf);
+}
+
+static void handle_lockstep_func(int id, const char *json) {
+    /* Dispatch-segment lockstep comparator. Same arming shape as lockstep,
+     * but the measured unit is one clean psx_dispatch_game_compiled() segment. */
+    extern void ls_func_set_window(uint32_t, uint32_t);
+    extern void ls_func_set_record_only(int);
+    extern int  ls_get_func_json(char*, int);
+    int lo = json_get_int(json, "lo", -1);
+    int hi = json_get_int(json, "hi", -1);
+    int ro = json_get_int(json, "record_only", -1);
+    if (ro >= 0) ls_func_set_record_only(ro);
+    if (lo >= 0 && hi >= 0) ls_func_set_window((uint32_t)lo, (uint32_t)hi);
+    char buf[8192];
+    ls_get_func_json(buf, (int)sizeof(buf));
+    send_fmt("{\"id\":%d,\"ok\":true,\"lockstep_func\":%s}", id, buf);
+}
+
 static const CmdEntry s_commands[] = {
+    { "lockstep",          handle_lockstep },
+    { "lockstep_func",     handle_lockstep_func },
     { "ping",              handle_ping },
+    { "parity_dump",       handle_parity_dump },
+    { "parity_ctl",        handle_parity_ctl },
+    { "devtrace_dump",     handle_devtrace_dump },
+    { "devtrace_ctl",      handle_devtrace_ctl },
     { "latency",           handle_latency },
     { "vk_perf",           handle_vk_perf },
     { "game_options",      handle_game_options },
@@ -9419,6 +10454,10 @@ static const CmdEntry s_commands[] = {
     { "xprobe_arm",        handle_xprobe_arm },
     { "ce_profile",        handle_ce_profile },
     { "frame",             handle_frame },
+    { "frame_fingerprint", handle_frame_fingerprint },
+    { "record_frame",      handle_record_frame },
+    { "record_frame_dump", handle_record_frame_dump },
+    { "record_reads_dump", handle_record_reads_dump },
     { "get_registers",     handle_get_registers },
     { "read_ram",          handle_read_ram },
     { "dump_ram",          handle_read_ram },   /* alias: one request, one response */
@@ -9443,6 +10482,7 @@ static const CmdEntry s_commands[] = {
     { "gl_fbo_peek",       handle_gl_fbo_peek },
     { "gl_vram_diff",      handle_gl_vram_diff },
     { "irq_state",         handle_irq_state },
+    { "cycles_to_next_event", handle_cycles_to_next_event },
     { "timers_state",      handle_timers_state },
     { "cdrom_state",       handle_cdrom_state },
     { "cdrom_sector_dump", handle_cdrom_sector_dump },
@@ -9544,6 +10584,11 @@ static const CmdEntry s_commands[] = {
     { "wtrace_del",          handle_wtrace_del },
     { "wtrace_clear",        handle_wtrace_clear },
     { "freeze_check",      handle_freeze_check },
+    { "d44_ring",          handle_d44_ring },
+    { "irqctx_ring",       handle_irqctx_ring },
+    { "cyc_watch",         handle_cyc_watch },
+    { "cyc_watch_dump",    handle_cyc_watch_dump },
+    { "cyc_watch_clear",   handle_cyc_watch_clear },
     { "mmio_dump",         handle_mmio_dump },
     { "mmio_clear",        handle_mmio_clear },
     { "rtrace_dump",       handle_rtrace_dump },
@@ -9621,8 +10666,13 @@ static const CmdEntry s_commands[] = {
     { "dirty_insn_gate",      handle_dirty_insn_gate },
     { "insn_freeze",          handle_insn_freeze },
     { "insn_freeze_status",   handle_insn_freeze_status },
+    { "insn_freeze_target",   handle_insn_freeze_target },
+    { "insn_freeze_snapshot", handle_insn_freeze_snapshot },
+    { "ra_load_watch",        handle_ra_load_watch },
     { "overlay_native_on",    handle_overlay_native_on },
     { "overlay_native_off",   handle_overlay_native_off },
+    { "overlay_native_block", handle_overlay_native_block },
+    { "overlay_cps_probe",    handle_overlay_cps_probe },
     { "overlay_capture_dump", handle_overlay_capture_dump },
     { "cdrom_instant_rate",   handle_cdrom_instant_rate },
     { "cd_overwrite",         handle_cd_overwrite },
@@ -9675,6 +10725,33 @@ void debug_server_set_cpu(CPUState *cpu)
 void debug_server_init(int port)
 {
     if (port > 0) s_port = port;
+
+    /* Race-free recorder arming: PSX_RECORD_FRAME=<N> arms the unified ordered
+     * access recorder from boot (instruction 0), so it deterministically
+     * captures guest frame N no matter when a probe connects — the same
+     * always-on-from-boot model as PSX_NATIVE_BLOCK / PSX_OVERLAY_NATIVE_OFF.
+     * Never race a connect against the target frame; seed it and free-run. */
+    {
+        const char *rf = getenv("PSX_RECORD_FRAME");
+        if (rf && *rf) {
+            s_rec_frame = (int64_t)strtoll(rf, NULL, 0);
+            s_rec_count = 0; s_rec_overflow = 0;
+        }
+        /* PSX_READ_WATCH="<lo>,<hi>" arms the targeted main-RAM read watch from
+         * boot (phys range, hex/dec ok). Reads in [lo,hi) during the recorded
+         * frame land in the unified buffer as REC_KIND_RAM_R. */
+        const char *rw = getenv("PSX_READ_WATCH");
+        if (rw && *rw) {
+            char tmp[64]; snprintf(tmp, sizeof(tmp), "%s", rw);
+            char *comma = strchr(tmp, ',');
+            if (comma) {
+                *comma = '\0';
+                s_rwatch_lo = (uint32_t)strtoul(tmp, NULL, 0);
+                s_rwatch_hi = (uint32_t)strtoul(comma + 1, NULL, 0);
+                if (s_rwatch_hi > s_rwatch_lo) g_ram_read_watch_active = 1;
+            }
+        }
+    }
 
 #ifdef _WIN32
     WSADATA wsa;
@@ -10183,6 +11260,10 @@ void debug_server_record_frame(void)
 
     s_history_count = s_frame_count + 1;
     s_frame_count++;
+    /* Layer-1 first-divergence: snapshot the cumulative write fingerprint for
+     * the frame that just completed. Tagged with the new frame number so two
+     * runs line up by frame index. */
+    fp_snapshot((uint32_t)s_frame_count);
 
     /* step / run_to_frame post-frame hooks: removed with the rest of
      * pause/step machinery. s_step_count and s_run_to stay at zero. */

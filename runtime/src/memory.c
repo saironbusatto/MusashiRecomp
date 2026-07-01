@@ -17,6 +17,7 @@
 #include "sio.h"
 #include "spu.h"
 #include "timers.h"
+#include "lockstep.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -72,6 +73,28 @@ static inline void dirty_ram_mark_kernel_write(uint32_t phys) {
     dirty_ram_mark_page(phys);
 }
 
+/* Establish the clean compiled-image baseline for the game-EXE text region.
+ * Called ONCE when the game entry is first reached (fntrace game-start): by then
+ * the BIOS has fully loaded the boot EXE into [0x10000, FLOOR) — which IS the
+ * compiled image — but no gameplay overlay has run yet. The EXE load (CD DMA via
+ * dirty_ram_mark_executable_range) marks the whole text dirty as a FALSE POSITIVE
+ * (RAM == compiled image); clearing it here means dirty_ram_is_dirty() afterwards
+ * is true ONLY for pages a later overlay actually overwrote. The dispatch can then
+ * trust a clean text page to run its compiled function and divert only truly-
+ * overlaid pages to the interpreter (Tomba 2 loads a loader overlay over
+ * 0x8001Dxxx). The kernel window [0,0x10000) (BIOS install stubs) and the overlay
+ * region [FLOOR, RAM) are left untouched. */
+extern uint32_t g_overlay_region_floor;
+void dirty_ram_clear_image_baseline(void) {
+    uint32_t floor = g_overlay_region_floor;
+    if (floor <= DIRTY_RAM_KERNEL_TRACK_BYTES) return;
+    if (floor > RAM_SIZE) floor = RAM_SIZE;
+    uint32_t first_page = DIRTY_RAM_KERNEL_TRACK_BYTES >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t last_page  = (floor - 1u) >> DIRTY_RAM_PAGE_SHIFT;
+    for (uint32_t page = first_page; page <= last_page; page++)
+        dirty_ram_bitmap[page >> 5] &= ~(1u << (page & 31u));
+}
+
 void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
     if (len == 0 || phys >= RAM_SIZE) return;
     uint32_t end = phys + len - 1u;
@@ -84,8 +107,36 @@ void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
     }
 }
 
+/* Force-interp mode (tooling): PSX_FORCE_INTERP=1 makes ALL RAM above the kernel
+ * window report dirty, so every dispatch into game/overlay text routes to the
+ * dirty-RAM interpreter (the SAME path overlays take) instead of the compiled
+ * image. Interp-path Δ-ruler enabler: lets the cyctest isolation loops be measured
+ * native-INTERP vs Beetle. Consulted by every routing site that already calls
+ * dirty_ram_is_dirty (top dispatch, dirty_ram_dispatch_inner gates, the
+ * psx_dispatch_game_compiled gates) — no emitter/dispatch change needed. */
+static int dirty_ram_force_interp(void) {
+    static int s = -1;
+    if (s < 0) { const char* e = getenv("PSX_FORCE_INTERP"); s = (e && e[0] && e[0] != '0'); }
+    return s;
+}
+
+/* DIAGNOSTIC ONLY (class-B reproduction, NOT a fix — Rule -1): PSX_SHELLWIN_INTERP=1
+ * reports the BIOS shell-copy relocated RAM window [0x30000, 0x5AFFF] as dirty, so
+ * the compiled dispatch (full_function_emitter.cpp:1380) routes those addresses
+ * through the recovering dirty-RAM interp instead of normalize()->shell ROM. This
+ * peels the class-A shell-window pc=0 wedge (func_1FC42090) so the *general*
+ * class-B compiled exception-return pc=0 (in [0x5B000, 0x8F000)) can surface and be
+ * captured. Must be reverted before any merge; it is a probe, not the fix. */
+static int dirty_ram_shellwin_interp(void) {
+    static int s = -1;
+    if (s < 0) { const char* e = getenv("PSX_SHELLWIN_INTERP"); s = (e && e[0] && e[0] != '0'); }
+    return s;
+}
+
 int dirty_ram_is_dirty(uint32_t phys) {
     if (phys >= RAM_SIZE) return 0;
+    if (dirty_ram_force_interp() && phys >= DIRTY_RAM_KERNEL_TRACK_BYTES) return 1;
+    if (dirty_ram_shellwin_interp() && phys >= 0x00030000u && phys <= 0x0005AFFFu) return 1;
     uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
     return (dirty_ram_bitmap[page >> 5] >> (page & 31u)) & 1u;
 }
@@ -236,9 +287,16 @@ static void imask_trace_record(uint32_t old_val, uint32_t new_val, uint8_t width
     imask_trace_count++;
 }
 
+/* VBLANK-ack telemetry (Tomba 2 exception-reentry-storm diagnosis): counts how
+ * many times an I_STAT write clears the VBLANK bit (the handler's ack). Read in
+ * the freeze heartbeat against g_vblank_raise/deliver counts. */
+uint64_t g_vblank_ack_count = 0;
+
 static void interrupt_write_stat_masked(uint32_t val, uint32_t mask) {
     uint32_t ack_mask = mask & 0x7FFu;
+    uint32_t before = i_stat;
     i_stat = (i_stat & ~ack_mask) | (i_stat & val & ack_mask);
+    if ((before & 1u) && !(i_stat & 1u)) g_vblank_ack_count++;  /* VBLANK bit 1->0 */
 }
 
 static void interrupt_write_mask_masked(uint32_t val, uint32_t mask, uint8_t width) {
@@ -261,10 +319,18 @@ extern void debug_server_trace_write_check(uint32_t phys, uint32_t old_val,
                                            uint32_t new_val, uint8_t width);
 extern void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width);
 extern void debug_server_trace_mmio_read(uint32_t addr, uint32_t val, uint8_t width);
+/* Targeted main-RAM read watch (debug_server.c). Flag gates the hot read path. */
+extern int  g_ram_read_watch_active;
+extern void debug_server_trace_ram_read_watch(uint32_t phys, uint32_t val);
 extern void debug_server_trace_entryint_write(uint32_t phys, uint32_t old_val,
                                               uint32_t new_val, uint8_t width);
 extern CPUState *debug_cpu_ptr;
 extern uint32_t g_debug_last_store_pc;
+
+/* Parity last-writer provenance (parity_trace.c): note every main-RAM write so
+ * the watch-word last-writer table tracks the exact producing store. No-op
+ * unless the parity ring is armed. */
+extern void parity_trace_note_write(uint32_t addr, uint32_t width, uint32_t writer_pc);
 
 /* Card-byte destination capture (Phase 3 audit). Always-on. */
 extern int card_data_writes_check(uint32_t phys, uint32_t value, uint8_t width);
@@ -621,6 +687,18 @@ static void mmio_write8(uint32_t addr, uint8_t val) {
         dma_write_masked(aligned, (uint32_t)val << shift, mask);
         return;
     }
+    /* Timers: 0x1F801100..0x1F80112F — byte writes update the addressed byte
+     * lane of the 32-bit register. Byte stores to timer registers are valid
+     * hardware accesses; mmio_write16/32 already route here via timers_write, so
+     * write8 must too (otherwise a guest `sb` to a timer fails loud). */
+    if (addr >= 0x1F801100u && addr <= 0x1F80112Fu) {
+        uint32_t aligned = addr & ~3u;
+        uint32_t cur = timers_read(aligned);
+        uint32_t shift = 8 * (addr & 3);
+        cur = (cur & ~(0xFFu << shift)) | ((uint32_t)val << shift);
+        timers_write(aligned, cur);
+        return;
+    }
     /* MDEC: 0x1F801820..0x1F801827 */
     if (addr >= 0x1F801820u && addr <= 0x1F801827u) {
         uint32_t aligned = addr & ~3u;
@@ -644,17 +722,40 @@ static void mmio_write8(uint32_t addr, uint8_t val) {
 
 /* --- Read functions --- */
 
+/* lockstep: 1 while a guest-direct memory op's REAL body runs, so nested ops
+ * (device-emulation reads triggered by an MMIO write, etc.) are not recorded —
+ * the shadow replay verifies writes without performing them, so it never sees
+ * those device-internal accesses. Interrupt-handler ops are excluded too
+ * (psx_get_in_exception): the replay runs only the block, never the handler. */
+static int s_ls_op_active = 0;
+extern int g_ls_suppress_record;
+extern int g_dma_exec_depth;
+extern int psx_get_in_exception(void);
+static uint32_t psx_read_word_raw(uint32_t addr);
 uint32_t psx_read_word(uint32_t addr) {
+    if (g_ls_mode == 2) return ls_read_hook(addr, 4, 0u);
+    if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) return psx_read_word_raw(addr);
+    s_ls_op_active = 1;
+    uint32_t v = psx_read_word_raw(addr);
+    s_ls_op_active = 0;
+    if (!psx_get_in_exception()) ls_read_hook(addr, 4, v);
+    return v;
+}
+static uint32_t psx_read_word_raw(uint32_t addr) {
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) return cache_ctrl;
 
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
-        return  (uint32_t)ram[phys]
+        uint32_t v = (uint32_t)ram[phys]
              | ((uint32_t)ram[phys + 1] << 8)
              | ((uint32_t)ram[phys + 2] << 16)
              | ((uint32_t)ram[phys + 3] << 24);
+        /* Targeted main-RAM read watch (debug). Flag is 0 in normal runs, so the
+         * hot read path pays only a predictable branch. */
+        if (g_ram_read_watch_active) debug_server_trace_ram_read_watch(phys, v);
+        return v;
     }
     /* Expansion 1: 0x1F000000..0x1F7FFFFF — no device, open bus */
     if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) {
@@ -681,7 +782,50 @@ uint32_t psx_read_word(uint32_t addr) {
     return 0;
 }
 
+/* ---- VSync callback-pointer provenance probe (MMX6 boot wedge) -------------
+ * The kernel VSync/RCnt callback-block pointer at phys 0x79D44 (KSEG0 0x80079D44)
+ * is corrupted to 0x016F0110 at frame ~1188 by a write whose g_debug_last_store_pc
+ * is STALE (so it is not a compiled/dirty-interp store — a DMA or runtime mem-op
+ * with a wrong destination). This always-on ring records EVERY write to that word
+ * at the unified RAM-write chokepoint, tagging CPU-vs-DMA via the dma.c exec flags,
+ * so the real corrupting writer (and, if DMA, its channel + madr) is captured even
+ * though the per-instruction store-PC tracker can't see it. Dump via `d44_ring`. */
+#define D44_PHYS 0x00079D44u
+#define D44_RING_CAP 32u
+typedef struct {
+    uint64_t seq;
+    uint32_t val, old, store_pc;
+    int32_t  dma_depth, dma_ch;
+    uint32_t dma_madr, dma_bcr, frame;
+} D44Entry;
+D44Entry  g_d44_ring[D44_RING_CAP];
+uint64_t  g_d44_seq = 0;
+extern uint32_t g_debug_last_store_pc;
+extern int      g_dma_exec_depth;     /* >0 while a DMA is moving data (dma.c) */
+extern int      g_dma_cur_ch;         /* channel of the in-flight DMA, else -1  */
+extern uint32_t g_dma_cur_madr;       /* current MADR of the in-flight DMA      */
+extern uint32_t g_dma_cur_bcr;        /* BCR of the in-flight DMA               */
+extern uint64_t s_frame_count;
+static inline void d44_note(uint32_t phys, uint32_t old, uint32_t val) {
+    if (phys != D44_PHYS) return;
+    uint64_t i = g_d44_seq++;
+    D44Entry *e = &g_d44_ring[i & (D44_RING_CAP - 1u)];
+    e->seq = i; e->val = val; e->old = old; e->store_pc = g_debug_last_store_pc;
+    e->dma_depth = g_dma_exec_depth; e->dma_ch = g_dma_cur_ch;
+    e->dma_madr = g_dma_cur_madr; e->dma_bcr = g_dma_cur_bcr;
+    e->frame = (uint32_t)s_frame_count;
+}
+
+static void psx_write_word_raw(uint32_t addr, uint32_t val);
 void psx_write_word(uint32_t addr, uint32_t val) {
+    if (g_ls_mode == 2) { ls_write_hook(addr, 4, val); return; }
+    if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_word_raw(addr, val); return; }
+    if (!psx_get_in_exception()) ls_write_hook(addr, 4, val);
+    s_ls_op_active = 1;
+    psx_write_word_raw(addr, val);
+    s_ls_op_active = 0;
+}
+static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) { cache_ctrl = val; return; }
 
@@ -692,10 +836,15 @@ void psx_write_word(uint32_t addr, uint32_t val) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
+        if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
+        parity_trace_note_write(phys, 4, g_debug_last_store_pc);
         card_data_writes_check(phys, val, 4);
         dirty_ram_mark_kernel_write(phys);
         overlay_watch_note_write(phys, 4);
+#ifdef PSX_COSIM
+        { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 4); }
+#endif
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         ram[phys + 2] = (uint8_t)(val >> 16);
@@ -729,7 +878,17 @@ void psx_write_word(uint32_t addr, uint32_t val) {
     unmapped_fatal(addr, phys, "WRITE");
 }
 
+static uint16_t psx_read_half_raw(uint32_t addr);
 uint16_t psx_read_half(uint32_t addr) {
+    if (g_ls_mode == 2) return (uint16_t)ls_read_hook(addr, 2, 0u);
+    if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) return psx_read_half_raw(addr);
+    s_ls_op_active = 1;
+    uint16_t v = psx_read_half_raw(addr);
+    s_ls_op_active = 0;
+    if (!psx_get_in_exception()) ls_read_hook(addr, 2, v);
+    return v;
+}
+static uint16_t psx_read_half_raw(uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
@@ -751,16 +910,29 @@ uint16_t psx_read_half(uint32_t addr) {
     return 0;
 }
 
+static void psx_write_half_raw(uint32_t addr, uint16_t val);
 void psx_write_half(uint32_t addr, uint16_t val) {
+    if (g_ls_mode == 2) { ls_write_hook(addr, 2, val); return; }
+    if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_half_raw(addr, val); return; }
+    if (!psx_get_in_exception()) ls_write_hook(addr, 2, val);
+    s_ls_op_active = 1;
+    psx_write_half_raw(addr, val);
+    s_ls_op_active = 0;
+}
+static void psx_write_half_raw(uint32_t addr, uint16_t val) {
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
+        parity_trace_note_write(phys, 2, g_debug_last_store_pc);
         card_data_writes_check(phys, (uint32_t)val, 2);
         dirty_ram_mark_kernel_write(phys);
         overlay_watch_note_write(phys, 2);
+#ifdef PSX_COSIM
+        { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 2); }
+#endif
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         return;
@@ -785,7 +957,17 @@ void psx_write_half(uint32_t addr, uint16_t val) {
     unmapped_fatal(addr, phys, "WRITE");
 }
 
+static uint8_t psx_read_byte_raw(uint32_t addr);
 uint8_t psx_read_byte(uint32_t addr) {
+    if (g_ls_mode == 2) return (uint8_t)ls_read_hook(addr, 1, 0u);
+    if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) return psx_read_byte_raw(addr);
+    s_ls_op_active = 1;
+    uint8_t v = psx_read_byte_raw(addr);
+    s_ls_op_active = 0;
+    if (!psx_get_in_exception()) ls_read_hook(addr, 1, v);
+    return v;
+}
+static uint8_t psx_read_byte_raw(uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
@@ -805,41 +987,162 @@ uint8_t psx_read_byte(uint32_t addr) {
     return 0;
 }
 
-/* ---- CPU guest-side data reads: model PS1 main-RAM read latency ----
- * The R3000A has no usable D-cache (its data cache is repurposed as the 1 KB
- * scratchpad), so every CPU data read from main DRAM costs 1 opcode cycle plus
- * 6 wait-state cycles (DuckStation RAM_READ_TICKS = 6; "1 opcode + 6 waitstates
- * = 7 cycles"). The base opcode cycle is already charged by the per-block
- * psx_advance_cycles(instruction_count); here we add only the +6 wait states,
- * and only for main-RAM targets — scratchpad, MMIO, BIOS ROM and open-bus are
- * excluded (they have their own access timing). The penalty is keyed on the
- * runtime effective physical address (all of KUSEG/KSEG0/KSEG1 alias the same
- * DRAM), NOT on the code region, so relocated kernel code is timed correctly.
+/* ---- CPU guest-side data loads: faithful R3000A load-delay pipeline interlock ----
+ * The R3000A has no usable D-cache (it is repurposed as the 1 KB scratchpad), so a
+ * CPU data load from main DRAM stalls the pipeline. Beetle (cpu.cpp ReadMemory,
+ * 364-451) models this as: a +2 "fudge" iff the predecessor committed no load, the
+ * region wait (main RAM = +3, libretro.cpp:884), and a completion cost (+2 CPU /
+ * +1 LWC2); the (region+completion) becomes a per-register LDAbsorb "give-back" that
+ * following instructions consume instead of their own +1 base (pipeline write-back
+ * overlap). The §1 base + GPR_DEPRES + DO_LDS that bracket this run in psx_cyc.h.
  *
- * These wrappers are wired to cpu->read_* (see main.cpp), so the penalty
- * applies to BOTH statically-recompiled and dirty-RAM-interpreted guest loads,
- * but NOT to debug-server / device reads that call psx_read_* directly. */
-#define PSX_RAM_READ_WAIT_CYCLES 6u
+ * These functions own the WHOLE per-instruction interlock for a CPU load (they call
+ * psx_cyc_base/deps/lds), so the emitters/interp invoke them in place of the prior
+ * cpu->read_* call and emit NO separate psx_cyc_step for the load. They return the
+ * raw value via the UNCHARGED psx_read_* (cpu->read_* is now uncharged too — the
+ * data-access cost is charged exactly once, here). Keyed on the runtime effective
+ * physical address (KUSEG/KSEG0/KSEG1 alias the same DRAM).
+ *
+ * DMACycleSteal residual: Beetle adds the (dynamic) DMACycleSteal to EVERY read
+ * (libretro.cpp:868-869). That is non-zero only while a DMA channel is actively
+ * stealing the bus; modeling it needs the live steal count threaded out of the DMA
+ * controller, and it can't be isolated by a static ruler. It remains an unmodeled
+ * dynamic axis; the per-region device waits below are the static, validatable piece. */
 extern void psx_advance_cycles(uint32_t cycles);
 
-static inline void charge_main_ram_read(uint32_t addr) {
-    if ((addr & 0x1FFFFFFFu) < RAM_SIZE) psx_advance_cycles(PSX_RAM_READ_WAIT_CYCLES);
+/* Beetle MemRW device-region READ wait (libretro.cpp:859-1131), the device-dependent
+ * part of a load's access cost (added to the timestamp before the +completion). `size`
+ * is the access width in bytes (1/2/4) — the SPU and CDC waits are width-dependent.
+ * Reads only; writes are posted (~free) in MemRW. phys is the masked physical address. */
+static inline uint32_t psx_mmio_read_wait(uint32_t phys, uint32_t size) {
+    /* Main RAM, mirrored across phys 0..0x7FFFFF (libretro.cpp:874 `A < 0x00800000`). */
+    if (phys < 0x00800000u) return 3u;
+    /* BIOS ROM (905) and Expansion 1 / PIO (1134): no extra device wait. */
+    if (phys >= 0x1FC00000u && phys <= 0x1FC7FFFFu) return 0u;
+    if (phys >= 0x1F000000u && phys <= 0x1F7FFFFFu) return 0u;
+    /* Hardware MMIO window 0x1F801000..0x1F802FFF (921). */
+    if (phys >= 0x1F801000u && phys <= 0x1F802FFFu) {
+        /* Bisect gate (PSX_MMIO_WAIT=0): disable the device-region read waits
+         * (the 9ae534d feature) to test whether they move the MMX6 cutscene
+         * ordering. Read once. */
+        static int s_mw = -1;
+        if (s_mw < 0) { const char* e = getenv("PSX_MMIO_WAIT"); s_mw = (e && e[0] == '0') ? 0 : 1; }
+        if (!s_mw) return 0u;
+        if (phys >= 0x1F801C00u && phys <= 0x1F801FFFu)            /* SPU (929) */
+            return (size == 4u) ? 36u : 16u;
+        if (phys >= 0x1F801800u && phys <= 0x1F80180Fu)            /* CDC (979) */
+            return 6u * size;
+        if (phys >= 0x1F801810u && phys <= 0x1F801817u) return 1u; /* GPU (994) */
+        if (phys >= 0x1F801820u && phys <= 0x1F801827u) return 1u; /* MDEC (1007) */
+        if (phys >= 0x1F801000u && phys <= 0x1F801023u) return 1u; /* SysControl (1020) */
+        if (phys >= 0x1F801040u && phys <= 0x1F80104Fu) return 1u; /* FrontIO/pad (1043) */
+        if (phys >= 0x1F801050u && phys <= 0x1F80105Fu) return 1u; /* SIO (1055) */
+        if (phys >= 0x1F801070u && phys <= 0x1F801077u) return 1u; /* IRQ (1094) */
+        if (phys >= 0x1F801080u && phys <= 0x1F8010FFu) return 1u; /* DMA (1106) */
+        if (phys >= 0x1F801100u && phys <= 0x1F80113Fu) return 1u; /* Timers (1119) */
+        return 0u;   /* unmatched MMIO: Beetle adds no device wait */
+    }
+    return 0u;       /* unknown / open-bus region */
 }
 
-uint32_t psx_guest_read_word(uint32_t addr) { charge_main_ram_read(addr); return psx_read_word(addr); }
-uint16_t psx_guest_read_half(uint32_t addr) { charge_main_ram_read(addr); return psx_read_half(addr); }
-uint8_t  psx_guest_read_byte(uint32_t addr) { charge_main_ram_read(addr); return psx_read_byte(addr); }
+/* Beetle ReadMemory data-access timing (cpu.cpp:369-448), after §1/deps/DO_LDS.
+ * compl_cost = 2 (CPU load) / 1 (LWC2); arm_rt = GPR to arm as pending load, or
+ * 0x20 = none (LWC2, dest is a GTE reg). size = access width in bytes (1/2/4). */
+static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
+                                   uint32_t compl_cost, uint32_t arm_rt) {
+    /* ReadMemory start (369-370): clear the current give-back slot. */
+    cpu->read_absorb[cpu->read_absorb_which] = 0u;
+    cpu->read_absorb_which = 0u;
+    /* Scratchpad (the D-cache): no wait, no give-back (414-422). */
+    if (phys >= 0x1F800000u && phys <= 0x1F8003FFu) {
+        cpu->ld_absorb = 0u;
+        cpu->ld_which_t = (uint8_t)arm_rt;
+        return;
+    }
+    /* fudge (424): +2 iff the predecessor committed no load (read_fudge==0x20). */
+    psx_advance_cycles((uint32_t)((cpu->read_fudge >> 4) & 2u));
+    uint32_t region = psx_mmio_read_wait(phys, size);  /* device-region wait */
+    uint32_t cost = region + compl_cost;               /* LDAbsorb = region + completion */
+    cpu->ld_absorb = cost;
+    psx_advance_cycles(cost);
+    cpu->ld_which_t = (uint8_t)arm_rt;
+}
 
+/* The interlock half of a load (§1+deps+(cancel)+DO_LDS+ReadMemory). Gated on
+ * PSX_ENABLE_BLOCK_CYCLES so the Beetle-oracle build (cycles off) does a plain read. */
+static inline void psx_cyc_load_timing(CPUState* cpu, uint32_t addr, uint32_t size,
+                                       uint32_t rt, uint32_t reg_mask) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    /* Bisect gate (PSX_LOAD_DELAY=0): disable the R3000A load-delay interlock
+     * timing (the d8c4a8e/fade560/d597797 feature) to test whether it moves the
+     * MMX6 cutscene ordering. Read once; default on. */
+    static int s_ld = -1;
+    if (s_ld < 0) { const char* e = getenv("PSX_LOAD_DELAY"); s_ld = (e && e[0] == '0') ? 0 : 1; }
+    if (!s_ld) { (void)addr; (void)size; (void)rt; (void)reg_mask; return; }
+    psx_cyc_base(cpu);
+    psx_cyc_deps(cpu, reg_mask);
+    if (cpu->ld_which_t == rt) cpu->ld_which_t = 0u;   /* cancel pending load to same dest */
+    psx_cyc_lds(cpu);
+    psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, size, 2u, rt);
+#else
+    (void)cpu; (void)addr; (void)size; (void)rt; (void)reg_mask;
+#endif
+}
+
+uint32_t psx_cyc_load_word(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    psx_cyc_load_timing(cpu, addr, 4u, rt, reg_mask);
+    return psx_read_word(addr);
+}
+uint16_t psx_cyc_load_half(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    psx_cyc_load_timing(cpu, addr, 2u, rt, reg_mask);
+    return psx_read_half(addr);
+}
+uint8_t psx_cyc_load_byte(CPUState* cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    psx_cyc_load_timing(cpu, addr, 1u, rt, reg_mask);
+    return psx_read_byte(addr);
+}
+
+/* LWC2 (GTE load): §1/DO_LDS done by psx_cyc_step(cpu,0); the GTE deadline stall by
+ * psx_gte_stall — both emitted before this call. 32-bit access, completion +1, no
+ * LDWhich arm. */
+uint32_t psx_cyc_lwc2_read(CPUState* cpu, uint32_t addr) {
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    psx_cyc_readmem(cpu, addr & 0x1FFFFFFFu, 4u, 1u, 0x20u);
+#else
+    (void)cpu;
+#endif
+    return psx_read_word(addr);
+}
+
+/* Deprecated uncharged passthroughs (the +4 flat wait-state model is gone; load
+ * timing now lives in psx_cyc_load_*). Kept so any stray reference stays valid. */
+uint32_t psx_guest_read_word(uint32_t addr) { return psx_read_word(addr); }
+uint16_t psx_guest_read_half(uint32_t addr) { return psx_read_half(addr); }
+uint8_t  psx_guest_read_byte(uint32_t addr) { return psx_read_byte(addr); }
+
+static void psx_write_byte_raw(uint32_t addr, uint8_t val);
 void psx_write_byte(uint32_t addr, uint8_t val) {
+    if (g_ls_mode == 2) { ls_write_hook(addr, 1, val); return; }
+    if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_byte_raw(addr, val); return; }
+    if (!psx_get_in_exception()) ls_write_hook(addr, 1, val);
+    s_ls_op_active = 1;
+    psx_write_byte_raw(addr, val);
+    s_ls_op_active = 0;
+}
+static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
+        parity_trace_note_write(phys, 1, g_debug_last_store_pc);
         card_data_writes_check(phys, (uint32_t)val, 1);
         dirty_ram_mark_kernel_write(phys);
         overlay_watch_note_write(phys, 1);
+#ifdef PSX_COSIM
+        { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 1); }
+#endif
         ram[phys] = val;
         return;
     }

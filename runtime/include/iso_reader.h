@@ -37,6 +37,18 @@ struct RootDirectoryInfo {
     uint32_t size;          // Size of root directory in bytes
 };
 
+/**
+ * A CD track parsed from the .cue sheet (or the synthesized single data
+ * track for a bare .bin/.iso). Multi-track discs (Tomba 2 etc.) carry a
+ * Red Book CD-DA audio track after the data track; the CD model's TOC
+ * commands (GetTN/GetTD) must report them.
+ */
+struct CDTrack {
+    int      number;     // 1-based track number
+    bool     is_audio;   // true = CD-DA audio (Red Book); false = data
+    uint32_t start_lba;  // .bin-relative start LBA (cue INDEX 01; track 1 = 0)
+};
+
 class ISOReader {
 public:
     /**
@@ -99,6 +111,15 @@ public:
      * Raw BIN images count 2352-byte sectors; cooked ISO images count 2048-byte sectors.
      */
     uint32_t GetSectorCount();
+
+    /**
+     * CD-track TOC accessors (multi-track .cue support).
+     * TrackCount() is >= 1 (a bare image synthesizes one data track).
+     * TrackStartLBA(n)/TrackIsAudio(n) take a 1-based track number.
+     */
+    int      TrackCount() const;
+    uint32_t TrackStartLBA(int track) const;
+    bool     TrackIsAudio(int track) const;
 
     /**
      * Get root directory information
@@ -171,6 +192,7 @@ private:
     std::string volume_id_;
     std::string bin_path_;
     RootDirectoryInfo root_dir_;
+    std::vector<CDTrack> tracks_;   // from the .cue TOC; >=1 entry after Open()
 };
 
 } // namespace PS1

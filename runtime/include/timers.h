@@ -25,6 +25,10 @@ void     timers_write(uint32_t addr, uint32_t value);
 /* Advance all timers by guest CPU cycles. Used by native block-cycle builds. */
 void timers_advance(uint32_t cycles);
 
+/* Cycle-budgeted precise event slicing: guest CPU cycles until a timer raises a
+ * DELIVERABLE IRQ (unmasked in i_mask + mode-armed). UINT32_MAX if none. */
+uint32_t timers_cycles_to_irq(uint32_t i_mask);
+
 /* Legacy coarse tick used by interpreter/oracle builds. */
 void timers_tick(int cycles);
 

@@ -5,6 +5,55 @@ session before doing any work.
 
 ---
 
+## ⛔ RULE -1: BUILD THE FAITHFUL CORE — NO HACKS, NO PRESERVATION
+
+This ecosystem is being BUILT, not maintained. There is nothing to preserve.
+
+- The correct fix is ALWAYS the faithful, hardware-accurate, class-level core.
+  NEVER a surgical per-game patch, a symptom workaround, a `game.toml` hack
+  (e.g. `overlay_native_block`), or "make native agree with interp even if both
+  are fake."
+- When a narrow patch and a general faithfulness fix both exist, the
+  faithfulness fix WINS — even if larger, even if it breaks other titles.
+  Other games were built on a faulty ecosystem and will be **regenerated**.
+  Backward-compatibility is NOT a constraint.
+- The recurring failure mode (weeks lost) is veering into a quick hack that
+  doesn't even work and burns the session. Do not do this. If you catch
+  yourself proposing a "surgical"/"temporary"/"just for this title" fix — STOP
+  and build the real thing.
+- PSX timing specifically: the faithful core = ONE shared per-instruction
+  cycle-cost function for BOTH backends (compiled + dirty-RAM interp), exact
+  block cycle totals (delay-slot ownership), timers derived on-demand from a
+  global guest-cycle counter, devices on scheduled event deadlines, every
+  basic-block leader re-enterable. Confer with ChatGPT via the Chrome MCP
+  browser (chatgpt.com, "PSX Static Recompiler Debug" chat), not the codex CLI.
+
+This supersedes any pressure to ship fast. Completeness is absolute here.
+
+**Scope (refined 2026-06-29 — faithfulness is the FOUNDATION, not the
+destination).** The rule above governs FOUNDATION work — building the faithful
+core — and forbids per-game patches / symptom-workarounds / `game.toml` hacks
+*as a way to fake faithfulness*. It does NOT forbid them forever: once the
+faithful core is proven, per-game shims/hacks are the legitimate tool of the
+*enhancement* phase — accelerated load times (toward 0), widescreen, etc. (see
+`ENHANCEMENTS.md`). Likewise **LLE is the BASELINE, not an absolute**: a
+faithful, Beetle-validated HLE *subsystem replacement* is permitted at a genuine
+LLE landmine (non-determinism with no hardware analog, or profound performance
+loss), never as the starting point — see §0's amendment below and
+recomp-template `PRINCIPLES.md` → "LLE Is the Baseline; HLE Is a Subsystem
+Replacement, Not a Starting Point".
+
+**The authoritative game plan is `FAITHFUL_TIMING_PLAN.md` — READ IT EACH
+SESSION** (north star, phased plan P1–P6, current status/log). Update its
+Status/Log section every session. The full-coverage accuracy burndown across ALL
+axes (semantics, cycle, IRQ, MMIO, peripherals, static-vs-dynamic, determinism)
+lives in `ACCURACY_BURNDOWN.md` — every item must be cross-referenced against an
+external comparative (psx-spx / in-tree Beetle source / DuckStation / HW test
+ROMs), not asserted. Axis 5 (peripherals — esp. SIO/controller, the hybrid-pad
+bug) is the suspected-weakest second front after the cycle axis.
+
+---
+
 ## 0. The architecture is locked
 
 v4 implements **Architecture A**: static MIPS-to-C recompilation of

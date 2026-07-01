@@ -28,8 +28,10 @@
 #include "debug_server.h"
 #include "interrupts.h"
 #include "psx_cycles.h"
+#include "psx_instr_cost.h"  /* psx_instr_base_cycles — single-source cycle cost */
 #include "gpu.h"   /* psx_ws_is_backdrop_site / psx_ws_backdrop_x (interp hook) */
 #include "ws_backdrop_detect.h"  /* shared backdrop-window detector (auto_backdrop) */
+#include "lockstep.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -40,6 +42,105 @@ uint64_t g_dirty_ram_insns_run  = 0;
 uint64_t g_dirty_window_dispatches = 0;  /* capture-window interp dispatches */
 uint64_t g_dirty_ram_aborts     = 0;
 uint64_t g_dirty_ram_guard_yields = 0;
+/* Scheduling-contract pump telemetry (see dirty_ram_dispatch). Always-on:
+ * g_dirty_pump_max_gap_insns is the largest interpreted-insn gap ever seen
+ * between two interrupt pumps — must stay bounded (~4096 + one block) once the
+ * region-independent pump is in place; a runaway value means a dirty path is
+ * advancing cycles without surfacing to psx_check_interrupts (the softlock). */
+uint64_t g_dirty_pump_max_gap_insns = 0;
+uint64_t g_dirty_pump_count         = 0;
+static uint64_t s_last_dirty_irq_pump_insns = 0;
+
+/* EPC de-overload signal (Tomba 2 frame-1997 fix). Set to the committed guest PC
+ * immediately around a dirty-pump psx_check_interrupts() call, 0 otherwise. When
+ * non-zero at exception entry, the interrupt is delivered at a dirty-interp safe point
+ * with a precise guest resume PC, so psx_check_interrupts sets COP0_EPC to the REAL PC
+ * (architectural RFE resume) instead of the host sentinel 0x80000048. The TCB then
+ * saves the real PC, so a game-installed handler that drives ReturnFromException
+ * itself (sync OR async) resumes correctly. Compiled-code block-boundary pumps leave
+ * this 0 -> the sentinel + host-GPR-restore + longjmp path (unchanged: T1/MMX6/Ape). */
+uint32_t g_dirty_safe_resume_pc = 0;
+
+/* Cycle-budgeted precise event slicing (PRECISE_IRQ_SLICE.md). Set while the
+ * block-leader slice guard is running a block through the per-instruction
+ * interpreter so the interrupt is taken at the EXACT architectural instruction
+ * (not the coarse block edge). While set, exec_one's jal/jalr short-circuit to a
+ * plain transfer (cpu->pc = target; return 1) so precise-mode steps INTO callees
+ * per-instruction instead of running them compiled — the "ignore native
+ * availability" invariant (ChatGPT-validated option b). Default 0 => every other
+ * path is byte-for-byte unchanged. */
+int g_precise_mode = 0;
+/* #2 lockstep: set ONLY around the dirty-interp loop's per-instruction
+ * cyc_observe so the lockstep comparator can tell a real COMPILED block leader
+ * (g_ls_dirty_observe==0) from an interpreted per-instruction sample (==1). */
+int g_ls_dirty_observe = 0;
+extern int g_ls_replay_active;     /* defined in the lockstep section; used by exec_one's jal/jalr guard */
+
+#ifdef PSX_COSIM
+static int g_cosim_exec_one_hooked = 0;
+static void cosim_exec_one_begin(void) { g_cosim_exec_one_hooked = 0; }
+static int cosim_exec_one_did_hook(void) { return g_cosim_exec_one_hooked; }
+static void cosim_exec_one_transfer_hook(uint32_t pc) {
+    extern void cosim_instr(uint32_t);
+    cosim_instr(pc);
+    g_cosim_exec_one_hooked = 1;
+}
+#else
+static void cosim_exec_one_begin(void) {}
+static int cosim_exec_one_did_hook(void) { return 0; }
+static void cosim_exec_one_transfer_hook(uint32_t pc) { (void)pc; }
+#endif
+uint64_t g_slice_fired = 0;        /* diagnostic: slices actually run */
+uint64_t g_slice_irq_taken = 0;    /* diagnostic: IRQs taken inside precise-mode */
+/* First-divergence trace for the precise slice (PRECISE_IRQ_SLICE.md Task #4). */
+uint32_t g_slice_last_block     = 0;  /* block_addr the guard fired on            */
+uint32_t g_slice_last_first_pc  = 0;  /* pc of the first interp instruction       */
+uint32_t g_slice_last_first_insn= 0;  /* raw word of that first instruction       */
+uint32_t g_slice_last_committed = 0;  /* committed PC handed back as resume/EPC   */
+uint32_t g_slice_last_istat     = 0;  /* i_stat at the take                        */
+uint32_t g_slice_last_imask     = 0;  /* i_mask at the take                        */
+uint32_t g_slice_last_sr        = 0;  /* COP0 SR at the take                       */
+uint32_t g_slice_entry_deliverable = 0; /* was IRQ deliverable at slice entry?    */
+uint32_t g_slice_exit_pc        = 0;  /* PC published by the last precise slice    */
+uint32_t g_slice_exit_reason    = 0;  /* 1=safe, 2=unsupported, 3=bail, 4=guard    */
+uint32_t g_slice_exit_iter      = 0;  /* loop iteration at exit                    */
+uint32_t g_slice_exit_dispatchable = 0; /* precise_pc_dispatchable(exit_pc)        */
+uint32_t g_slice_exit_dirty     = 0;  /* dirty_ram_is_dirty(exit_pc phys)          */
+uint32_t g_slice_exit_in_text   = 0;  /* psx_game_address_in_text(exit_pc)         */
+uint32_t g_slice_exit_want      = 0;  /* want_exit value at exit                   */
+
+/* Persistent async-RFE resume PC (Tomba 2 frame-1997 fix). psx_check_interrupts latches
+ * this from g_dirty_safe_resume_pc at each dirty-safe-point exception entry, so it holds
+ * the real guest PC of the most recent dirty-interp interruption. When a game-installed
+ * handler drives ReturnFromException ASYNCHRONOUSLY (sentinel RFE with in_exception==0),
+ * the sentinel gates resume the guest here instead of resolving to pc=0 (abnormal exit).
+ * Unlike g_dirty_safe_resume_pc (transient, scoped to the pump call) this persists across
+ * the gap between the interrupt and the game's later ReturnFromException. */
+uint32_t g_async_rfe_resume_pc = 0;
+/* Diagnostics for the async-RFE fix: times the resume PC was latched at a dirty-safe
+ * exception entry, and times the sentinel gates actually redirected to it. */
+uint64_t g_async_rfe_set_count  = 0;
+uint64_t g_async_rfe_fire_count = 0;
+/* Reach diagnostics: which gate the sentinel dispatch lands in, and what
+ * g_async_rfe_resume_pc held there. */
+uint64_t g_sentinel_reach_dirty = 0;
+uint64_t g_sentinel_reach_traps = 0;
+uint32_t g_sentinel_reach_async = 0;
+
+/* One-shot pc=0 producer tripwire (MMX6 boot-wedge investigation, Task #4 family).
+ * Latches the FIRST time dirty_ram_dispatch returns "handled" (r==1) but leaves
+ * cpu->pc == 0 — i.e. the dirty path produced the abnormal-exit null PC rather
+ * than psx_unknown_dispatch (which has its own fail-fast). Captures the dispatch
+ * addr + interrupt-return context so the exact producing path is identifiable
+ * without printf. Surfaced in freeze_check (pczero_*). */
+int      g_cosim_dirty_pump_site = 0; /* PSX_COSIM diagnostic: current dirty IRQ pump site */
+int      g_pczero_latched     = 0;
+uint32_t g_pczero_addr        = 0;
+uint32_t g_pczero_ra          = 0;
+uint32_t g_pczero_in_exc      = 0;
+uint32_t g_pczero_async_rfe   = 0;
+uint32_t g_pczero_dirty_safe  = 0;
+uint64_t g_pczero_count       = 0;
 
 /* Mid-block unsupported-opcode counters. Bumped instead of fprintf-spamming
  * stderr (CLAUDE.md §3). Read via dirty_ram_get_unsupported(). The "last_*"
@@ -118,9 +219,40 @@ uint32_t g_insn_freeze_addr  = 0;  /* candidate phys entry to watch            *
 uint32_t g_insn_freeze_nth   = 0;  /* freeze before its Nth dispatch           */
 uint32_t g_insn_freeze_count = 0;
 int      g_insn_log_frozen   = 0;
+/* Tomba2 wild-jump capture (Confirm-(b)): freeze the insn ring the instant an
+ * interpreted instruction's transfer TARGET (or next_pc) equals this watched
+ * value, so the offending jr/jalr is preserved as the ring's last entry with its
+ * full register snapshot. Set via the `insn_freeze_target` debug command (0 =
+ * disabled). Matches on full 32-bit value (wild PCs are not phys-normalizable). */
+uint32_t g_insn_freeze_on_target = 0;
+/* Register snapshot captured at the instruction that hits g_insn_freeze_on_target
+ * (the offending jr/jalr). g_freeze_snap_valid latches 1; pc/insn identify the
+ * branch, gpr[] is the full guest register file at that moment (the source
+ * register still holds the wild target; scan for which reg == the target). */
+int      g_freeze_snap_valid = 0;
+uint32_t g_freeze_snap_pc    = 0;
+uint32_t g_freeze_snap_insn  = 0;
+uint32_t g_freeze_snap_tcb   = 0;
+uint32_t g_freeze_snap_gpr[32] = {0};
+/* ra-load watch (Confirm-(b)): capture the instruction that sets $ra to this
+ * value. 0 = disabled. */
+uint32_t g_ra_load_watch        = 0;
+int      g_ra_load_snap_valid   = 0;
+uint32_t g_ra_load_snap_pc      = 0;
+uint32_t g_ra_load_snap_insn    = 0;
+uint32_t g_ra_load_snap_before_ra = 0;
+uint32_t g_ra_load_snap_srcaddr = 0;
+uint32_t g_ra_load_snap_gpr[32] = {0};
+
+/* Overlay-region floor (phys) = the loaded game's main-EXE text end. Defaults to
+ * the BIOS-only value; main.cpp pins it to (load_address + text_size) at game
+ * load. See dirty_ram_interp.h for the per-game rationale. */
+uint32_t g_overlay_region_floor = OVERLAY_REGION_FLOOR_DEFAULT;
 
 #ifdef PSX_HAS_GAME_DISPATCH
 extern int psx_dispatch_game_compiled(CPUState* cpu, uint32_t addr);
+extern int psx_game_address_in_text(uint32_t addr);
+extern int psx_game_is_function_entry(uint32_t addr);  /* non-destructive entry test */
 #endif
 extern void psx_dispatch_call(CPUState* cpu, uint32_t addr, uint32_t return_addr);
 
@@ -205,6 +337,24 @@ static void dirty_ram_log_instruction(CPUState *cpu, uint32_t pc, uint32_t insn,
                                       uint32_t before_s0, uint32_t next_pc,
                                       uint32_t target, int transferred) {
     if (g_insn_log_frozen) return;
+    /* Freeze-on-target (Confirm-(b)): checked BEFORE the gate filter so it fires
+     * for ANY interpreted instruction transferring to the watched wild PC, even
+     * if that jr/jalr sits outside the recorded gate range. We do NOT record this
+     * out-of-gate entry (the gate still governs what's stored); we just stop the
+     * ring so the in-gate window leading up to the wild jump is preserved. */
+    if (g_insn_freeze_on_target != 0u &&
+        (target == g_insn_freeze_on_target || next_pc == g_insn_freeze_on_target)) {
+        if (!g_freeze_snap_valid) {
+            g_freeze_snap_pc   = pc;
+            g_freeze_snap_insn = insn;
+            uint32_t tcb_ptr = cpu->read_word(0x00000108u);
+            g_freeze_snap_tcb = tcb_ptr ? cpu->read_word(tcb_ptr) : 0;
+            for (int r = 0; r < 32; r++) g_freeze_snap_gpr[r] = cpu->gpr[r];
+            g_freeze_snap_valid = 1;
+        }
+        g_insn_log_frozen = 1;
+        return;
+    }
     uint32_t phys = pc & 0x1FFFFFFFu;
     if (!((g_insn_gate_hi != 0u && phys >= g_insn_gate_lo && phys < g_insn_gate_hi) ||
           (phys >= 0x000E0000u && phys < 0x000F0000u) ||
@@ -263,8 +413,9 @@ void dirty_ram_log_marker(uint32_t addr, uint32_t tag, int kind) {
     e->transferred = (uint8_t)(200 + kind);
 }
 
-static inline uint32_t interp_lwl(CPUState *cpu, uint32_t addr, uint32_t rt_value) {
-    uint32_t word = cpu->read_word(addr & ~3u);
+/* LWL/LWR are merge-only here; the timed aligned-word read is done by the caller via
+ * psx_cyc_load_word (Beetle reads the aligned word; GPR_DEP rs only, arms LDWhich=rt). */
+static inline uint32_t lwl_merge(uint32_t addr, uint32_t word, uint32_t rt_value) {
     switch (addr & 3u) {
         case 0: return (rt_value & 0x00FFFFFFu) | (word << 24);
         case 1: return (rt_value & 0x0000FFFFu) | (word << 16);
@@ -273,8 +424,7 @@ static inline uint32_t interp_lwl(CPUState *cpu, uint32_t addr, uint32_t rt_valu
     }
 }
 
-static inline uint32_t interp_lwr(CPUState *cpu, uint32_t addr, uint32_t rt_value) {
-    uint32_t word = cpu->read_word(addr & ~3u);
+static inline uint32_t lwr_merge(uint32_t addr, uint32_t word, uint32_t rt_value) {
     switch (addr & 3u) {
         case 0: return word;
         case 1: return (rt_value & 0xFF000000u) | (word >> 8);
@@ -336,14 +486,29 @@ static int abort_unsupported(uint32_t pc, uint32_t insn, const char *reason) {
     return 1; /* signal "control transferred" so the caller stops */
 }
 
-/* Local-flow gate: overlay region ONLY, by design. Kernel-window code
- * (phys < DIRTY_RAM_KERNEL_WINDOW_END) keeps the verified per-block dispatch
- * cadence — it runs in exception context, where interrupt-check cadence and
- * EPC handling are delicate (see dirty_ram_interp.h window note). Kernel
- * native coverage comes from overlay_loader candidates, not interp chaining. */
+/* A dirty page that should run as a locally-chained overlay: anything ABOVE the
+ * kernel window. The kernel window [0, DIRTY_RAM_KERNEL_WINDOW_END) intentionally
+ * stays per-block (it runs in exception context, where interrupt-check cadence and
+ * EPC handling are delicate — see dirty_ram_interp.h window note; kernel native
+ * coverage comes from overlay_loader candidates, not interp chaining).
+ *
+ * NOTE this is the kernel-window end, NOT OVERLAY_REGION_FLOOR. The floor is the
+ * end of the boot-EXE text, and the original design assumed [0x10000, FLOOR) is
+ * immutable statically-recompiled text. That assumption is FALSE for games that
+ * discard their boot/init code and load gameplay overlays OVER the boot-text region
+ * (Tomba 2: a START.BIN-loader overlay at 0x8001Dxxx, well below its 0x38800 floor).
+ * Such a page is dirty (RAM != compiled image), so dispatching to it must interpret
+ * the live overlay and chain locally — exactly like the [FLOOR, RAM_SIZE) overlay
+ * region — NOT run the stale compiled image or route through the bail-prone
+ * non-local-call contract (the Whoopee-Camp splash wild-jr). dirty_ram_is_dirty()
+ * keeps clean boot text on the fast compiled path; only overwritten pages divert. */
+static inline int phys_is_overlay_flow_region(uint32_t phys) {
+    return phys >= DIRTY_RAM_KERNEL_WINDOW_END;
+}
+
 static int is_local_dirty_target(uint32_t target) {
     uint32_t phys = target & 0x1FFFFFFFu;
-    return phys >= OVERLAY_REGION_FLOOR && dirty_ram_is_dirty(phys);
+    return phys_is_overlay_flow_region(phys) && dirty_ram_is_dirty(phys);
 }
 
 /* Target the last interp run handed back to the dispatch loop (chained
@@ -400,6 +565,46 @@ static int dirty_ram_word_looks_decodable(uint32_t insn) {
     }
 }
 
+static int dirty_ram_same_pc(uint32_t a, uint32_t b) {
+    return (((a ^ b) & 0x1FFFFFFFu) == 0);
+}
+
+static int dirty_ram_pump_boundary(CPUState *cpu, uint32_t committed_pc, int site) {
+    uint32_t prev_safe = g_dirty_safe_resume_pc;
+    int prev_site = g_cosim_dirty_pump_site;
+
+    s_last_dirty_irq_pump_insns = g_dirty_ram_insns_run;
+    if (!psx_interrupts_checked_at_current_cycle(committed_pc)) {
+        g_dirty_safe_resume_pc = committed_pc;
+        g_cosim_dirty_pump_site = site;
+        psx_check_interrupts(cpu);
+        g_dirty_safe_resume_pc = prev_safe;
+        g_cosim_dirty_pump_site = prev_site;
+    }
+
+    if (g_psx_call_bail) return 1;
+    if (cpu->pc == 0u && committed_pc != 0u) {
+        cpu->pc = committed_pc;
+        g_async_rfe_fire_count++;
+    }
+    if (cpu->pc != 0u && !dirty_ram_same_pc(cpu->pc, committed_pc)) {
+        return 1;
+    }
+
+    cpu->pc = committed_pc;
+    return 0;
+}
+
+static int dirty_ram_finish_call_return(CPUState *cpu, uint32_t return_pc,
+                                        uint32_t *next_pc_out) {
+    uint32_t prev_pc = cpu->pc;
+    cpu->pc = return_pc;
+    if (dirty_ram_pump_boundary(cpu, return_pc, 5)) return 1;
+    cpu->pc = prev_pc;
+    *next_pc_out = return_pc;
+    return 0;
+}
+
 static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
                                   uint32_t return_pc,
                                   uint32_t *next_pc_out) {
@@ -409,8 +614,7 @@ static int dispatch_nonlocal_call(CPUState *cpu, uint32_t target,
      * unwind in progress surfaces with cpu->pc = the guest's true target. */
     if (g_psx_call_bail) return 1;
     if (cpu->pc != 0) return 1;
-    *next_pc_out = return_pc;
-    return 0;
+    return dirty_ram_finish_call_return(cpu, return_pc, next_pc_out);
 }
 
 /* ── Mixed interp<->compiled dispatch owner (host-stack recursion fix) ──────
@@ -729,6 +933,12 @@ int dirty_ram_xprobe_json(char *out, int cap) {
 #ifdef PSX_HAS_GAME_DISPATCH
 static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
     if (target == 0x8001A954u) site_note(&g_site_interp);
+    /* Decline if the target page is dirty: an overlay overwrote it after the
+     * game-start baseline, so the compiled function is STALE. Returning 0 lets the
+     * JAL/JALR handler fall through to is_local_dirty_target -> local-flow interp of
+     * the live overlay, instead of running stale compiled code (the same staleness
+     * the dirty_ram_dispatch_inner gate guards). Clean targets run compiled. */
+    if (dirty_ram_is_dirty(target & 0x1FFFFFFFu)) return 0;
     if (psx_mixed_owner_enabled()
         && interp_host_stack_used() > psx_mixed_stack_watermark()) {
         cpu->pc = target;
@@ -736,7 +946,9 @@ static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
         return 1;
     }
     g_mixed_depth++;
+    ls_func_enter(target, cpu);
     int r = psx_dispatch_game_compiled(cpu, target);
+    ls_func_exit(target, cpu, r);
     g_mixed_depth--;
     return r;
 }
@@ -772,6 +984,10 @@ static void exec_delay_slot(CPUState *cpu, uint32_t pc) {
     uint32_t dummy_next = 0;
     (void)exec_one(cpu, pc, &dummy_next);
     g_dirty_ram_insns_run++;
+    /* CYCLE MODEL: the delay-slot instruction is a real retired R3000A instruction
+     * and is charged its own per-instruction interlock INSIDE exec_one (top-of-fn
+     * §1+deps+DO_LDS, or psx_cyc_load_* for a load delay slot) — so a branch+slot
+     * pair costs both, matching hardware. No separate charge here. */
 }
 
 static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
@@ -788,6 +1004,22 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     uint32_t imm  = imm16_field(insn);
 
     *next_pc_out = pc + 4;
+
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+    /* Instruction FETCH cost (I-cache) — charged FIRST, before the §1 base, exactly
+     * like Beetle ReadInstruction precedes the per-instruction base (cpu.cpp). HIT=+0,
+     * KSEG1=+4, cached miss=+3+refill; a miss also clears the load give-back. */
+    psx_icache_fetch(cpu, pc);
+
+    /* Per-instruction R3000A load-delay interlock (single-source: psx_cyc.h, shared
+     * with both static emitters). §1 base + GPR_DEPRES + DO_LDS run HERE, before the
+     * instruction body, so §1 precedes any muldiv/GTE deadline stall the body applies
+     * (Beetle order). CPU loads (op 0x20-0x26) are skipped here — psx_cyc_load_* runs
+     * their full interlock inside the body (and arms LDWhich=rt). This replaces the
+     * old flat per-instruction psx_advance_cycles(psx_instr_base_cycles). */
+    if (!(opc >= 0x20u && opc <= 0x26u))
+        psx_cyc_step(cpu, psx_cyc_dep_res_mask(insn));
+#endif
 
     /* Update last-store PC tracker so SIO PC tracer attribution stays
      * coherent through interpreted stubs. */
@@ -879,6 +1111,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         case 0x08: { /* JR rs */
             uint32_t target = cpu->gpr[rs];
             exec_delay_slot(cpu, pc + 4);
+            cosim_exec_one_transfer_hook(pc + 4);
             /* crossing (if target is compiled) is counted at the block-loop
              * tail-transfer site (interp_enter_compiled, §18) — not here, to
              * avoid double-counting J/JR-to-compiled. */
@@ -891,9 +1124,11 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             cpu->gpr[rd ? rd : 31] = return_pc;
             cpu->gpr[0] = 0;
             exec_delay_slot(cpu, pc + 4);
+            cosim_exec_one_transfer_hook(pc + 4);
             uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
             xprobe_event(pc, XOP_JALR, XSITE_INTERP, target,
                          fetch_word((pc + 4) & 0x1FFFFFFFu), site_sp, cpu->gpr[31], 1);
+            if (g_precise_mode || g_ls_replay_active) { cpu->pc = target; return 1; }  /* slice / lockstep-replay: plain transfer, never execute the callee */
 #ifdef PSX_HAS_GAME_DISPATCH
             cpu->pc = 0;
             if (interp_enter_compiled(cpu, target)) {
@@ -902,8 +1137,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                 if (rd == 0 || rd == 31) {
                     if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
                 }
-                *next_pc_out = return_pc;
-                return 0;
+                return dirty_ram_finish_call_return(cpu, return_pc, next_pc_out);
             }
 #endif
             /* Native overlay candidates get the SAME call contract as
@@ -920,8 +1154,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                     if (rd == 0 || rd == 31) {
                         if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
                     }
-                    *next_pc_out = return_pc;
-                    return 0;
+                    return dirty_ram_finish_call_return(cpu, return_pc, next_pc_out);
                 }
             }
             if (!is_local_dirty_target(target)) {
@@ -940,6 +1173,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         case 0x0F: /* SYNC */
             return 0;
         case 0x10: /* MFHI */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_muldiv_stall(cpu);   /* stall to mult/div completion (faithful) */
+#endif
             cpu->gpr[rd] = cpu->hi;
             cpu->gpr[0] = 0;
             return 0;
@@ -947,6 +1183,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             cpu->hi = cpu->gpr[rs];
             return 0;
         case 0x12: /* MFLO */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_muldiv_stall(cpu);   /* stall to mult/div completion (faithful) */
+#endif
             cpu->gpr[rd] = cpu->lo;
             cpu->gpr[0] = 0;
             return 0;
@@ -957,12 +1196,18 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             int64_t r = (int64_t)(int32_t)cpu->gpr[rs] * (int64_t)(int32_t)cpu->gpr[rt];
             cpu->lo = (uint32_t)r;
             cpu->hi = (uint32_t)((uint64_t)r >> 32);
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_muldiv_set(cpu, psx_mult_latency_s(cpu->gpr[rs]));  /* completion deadline */
+#endif
             return 0;
         }
         case 0x19: { /* MULTU */
             uint64_t r = (uint64_t)cpu->gpr[rs] * (uint64_t)cpu->gpr[rt];
             cpu->lo = (uint32_t)r;
             cpu->hi = (uint32_t)(r >> 32);
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_muldiv_set(cpu, psx_mult_latency_u(cpu->gpr[rs]));  /* completion deadline */
+#endif
             return 0;
         }
         case 0x1A: { /* DIV */
@@ -978,6 +1223,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                 cpu->lo = (uint32_t)(a / b);
                 cpu->hi = (uint32_t)(a % b);
             }
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_muldiv_set(cpu, 37u);   /* DIV completion deadline (fixed) */
+#endif
             return 0;
         }
         case 0x1B: /* DIVU */
@@ -988,6 +1236,9 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                 cpu->lo = cpu->gpr[rs] / cpu->gpr[rt];
                 cpu->hi = cpu->gpr[rs] % cpu->gpr[rt];
             }
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_muldiv_set(cpu, 37u);   /* DIVU completion deadline (fixed) */
+#endif
             return 0;
         case 0x20: /* ADD - overflow traps are delegated if they occur. */
         case 0x21: /* ADDU rd, rs, rt */
@@ -1031,6 +1282,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     case 0x02: { /* J target */
         uint32_t target = ((pc + 4) & 0xF0000000u) | (target26(insn) << 2);
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         /* crossing counted at the block-loop tail-transfer site (§18). */
         cpu->pc = target;
         return 1;
@@ -1040,17 +1292,18 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         uint32_t return_pc = pc + 8;
         cpu->gpr[31] = return_pc;
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
         xprobe_event(pc, XOP_JAL, XSITE_INTERP, target,
                      fetch_word((pc + 4) & 0x1FFFFFFFu), site_sp, cpu->gpr[31], 1);
+        if (g_precise_mode || g_ls_replay_active) { cpu->pc = target; return 1; }  /* slice / lockstep-replay: plain transfer, never execute the callee */
 #ifdef PSX_HAS_GAME_DISPATCH
         cpu->pc = 0;
         if (interp_enter_compiled(cpu, target)) {
             if (g_psx_call_bail) return 1;  /* wild unwind: cpu->pc = true target */
             if (cpu->pc != 0) return 1;
             if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
-            *next_pc_out = return_pc;
-            return 0;
+            return dirty_ram_finish_call_return(cpu, return_pc, next_pc_out);
         }
 #endif
         /* Native overlay candidates get the SAME call contract as statically-
@@ -1066,8 +1319,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
                 if (g_psx_call_bail) return 1;
                 if (cpu->pc != 0) return 1;
                 if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
-                *next_pc_out = return_pc;
-                return 0;
+                return dirty_ram_finish_call_return(cpu, return_pc, next_pc_out);
             }
         }
         if (!is_local_dirty_target(target)) {
@@ -1082,24 +1334,28 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     case 0x04: { /* BEQ rs, rt, simm */
         int taken = (cpu->gpr[rs] == cpu->gpr[rt]);
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
         return 1;
     }
     case 0x05: { /* BNE */
         int taken = (cpu->gpr[rs] != cpu->gpr[rt]);
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
         return 1;
     }
     case 0x06: { /* BLEZ */
         int taken = ((int32_t)cpu->gpr[rs] <= 0);
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
         return 1;
     }
     case 0x07: { /* BGTZ */
         int taken = ((int32_t)cpu->gpr[rs] > 0);
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
         return 1;
     }
@@ -1115,6 +1371,7 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         default: return abort_unsupported(pc, insn, "REGIMM rt");
         }
         exec_delay_slot(cpu, pc + 4);
+        cosim_exec_one_transfer_hook(pc + 4);
         cpu->pc = taken ? (pc + 4 + (simm << 2)) : (pc + 8);
         return 1;
     }
@@ -1159,7 +1416,11 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         return 0;
     case 0x10: { /* COP0 */
         uint32_t cop_op = rs;
-        if (cop_op == 0x00) { /* MFC0 */
+        if (cop_op == 0x00) { /* MFC0 — delayed load (Beetle: LDAbsorb=0, LDWhich=rt) */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            cpu->ld_absorb = 0u;
+            cpu->ld_which_t = (uint8_t)rt;
+#endif
             cpu->gpr[rt] = cpu->cop0[rd];
             cpu->gpr[0] = 0;
             return 0;
@@ -1177,21 +1438,35 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
     }
     case 0x12: { /* COP2 / GTE */
         uint32_t cop_op = rs;
-        if (cop_op == 0x00) { /* MFC2 */
+        /* Faithful GTE: any COP2 register access stalls to the pending command
+         * completion deadline (gte_execute armed it via psx_gte_set). */
+        if (cop_op == 0x00) { /* MFC2 — read: stall + give-back (Beetle) */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_gte_read(cpu, rt);
+#endif
             cpu->gpr[rt] = gte_read_data(cpu, (uint8_t)rd);
             cpu->gpr[0] = 0;
             return 0;
         }
-        if (cop_op == 0x02) { /* CFC2 */
+        if (cop_op == 0x02) { /* CFC2 — read: stall + give-back (Beetle) */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_gte_read(cpu, rt);
+#endif
             cpu->gpr[rt] = gte_read_ctrl(cpu, (uint8_t)rd);
             cpu->gpr[0] = 0;
             return 0;
         }
         if (cop_op == 0x04) { /* MTC2 */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_gte_stall(cpu);
+#endif
             gte_write_data(cpu, (uint8_t)rd, cpu->gpr[rt]);
             return 0;
         }
         if (cop_op == 0x06) { /* CTC2 */
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+            psx_gte_stall(cpu);
+#endif
             gte_write_ctrl(cpu, (uint8_t)rd, cpu->gpr[rt]);
             return 0;
         }
@@ -1201,45 +1476,52 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         }
         return abort_unsupported(pc, insn, "COP2 op");
     }
+    /* CPU loads: the full per-instruction R3000A interlock (§1 + GPR_DEPRES(rs) +
+     * DO_LDS + ReadMemory timing + arm LDWhich=rt) lives in psx_cyc_load_*; exec_one's
+     * top-of-function step is skipped for op 0x20-0x26 so it is not double-charged.
+     * #ifndef PSX_ENABLE_BLOCK_CYCLES these still read the value via the uncharged
+     * accessor (psx_cyc_load_* falls back to a plain read when cycles are off). */
     case 0x20: { /* LB rt, simm(rs) */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = (uint32_t)(int32_t)(int8_t)cpu->read_byte(addr);
+        cpu->gpr[rt] = (uint32_t)(int32_t)(int8_t)psx_cyc_load_byte(cpu, addr, rt, 1u << rs);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x21: { /* LH */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = (uint32_t)(int32_t)(int16_t)cpu->read_half(addr);
+        cpu->gpr[rt] = (uint32_t)(int32_t)(int16_t)psx_cyc_load_half(cpu, addr, rt, 1u << rs);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x22: { /* LWL */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = interp_lwl(cpu, addr, cpu->gpr[rt]);
+        uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, 1u << rs);
+        cpu->gpr[rt] = lwl_merge(addr, word, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x23: { /* LW */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = cpu->read_word(addr);
+        cpu->gpr[rt] = psx_cyc_load_word(cpu, addr, rt, 1u << rs);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x24: { /* LBU */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = (uint32_t)cpu->read_byte(addr);
+        cpu->gpr[rt] = (uint32_t)psx_cyc_load_byte(cpu, addr, rt, 1u << rs);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x25: { /* LHU */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = (uint32_t)cpu->read_half(addr);
+        cpu->gpr[rt] = (uint32_t)psx_cyc_load_half(cpu, addr, rt, 1u << rs);
         cpu->gpr[0] = 0;
         return 0;
     }
     case 0x26: { /* LWR */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        cpu->gpr[rt] = interp_lwr(cpu, addr, cpu->gpr[rt]);
+        uint32_t word = psx_cyc_load_word(cpu, addr & ~3u, rt, 1u << rs);
+        cpu->gpr[rt] = lwr_merge(addr, word, cpu->gpr[rt]);
         cpu->gpr[0] = 0;
         return 0;
     }
@@ -1276,13 +1558,19 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         interp_swr(cpu, addr, cpu->gpr[rt]);
         return 0;
     }
-    case 0x32: { /* LWC2 */
+    case 0x32: { /* LWC2 — §1+DO_LDS charged by exec_one's top step (mask 0) */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
-        gte_write_data(cpu, (uint8_t)rt, cpu->read_word(addr));
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+        psx_gte_stall(cpu);   /* COP2 reg write stalls to GTE completion */
+#endif
+        gte_write_data(cpu, (uint8_t)rt, psx_cyc_lwc2_read(cpu, addr));
         return 0;
     }
     case 0x3A: { /* SWC2 */
         uint32_t addr = cpu->gpr[rs] + (uint32_t)simm;
+#ifdef PSX_ENABLE_BLOCK_CYCLES
+        psx_gte_stall(cpu);   /* COP2 reg read stalls to GTE completion */
+#endif
         cpu->write_word(addr, gte_read_data(cpu, (uint8_t)rt));
         return 0;
     }
@@ -1337,25 +1625,369 @@ int dirty_ram_dispatch(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     int prev = g_dirty_interp_active;
     g_dirty_interp_active = 1;
     int r = dirty_ram_dispatch_inner(cpu, addr, stop_addr);
+
+    /* pc=0 producer tripwire: the dirty path reported "handled" yet published a
+     * null PC — the abnormal-exit source we're hunting (MMX6 boot wedge). Latch
+     * full context the first time; count every occurrence. */
+    if (r == 1 && cpu->pc == 0u) {
+        extern uint32_t g_async_rfe_resume_pc, g_dirty_safe_resume_pc;
+        g_pczero_count++;
+        if (!g_pczero_latched) {
+            g_pczero_latched    = 1;
+            g_pczero_addr       = addr;
+            g_pczero_ra         = cpu->gpr[31];
+            g_pczero_in_exc     = (uint32_t)psx_get_in_exception();
+            g_pczero_async_rfe  = g_async_rfe_resume_pc;
+            g_pczero_dirty_safe = g_dirty_safe_resume_pc;
+        }
+    }
+
+    /* Dirty-RAM scheduling contract (Tomba 2 Whoopee-Camp softlock fix):
+     * ANY path that advanced guest cycles must periodically expose the CPU to
+     * the interrupt/event pump, regardless of RAM region. The local-dirty-flow
+     * fast path (overlay region, phys >= OVERLAY_REGION_FLOOR) already pumps
+     * psx_check_interrupts() every 4096 insns internally — but a LOW-RAM kernel
+     * dirty loop (e.g. 0x2CA8 / 0xE10 / 0xB0 polling for VBlank) takes the
+     * per-block-return path instead and re-dispatches through the CPS chain
+     * WITHOUT ever surfacing to the top-level interrupt check. Result: VBlank is
+     * never raised, i_stat stays 0, the wait-loop deadlocks (frame frozen,
+     * total_checks frozen, dirty_ram_insns -> billions). OVERLAY_REGION_FLOOR may
+     * decide HOW dirty code is dispatched; it must never decide whether time
+     * exists. So pump here on a region-independent insn budget. This is a clean
+     * poll boundary: the inner committed cpu->pc, the executed instruction and
+     * its delay slot are fully retired, and psx_check_interrupts() clears
+     * g_dirty_interp_active at its longjmp landing (same contract as the inner
+     * local-flow pump), so a deliver-via-longjmp here is safe. */
+    if (r == 1) {
+        uint64_t now = g_dirty_ram_insns_run;
+        uint64_t gap = now - s_last_dirty_irq_pump_insns;
+        if (gap > g_dirty_pump_max_gap_insns) g_dirty_pump_max_gap_insns = gap;
+        if (gap >= 4096u) {
+            s_last_dirty_irq_pump_insns = now;
+            g_dirty_pump_count++;
+            uint32_t committed = cpu->pc;      /* block already retired; this is next PC */
+            int prev_site = g_cosim_dirty_pump_site;
+            g_cosim_dirty_pump_site = 6;
+            g_dirty_safe_resume_pc = committed;
+            psx_check_interrupts(cpu);   /* may exception-enter / longjmp */
+            /* Frame-1997 fix: a game-driven ReturnFromException longjmp'd through the
+             * handler and left cpu->pc=0. Here (outer pump, the block already returned)
+             * that null PC would propagate up the trampoline to the OUTERMOST dispatch
+             * and be read as a clean "execution completed" exit. Restore the committed
+             * guest PC so the trampoline re-dispatches and the game resumes. (The
+             * local-flow internal pump resumes via its own loop, so this only matters at
+             * block-return pumps.) */
+            if (cpu->pc == 0u && committed != 0u) {
+                cpu->pc = committed;
+                g_async_rfe_fire_count++;
+            }
+            g_dirty_safe_resume_pc = 0;
+            g_cosim_dirty_pump_site = prev_site;
+        }
+    }
+
     g_dirty_interp_active = prev;
     return r;
 }
 
+/* ===== Cycle-budgeted precise event slicing (PRECISE_IRQ_SLICE.md) ===== */
+
+/* Is a hardware interrupt deliverable to the guest at this exact instruction
+ * boundary? Mirrors the gate in psx_check_interrupts: a pending+unmasked I_STAT
+ * bit, COP0 IEc + IM2 set, and not already inside the exception handler. */
+static int precise_irq_deliverable(CPUState *cpu) {
+    extern uint32_t i_stat;
+    if ((i_stat & i_mask) == 0) return 0;
+    if (psx_get_in_exception()) return 0;
+    uint32_t sr = cpu->cop0[12];
+    if (!(sr & 0x1u))        return 0;   /* IEc: interrupts globally enabled */
+    if (!(sr & (1u << 10)))  return 0;   /* IM2: hardware interrupt mask bit */
+    return 1;
+}
+
+/* Is `pc` a point the TOP-LEVEL dispatcher can re-enter? Clean (compiled) game
+ * text is only re-enterable at a FUNCTION ENTRY: psx_dispatch_game_compiled is a
+ * switch over entries and returns 0 for any mid-function PC; the dirty path then
+ * sees a non-dirty page and also returns 0, which the top dispatch reads as PC=0
+ * ("execution completed" — the deterministic precise-slice boot exit, root-caused
+ * to a mid-function clean-text resume PC, PRECISE_IRQ_SLICE.md Task #4). Every
+ * other PC class — BIOS ROM, dirty RAM (overlays / install-at-runtime stubs),
+ * overlay candidates, the A0/B0/C0 kernel call vectors, scratchpad — is handled by
+ * psx_dispatch / the dirty interp / the overlay loader, so it is dispatchable.
+ * Therefore the precise slicer must never hand control back at a mid-function
+ * clean-text PC: it keeps interpreting (exec_one handles arbitrary mid-function
+ * flow) until cpu->pc satisfies this predicate. */
+static int precise_pc_dispatchable(uint32_t pc) {
+#ifdef PSX_HAS_GAME_DISPATCH
+    uint32_t phys = pc & 0x1FFFFFFFu;
+    if (psx_game_address_in_text(pc) && !dirty_ram_is_dirty(phys))
+        return psx_game_is_function_entry(pc);
+#endif
+    (void)pc;
+    return 1;
+}
+
+/* Run the guest per-instruction from cpu->pc through the interpreter, taking any
+ * deliverable interrupt at the EXACT instruction boundary, until a safe resume
+ * point. g_precise_mode makes exec_one step INTO jal/jalr callees per-instruction
+ * (ignore native availability), so the slice is owned by the event deadline, not
+ * the function boundary. ALL exits land on a control-transfer target — every
+ * branch/jump target is dispatchable (compiled blocks end with cpu->pc=target;
+ * return), whereas an arbitrary mid-block PC is not — so after taking a mid-block
+ * IRQ we keep interpreting to the next transfer before handing back to compiled.
+ * `bcyc` = originating block's cycle budget; `deadline_entry` = entered because an
+ * event is due within bcyc (vs a side-effect-only block, which runs one block). */
+static void psx_run_precise(CPUState *cpu, uint32_t bcyc, int deadline_entry) {
+    int prev_precise = g_precise_mode;
+    int prev_active  = g_dirty_interp_active;
+    g_precise_mode = 1;
+    g_dirty_interp_active = 1;
+
+    uint32_t pc = cpu->pc;
+    g_slice_last_block    = pc;
+    g_slice_last_first_pc = pc;
+    g_slice_last_first_insn = fetch_word(pc & 0x1FFFFFFFu);
+    g_slice_exit_pc = pc;
+    g_slice_exit_reason = 0;
+    g_slice_exit_iter = 0;
+    g_slice_exit_dispatchable = 0;
+    g_slice_exit_dirty = dirty_ram_is_dirty(pc & 0x1FFFFFFFu) ? 1u : 0u;
+#ifdef PSX_HAS_GAME_DISPATCH
+    g_slice_exit_in_text = psx_game_address_in_text(pc) ? 1u : 0u;
+#else
+    g_slice_exit_in_text = 0;
+#endif
+    g_slice_exit_want = 0;
+    int irq_taken = 0;   /* one take per slice (avoid re-taking an unacked IRQ) */
+    enum { MAX_PRECISE_INSNS = 200000 };
+    for (int i = 0; i < MAX_PRECISE_INSNS; i++) {
+        if (!irq_taken && precise_irq_deliverable(cpu)) {
+            uint32_t committed = pc;
+            extern uint32_t i_stat;
+            g_slice_last_committed = committed;
+            g_slice_last_istat = i_stat;
+            g_slice_last_imask = i_mask;
+            g_slice_last_sr    = cpu->cop0[12];
+            cpu->pc = committed;
+            int prev_site = g_cosim_dirty_pump_site;
+            g_cosim_dirty_pump_site = 7;
+            g_dirty_safe_resume_pc = committed;
+            s_last_dirty_irq_pump_insns = g_dirty_ram_insns_run;
+            psx_check_interrupts(cpu);
+            if (cpu->pc == 0u && committed != 0u) {
+                cpu->pc = committed;
+                g_async_rfe_fire_count++;
+            }
+            g_dirty_safe_resume_pc = 0;
+            g_cosim_dirty_pump_site = prev_site;
+            g_slice_irq_taken++;
+            irq_taken = 1;
+            pc = cpu->pc ? cpu->pc : committed;
+            cpu->pc = pc;
+            if (precise_pc_dispatchable(cpu->pc)) {
+                g_slice_exit_reason = 1;
+                g_slice_exit_iter = (uint32_t)i;
+                g_slice_exit_want = 1;
+                break;
+            }
+            continue;
+        }
+
+        uint32_t next_pc = 0;
+        g_unsupported_seen = 0;
+        cosim_exec_one_begin();
+        int transferred = exec_one(cpu, pc, &next_pc);  /* charges its own interlock */
+        g_dirty_ram_insns_run++;
+#ifdef PSX_COSIM
+        if (!cosim_exec_one_did_hook()) { extern void cosim_instr(uint32_t); cosim_instr(pc); }
+#endif
+        if (g_unsupported_seen) {
+            /* Valid compiled code always decodes; if not, hand the committed PC to
+             * the dispatcher rather than abort the slice. */
+            g_unsupported_seen = 0;
+            pc = transferred ? cpu->pc : next_pc;
+            g_slice_exit_reason = 2;
+            g_slice_exit_iter = (uint32_t)i;
+            g_slice_exit_want = 0;
+            break;
+        }
+        uint32_t committed = transferred ? cpu->pc : next_pc;
+
+        /* `want_exit`: the slice has done its job and would like to hand back. But
+         * it may ONLY return control at a dispatchable PC (precise_pc_dispatchable)
+         * — a mid-function clean-text resume PC is unhandleable by the top dispatch
+         * (root cause of the deterministic boot PC=0). When we want to exit but the
+         * committed PC is mid-function clean text, keep interpreting (exec_one runs
+         * arbitrary mid-function flow) until control lands on a real entry / leaves
+         * clean game text. */
+        int want_exit = 0;
+
+        /* Exact take-point: an interrupt deliverable on THIS instruction's cycle is
+         * taken before the next instruction retires — once per slice. Re-checking
+         * after a take re-fires an IRQ the handler has not acked yet (an
+         * 8-takes-in-11-insns storm), so gate on !irq_taken. */
+        if (!irq_taken && precise_irq_deliverable(cpu)) {
+            extern uint32_t i_stat;
+            g_slice_last_committed = committed;
+            g_slice_last_istat = i_stat;
+            g_slice_last_imask = i_mask;
+            g_slice_last_sr    = cpu->cop0[12];
+            cpu->pc = committed;
+            int prev_site = g_cosim_dirty_pump_site;
+            g_cosim_dirty_pump_site = 7;
+            g_dirty_safe_resume_pc = committed;   /* real EPC for exception entry */
+            s_last_dirty_irq_pump_insns = g_dirty_ram_insns_run;
+            psx_check_interrupts(cpu);            /* takes it; runs handler; restores GPRs */
+            g_dirty_safe_resume_pc = 0;
+            g_cosim_dirty_pump_site = prev_site;
+            g_slice_irq_taken++;
+            irq_taken = 1;
+            committed = cpu->pc ? cpu->pc : committed;
+            want_exit = 1;
+        }
+
+        pc = committed;
+        cpu->pc = committed;
+
+        if (g_psx_call_bail) {
+            g_slice_exit_reason = 3;
+            g_slice_exit_iter = (uint32_t)i;
+            g_slice_exit_want = want_exit ? 1u : 0u;
+            break;   /* wild unwind: hand cpu->pc to the dispatcher */
+        }
+
+        if (irq_taken) {
+            want_exit = 1;            /* after the take, leave as soon as it is safe */
+        } else if (transferred) {
+            want_exit = 1;
+            /* else still imminent — keep slicing across this boundary */
+        }
+
+        /* Hand back ONLY at a dispatchable PC. Otherwise (mid-function clean text)
+         * keep interpreting until one is reached. */
+        if (want_exit && precise_pc_dispatchable(cpu->pc)) {
+            g_slice_exit_reason = 1;
+            g_slice_exit_iter = (uint32_t)i;
+            g_slice_exit_want = 1;
+            break;
+        }
+    }
+    if (g_slice_exit_reason == 0) {
+        g_slice_exit_reason = 4;
+        g_slice_exit_iter = MAX_PRECISE_INSNS;
+    }
+
+    cpu->pc = pc;
+    g_slice_exit_pc = cpu->pc;
+    g_slice_exit_dispatchable = precise_pc_dispatchable(cpu->pc) ? 1u : 0u;
+    g_slice_exit_dirty = dirty_ram_is_dirty(cpu->pc & 0x1FFFFFFFu) ? 1u : 0u;
+#ifdef PSX_HAS_GAME_DISPATCH
+    g_slice_exit_in_text = psx_game_address_in_text(cpu->pc) ? 1u : 0u;
+#else
+    g_slice_exit_in_text = 0;
+#endif
+    g_precise_mode = prev_precise;
+    g_dirty_interp_active = prev_active;
+}
+
+/* Block-leader slice guard, called by the emitted prologue of every compiled
+ * block BEFORE it charges cycles / runs its body:
+ *     if (psx_slice_block(cpu, <block_addr>, <bcyc>, <side_effects>)) return;
+ * Returns 1 if it sliced (ran the block — and possibly more — through the precise
+ * interpreter and left cpu->pc at a dispatchable resume point; the caller MUST
+ * `return` so its compiled body does not re-execute the same instructions).
+ * Returns 0 if the whole block is provably safe to run as fast compiled C. */
+int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
+    /* Runtime A/B toggle (diagnostic, stays in the build): PSX_PRECISE_SLICE=0
+     * disables precise slicing entirely so the SAME binary can be run slice-on vs
+     * slice-off to isolate the first divergence the slice introduces. Read once. */
+    /* PARKED (PRECISE_IRQ_SLICE.md): precise take-point slicing is a later
+     * correctness upgrade, NOT the current FMV blocker (that is the -8 cycle
+     * drift / faithful per-instruction cycle model — see CLAUDE.md Rule -1).
+     * Default OFF so the runtime boots on the baseline; opt in with
+     * PSX_PRECISE_SLICE=1 to continue the block-leader-continuation work. */
+    static int s_slice_enabled = -1;
+    if (s_slice_enabled < 0) {
+        const char *e = getenv("PSX_PRECISE_SLICE");
+        s_slice_enabled = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (!s_slice_enabled) return 0;
+
+    /* No nested slicing: a handler dispatched from inside precise-mode, and any
+     * block executed while in_exception, run compiled (interrupts are gated during
+     * exception handling anyway). Keeps re-entrancy structurally impossible. */
+    if (g_precise_mode || psx_get_in_exception()) return 0;
+
+    static int s_slice_always = -1;
+    static int s_slice_margin = -1;
+    if (s_slice_always < 0) {
+        const char *e = getenv("PSX_PRECISE_ALWAYS");
+        s_slice_always = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (s_slice_margin < 0) {
+        const char *e = getenv("PSX_PRECISE_MARGIN");
+        s_slice_margin = (e && *e) ? atoi(e) : 0;
+        if (s_slice_margin < 0) s_slice_margin = 0;
+    }
+
+    uint32_t deadline = cycles_to_next_event();
+    uint32_t budget = bcyc + (uint32_t)s_slice_margin;
+    if (budget < bcyc) budget = 0xFFFFFFFFu;
+    int entry_deliverable = precise_irq_deliverable(cpu);
+    int has_deadline = s_slice_always || entry_deliverable || (deadline <= budget);
+    if (!has_deadline && !side_effects) return 0;   /* fast path: no event in this block */
+
+    g_slice_entry_deliverable = (uint32_t)entry_deliverable;
+    g_slice_fired++;
+    cpu->pc = block_addr;
+    psx_run_precise(cpu, bcyc, has_deadline);
+    return 1;
+}
+
 static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
+    int clean_game_text_miss = 0;
 
     if (addr == 0x80000048u) {
+        g_sentinel_reach_dirty++;
+        if (!psx_get_in_exception()) g_sentinel_reach_traps++; /* reuse: in_exc==0 dirty reaches */
+        g_sentinel_reach_async = g_async_rfe_resume_pc;
         cpu->pc = 0;
         if (psx_get_in_exception()) {
             psx_exception_longjmp(); /* does not return */
+        }
+        /* Async ReturnFromException (Tomba 2 frame-1997 fix): game-installed handler
+         * RFE'd outside our exception window. Resume at the latched real guest PC
+         * instead of returning pc=0 (which the top dispatch reads as a clean exit). */
+        if (g_async_rfe_resume_pc != 0u) {
+            g_async_rfe_fire_count++;
+            cpu->pc = g_async_rfe_resume_pc;
+            return 1;
         }
         return 1;
     }
 
 #ifdef PSX_HAS_GAME_DISPATCH
     xprobe_event(cpu->gpr[31], XOP_DD, XSITE_DD, addr, 0u, cpu->gpr[29], cpu->gpr[31], 0);
-    g_mixed_depth++;
-    { int _gc = psx_dispatch_game_compiled(cpu, addr); g_mixed_depth--; if (_gc) return 1; }
+    /* Run the statically-compiled game function ONLY for a CLEAN page (RAM matches
+     * the compiled image). A dirty page in the game-text region means an overlay
+     * overwrote it after the game-start baseline (dirty_ram_clear_image_baseline),
+     * so the compiled function is STALE and we must fall through to interpret the
+     * live overlay. Without this gate the loader thread's psx_dispatch(0x8001DB38)
+     * ran the stale compiled func_8001DB38 instead of the START.BIN-loader overlay
+     * (Tomba 2 Whoopee-Camp splash). Clean text still runs compiled (the fast path,
+     * unchanged for non-overlaying games once their text is baselined). */
+    if (!dirty_ram_is_dirty(phys)) {
+        g_mixed_depth++;
+        {
+            ls_func_enter(addr, cpu);
+            int _gc = psx_dispatch_game_compiled(cpu, addr);
+            ls_func_exit(addr, cpu, _gc);
+            g_mixed_depth--;
+            if (_gc) return 1;
+        }
+        clean_game_text_miss = psx_game_address_in_text(addr) ? 1 : 0;
+    }
 #endif
 
     /* B-2: statically-compiled overlay functions (generated/overlays_static.c).
@@ -1398,7 +2030,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     }
 #define OV_FPLOG_RET1() do { if (_ovfp) overlay_fp_log(addr, _in_regs, cpu, 0); return 1; } while (0)
 
-    if (!dirty_ram_is_dirty(phys)) return 0;
+    if (!dirty_ram_is_dirty(phys) && !clean_game_text_miss) return 0;
 
     /* Interp-pressure signal for variant-capture automation (step 2.8):
      * counts dispatches the interpreter actually handles inside a capture
@@ -1408,9 +2040,10 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 
     /* Reset soft-fail state at block entry. */
     g_unsupported_seen = 0;
-    /* Overlay region only — kernel window stays per-block (see
-     * is_local_dirty_target). */
-    int allow_local_dirty_flow = (phys >= OVERLAY_REGION_FLOOR);
+    /* Overlay flow above the kernel window — kernel window stays per-block (see
+     * is_local_dirty_target / phys_is_overlay_flow_region). Includes boot-text
+     * pages overwritten by a runtime overlay (Tomba 2), not just [FLOOR, RAM). */
+    int allow_local_dirty_flow = phys_is_overlay_flow_region(phys);
 
     /* Per-PC entry counter (visible via dirty_ram_stats). */
     DirtyRamPcEntry *pc_entry = pc_table_get_or_insert(phys);
@@ -1456,17 +2089,63 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     enum { MAX_INSNS_PER_DISPATCH = 1000000 };
     uint32_t pc = addr;
     int insns_executed = 0;
+#ifndef PSX_NO_DEBUG_TOOLS
+    extern void debug_server_cyc_observe(uint32_t block_leader_phys);
+#endif
     for (int i = 0; i < MAX_INSNS_PER_DISPATCH; i++) {
         uint32_t next_pc = 0;
+#ifndef PSX_NO_DEBUG_TOOLS
+        /* Interp-path cycle ruler: make every interpreted PC anchorable by
+         * cyc_watch (parity with the compiled emitter's block-leader observe).
+         * Early-returns when cyc_watch is disarmed → ~free in normal runs. */
+        g_ls_dirty_observe = 1;
+        debug_server_cyc_observe(pc & 0x1FFFFFFFu);
+        g_ls_dirty_observe = 0;
+#endif
+#ifdef PSX_COSIM
+        { extern void cosim_block(uint32_t); cosim_block(pc); }
+#endif
         uint32_t insn = fetch_word(pc & 0x1FFFFFFFu);
         uint32_t before_s0 = cpu->gpr[16];
+        uint32_t before_ra = cpu->gpr[31];
+        cosim_exec_one_begin();
         int transferred = exec_one(cpu, pc, &next_pc);
-#ifdef PSX_ENABLE_BLOCK_CYCLES
-        psx_advance_cycles(1u);
-#endif
+        /* $ra->1 corruption tripwire (confirm-first probe): did THIS overlay
+         * instruction clobber $ra to 1? Latches once, cheap after. */
+        if (cpu->gpr[31] == 1u && before_ra != 1u) {
+            extern void psx_ra_tripwire(CPUState *, uint32_t, uint32_t, uint32_t);
+            psx_ra_tripwire(cpu, before_ra, pc, 0u /*INTERP*/);
+        }
+        /* Tomba2 ra-corruption pin (Confirm-(b)): capture the EXACT instruction
+         * that loads/sets $ra to the watched wild value (0x49422E54). For a
+         * `lw ra, off(sp)` this records the loading pc/insn + sp + the source
+         * stack address so we can see whether sp is wrong or the filename string
+         * was written onto the saved-ra slot. Latches g_ra_load_snap_valid. */
+        if (g_ra_load_watch != 0u && cpu->gpr[31] == g_ra_load_watch &&
+            before_ra != g_ra_load_watch && !g_ra_load_snap_valid) {
+            g_ra_load_snap_valid = 1;
+            g_ra_load_snap_pc    = pc;
+            g_ra_load_snap_insn  = insn;
+            g_ra_load_snap_before_ra = before_ra;
+            for (int r = 0; r < 32; r++) g_ra_load_snap_gpr[r] = cpu->gpr[r];
+            /* If it's a load (lw/lbu/...), decode base+imm to record the source addr. */
+            uint32_t op = insn >> 26;
+            if (op >= 0x20u && op <= 0x25u) { /* lb/lh/lwl/lw/lbu/lhu */
+                uint32_t base = cpu->gpr[(insn >> 21) & 0x1Fu];
+                int16_t  imm  = (int16_t)(insn & 0xFFFFu);
+                g_ra_load_snap_srcaddr = base + (int32_t)imm;
+            } else {
+                g_ra_load_snap_srcaddr = 0;
+            }
+        }
+        /* Per-instruction cycle cost (R3000A load-delay interlock) is charged
+         * INSIDE exec_one (top-of-fn §1+deps+DO_LDS, or psx_cyc_load_* for loads). */
         dirty_ram_log_instruction(cpu, pc, insn, before_s0, next_pc,
                                   transferred ? cpu->pc : next_pc,
                                   transferred);
+#ifdef PSX_COSIM
+        if (!cosim_exec_one_did_hook()) { extern void cosim_instr(uint32_t); cosim_instr(pc); }
+#endif
         if (g_unsupported_seen) {
             if (insns_executed == 0) {
                 /* Couldn't decode the first instruction.  Most likely
@@ -1509,6 +2188,13 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 OV_FPLOG_RET1();
             }
             uint32_t target = cpu->pc;
+            if (target != 0u && dirty_ram_pump_boundary(cpu, target, 1)) {
+                g_dirty_ram_blocks_run++;
+                if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                g_dirty_interp_chain_target = cpu->pc;
+                OV_FPLOG_RET1();
+            }
+            target = cpu->pc;
 #ifdef PSX_HAS_GAME_DISPATCH
             if (target != 0) {
                 /* §20 FIX — the long-run idle freeze. A guest TAIL-transfer (j/jr/
@@ -1539,7 +2225,7 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             uint32_t target_phys = target & 0x1FFFFFFFu;
             if (allow_local_dirty_flow && target != 0 &&
                 target != stop_addr &&
-                target_phys >= OVERLAY_REGION_FLOOR &&
+                phys_is_overlay_flow_region(target_phys) &&
                 dirty_ram_is_dirty(target_phys)) {
                 /* Capture freeze gates ONLY the ring write — never flow. */
                 if (!g_insn_log_frozen) {
@@ -1561,7 +2247,6 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
                 if ((insns_executed & 0xFFF) == 0) {
                     debug_server_poll();
                     debug_server_wait_if_paused();
-                    psx_check_interrupts(cpu);
                 }
                 continue;
             }
@@ -1576,6 +2261,12 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
          * hazard as a transfer to stop_addr). */
         if (stop_addr != 0 && pc == stop_addr) {
             cpu->pc = pc;
+            if (dirty_ram_pump_boundary(cpu, pc, 2)) {
+                g_dirty_ram_blocks_run++;
+                if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                g_dirty_interp_chain_target = cpu->pc;
+                OV_FPLOG_RET1();
+            }
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
             g_dirty_interp_chain_target = pc;
@@ -1586,6 +2277,12 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
         uint32_t next_phys = pc & 0x1FFFFFFFu;
         if (!dirty_ram_is_dirty(next_phys)) {
             cpu->pc = pc;
+            if (dirty_ram_pump_boundary(cpu, pc, 3)) {
+                g_dirty_ram_blocks_run++;
+                if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
+                g_dirty_interp_chain_target = cpu->pc;
+                OV_FPLOG_RET1();
+            }
             g_dirty_ram_blocks_run++;
             if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
             g_dirty_interp_chain_target = pc;
@@ -1600,7 +2297,525 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     cpu->pc = pc;
     if (pc_entry) pc_entry->insns += (uint64_t)insns_executed;
     g_dirty_interp_chain_target = pc;
-    psx_check_interrupts(cpu);
+    {
+        uint64_t gap = g_dirty_ram_insns_run - s_last_dirty_irq_pump_insns;
+        if (gap >= 4096u) {
+            uint32_t committed = cpu->pc;
+            int prev_site = g_cosim_dirty_pump_site;
+            g_cosim_dirty_pump_site = 4;
+            g_dirty_safe_resume_pc = committed;
+            s_last_dirty_irq_pump_insns = g_dirty_ram_insns_run;
+            psx_check_interrupts(cpu);
+            /* Frame-1997 fix (see outer pump): restore the committed PC if a game RFE
+             * longjmp left cpu->pc=0, so the trampoline re-dispatches instead of exiting. */
+            if (cpu->pc == 0u && committed != 0u) {
+                cpu->pc = committed;
+                g_async_rfe_fire_count++;
+            }
+            g_dirty_safe_resume_pc = 0;
+            g_cosim_dirty_pump_site = prev_site;
+        }
+    }
     OV_FPLOG_RET1();
 }
 #undef OV_FPLOG_RET1
+
+/* ============================================================================
+ * #2 — Lockstep "unit-test interp" comparator. See lockstep.h.
+ * Compiled-first + read-trace replay, per basic block, window-gated.
+ * ==========================================================================*/
+#include "lockstep.h"
+
+int g_ls_mode = 0;
+int g_ls_replay_active = 0;
+int g_ls_suppress_record = 0;
+
+static uint32_t s_ls_frame_lo = 0, s_ls_frame_hi = 0;   /* hi==0 => disabled */
+
+typedef struct { uint8_t is_write, size; uint32_t addr, val; } ls_op_t;
+enum { LS_TRACE_CAP = 65536 };
+static ls_op_t  s_ls_trace[LS_TRACE_CAP];
+static int      s_ls_trace_n = 0, s_ls_trace_idx = 0;
+static int      s_ls_overflow = 0, s_ls_mismatch = 0;
+static int      s_ls_replay_done = 0;   /* trace exhausted: stop replay (benign count mismatch) */
+static uint32_t s_ls_cur_pc = 0;          /* pc of the instruction being replayed */
+static CPUState s_ls_R0;                   /* register snapshot at block entry     */
+static uint32_t s_ls_block = 0;
+static int      s_ls_prev_valid = 0;
+
+/* mismatch detail captured by the hooks (read by ls_replay_and_compare) */
+static int      s_ls_m_kind = 0;          /* 1 read-addr 2 write-addr 3 write-val 4 trace-exhausted */
+static uint32_t s_ls_m_pc = 0, s_ls_m_addr = 0, s_ls_m_exp = 0, s_ls_m_act = 0;
+
+static struct {
+    int      found;
+    int      kind;        /* see ls_kind below */
+    uint32_t frame, block, pc, addr;
+    uint32_t exp, act;    /* exp = interp(correct), act = compiled(actual)   */
+    int      detail;      /* reg index for REG kind, else 0                  */
+    uint64_t blocks_checked;
+} s_ls_div = {0};
+/* kinds: 1 REG 2 HI 3 LO 4 WRITE-VAL 5 READ-ADDR 6 WRITE-ADDR 7 TRACE-EXHAUSTED
+ *        8 COMPILED-EXTRA-OPS 9 PATH-CAP */
+/* Post-mortem: the recorded op-trace of the diverging block + the replay's
+ * op index where it diverged, so the desync can be read off directly. */
+static ls_op_t  s_ls_div_trace[48];
+static int      s_ls_div_trace_n = 0, s_ls_div_idx = 0;
+
+static int s_ls_record_only = 0;   /* diagnostic: record but skip inline replay (perturbation test) */
+
+static uint32_t s_lsf_frame_lo = 0, s_lsf_frame_hi = 0; /* hi==0 => disabled */
+static int      s_lsf_record_only = 0;
+static int      s_lsf_active = 0;
+static int      s_lsf_recording = 0;
+static int      s_lsf_saw_irq = 0;
+static CPUState s_lsf_R0;
+static uint32_t s_lsf_entry = 0, s_lsf_dispatch_entry = 0, s_lsf_frame = 0;
+
+static struct {
+    int      found;
+    int      kind;        /* see lsf_kind names in ls_get_func_json */
+    uint32_t frame, entry, pc, addr;
+    uint32_t exp, act;
+    int      detail;
+    uint64_t segments_checked, skipped_irq, skipped_overflow;
+    uint64_t skipped_unhandled, skipped_conflict, skipped_disabled;
+    uint32_t trace_ops, replay_ops, steps;
+} s_lsf_div = {0};
+
+static ls_op_t s_lsf_div_trace[48];
+static int     s_lsf_div_trace_n = 0, s_lsf_div_idx = 0;
+
+void ls_set_window(uint32_t lo, uint32_t hi) { s_ls_frame_lo = lo; s_ls_frame_hi = hi; }
+void ls_set_record_only(int on) { s_ls_record_only = on; }
+void ls_func_set_window(uint32_t lo, uint32_t hi) { s_lsf_frame_lo = lo; s_lsf_frame_hi = hi; }
+void ls_func_set_record_only(int on) { s_lsf_record_only = on; }
+
+void ls_note_exception_entry(void) {
+    if (s_lsf_active) s_lsf_saw_irq = 1;
+}
+
+void ls_suppress_begin(void) {
+    g_ls_suppress_record++;
+}
+
+void ls_suppress_end(void) {
+    if (g_ls_suppress_record > 0) g_ls_suppress_record--;
+}
+
+uint32_t ls_read_hook(uint32_t addr, int size, uint32_t real_val) {
+    if (g_ls_mode == 2) {                 /* replay: serve from trace */
+        if (s_ls_trace_idx >= s_ls_trace_n) { s_ls_replay_done = 1; return 0; }  /* count mismatch: benign block-boundary artifact */
+        ls_op_t *o = &s_ls_trace[s_ls_trace_idx];
+        if (o->is_write || o->addr != addr) {
+            if (!s_ls_mismatch) { s_ls_mismatch = 1; s_ls_m_kind = 1; s_ls_m_pc = s_ls_cur_pc;
+                                  s_ls_m_addr = addr; s_ls_m_exp = addr; s_ls_m_act = o->addr; }
+            return 0;
+        }
+        s_ls_trace_idx++;
+        return o->val;
+    }
+    if (g_ls_mode == 1) {                  /* record */
+        if (s_ls_trace_n < LS_TRACE_CAP) {
+            ls_op_t *o = &s_ls_trace[s_ls_trace_n++];
+            o->is_write = 0; o->size = (uint8_t)size; o->addr = addr; o->val = real_val;
+        } else s_ls_overflow = 1;
+    }
+    return real_val;
+}
+
+void ls_write_hook(uint32_t addr, int size, uint32_t val) {
+    if (g_ls_mode == 2) {                 /* replay: verify against trace */
+        if (s_ls_trace_idx >= s_ls_trace_n) { s_ls_replay_done = 1; return; }  /* count mismatch: benign block-boundary artifact */
+        ls_op_t *o = &s_ls_trace[s_ls_trace_idx];
+        if (!o->is_write || o->addr != addr) {
+            if (!s_ls_mismatch) { s_ls_mismatch = 1; s_ls_m_kind = 2; s_ls_m_pc = s_ls_cur_pc;
+                                  s_ls_m_addr = addr; s_ls_m_exp = addr; s_ls_m_act = o->addr; }
+            return;
+        }
+        if (o->val != val) {              /* compiled wrote a different value than interp */
+            if (!s_ls_mismatch) { s_ls_mismatch = 1; s_ls_m_kind = 3; s_ls_m_pc = s_ls_cur_pc;
+                                  s_ls_m_addr = addr; s_ls_m_exp = val; s_ls_m_act = o->val; }
+        }
+        s_ls_trace_idx++;
+        return;
+    }
+    if (g_ls_mode == 1) {                  /* record */
+        if (s_ls_trace_n < LS_TRACE_CAP) {
+            ls_op_t *o = &s_ls_trace[s_ls_trace_n++];
+            o->is_write = 1; o->size = (uint8_t)size; o->addr = addr; o->val = val;
+        } else s_ls_overflow = 1;
+    }
+}
+
+static void ls_latch(int kind, uint32_t frame, uint32_t pc, uint32_t addr,
+                     uint32_t exp, uint32_t act, int detail) {
+    if (s_ls_div.found) return;
+    s_ls_div.found = 1; s_ls_div.kind = kind; s_ls_div.frame = frame;
+    s_ls_div.block = s_ls_block; s_ls_div.pc = pc; s_ls_div.addr = addr;
+    s_ls_div.exp = exp; s_ls_div.act = act; s_ls_div.detail = detail;
+}
+
+/* Re-interpret the just-recorded block from the entry snapshot, comparing the
+ * interp result to native (cpu == post-block native state). */
+static void ls_replay_and_compare(CPUState *cpu, uint32_t frame, uint32_t target_phys) {
+    CPUState rep = s_ls_R0;                 /* registers from block entry (pc is stale in compiled) */
+    rep.pc = s_ls_block | 0x80000000u;      /* start at the recorded block's leader (KSEG0) */
+    s_ls_trace_idx = 0; s_ls_mismatch = 0; s_ls_m_kind = 0; s_ls_replay_done = 0;
+    /* The replay's exec_one writes process-global decode state on any
+     * instruction it can't handle; snapshot+restore so the replay can never
+     * divert the REAL dispatch (which reacts to g_unsupported_seen). */
+    int         sav_unsup_seen   = g_unsupported_seen;
+    uint32_t    sav_unsup_pc     = g_unsupported_pc;
+    uint32_t    sav_unsup_insn   = g_unsupported_insn;
+    const char *sav_unsup_reason = g_unsupported_reason;
+    g_ls_replay_active = 1;
+    g_ls_mode = 2;
+    uint32_t pc = rep.pc;
+    int cap = 512, steps = 0;
+    for (;;) {
+        /* Stop at the next block leader (fall-through block, or a branch's
+         * target). steps>0 so a self-looping block runs one iteration. */
+        if (steps > 0 && (pc & 0x1FFFFFFFu) == target_phys) break;
+        if (cap-- <= 0 || s_ls_mismatch || s_ls_replay_done) break;
+        uint32_t next_pc = 0;
+        s_ls_cur_pc = pc;
+        int transferred = exec_one(&rep, pc, &next_pc);
+        pc = transferred ? rep.pc : next_pc;
+        steps++;
+        /* Also stop at the block TERMINATOR (branch/jump/call) — do NOT follow
+         * it. A call would run the callee (kernel/syscall/another fn) which the
+         * recording dispatched separately or whose ops trail in the trace;
+         * following it desyncs. Compare only the block's own in-line memory ops,
+         * checked op-by-op against the trace as we go. */
+        if (transferred) break;
+    }
+    g_ls_mode = 0;
+    g_ls_replay_active = 0;
+    g_unsupported_seen   = sav_unsup_seen;     /* undo any replay-side decode-state leak */
+    g_unsupported_pc     = sav_unsup_pc;
+    g_unsupported_insn   = sav_unsup_insn;
+    g_unsupported_reason = sav_unsup_reason;
+    s_ls_div.blocks_checked++;
+
+    /* Divergence = an in-block memory-op mismatch (the interp replay read a
+     * different address, or the compiled block wrote a different value, at the
+     * same op index given identical entry state). Leftover trace ops past the
+     * terminator are the callee's (recording spanned a call) and are ignored;
+     * registers are not compared (boundary-sensitive across calls). A wrong
+     * register value still surfaces here later, as a wrong store value / load
+     * address, when the bad value is used. */
+    if (s_ls_mismatch) {
+        int n = s_ls_trace_n; if (n > 48) n = 48;
+        for (int i = 0; i < n; i++) s_ls_div_trace[i] = s_ls_trace[i];
+        s_ls_div_trace_n = n;
+        s_ls_div_idx = s_ls_trace_idx;
+        int k = (s_ls_m_kind == 1) ? 5 : (s_ls_m_kind == 2) ? 6 : (s_ls_m_kind == 3) ? 4 : 7;
+        ls_latch(k, frame, s_ls_m_pc, s_ls_m_addr, s_ls_m_exp, s_ls_m_act, 0);
+        return;
+    }
+}
+
+static int ls_same_phys(uint32_t a, uint32_t b) {
+    return (((a ^ b) & 0x1FFFFFFFu) == 0);
+}
+
+static void lsf_copy_div_trace(void) {
+    int n = s_ls_trace_n;
+    if (n > 48) n = 48;
+    for (int i = 0; i < n; i++) s_lsf_div_trace[i] = s_ls_trace[i];
+    s_lsf_div_trace_n = n;
+    s_lsf_div_idx = s_ls_trace_idx;
+}
+
+static void lsf_latch(int kind, uint32_t frame, uint32_t entry, uint32_t pc,
+                      uint32_t addr, uint32_t exp, uint32_t act, int detail,
+                      uint32_t steps) {
+    if (s_lsf_div.found) return;
+    s_lsf_div.found = 1;
+    s_lsf_div.kind = kind;
+    s_lsf_div.frame = frame;
+    s_lsf_div.entry = entry;
+    s_lsf_div.pc = pc;
+    s_lsf_div.addr = addr;
+    s_lsf_div.exp = exp;
+    s_lsf_div.act = act;
+    s_lsf_div.detail = detail;
+    s_lsf_div.trace_ops = (uint32_t)s_ls_trace_n;
+    s_lsf_div.replay_ops = (uint32_t)s_ls_trace_idx;
+    s_lsf_div.steps = steps;
+    lsf_copy_div_trace();
+}
+
+static void lsf_compare_regs(CPUState *rep, CPUState *nat, uint32_t frame,
+                             uint32_t entry, uint32_t steps) {
+    if (!ls_same_phys(rep->pc, nat->pc)) {
+        lsf_latch(4, frame, entry, rep->pc, 0, rep->pc, nat->pc, 0, steps);
+        return;
+    }
+    for (int i = 0; i < 32; i++) {
+        if (rep->gpr[i] != nat->gpr[i]) {
+            lsf_latch(1, frame, entry, rep->pc, 0, rep->gpr[i], nat->gpr[i], i, steps);
+            return;
+        }
+    }
+    if (rep->hi != nat->hi) {
+        lsf_latch(2, frame, entry, rep->pc, 0, rep->hi, nat->hi, 0, steps);
+        return;
+    }
+    if (rep->lo != nat->lo) {
+        lsf_latch(3, frame, entry, rep->pc, 0, rep->lo, nat->lo, 0, steps);
+        return;
+    }
+}
+
+static void lsf_replay_and_compare(CPUState *native_post, uint32_t frame,
+                                   uint32_t entry_pc) {
+    CPUState rep = s_lsf_R0;
+    uint32_t target = native_post->pc;
+    rep.pc = entry_pc;
+
+    s_ls_trace_idx = 0;
+    s_ls_mismatch = 0;
+    s_ls_m_kind = 0;
+    s_ls_replay_done = 0;
+
+    int         sav_unsup_seen   = g_unsupported_seen;
+    uint32_t    sav_unsup_pc     = g_unsupported_pc;
+    uint32_t    sav_unsup_insn   = g_unsupported_insn;
+    const char *sav_unsup_reason = g_unsupported_reason;
+    uint32_t    sav_store_pc     = g_debug_last_store_pc;
+    uint32_t    sav_func_addr    = g_debug_current_func_addr;
+
+    g_ls_replay_active = 1;
+    g_ls_mode = 2;
+
+    uint32_t pc = entry_pc;
+    uint32_t steps = 0;
+    int done = 0;
+    enum { MAX_FUNC_REPLAY_INSNS = 250000 };
+    for (;;) {
+        if (steps > 0 && target != 0 && ls_same_phys(pc, target) &&
+            s_ls_trace_idx == s_ls_trace_n) {
+            done = 1;
+            break;
+        }
+        if (steps >= MAX_FUNC_REPLAY_INSNS) {
+            lsf_latch(10, frame, entry_pc, pc, 0, target, pc, 0, steps);
+            break;
+        }
+        if (s_ls_mismatch || s_ls_replay_done) break;
+
+        uint32_t next_pc = 0;
+        s_ls_cur_pc = pc;
+        g_unsupported_seen = 0;
+        int transferred = exec_one(&rep, pc, &next_pc);
+        if (g_unsupported_seen) {
+            lsf_latch(11, frame, entry_pc, pc, 0, 0, g_unsupported_insn, 0, steps);
+            break;
+        }
+        pc = transferred ? rep.pc : next_pc;
+        rep.pc = pc;
+        steps++;
+    }
+
+    g_ls_mode = 0;
+    g_ls_replay_active = 0;
+    g_unsupported_seen   = sav_unsup_seen;
+    g_unsupported_pc     = sav_unsup_pc;
+    g_unsupported_insn   = sav_unsup_insn;
+    g_unsupported_reason = sav_unsup_reason;
+    g_debug_last_store_pc = sav_store_pc;
+    g_debug_current_func_addr = sav_func_addr;
+
+    s_lsf_div.segments_checked++;
+
+    if (s_ls_mismatch) {
+        int k = (s_ls_m_kind == 1) ? 6 : (s_ls_m_kind == 2) ? 7 :
+                (s_ls_m_kind == 3) ? 5 : 8;
+        lsf_latch(k, frame, entry_pc, s_ls_m_pc, s_ls_m_addr,
+                  s_ls_m_exp, s_ls_m_act, 0, steps);
+        return;
+    }
+    if (s_ls_replay_done) {
+        lsf_latch(8, frame, entry_pc, s_ls_cur_pc, 0, (uint32_t)s_ls_trace_n,
+                  (uint32_t)s_ls_trace_idx, 0, steps);
+        return;
+    }
+    if (!done) {
+        lsf_latch(10, frame, entry_pc, pc, 0, target, pc, 0, steps);
+        return;
+    }
+    if (s_ls_trace_idx != s_ls_trace_n) {
+        lsf_latch(9, frame, entry_pc, pc, 0, (uint32_t)s_ls_trace_n,
+                  (uint32_t)s_ls_trace_idx, 0, steps);
+        return;
+    }
+
+    lsf_compare_regs(&rep, native_post, frame, entry_pc, steps);
+}
+
+void ls_func_enter(uint32_t entry_pc, CPUState *cpu) {
+    if (s_lsf_frame_hi == 0 || s_lsf_div.found || !cpu) return;
+    if (g_ls_replay_active || g_ls_mode != 0 || s_lsf_active) {
+        s_lsf_div.skipped_conflict++;
+        return;
+    }
+    if (psx_get_in_exception()) {
+        s_lsf_div.skipped_irq++;
+        return;
+    }
+    uint32_t frame = (uint32_t)s_frame_count;
+    if (frame < s_lsf_frame_lo || frame > s_lsf_frame_hi) {
+        s_lsf_div.skipped_disabled++;
+        return;
+    }
+    uint32_t phys = entry_pc & 0x1FFFFFFFu;
+    if (phys < 0x00010000u || phys >= 0x00200000u) return;
+
+    s_lsf_dispatch_entry = entry_pc;
+    s_lsf_entry = entry_pc;
+    s_lsf_frame = frame;
+    s_lsf_saw_irq = 0;
+    s_lsf_active = 1;
+    s_lsf_recording = 0;
+}
+
+void ls_func_exit(uint32_t entry_pc, CPUState *cpu, int handled) {
+    if (!s_lsf_active) return;
+    if (s_lsf_dispatch_entry != entry_pc) {
+        g_ls_mode = 0;
+        s_lsf_active = 0;
+        s_lsf_recording = 0;
+        s_lsf_div.skipped_conflict++;
+        return;
+    }
+    g_ls_mode = 0;
+    s_lsf_active = 0;
+    if (!s_lsf_recording) {
+        s_lsf_div.skipped_unhandled++;
+        return;
+    }
+    s_lsf_recording = 0;
+
+    if (!handled || !cpu) {
+        s_lsf_div.skipped_unhandled++;
+        return;
+    }
+    if (s_lsf_saw_irq) {
+        s_lsf_div.skipped_irq++;
+        return;
+    }
+    if (s_ls_overflow) {
+        s_lsf_div.skipped_overflow++;
+        return;
+    }
+    if (s_lsf_record_only) {
+        s_lsf_div.segments_checked++;
+        return;
+    }
+    lsf_replay_and_compare(cpu, s_lsf_frame, s_lsf_entry);
+}
+
+void ls_at_leader(uint32_t leader_phys, CPUState *cpu) {
+    if (s_lsf_active) {
+        if (!s_lsf_recording && cpu && !s_lsf_div.found && g_ls_mode == 0) {
+            s_lsf_R0 = *cpu;
+            s_lsf_entry = leader_phys | 0x80000000u;
+            s_ls_trace_n = 0;
+            s_ls_trace_idx = 0;
+            s_ls_overflow = 0;
+            s_ls_mismatch = 0;
+            s_ls_m_kind = 0;
+            s_lsf_recording = 1;
+            g_ls_mode = 1;
+        }
+        return;                           /* function-scope recording owns g_ls_mode */
+    }
+    if (s_ls_frame_hi == 0 || s_ls_div.found || !cpu) return;
+    if (g_ls_mode == 2) return;            /* re-entrancy guard (shouldn't happen) */
+    uint32_t frame = (uint32_t)s_frame_count;
+    int in_win = (frame >= s_ls_frame_lo && frame <= s_ls_frame_hi);
+    if (!in_win) { if (g_ls_mode == 1) { g_ls_mode = 0; s_ls_prev_valid = 0; } return; }
+
+    if (s_ls_prev_valid && g_ls_mode == 1) {   /* finalize previous game block */
+        g_ls_mode = 0;
+        if (!s_ls_record_only) {                /* record_only: skip inline replay (perturbation test) */
+            ls_replay_and_compare(cpu, frame, leader_phys);  /* this leader = where prev block went */
+            if (s_ls_div.found) { s_ls_prev_valid = 0; return; }
+        } else {
+            s_ls_div.blocks_checked++;          /* count recorded blocks */
+        }
+        s_ls_prev_valid = 0;
+    }
+    /* Only START recording for a genuinely COMPILED game-text block:
+     *  - !g_ls_dirty_observe: the dirty-RAM interp loop also calls cyc_observe
+     *    (per-instruction, for the cycle ruler); skip those — they're already
+     *    interpreted (clean game text dispatched FROM the dirty path still runs
+     *    compiled, so we can't use g_dirty_interp_active here).
+     *  - [0x10000, 0x200000): game EXE text in main RAM (above the low-RAM
+     *    kernel/relocated-BIOS area, which isn't the regression locus). */
+    if (!g_ls_dirty_observe && leader_phys >= 0x00010000u && leader_phys < 0x00200000u) {
+        s_ls_R0 = *cpu;
+        s_ls_block = leader_phys;
+        s_ls_trace_n = 0; s_ls_trace_idx = 0; s_ls_overflow = 0; s_ls_mismatch = 0;
+        s_ls_prev_valid = 1;
+        g_ls_mode = 1;
+    }
+}
+
+int ls_get_diverge_json(char *buf, int buflen) {
+    static const char *kn[] = {"none","reg","hi","lo","write-val","read-addr",
+                               "write-addr","trace-exhausted","compiled-extra-ops","path-cap"};
+    int k = (s_ls_div.kind >= 0 && s_ls_div.kind <= 9) ? s_ls_div.kind : 0;
+    int p = snprintf(buf, buflen,
+        "{\"found\":%d,\"kind\":\"%s\",\"frame\":%u,\"block\":\"0x%08X\",\"pc\":\"0x%08X\","
+        "\"addr\":\"0x%08X\",\"interp_expected\":\"0x%08X\",\"compiled_actual\":\"0x%08X\","
+        "\"reg\":%d,\"blocks_checked\":%llu,\"window\":[%u,%u],\"div_idx\":%d,\"trace\":[",
+        s_ls_div.found, kn[k], s_ls_div.frame, s_ls_div.block, s_ls_div.pc,
+        s_ls_div.addr, s_ls_div.exp, s_ls_div.act, s_ls_div.detail,
+        (unsigned long long)s_ls_div.blocks_checked, s_ls_frame_lo, s_ls_frame_hi,
+        s_ls_div_idx);
+    for (int i = 0; i < s_ls_div_trace_n && p < buflen - 48; i++) {
+        p += snprintf(buf + p, buflen - p, "%s\"%c%d:%08X=%08X\"",
+                      i ? "," : "", s_ls_div_trace[i].is_write ? 'W' : 'R',
+                      s_ls_div_trace[i].size, s_ls_div_trace[i].addr, s_ls_div_trace[i].val);
+    }
+    p += snprintf(buf + p, buflen - p, "]}");
+    return p;
+}
+
+int ls_get_func_json(char *buf, int buflen) {
+    static const char *kn[] = {
+        "none","gpr","hi","lo","pc","write-val","read-addr","write-addr",
+        "trace-exhausted","trace-leftover","path-cap","unsupported"
+    };
+    int k = (s_lsf_div.kind >= 0 && s_lsf_div.kind <= 11) ? s_lsf_div.kind : 0;
+    int p = snprintf(buf, buflen,
+        "{\"found\":%d,\"kind\":\"%s\",\"frame\":%u,\"entry\":\"0x%08X\","
+        "\"pc\":\"0x%08X\",\"addr\":\"0x%08X\","
+        "\"interp_expected\":\"0x%08X\",\"compiled_actual\":\"0x%08X\","
+        "\"reg\":%d,\"segments_checked\":%llu,\"skipped_irq\":%llu,"
+        "\"skipped_overflow\":%llu,\"skipped_unhandled\":%llu,"
+        "\"skipped_conflict\":%llu,\"skipped_disabled\":%llu,"
+        "\"window\":[%u,%u],\"trace_ops\":%u,\"replay_ops\":%u,"
+        "\"steps\":%u,\"div_idx\":%d,\"trace\":[",
+        s_lsf_div.found, kn[k], s_lsf_div.frame, s_lsf_div.entry,
+        s_lsf_div.pc, s_lsf_div.addr, s_lsf_div.exp, s_lsf_div.act,
+        s_lsf_div.detail, (unsigned long long)s_lsf_div.segments_checked,
+        (unsigned long long)s_lsf_div.skipped_irq,
+        (unsigned long long)s_lsf_div.skipped_overflow,
+        (unsigned long long)s_lsf_div.skipped_unhandled,
+        (unsigned long long)s_lsf_div.skipped_conflict,
+        (unsigned long long)s_lsf_div.skipped_disabled,
+        s_lsf_frame_lo, s_lsf_frame_hi, s_lsf_div.trace_ops,
+        s_lsf_div.replay_ops, s_lsf_div.steps, s_lsf_div_idx);
+    for (int i = 0; i < s_lsf_div_trace_n && p < buflen - 48; i++) {
+        p += snprintf(buf + p, buflen - p, "%s\"%c%d:%08X=%08X\"",
+                      i ? "," : "", s_lsf_div_trace[i].is_write ? 'W' : 'R',
+                      s_lsf_div_trace[i].size, s_lsf_div_trace[i].addr,
+                      s_lsf_div_trace[i].val);
+    }
+    p += snprintf(buf + p, buflen - p, "]}");
+    return p;
+}

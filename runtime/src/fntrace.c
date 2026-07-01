@@ -1,8 +1,18 @@
 /* fntrace.c — runtime side of psx_dispatch call ring. See fntrace.h. */
 
 #include "fntrace.h"
+#include "parity_trace.h"   /* general control-flow parity ring (native producer) */
 #include <string.h>
 #include <stdlib.h>
+
+/* RAM reader adapter for the parity trace (cpu->read_word takes only addr). */
+static uint32_t parity_rw_cb(void* ctx, uint32_t addr) {
+    return ((CPUState*)ctx)->read_word(addr);
+}
+
+/* Frame + guest-cycle accessors for parity_trace.c (decoupled per process). */
+uint32_t parity_host_frame(void) { extern uint64_t s_frame_count; return (uint32_t)s_frame_count; }
+uint64_t parity_host_cycle(void) { extern uint64_t psx_get_cycle_count(void); return psx_get_cycle_count(); }
 
 FntraceEntry g_fntrace_ring[FNTRACE_RING_CAP];
 uint64_t     g_fntrace_seq = 0;
@@ -46,9 +56,47 @@ static inline int armed_match(uint32_t target) {
 }
 
 void fntrace_record(CPUState* cpu, uint32_t target) {
+    /* General parity ring: one DISPATCH row per leader while current_tcb matches
+     * the watched thread. Gated by the cheap armed flag so disarmed runs pay only
+     * a single branch on this hot path. pc==target (the leader being entered). */
+    if (parity_trace_is_armed()) {
+        parity_trace_record(PARITY_KIND_DISPATCH, target, cpu->gpr[31],
+                            cpu->gpr[29], target, parity_rw_cb, cpu);
+    }
+
+    /* Dispatch-level bail-source capture (Tomba 2 wild-return spin, runtime-only,
+     * no BIOS regen). The generated psx_dispatch_impl calls us at the top of each
+     * dispatch iteration. When a previous iteration bail-FLATTENED a compiled
+     * function's wild return, g_psx_bail_flattened has incremented and
+     * g_debug_current_func_addr still holds that bailing function, while `target`
+     * is the wild destination it returned to. Feed (bailing_fn, wild_target) into
+     * the traps.c bail ledger (surfaced in the heartbeat as bail_top_site_ra /
+     * bail_top_wild_pc) so the dominant wild-returning function is readable even
+     * when the bail storm makes the window "Not Responding". */
+    {
+        extern uint64_t g_psx_bail_flattened;
+        extern uint32_t g_debug_current_func_addr;
+        extern void psx_bail_record(uint32_t site_ra, uint32_t site_sp,
+                                    uint32_t wild_pc, uint32_t guest_sp);
+        static uint64_t s_last_flat = 0;
+        uint64_t f = g_psx_bail_flattened;
+        if (f != s_last_flat) {
+            s_last_flat = f;
+            psx_bail_record(g_debug_current_func_addr, cpu->gpr[29], target, cpu->gpr[31]);
+        }
+    }
+
     if (!s_game_started && s_game_entry_phys != 0) {
         if ((target & 0x1FFFFFFFu) == s_game_entry_phys) {
             s_game_started = 1;
+            /* Establish the clean compiled-image baseline now: the boot EXE is fully
+             * loaded into the game-text region (== compiled image) and no gameplay
+             * overlay has run yet. The EXE load marked the whole text dirty (false
+             * positive); clearing it makes dirty_ram_is_dirty() true ONLY for pages a
+             * later overlay overwrites, so the dispatch runs clean text compiled and
+             * interprets only true overlays (Tomba 2 boot-text loader overlay). */
+            extern void dirty_ram_clear_image_baseline(void);
+            dirty_ram_clear_image_baseline();
             cdrom_notify_game_started();
             boot_state_trigger_capture(cpu);
         }
