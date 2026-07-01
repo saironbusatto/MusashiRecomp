@@ -1302,6 +1302,17 @@ static void sample_headless_pad_into_sio(int override) {
         sio_set_pad_state_slot(0, (uint16_t)override);
         return;
     }
+#ifdef PSX_COSIM
+    /* Input-driven cosim (EXPERIMENTAL): the coordinator sets a HELD pad state via the
+     * `setpad` TCP command; the headless sampler applies it every frame so the same
+     * button input is fed to BOTH lockstep instances at the same guest cycle. If the
+     * two instances desync under input, this path is proven nondeterministic and gets
+     * stubbed out (see cosim.c). Default 0xFFFF = all released (PSX pad is active-low). */
+    { extern volatile int g_cosim_pad_hold[2];
+      sio_set_pad_state_slot(0, (uint16_t)g_cosim_pad_hold[0]);
+      sio_set_pad_state_slot(1, (uint16_t)g_cosim_pad_hold[1]);
+      return; }
+#endif
     sio_set_pad_state_slot(0, 0xFFFFu);
     sio_set_pad_state_slot(1, 0xFFFFu);
 }

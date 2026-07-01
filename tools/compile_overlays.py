@@ -854,6 +854,51 @@ void debug_server_log_call_entry(uint32_t func_addr) {
 void psx_restore_state_escape(void) {
     if (g_cbs.psx_restore_state_escape) g_cbs.psx_restore_state_escape();
 }
+/* Faithful-timing functions (ABI v9): overlay code built with PSX_ENABLE_BLOCK_CYCLES
+ * emits these; forward to the runtime's real impls so native overlays charge cycles on
+ * the SAME timeline as the interp/BIOS (a local copy would diverge). NULL-guarded so a
+ * v9 DLL stays safe on a host that predates a given callback. */
+uint32_t psx_cyc_load_word(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    return g_cbs.cyc_load_word ? g_cbs.cyc_load_word(cpu, addr, rt, reg_mask) : cpu->read_word(addr);
+}
+uint16_t psx_cyc_load_half(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    return g_cbs.cyc_load_half ? g_cbs.cyc_load_half(cpu, addr, rt, reg_mask) : cpu->read_half(addr);
+}
+uint8_t psx_cyc_load_byte(CPUState *cpu, uint32_t addr, uint32_t rt, uint32_t reg_mask) {
+    return g_cbs.cyc_load_byte ? g_cbs.cyc_load_byte(cpu, addr, rt, reg_mask) : cpu->read_byte(addr);
+}
+uint32_t psx_cyc_lwc2_read(CPUState *cpu, uint32_t addr) {
+    return g_cbs.cyc_lwc2_read ? g_cbs.cyc_lwc2_read(cpu, addr) : cpu->read_word(addr);
+}
+void psx_icache_fetch(CPUState *cpu, uint32_t addr) {
+    if (g_cbs.icache_fetch) g_cbs.icache_fetch(cpu, addr);
+}
+void psx_muldiv_set(CPUState *cpu, uint32_t latency) {
+    if (g_cbs.muldiv_set) g_cbs.muldiv_set(cpu, latency);
+}
+void psx_muldiv_stall(CPUState *cpu) {
+    if (g_cbs.muldiv_stall) g_cbs.muldiv_stall(cpu);
+}
+uint32_t psx_mult_latency_s(uint32_t rs) {
+    return g_cbs.mult_latency_s ? g_cbs.mult_latency_s(rs) : 0u;
+}
+uint32_t psx_mult_latency_u(uint32_t rs) {
+    return g_cbs.mult_latency_u ? g_cbs.mult_latency_u(rs) : 0u;
+}
+void psx_gte_stall(CPUState *cpu) {
+    if (g_cbs.gte_stall) g_cbs.gte_stall(cpu);
+}
+void psx_gte_read(CPUState *cpu, uint32_t rt) {
+    if (g_cbs.gte_read) g_cbs.gte_read(cpu, rt);
+}
+int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
+    return g_cbs.slice_block ? g_cbs.slice_block(cpu, block_addr, bcyc, side_effects) : 0;
+}
+/* g_debug_last_store_pc: a provenance breadcrumb the emitter writes before stores.
+ * Overlays are built PSX_NO_DEBUG_TOOLS (the runtime's only consumer is debug tooling),
+ * so a local definition satisfies the link; overlay-store provenance is simply not
+ * tracked in a no-debug-tools build (by design). */
+uint32_t g_debug_last_store_pc;
 /* Widescreen hooks (ABI v3): forward to the runtime's live widescreen state.
  * Identity fallback if the host predates the callbacks (NULL) — so a v3 DLL
  * stays correct (4:3) on an older host. */
@@ -1368,6 +1413,11 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
     cmd = [
         gcc, '-shared', *pic_flag, '-O2',
         '-DPSX_OVERLAY_DLL_BUILD',
+        # Overlays mirror the runtime's no-debug-tools build: the emitter guards
+        # debug_server_cyc_observe (and friends) behind PSX_NO_DEBUG_TOOLS, and the
+        # shipped/native runtime is built without debug tools, so define it here too or
+        # the overlay emits calls to symbols the runtime doesn't have (undefined ref).
+        '-DPSX_NO_DEBUG_TOOLS',
         # CYCLE MODEL UNIFICATION (Tomba2 logo Timer1 fork): compiled-overlay code
         # MUST charge guest cycles exactly like the dirty-RAM interpreter and the
         # BIOS (both built with PSX_ENABLE_BLOCK_CYCLES=1). Without this flag every
