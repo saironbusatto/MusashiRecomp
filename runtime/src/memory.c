@@ -728,11 +728,13 @@ static void mmio_write8(uint32_t addr, uint8_t val) {
  * those device-internal accesses. Interrupt-handler ops are excluded too
  * (psx_get_in_exception): the replay runs only the block, never the handler. */
 static int s_ls_op_active = 0;
+extern int g_ls_suppress_record;
+extern int g_dma_exec_depth;
 extern int psx_get_in_exception(void);
 static uint32_t psx_read_word_raw(uint32_t addr);
 uint32_t psx_read_word(uint32_t addr) {
     if (g_ls_mode == 2) return ls_read_hook(addr, 4, 0u);
-    if (g_ls_mode != 1 || s_ls_op_active) return psx_read_word_raw(addr);
+    if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) return psx_read_word_raw(addr);
     s_ls_op_active = 1;
     uint32_t v = psx_read_word_raw(addr);
     s_ls_op_active = 0;
@@ -817,7 +819,7 @@ static inline void d44_note(uint32_t phys, uint32_t old, uint32_t val) {
 static void psx_write_word_raw(uint32_t addr, uint32_t val);
 void psx_write_word(uint32_t addr, uint32_t val) {
     if (g_ls_mode == 2) { ls_write_hook(addr, 4, val); return; }
-    if (g_ls_mode != 1 || s_ls_op_active) { psx_write_word_raw(addr, val); return; }
+    if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_word_raw(addr, val); return; }
     if (!psx_get_in_exception()) ls_write_hook(addr, 4, val);
     s_ls_op_active = 1;
     psx_write_word_raw(addr, val);
@@ -840,6 +842,9 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
         card_data_writes_check(phys, val, 4);
         dirty_ram_mark_kernel_write(phys);
         overlay_watch_note_write(phys, 4);
+#ifdef PSX_COSIM
+        { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 4); }
+#endif
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         ram[phys + 2] = (uint8_t)(val >> 16);
@@ -876,7 +881,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
 static uint16_t psx_read_half_raw(uint32_t addr);
 uint16_t psx_read_half(uint32_t addr) {
     if (g_ls_mode == 2) return (uint16_t)ls_read_hook(addr, 2, 0u);
-    if (g_ls_mode != 1 || s_ls_op_active) return psx_read_half_raw(addr);
+    if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) return psx_read_half_raw(addr);
     s_ls_op_active = 1;
     uint16_t v = psx_read_half_raw(addr);
     s_ls_op_active = 0;
@@ -908,7 +913,7 @@ static uint16_t psx_read_half_raw(uint32_t addr) {
 static void psx_write_half_raw(uint32_t addr, uint16_t val);
 void psx_write_half(uint32_t addr, uint16_t val) {
     if (g_ls_mode == 2) { ls_write_hook(addr, 2, val); return; }
-    if (g_ls_mode != 1 || s_ls_op_active) { psx_write_half_raw(addr, val); return; }
+    if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_half_raw(addr, val); return; }
     if (!psx_get_in_exception()) ls_write_hook(addr, 2, val);
     s_ls_op_active = 1;
     psx_write_half_raw(addr, val);
@@ -925,6 +930,9 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
         card_data_writes_check(phys, (uint32_t)val, 2);
         dirty_ram_mark_kernel_write(phys);
         overlay_watch_note_write(phys, 2);
+#ifdef PSX_COSIM
+        { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 2); }
+#endif
         ram[phys]     = (uint8_t)(val);
         ram[phys + 1] = (uint8_t)(val >> 8);
         return;
@@ -952,7 +960,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
 static uint8_t psx_read_byte_raw(uint32_t addr);
 uint8_t psx_read_byte(uint32_t addr) {
     if (g_ls_mode == 2) return (uint8_t)ls_read_hook(addr, 1, 0u);
-    if (g_ls_mode != 1 || s_ls_op_active) return psx_read_byte_raw(addr);
+    if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) return psx_read_byte_raw(addr);
     s_ls_op_active = 1;
     uint8_t v = psx_read_byte_raw(addr);
     s_ls_op_active = 0;
@@ -1115,7 +1123,7 @@ uint8_t  psx_guest_read_byte(uint32_t addr) { return psx_read_byte(addr); }
 static void psx_write_byte_raw(uint32_t addr, uint8_t val);
 void psx_write_byte(uint32_t addr, uint8_t val) {
     if (g_ls_mode == 2) { ls_write_hook(addr, 1, val); return; }
-    if (g_ls_mode != 1 || s_ls_op_active) { psx_write_byte_raw(addr, val); return; }
+    if (g_ls_mode != 1 || s_ls_op_active || g_ls_suppress_record || g_dma_exec_depth > 0) { psx_write_byte_raw(addr, val); return; }
     if (!psx_get_in_exception()) ls_write_hook(addr, 1, val);
     s_ls_op_active = 1;
     psx_write_byte_raw(addr, val);
@@ -1132,6 +1140,9 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
         card_data_writes_check(phys, (uint32_t)val, 1);
         dirty_ram_mark_kernel_write(phys);
         overlay_watch_note_write(phys, 1);
+#ifdef PSX_COSIM
+        { extern void cosim_note_ram_write(uint32_t,uint32_t); cosim_note_ram_write(phys, 1); }
+#endif
         ram[phys] = val;
         return;
     }

@@ -58,6 +58,21 @@ static uint32_t ram_alias_to_rom(uint32_t addr) {
     return addr;
 }
 
+/* Map a BIOS ROM PC to the address the PSX CPU actually executes from after the
+ * BIOS copies kernel/shell code into RAM. Literal interrupt resume PCs must use
+ * this runtime address; otherwise psx_check_interrupts rejects ROM-shell EPCs
+ * and falls back to the legacy sentinel path. */
+static uint32_t bios_runtime_pc(uint32_t rom_pc) {
+    uint32_t phys = rom_pc & 0x1FFFFFFFu;
+    if (phys >= 0x1FC18000u && phys <= 0x1FC42FFFu) {
+        return 0x80030000u + (phys - 0x1FC18000u);
+    }
+    if (phys >= 0x1FC10000u && phys <= 0x1FC17FFFu) {
+        return phys - 0x1FC10000u + 0x00000500u;
+    }
+    return rom_pc;
+}
+
 uint32_t FullFunctionEmitter::read_u32_le(const std::vector<uint8_t>& rom, uint32_t offset) {
     return  static_cast<uint32_t>(rom[offset + 0])
          | (static_cast<uint32_t>(rom[offset + 1]) << 8)
@@ -118,11 +133,17 @@ bool FullFunctionEmitter::emit_function(
         return e == nullptr || e[0] != '0';
     }();
     auto emit_irq_check = [](uint32_t resume_pc, const std::string& indent = "    ") {
-        return indent + fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n", resume_pc);
+        return indent + fmt::format("psx_check_interrupts_at(cpu, 0x{:08X}u);\n",
+                                    bios_runtime_pc(resume_pc));
     };
     auto emit_irq_check_expr = [](const std::string& resume_pc_expr,
                                   const std::string& indent = "    ") {
         return indent + fmt::format("psx_check_interrupts_at(cpu, {});\n", resume_pc_expr);
+    };
+    auto emit_cosim_instr = [](uint32_t pc, const std::string& indent = "    ") {
+        return "#ifdef PSX_COSIM\n" + indent +
+               fmt::format("cosim_instr(0x{:08X}u);\n", bios_runtime_pc(pc)) +
+               "#endif\n";
     };
 
     // Build sorted instruction list and a set for O(1) membership test.
@@ -270,19 +291,7 @@ bool FullFunctionEmitter::emit_function(
      * Without this, handler/callback tables get ROM addresses instead of
      * RAM addresses, breaking pointer comparisons in the BIOS. */
     auto relocate_ra = [](uint32_t rom_ra) -> uint32_t {
-        uint32_t phys = rom_ra & 0x1FFFFFFFu;
-        /* Shell relocation upper bound matches the runtime dispatcher's
-         * normalize() in SCPH1001_dispatch.c: shell covers RAM 0x30000-0x5AFFF
-         * (= ROM 0x1FC18000-0x1FC42FFF inclusive). Previously this was
-         * 0x1FC427FF, which left BFC42800-BFC42FFF JAL targets un-relocated
-         * (target kept ROM PC[31:28]=0xB instead of RAM PC[31:28]=0x8). */
-        if (phys >= 0x1FC18000u && phys <= 0x1FC42FFFu) {
-            return 0x80030000u + (phys - 0x1FC18000u);
-        }
-        if (phys >= 0x1FC10000u && phys <= 0x1FC17FFFu) {
-            return phys - 0x1FC10000u + 0x00000500u;
-        }
-        return rom_ra;
+        return bios_runtime_pc(rom_ra);
     };
 
     // First pass: identify terminators and their delay slots.
@@ -430,6 +439,10 @@ bool FullFunctionEmitter::emit_function(
             out += fmt::format("    debug_server_cyc_observe(0x{:08X}u);\n",
                                normalize_address(addr));
             out += "#endif\n";
+            // First-divergence co-sim oracle (COSIM_ORACLE.md): lean block-leader hook.
+            out += "#ifdef PSX_COSIM\n";
+            out += fmt::format("    cosim_block(0x{:08X}u);\n", normalize_address(addr));
+            out += "#endif\n";
             // Phase 1.0e-d: advance guest cycles for this block. Macro-
             // gated; when off, generated code matches pre-1.0e-d output.
             // In per-instruction mode the charge is emitted per instruction
@@ -474,6 +487,16 @@ bool FullFunctionEmitter::emit_function(
             out += fmt::format("    /* 0x{:08X}: {:08X}  {} */\n", addr, raw, tr.comment);
 
             const std::string kind = tr.terminator_kind ? tr.terminator_kind : "";
+            if (kind == "jal") {
+                out += fmt::format("    cpu->gpr[31] = 0x{:08X}u;  /* jal link before delay slot */\n",
+                                   relocate_ra(addr + 8));
+            } else if (kind == "jalr") {
+                uint8_t rd = (raw >> 11) & 0x1F;
+                if (rd != 0) {
+                    out += fmt::format("    cpu->gpr[{}] = 0x{:08X}u;  /* jalr link before delay slot */\n",
+                                       static_cast<int>(rd), relocate_ra(addr + 8));
+                }
+            }
 
             if (is_branch_kind(tr.terminator_kind)) {
                 // Emit pre-delay snapshot using a unique flag.
@@ -799,6 +822,7 @@ bool FullFunctionEmitter::emit_function(
         // Non-terminator: emit normally.
         out += fmt::format("    /* 0x{:08X}: {:08X}  {} */\n", addr, raw, tr.comment);
         out += fmt::format("    {}\n", tr.c_code);
+        out += emit_cosim_instr(addr);
 
         // Check if this instruction is a delay slot with pending resolution.
         if (pending_at.count(addr)) {
@@ -1357,6 +1381,14 @@ void FullFunctionEmitter::emit_dispatch(
     out += "extern uint64_t g_dispatch_static_hits;\n";
     out += "\n";
     out += "int g_psx_dispatch_depth = 0;\n\n";
+    out += "static void psx_dispatch_check_return_boundary(CPUState* cpu, uint32_t stop_addr) {\n";
+    out += "    if (stop_addr != 0u) {\n";
+    out += "        psx_check_interrupts_at(cpu, stop_addr);\n";
+    out += "        if (((cpu->pc ^ stop_addr) & 0x1FFFFFFFu) == 0) cpu->pc = 0;\n";
+    out += "    } else {\n";
+    out += "        psx_check_interrupts(cpu);\n";
+    out += "    }\n";
+    out += "}\n\n";
     out += "static void psx_dispatch_impl(CPUState* cpu, uint32_t addr, uint32_t stop_addr) {\n";
     out += "    /* Tail-call trampoline: functions signal tail calls by setting\n";
     out += "     * cpu->pc to the target and returning. We loop here to re-dispatch\n";
@@ -1447,7 +1479,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "                cpu->pc = 0;\n";
     out += "                --g_psx_dispatch_depth;\n";
     out += "                if (outermost) {\n";
-    out += "                    psx_check_interrupts(cpu);\n";
+    out += "                    psx_dispatch_check_return_boundary(cpu, stop_addr);\n";
     out += "                }\n";
     out += "                return;\n";
     out += "            }\n";
@@ -1484,7 +1516,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "            }\n";
     out += "            --g_psx_dispatch_depth;\n";
     out += "            if (outermost) {\n";
-    out += "                psx_check_interrupts(cpu);\n";
+    out += "                psx_dispatch_check_return_boundary(cpu, stop_addr);\n";
     out += "            }\n";
     out += "            return;\n";
     out += "        }\n";
@@ -1499,7 +1531,7 @@ void FullFunctionEmitter::emit_dispatch(
     out += "            cpu->pc = 0;\n";
     out += "            --g_psx_dispatch_depth;\n";
     out += "            if (outermost) {\n";
-    out += "                psx_check_interrupts(cpu);\n";
+    out += "                psx_dispatch_check_return_boundary(cpu, stop_addr);\n";
     out += "            }\n";
     out += "            return;\n";
     out += "        }\n";
@@ -1589,6 +1621,10 @@ EmitStats FullFunctionEmitter::emit(
     full_c += "extern uint32_t gte_read_data(CPUState* cpu, uint8_t reg);\n";
     full_c += "extern void debug_server_log_call_entry(uint32_t func_addr);\n";
     full_c += "extern void debug_server_log_probe(uint32_t pc, CPUState *cpu);\n";
+    full_c += "#ifdef PSX_COSIM\n";
+    full_c += "extern void cosim_block(uint32_t block_leader_phys);\n";
+    full_c += "extern void cosim_instr(uint32_t pc);\n";
+    full_c += "#endif\n";
     full_c += "#ifndef PSX_NO_DEBUG_TOOLS\n";
     full_c += "extern void debug_server_cyc_observe(uint32_t block_leader_phys);\n";
     full_c += "#endif\n";

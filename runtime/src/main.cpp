@@ -94,6 +94,9 @@ extern "C" void timers_init(void);
 
 /* interrupts.c */
 extern "C" void interrupts_init(void);
+#ifdef PSX_COSIM
+extern "C" void cosim_init(void);  /* first-divergence oracle server (cosim.c) */
+#endif
 extern "C" uint32_t psx_read_word(uint32_t addr);
 extern "C" void     psx_write_word(uint32_t addr, uint32_t val);
 extern "C" uint16_t psx_read_half(uint32_t addr);
@@ -143,6 +146,7 @@ static int           g_video_screen   = 0;  /* 0=raw,1=crt,2=composite,3=trinitr
 static int           g_video_win_w    = 1280; /* window width (height follows aspect) */
 static bool          g_audio_spu_hq   = false; /* SPU float-shadow (env overrides) */
 static int           g_auto_skip_fmv  = 0;   /* skip FMVs the instant they're detected */
+static int           g_headless       = 0;   /* debug/CI frontend: no SDL window/audio */
 /* FMV instant-skip via the game's OWN end-of-movie path. Tomba's MDEC player
  * (FUN_8001efe8) tears a movie down when the streamed frame number reaches that
  * movie's per-movie total minus 3; writing the current movie's total down to
@@ -1293,6 +1297,15 @@ static void sample_pad_into_sio(int override) {
     }
 }
 
+static void sample_headless_pad_into_sio(int override) {
+    if (override >= 0) {
+        sio_set_pad_state_slot(0, (uint16_t)override);
+        return;
+    }
+    sio_set_pad_state_slot(0, 0xFFFFu);
+    sio_set_pad_state_slot(1, 0xFFFFu);
+}
+
 /* PSX native vblank cadence: NTSC ≈ 59.94 Hz. Wall-clock target keeps
  * audio sample generation (735 samples/vblank * 60 = 44100/sec) matched
  * to the SDL audio device drain rate, eliminating queue overflow drops
@@ -1403,33 +1416,35 @@ static void sdl_vblank_present(void) {
         if (cp->poll_main) cp->poll_main();
     }
 
-    /* Pump SDL events to prevent window freeze. */
-    SDL_Event ev;
-    while (SDL_PollEvent(&ev)) {
-        if (ev.type == SDL_QUIT) {
-            psx_crash_trace_set_exit_origin("sdl_window_close");
-            shutdown_runtime();
-            std::exit(0);
-        } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
-            refresh_player_devices();
-        } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
-            if (ev.cdevice.which == g_players[0].instance ||
-                ev.cdevice.which == g_players[1].instance) {
-                close_controller();
+    if (!g_headless) {
+        /* Pump SDL events to prevent window freeze. */
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) {
+                psx_crash_trace_set_exit_origin("sdl_window_close");
+                shutdown_runtime();
+                std::exit(0);
+            } else if (ev.type == SDL_CONTROLLERDEVICEADDED) {
                 refresh_player_devices();
-            }
-        } else if (ev.type == SDL_KEYDOWN) {
-            /* Fullscreen toggle: F11, Alt+Enter, or Cmd/Ctrl+F.
-             * FULLSCREEN_DESKTOP keeps the desktop resolution; the
-             * renderer's logical size letterboxes the 640x480 image. */
-            const Uint16 mod = ev.key.keysym.mod;
-            if (ev.key.keysym.sym == SDLK_F11 ||
-                (ev.key.keysym.sym == SDLK_RETURN && (mod & KMOD_ALT)) ||
-                (ev.key.keysym.sym == SDLK_f && (mod & (KMOD_GUI | KMOD_CTRL)))) {
-                Uint32 is_fs = SDL_GetWindowFlags(sdl_window) &
-                               SDL_WINDOW_FULLSCREEN_DESKTOP;
-                SDL_SetWindowFullscreen(sdl_window,
-                    is_fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+            } else if (ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+                if (ev.cdevice.which == g_players[0].instance ||
+                    ev.cdevice.which == g_players[1].instance) {
+                    close_controller();
+                    refresh_player_devices();
+                }
+            } else if (ev.type == SDL_KEYDOWN) {
+                /* Fullscreen toggle: F11, Alt+Enter, or Cmd/Ctrl+F.
+                 * FULLSCREEN_DESKTOP keeps the desktop resolution; the
+                 * renderer's logical size letterboxes the 640x480 image. */
+                const Uint16 mod = ev.key.keysym.mod;
+                if (ev.key.keysym.sym == SDLK_F11 ||
+                    (ev.key.keysym.sym == SDLK_RETURN && (mod & KMOD_ALT)) ||
+                    (ev.key.keysym.sym == SDLK_f && (mod & (KMOD_GUI | KMOD_CTRL)))) {
+                    Uint32 is_fs = SDL_GetWindowFlags(sdl_window) &
+                                   SDL_WINDOW_FULLSCREEN_DESKTOP;
+                    SDL_SetWindowFullscreen(sdl_window,
+                        is_fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+                }
             }
         }
     }
@@ -1439,7 +1454,8 @@ static void sdl_vblank_present(void) {
      * g_low_latency_input this early sample is re-done after the pacer wait
      * (below) for the interactive present path; it still covers the turbo /
      * FMV-skip paths that early-return before pacing. */
-    sample_pad_into_sio(override);
+    if (g_headless) sample_headless_pad_into_sio(override);
+    else            sample_pad_into_sio(override);
 
     /* Latency ring: open this present cycle's slot, stamping when input was
      * sampled into SIO.  Always-on; queried via the debug server "latency". */
@@ -1515,6 +1531,8 @@ static void sdl_vblank_present(void) {
      * where rendering the time-compressed audio would be pure noise. */
     sdl_audio_update(fmv_skip_active);
 #endif
+
+    if (g_headless) return;
 
     /* TCP turbo is for automated validation and trace capture. It keeps the
      * simulation advancing and the debug server polling, but removes frontend
@@ -1837,6 +1855,7 @@ int main(int argc, char** argv) {
      *   --renderer <name>   override the renderer: software|opengl|vulkan
      *   --launcher          force the GUI launcher (overrides skip_launcher)
      *   --no-launcher       skip the GUI launcher (boot straight in)
+     *   --headless          skip SDL window/audio; use TCP screenshots/state
      *   <positional>        deprecated alias for --bios
      * No --memcard-dir / --game-root flags: those are config-driven. */
     for (int i = 1; i < argc; i++) {
@@ -1860,9 +1879,18 @@ int main(int argc, char** argv) {
             force_launcher = true;
         } else if (std::strcmp(argv[i], "--no-launcher") == 0) {
             force_no_launcher = true;
+        } else if (std::strcmp(argv[i], "--headless") == 0) {
+            g_headless = 1;
+            force_no_launcher = true;
         } else if (argv[i][0] != '-') {
             bios_path = argv[i];
             bios_from_cli = true;
+        }
+    }
+    if (const char *e = std::getenv("PSX_HEADLESS")) {
+        if (e[0] && e[0] != '0') {
+            g_headless = 1;
+            force_no_launcher = true;
         }
     }
 
@@ -2457,6 +2485,9 @@ int main(int argc, char** argv) {
 #else
     (void)debug_port;
 #endif
+#ifdef PSX_COSIM
+    cosim_init();  /* first-divergence oracle server */
+#endif
     /* Heartbeat always on — see freeze_heartbeat.c rationale. */
     freeze_heartbeat_start("psx-runtime");
     /* Register game entry_pc for post-BIOS disc speed switch. Fires once when
@@ -2464,6 +2495,9 @@ int main(int argc, char** argv) {
     if (game_entry_pc != 0)
         fntrace_set_game_range(game_entry_pc, 0);
 
+  if (g_headless) {
+    std::fprintf(stdout, "psxrecomp: headless frontend enabled\n");
+  } else {
     /* ---- SDL init ---- */
     /* Scale quality governs SDL's logical-size -> window scaling. Linear when
      * antialiasing is on so the (super)sampled frame stays smooth when the
@@ -2637,6 +2671,7 @@ int main(int argc, char** argv) {
     }
     SDL_SetTextureScaleMode(sdl_texture,
                             g_video_aa ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+  }
   }
 
     /* Register vblank presentation callback. */
@@ -2897,9 +2932,13 @@ int main(int argc, char** argv) {
 
     std::fprintf(stdout, "psxrecomp runtime: execution completed, PC=0x%08X\n", cpu.pc);
     { extern uint64_t g_slice_fired, g_slice_irq_taken, g_dirty_ram_insns_run;
-      std::fprintf(stdout, "psxrecomp runtime: [slice diag] slice_fired=%llu slice_irq_taken=%llu dirty_insns=%llu\n",
+      extern uint32_t g_slice_exit_pc, g_slice_exit_reason, g_slice_exit_iter;
+      extern uint32_t g_slice_exit_dispatchable, g_slice_exit_dirty, g_slice_exit_in_text, g_slice_exit_want;
+      std::fprintf(stdout, "psxrecomp runtime: [slice diag] slice_fired=%llu slice_irq_taken=%llu dirty_insns=%llu exit_pc=0x%08X reason=%u iter=%u dispatchable=%u dirty=%u in_text=%u want=%u\n",
                    (unsigned long long)g_slice_fired, (unsigned long long)g_slice_irq_taken,
-                   (unsigned long long)g_dirty_ram_insns_run); }
+                   (unsigned long long)g_dirty_ram_insns_run, g_slice_exit_pc, g_slice_exit_reason,
+                   g_slice_exit_iter, g_slice_exit_dispatchable, g_slice_exit_dirty,
+                   g_slice_exit_in_text, g_slice_exit_want); }
 
     shutdown_runtime();
     if (g_gl_active) gl_renderer_shutdown();

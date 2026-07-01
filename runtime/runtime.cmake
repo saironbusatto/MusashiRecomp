@@ -135,6 +135,8 @@ set(PSXRECOMP_RUNTIME_SOURCES
     ${PSXRECOMP_ROOT}/runtime/src/parity_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/device_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/boot_state.c
+    ${PSXRECOMP_ROOT}/runtime/src/cosim_state.c
+    ${PSXRECOMP_ROOT}/runtime/src/cosim.c
     ${PSXRECOMP_ROOT}/runtime/src/traps.c
     ${PSXRECOMP_ROOT}/runtime/src/crash_trace.c
     ${PSXRECOMP_ROOT}/runtime/src/freeze_heartbeat.c
@@ -220,7 +222,7 @@ if(NOT PSXRECOMP_SKIP_BIOS_STALE_CHECK)
 endif()
 
 function(psxrecomp_add_runtime_target target)
-    set(options ORACLE)
+    set(options ORACLE COSIM)
     set(oneValueArgs
         GAME_GENERATED_FULL_C
         GAME_GENERATED_DISPATCH_C
@@ -385,6 +387,15 @@ function(psxrecomp_add_runtime_target target)
     # also visible to psx-beetle / non-runtime-helper targets.
     if(NOT PSX_DEBUG_TOOLS)
         target_compile_definitions(${target} PRIVATE PSX_NO_DEBUG_TOOLS=1)
+    endif()
+
+    # First-divergence co-sim oracle (COSIM_ORACLE.md): the clean, deterministic build.
+    # PSX_COSIM activates the cosim engine/hooks; PSX_NO_DEBUG_TOOLS strips ALL the laggy
+    # diagnostic tooling (the debug server thread, per-block recording, rings) so the run
+    # is single-threaded + fast + deterministic. The two instances (this + a FORCE_INTERP
+    # run) are driven in cycle-lockstep by tools/cosim.py.
+    if(PSXRT_COSIM)
+        target_compile_definitions(${target} PRIVATE PSX_COSIM=1 PSX_NO_DEBUG_TOOLS=1)
     endif()
 
     # Integrated RmlUi launcher (not in the oracle build — that's headless).

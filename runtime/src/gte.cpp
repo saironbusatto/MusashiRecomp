@@ -902,6 +902,10 @@ static void gte_load_data(PSXRecomp::GTE::GTEState& gte, CPUState* cpu) {
         gte_mtc2(&gte, i, cpu->gte_data[i]);
     }
     for (int i = 0; i < 32; i++) gte_ctc2(&gte, i, cpu->gte_ctrl[i]);
+    /* Loading emulator state is not a guest CTC2 write. CTC2 to FLAG masks
+     * bit 31, but a previously computed FLAG error bit must survive reads and
+     * unrelated control-register writes. */
+    gte.FLAG = cpu->gte_ctrl[31];
 }
 
 extern "C" uint32_t gte_read_data(CPUState* cpu, uint8_t reg) {
