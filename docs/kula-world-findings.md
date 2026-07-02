@@ -254,3 +254,39 @@ oracle-matched. funcs still cycle (0xf40/0x2dbc) and frames advance, so it is
 a spin-wait: the game polls a condition its CD-init never satisfies. NEXT:
 diff the game-phase CD command/response sequence (pc 0x63A14) against the
 oracle's game, which does the same GetStat/Init but then proceeds to read.
+
+
+### Round 7 — remaining wedge localized: CD IRQ pending+enabled but never serviced
+
+With the boot fixed, the visible wedge is the game's libcd CD-init retry.
+Live state during the loop (gdb):
+  i_stat = 0x05  (bit0 VBLANK + bit2 CDROM)   <- CD IRQ IS raised to the CPU
+  i_mask = 0x0d  (bits 0,2,3 enabled)         <- CD IRQ IS enabled
+  cdrom: irq_flag=0x03 (INT3 unacked), response_count=1, response_read=0
+  funcs cycle 0xf40 (ReturnFromException) + 0x2dbc -> CPU DOES take exceptions
+
+So a CD command completed (INT3 + response waiting), the CDROM interrupt is
+pending AND unmasked, and the CPU is taking exceptions (VBLANK bit0 gets
+cleared each frame) -- yet the CDROM bit (bit2) is NEVER cleared and the
+response FIFO is never drained. The game's/libcd's CD interrupt handler in the
+BIOS IRQ chain (IntRP) is not servicing the CD IRQ. libcd's CdSync therefore
+never completes -> the GetStat/Init retry loop -> black screen.
+
+This is a distinct, deeper issue from everything fixed today (it is a BIOS-
+IRQ-chain / libcd-handler / possibly dynamic-handler-install matter, CLAUDE.md
+rule 18 territory), not a CD-response-value bug. NEXT: inspect the BIOS IntRP
+handler chain and whether libcd's CD handler is installed + run; check our CD
+IRQ presentation vs the BIOS root handler's expectations (present_cdrom_irq
+generation latch, and whether the handler that should drain the response FIFO
+and ack is being dispatched at all).
+
+## Session tally (fixes shipped)
+- Bug 1 RAM mirror (memory.c) — FIXED
+- Bug 2 GetID region (cdrom.c + main.cpp) — FIXED
+- Bug 3a CD status bits ADPBUSY/BUSYSTS (cdrom.c) — FIXED (correctness)
+- Bug 3b CD controller version 0x94.. for SCPH-1001 (cdrom.c) — FIXED; removes
+  the spurious boot ReadTOC, boot command stream now matches the oracle
+- Bug 3c (OPEN) libcd CD-IRQ not serviced -> game CD-init never completes
+Tooling built: null-dispatch fntrace freeze, PSX_CD_TRAP_CMD self-stop trap
+(runtime + oracle), PSX_FNTRACE_ALL boot trace, oracle cdrom_cmd_dump hook,
+Linux port of runtime+oracle, beetle-linux build docs + patches.
