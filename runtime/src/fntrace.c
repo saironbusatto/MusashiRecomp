@@ -53,11 +53,18 @@ void fntrace_record(CPUState* cpu, uint32_t target) {
             boot_state_trigger_capture(cpu);
         }
     }
-    if (!armed_match(target)) return;
     /* Honor the one-shot capture freeze (insn_freeze): once latched, the ring
      * preserves the pre-divergence window instead of evicting it. */
     extern int g_insn_log_frozen;
-    if (g_insn_log_frozen) return;
+    int was_frozen = g_insn_log_frozen;
+    /* Null-page dispatch guard: a dispatch whose phys target sits below the
+     * exception vectors (0x80/0xA0) is a jump through a null/garbage pointer —
+     * the wedge itself, never legitimate code. Latch the capture freeze so the
+     * ring preserves the window that led here (this culprit entry, with its
+     * ra, still records; the wedge storm after it does not). */
+    if ((target & 0x1FFFFFFFu) < 0x40u) g_insn_log_frozen = 1;
+    if (!armed_match(target)) return;
+    if (was_frozen) return;
     uint64_t idx = g_fntrace_seq++ & (FNTRACE_RING_CAP - 1);
     FntraceEntry* e = &g_fntrace_ring[idx];
     e->frame  = (uint32_t)s_frame_count;

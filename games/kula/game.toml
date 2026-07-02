@@ -4,6 +4,7 @@
 # the parser normalizes them to KSEG0.
 
 [game]
+name         = "Kula World"
 id           = "SCES-01000"
 exe          = "games/kula/SCES_010.00"
 load_address = "0x80011000"
@@ -13,6 +14,8 @@ stack_base   = "0x801FFFF0"
 disc         = "games/kula/Kula World (Europe).cue"
 
 [recompiler]
+# No Ghidra seeds yet — discovery walks the call graph from entry_pc alone.
+seeds   = "games/kula/seeds.txt"
 out_dir = "games/kula/generated"
 strict  = true
 

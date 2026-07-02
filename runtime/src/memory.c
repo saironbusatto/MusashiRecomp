@@ -30,6 +30,19 @@ static uint8_t ram[RAM_SIZE];
 static uint8_t scratchpad[SCRATCHPAD_SIZE];
 static uint8_t bios_rom[BIOS_ROM_SIZE];
 
+/* Physical address translation for guest accesses. The 2 MB main RAM is
+ * mirrored 4x across the first 8 MB of each segment (mem-ctrl RAM_SIZE
+ * register, default 0x0B88) and games rely on it — Kula World's crt0
+ * parks $sp in the 4th mirror (0x807FFFF8). Fold the mirrors here so the
+ * RAM bounds checks below see canonical offsets; without this, mirror
+ * writes fell into the open-bus no-op and mirror reads returned 0 (the
+ * guest's stack silently vanished and $ra came back as 0). */
+static inline uint32_t psx_phys_addr(uint32_t addr) {
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys < 0x00800000u) phys &= (uint32_t)(RAM_SIZE - 1);
+    return phys;
+}
+
 /* Expose RAM pointer for oracle comparison (find_first_divergence). */
 uint8_t *memory_get_ram_ptr(void) { return ram; }
 uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
@@ -648,7 +661,7 @@ uint32_t psx_read_word(uint32_t addr) {
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) return cache_ctrl;
 
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
         return  (uint32_t)ram[phys]
@@ -689,7 +702,7 @@ void psx_write_word(uint32_t addr, uint32_t val) {
      * We have no cache model, so silently discard RAM/scratchpad writes. */
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
@@ -730,7 +743,7 @@ void psx_write_word(uint32_t addr, uint32_t val) {
 }
 
 uint16_t psx_read_half(uint32_t addr) {
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
         return (uint16_t)ram[phys] | ((uint16_t)ram[phys + 1] << 8);
@@ -754,7 +767,7 @@ uint16_t psx_read_half(uint32_t addr) {
 void psx_write_half(uint32_t addr, uint16_t val) {
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
@@ -786,7 +799,7 @@ void psx_write_half(uint32_t addr, uint16_t val) {
 }
 
 uint8_t psx_read_byte(uint32_t addr) {
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
         return ram[phys];
@@ -823,7 +836,7 @@ uint8_t psx_read_byte(uint32_t addr) {
 extern void psx_advance_cycles(uint32_t cycles);
 
 static inline void charge_main_ram_read(uint32_t addr) {
-    if ((addr & 0x1FFFFFFFu) < RAM_SIZE) psx_advance_cycles(PSX_RAM_READ_WAIT_CYCLES);
+    if (psx_phys_addr(addr) < RAM_SIZE) psx_advance_cycles(PSX_RAM_READ_WAIT_CYCLES);
 }
 
 uint32_t psx_guest_read_word(uint32_t addr) { charge_main_ram_read(addr); return psx_read_word(addr); }
@@ -833,7 +846,7 @@ uint8_t  psx_guest_read_byte(uint32_t addr) { charge_main_ram_read(addr); return
 void psx_write_byte(uint32_t addr, uint8_t val) {
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_phys_addr(addr);
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);

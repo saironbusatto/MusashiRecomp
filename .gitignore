@@ -83,3 +83,4 @@ _wip/
 # Only the per-game config (game.toml) is tracked.
 games/*/*
 !games/*/game.toml
+!games/*/seeds.txt
