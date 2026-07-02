@@ -7607,24 +7607,33 @@ static void handle_irqctx_ring(int id, const char *json)
 {
     (void)json;
     typedef struct { uint64_t seq, cycle; uint32_t frame, istat, imask, sr, d44,
-                     cdrom_active, is_vblank; int dma_depth; } E;
+                     cdrom_active, is_vblank; int dma_depth;
+                     uint32_t take_pc, real_epc, exit_pc, exit_reason, same_thread,
+                     restored, v1_exit, v1_saved, ra_exit, ra_saved, redirects; } E;
     extern E g_irqctx_ring[]; extern uint64_t g_irqctx_seq;
     uint64_t total = g_irqctx_seq; uint32_t cap = 64u;
     uint32_t n = total < cap ? (uint32_t)total : cap;
-    char buf[16384]; size_t pos = 0;
+    static char buf[49152]; size_t pos = 0;
     pos += snprintf(buf + pos, sizeof(buf) - pos,
                     "{\"id\":%d,\"ok\":true,\"total\":%llu,\"entries\":[",
                     id, (unsigned long long)total);
-    for (uint32_t i = 0; i < n && pos < sizeof(buf) - 256; i++) {
+    for (uint32_t i = 0; i < n && pos < sizeof(buf) - 512; i++) {
         uint64_t idx = total - n + i;
         E *e = &g_irqctx_ring[idx & (cap - 1u)];
         pos += snprintf(buf + pos, sizeof(buf) - pos,
             "%s{\"seq\":%llu,\"cycle\":%llu,\"frame\":%u,\"vblank\":%u,"
             "\"d44\":\"0x%08X\",\"cdrom_active\":%u,\"dma_depth\":%d,"
-            "\"sr\":\"0x%08X\",\"istat\":\"0x%08X\",\"imask\":\"0x%08X\"}",
+            "\"sr\":\"0x%08X\",\"istat\":\"0x%08X\",\"imask\":\"0x%08X\","
+            "\"take_pc\":\"0x%08X\",\"real_epc\":\"0x%08X\",\"exit_pc\":\"0x%08X\","
+            "\"exit_reason\":%u,\"same_thread\":%u,\"restored\":%u,"
+            "\"v1_exit\":\"0x%08X\",\"v1_saved\":\"0x%08X\","
+            "\"ra_exit\":\"0x%08X\",\"ra_saved\":\"0x%08X\",\"redirects\":%u}",
             i ? "," : "", (unsigned long long)e->seq, (unsigned long long)e->cycle,
             e->frame, e->is_vblank, e->d44, e->cdrom_active, e->dma_depth,
-            e->sr, e->istat, e->imask);
+            e->sr, e->istat, e->imask,
+            e->take_pc, e->real_epc, e->exit_pc, e->exit_reason, e->same_thread,
+            e->restored, e->v1_exit, e->v1_saved, e->ra_exit, e->ra_saved,
+            e->redirects);
     }
     pos += snprintf(buf + pos, sizeof(buf) - pos, "]}");
     debug_server_send_line(buf);

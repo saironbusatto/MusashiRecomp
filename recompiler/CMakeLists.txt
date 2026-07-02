@@ -89,6 +89,34 @@ if(MINGW OR WIN32)
     target_link_options(psxrecomp-game PRIVATE -Wl,--stack,16777216)
 endif()
 
+# ---- baked codegen hash (stale-binary guard) --------------------------------
+# Bake the SAME emitter-source hash the runtime folds into its overlay cache
+# tag (runtime/runtime.cmake -> hash_codegen.cmake, shared canonical list in
+# runtime/codegen_hash_sources.cmake) into THIS binary, exposed via
+# `psxrecomp-game --codegen-hash`. compile_overlays.py compares it against the
+# hash it stamps on the cache dir (from --runtime-include) and HARD-FAILS on
+# mismatch. Closes the 2026-07-01 Tomba pause-menu wedge class: a stale
+# recompiler binary emitting shards that get filed under the CURRENT cg tag
+# (read tag == write tag, content stale — invisible to the tag alone).
+set(PSXRECOMP_CODEGEN_HASH_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../runtime/codegen_hash_sources.cmake)
+set(_baked_hash_hdr ${CMAKE_CURRENT_BINARY_DIR}/psxrecomp_baked_codegen_hash.h)
+add_custom_command(
+    OUTPUT  ${_baked_hash_hdr}
+    COMMAND ${CMAKE_COMMAND} -DOUT=${_baked_hash_hdr}
+            "-DSRCS=${PSXRECOMP_CODEGEN_HASH_SRCS}"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/hash_codegen.cmake
+    DEPENDS ${PSXRECOMP_CODEGEN_HASH_SRCS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../runtime/hash_codegen.cmake
+    COMMENT "Hashing codegen sources -> psxrecomp_baked_codegen_hash.h"
+    VERBATIM)
+add_custom_target(psxrecomp_baked_codegen_hash DEPENDS ${_baked_hash_hdr})
+add_dependencies(psxrecomp-game psxrecomp_baked_codegen_hash)
+# Force main_psx.cpp to recompile whenever the hash header content changes
+# (same OBJECT_DEPENDS hardening as runtime.cmake — __has_include depfile gap).
+set_source_files_properties(src/main_psx.cpp PROPERTIES OBJECT_DEPENDS ${_baked_hash_hdr})
+target_include_directories(psxrecomp-game PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+
 add_executable(PSXRecomp ${PSXRECOMP_GAME_SOURCES})
 target_include_directories(PSXRecomp PRIVATE
     include

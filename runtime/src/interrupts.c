@@ -52,6 +52,21 @@ typedef struct {
     uint64_t seq, cycle;
     uint32_t frame, istat, imask, sr, d44, cdrom_active, is_vblank;
     int      dma_depth;
+    /* Exception-EXIT half (Tomba menu IRQ-resume wedge): filled when this
+     * delivery returns to the interrupted code, so the ring shows for EVERY
+     * delivery which escape path fired and whether the interrupted GPRs were
+     * restored. take_pc/real_epc are the entry-side resume selection. */
+    uint32_t take_pc;      /* resume PC selected at entry (0 = boundary/sentinel) */
+    uint32_t real_epc;     /* g_exception_real_epc installed at entry */
+    uint32_t exit_pc;      /* cpu->pc at the restore decision */
+    uint32_t exit_reason;  /* g_exc_escape_reason at exit */
+    uint32_t same_thread;  /* same_thread_resume discriminator result */
+    uint32_t restored;     /* saved_gpr restore fired */
+    uint32_t v1_exit;      /* cpu->gpr[3] at exit before restore decision */
+    uint32_t v1_saved;     /* saved_gpr[3] (interrupted code's v1) */
+    uint32_t ra_exit;      /* cpu->gpr[31] at exit before restore decision */
+    uint32_t ra_saved;     /* saved_gpr[31] */
+    uint32_t redirects;    /* jmp_val==2 RestoreState redirects in this delivery */
 } IrqCtxEntry;
 IrqCtxEntry g_irqctx_ring[IRQCTX_RING_CAP];
 uint64_t    g_irqctx_seq = 0;
@@ -743,6 +758,18 @@ void psx_check_interrupts(CPUState* cpu) {
         cosim_irq_note(cpu, 1u, real_pc, g_dirty_safe_resume_pc,
                        s_compiled_interrupt_resume_pc, sr);
 #endif
+        /* Ring exit-half init: record the entry-side resume selection now; the
+         * exit fields are filled at the restore decision below. No nesting is
+         * possible between here and there (in_exception blocks re-entry), so
+         * (g_irqctx_seq - 1) is this delivery's entry. */
+        {
+            IrqCtxEntry *e = &g_irqctx_ring[(g_irqctx_seq - 1u) & (IRQCTX_RING_CAP - 1u)];
+            e->take_pc  = real_pc;
+            e->real_epc = g_exception_real_epc;
+            e->exit_pc = 0; e->exit_reason = 0; e->same_thread = 0;
+            e->restored = 0; e->v1_exit = 0; e->v1_saved = 0;
+            e->ra_exit = 0; e->ra_saved = 0; e->redirects = 0;
+        }
     }
 
     /* Save the interrupted code's full register state.
@@ -830,6 +857,7 @@ void psx_check_interrupts(CPUState* cpu) {
             /* RestoreState redirect: re-dispatch to cpu->pc.
              * GPRs were already set by RestoreState — do NOT restore.
              * Stay in exception context so ReturnFromException works. */
+            g_irqctx_ring[(g_irqctx_seq - 1u) & (IRQCTX_RING_CAP - 1u)].redirects++;
             g_psx_dispatch_depth = 0;
             debug_server_log_restore_event(3, cpu->pc, (uint32_t)jmp_val);
             target_pc = cpu->pc;
@@ -873,7 +901,45 @@ void psx_check_interrupts(CPUState* cpu) {
      * restored the RESUMED thread's GPRs from its TCB; overwriting them with our
      * saved_gpr would clobber the resumed thread with the state of the thread that
      * ENTERED the exception (the cross-thread corruption fix B exists to prevent). */
-    if (g_exc_escape_reason == PSX_EXC_ESCAPE_LEGACY_SENTINEL) {
+    /* Fix B refinement (2026-07-01, Tomba pause-menu wedge): restore the
+     * interrupted GPRs whenever this resume returns to the SAME thread it
+     * interrupted — either the LEGACY sentinel exit, OR a real-EPC RFE that
+     * resumes at exactly the PC we installed as EPC (no ChangeThread happened).
+     *
+     * Real hardware saves and restores ALL GPRs across every exception, so a
+     * transparent same-thread interrupt must give the interrupted code its exact
+     * pre-exception registers back. The original Fix B skipped this for all
+     * real-EPC resumes, trusting the recompiled BIOS handler's TCB restore — but
+     * for a same-thread compiled resume that restore is incomplete, so a live
+     * value held in a register across a block-leader IRQ check gets clobbered by
+     * the handler. Concretely: Tomba's pause-menu frame-wait spin holds its loop
+     * bound (256) in gpr[3] across 0x80016588; a VBLANK there returned gpr[3]=1,
+     * so the wait exited early every frame and the menu never opened.
+     *
+     * A GENUINE ChangeThread resumes a DIFFERENT thread at its own PC (!= our
+     * EPC); there the BIOS handler restored the NEW thread's GPRs from its TCB
+     * and saved_gpr holds the thread that ENTERED the exception — restoring it
+     * would reintroduce the MMX6 cooperative-thread corruption Fix B prevents. */
+    int same_thread_resume =
+        (g_exc_escape_reason != PSX_EXC_ESCAPE_LEGACY_SENTINEL) &&
+        g_exception_real_epc != 0u &&
+        same_guest_pc(cpu->pc, g_exception_real_epc);
+    int do_restore =
+        (g_exc_escape_reason == PSX_EXC_ESCAPE_LEGACY_SENTINEL || same_thread_resume);
+    /* Ring exit-half: every delivery records which escape path it took and
+     * whether the interrupted GPRs were restored (Tomba menu wedge evidence). */
+    {
+        IrqCtxEntry *e = &g_irqctx_ring[(g_irqctx_seq - 1u) & (IRQCTX_RING_CAP - 1u)];
+        e->exit_pc     = cpu->pc;
+        e->exit_reason = (uint32_t)g_exc_escape_reason;
+        e->same_thread = (uint32_t)same_thread_resume;
+        e->restored    = (uint32_t)do_restore;
+        e->v1_exit     = cpu->gpr[3];
+        e->v1_saved    = saved_gpr[3];
+        e->ra_exit     = cpu->gpr[31];
+        e->ra_saved    = saved_gpr[31];
+    }
+    if (do_restore) {
         for (int i = 0; i < 32; i++) cpu->gpr[i] = saved_gpr[i];
         cpu->hi = saved_hi;
         cpu->lo = saved_lo;

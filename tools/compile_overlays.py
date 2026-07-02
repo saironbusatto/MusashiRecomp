@@ -75,6 +75,45 @@ def codegen_hash(runtime_include: str) -> int:
     return 0
 
 
+def verify_recompiler_matches_tag(recompiler: str, tag_hash: int) -> None:
+    """Stale-recompiler-binary guard. The cg tag hash is computed from the
+    EMITTER SOURCES (via --runtime-include's overlay_codegen_hash.h), but the
+    code is emitted by the --recompiler BINARY — nothing else ties the two.
+    A recompiler built before the last emitter change happily emits OLD code
+    that gets stamped with the CURRENT tag: read tag == write tag, content
+    stale (the 2026-07-01 Tomba pause-menu wedge; loaded-save scene shards
+    corrupted the display-list queue while every tag check passed).
+
+    psxrecomp-game bakes the same hash at ITS build time and prints it via
+    --codegen-hash. Any mismatch — including a binary too old to support the
+    flag — is a HARD failure: rebuild the recompiler, never build shards."""
+    import subprocess
+    try:
+        out = subprocess.run([recompiler, '--codegen-hash'],
+                             capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        raise SystemExit(f'FATAL: cannot execute {recompiler} for --codegen-hash '
+                         f'staleness check: {e}')
+    line = (out.stdout or '').strip().splitlines()
+    baked = line[0].strip() if line else ''
+    if out.returncode != 0 or not re.fullmatch(r'[0-9a-fA-F]{8}', baked or ''):
+        raise SystemExit(
+            f'FATAL: {recompiler} does not support --codegen-hash (or errored).\n'
+            f'  This binary predates the stale-recompiler guard and CANNOT be\n'
+            f'  verified against the emitter sources. Rebuild it:\n'
+            f'    cmake --build <recompiler-build-dir> --target psxrecomp-game')
+    if int(baked, 16) != tag_hash:
+        raise SystemExit(
+            f'FATAL: STALE RECOMPILER BINARY.\n'
+            f'  {recompiler}\n'
+            f'  was built from emitter sources hashing {baked}, but the runtime\n'
+            f'  tree stamps cache tag hash {tag_hash:08x}. Shards it emits would\n'
+            f'  carry the current tag with OLD codegen semantics (the silent\n'
+            f'  stale-shard class). Rebuild the recompiler first:\n'
+            f'    cmake --build <recompiler-build-dir> --target psxrecomp-game')
+    print(f'recompiler codegen hash verified: {baked} == cg tag hash')
+
+
 def cache_arch_abi() -> str:
     """Canonical cache arch-abi tag, IDENTICAL to overlay_loader.c's
     PSX_OVERLAY_ARCH_ABI ("<os>-<arch>": win|linux|macos + x64|arm64|x86).
@@ -1531,6 +1570,10 @@ def main():
     toml = tomllib.loads(raw.decode('utf-8'))
     game_id = toml.get('game', {}).get('id', 'UNKNOWN')
     print(f'Game ID: {game_id}')
+
+    # Stale-recompiler-binary guard — BOTH modes (static overlays are just as
+    # wrong when emitted by a stale binary; they simply have no tag to hide in).
+    verify_recompiler_matches_tag(args.recompiler, codegen_hash(args.runtime_include))
 
     if args.static:
         static_out = os.path.join(args.out_dir, 'overlays_static.c')
