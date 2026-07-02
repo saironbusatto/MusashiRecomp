@@ -163,3 +163,32 @@ selects between these kernel CD-init paths. The 0xBFC0Dxxx CD-driver region
 is not covered by docs/psx_bios_disasm.txt — needs Ghidra (source of truth
 #2) or manual decode of those ROM bytes. The game-side wedge (GetStat/Init
 retry loop) is downstream of this boot-flow divergence.
+
+
+### Round 4 — status-register fix + boot-diff instrumentation status
+
+Fixed vs the oracle source (beetle cdc.cpp Read A==0): our 0x1F801800
+status register raised bit 2 (ADPBUSY, "XA-ADPCM playing") permanently —
+it must idle at 0 — and never raised bit 7 (BUSYSTS, command written but
+response not ready; now mapped to our queued-command window). Verified the
+fix does NOT change the boot command stream, so ADPBUSY was not the branch
+input steering the early boot; the fix stands on correctness regardless.
+
+Environment note: the "everything got 40x slower" mystery was real and
+environmental — leftover wedged instances before a container restart. A
+clean baseline runs ~50 fps and reaches the frame-890 re-check in ~13 s.
+Rule-15 lesson: measure the baseline before blaming the tool.
+
+Instrumentation gap found while diffing boots: the oracle's cdcmd hook has
+no guest PC, and reconstructing command writes from wtrace (index-register
+tracking) is unreliable because IRQ handlers interleave index changes.
+Also learned: pc 0x63A14 is simply the game driver's generic
+write-byte-to-CD-register routine (same pc for all registers, on the
+oracle too) — not specific to the retry loop.
+
+NEXT (small, sharp): extend the beetle cdcmd hook with the guest PC
+(PS_CPU exposes it), recapture both boot command streams with PCs, and
+diff the first divergent command's call site. Then disassemble that
+site's branch (capstone is installed) and inspect its inputs on both
+sides. All tooling for this exists after this session: self-stop trap,
+command-history ring parse, oracle cdcmd dump, oracle wtrace/fntrace.

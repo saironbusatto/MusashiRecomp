@@ -1424,11 +1424,19 @@ uint32_t cdrom_read(uint32_t addr) {
     switch (addr) {
     case 0x1F801800: {
         uint8_t s = index_reg & 0x03;
-        s |= (1 << 2); /* ADPCM empty */
+        /* Bit 2 is ADPBUSY (XA-ADPCM playback in progress), NOT "ADPCM
+         * empty" — it must idle at 0. The oracle (beetle cdc.cpp, Read
+         * A==0) never raises it. Raising it permanently made every BIOS
+         * status poll see "XA busy" and steered the kernel CD driver
+         * init down a different branch from real hardware. */
         if (param_count == 0) s |= (1 << 3);
         if (param_count < PARAM_FIFO_SIZE) s |= (1 << 4);
         if (response_read < response_count) s |= (1 << 5);
         if (data_fifo_ready()) s |= (1 << 6);
+        /* Bit 7 BUSYSTS: command written but not yet executed (our queued
+         * path; the synchronous path leaves no guest-observable window).
+         * Mirrors beetle's PendingCommandCounter/phase<=1 busy window. */
+        if (queued_cmd.pending) s |= (1 << 7);
         ret = s;
         break;
     }
