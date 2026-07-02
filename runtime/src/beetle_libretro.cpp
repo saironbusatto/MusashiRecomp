@@ -59,15 +59,16 @@ static void sio_trace_callback(uint8_t tx, uint8_t rx, uint16_t ctrl) {
 /* ---- CD command trace (oracle-diff for the Kula World CD-init wedge) ---- */
 #define BEETLE_CDCMD_TRACE_CAP 8192
 struct BeetleCdcmdEntry {
-    uint32_t seq; uint8_t cmd, nargs, a0, a1, a2;
+    uint32_t seq; uint32_t pc; uint8_t cmd, nargs, a0, a1, a2;
 };
 static BeetleCdcmdEntry s_cdcmd_trace[BEETLE_CDCMD_TRACE_CAP];
 static int      s_cdcmd_idx = 0;
 static uint32_t s_cdcmd_seq = 0;
 static void cdcmd_trace_callback(uint8_t cmd, uint8_t nargs,
-                                 uint8_t a0, uint8_t a1, uint8_t a2) {
+                                 uint8_t a0, uint8_t a1, uint8_t a2,
+                                 uint32_t pc) {
     BeetleCdcmdEntry *e = &s_cdcmd_trace[s_cdcmd_idx];
-    e->seq = s_cdcmd_seq++; e->cmd = cmd; e->nargs = nargs;
+    e->seq = s_cdcmd_seq++; e->pc = pc; e->cmd = cmd; e->nargs = nargs;
     e->a0 = a0; e->a1 = a1; e->a2 = a2;
     s_cdcmd_idx = (s_cdcmd_idx + 1) % BEETLE_CDCMD_TRACE_CAP;
 }
@@ -574,6 +575,7 @@ extern "C" void beetle_reset_sio_trace(void) {
 extern "C" uint32_t beetle_get_cdcmd_trace(uint32_t *out_seq, uint8_t *out_cmd,
                                            uint8_t *out_nargs, uint8_t *out_a0,
                                            uint8_t *out_a1, uint8_t *out_a2,
+                                           uint32_t *out_pc,
                                            int max_count)
 {
     int avail = (int)(s_cdcmd_seq < (uint32_t)BEETLE_CDCMD_TRACE_CAP
@@ -588,6 +590,7 @@ extern "C" uint32_t beetle_get_cdcmd_trace(uint32_t *out_seq, uint8_t *out_cmd,
         out_a0[i]    = e->a0;
         out_a1[i]    = e->a1;
         out_a2[i]    = e->a2;
+        out_pc[i]    = e->pc;
     }
     return (uint32_t)count;
 }
