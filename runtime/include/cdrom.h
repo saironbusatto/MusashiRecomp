@@ -8,6 +8,9 @@ extern "C" {
 #endif
 
 void cdrom_init(const char* cue_path);
+/* Disc license region for GetID ("SCEE"/"SCEA"/"SCEI"); derived from the
+ * mounted disc's boot serial at launch. Defaults to "SCEA" (SCPH1001). */
+void cdrom_set_disc_scex(const char scex[4]);
 
 /* Set disc speed multiplier immediately. divisor=0 → instant, 1 → 1x, 2 → 2x. */
 void cdrom_set_speed(int divisor);

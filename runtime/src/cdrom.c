@@ -43,6 +43,21 @@ static uint8_t request_reg;
 static uint8_t irq_enable;
 static uint8_t irq_flag;
 
+/* Disc license region string returned in GetID's last four response bytes
+ * ("SCEE" PAL / "SCEA" NTSC-U / "SCEI" NTSC-J). Real hardware reports the
+ * region of the INSERTED DISC (mechacon reads it from the license area);
+ * the BIOS CD driver revalidates it when the kernel CD subsystem
+ * reinitializes mid-game, and a mismatch throws it into an endless
+ * GetStat/Init retry loop (Kula World wedged at its first level load this
+ * way). Set from the mounted disc's SYSTEM.CNF serial at launch
+ * (main.cpp); the default matches the console region of the one supported
+ * BIOS (SCPH1001, NTSC-U). */
+static uint8_t disc_scex[4] = { 'S', 'C', 'E', 'A' };
+
+void cdrom_set_disc_scex(const char scex[4]) {
+    memcpy(disc_scex, scex, 4);
+}
+
 /* CPS-native CD interrupt single-outstanding latch.
  *
  * The CD controller serializes responses: it presents one INT to the CPU
@@ -1261,10 +1276,10 @@ static void process_pending(uint32_t cycles) {
             response_push(0x00);
             response_push(0x20);
             response_push(0x00);
-            response_push('S');
-            response_push('C');
-            response_push('E');
-            response_push('I');
+            response_push(disc_scex[0]);
+            response_push(disc_scex[1]);
+            response_push(disc_scex[2]);
+            response_push(disc_scex[3]);
             set_irq(CDIRQ_COMPLETE);
         }
         fire_cdrom_irq();
