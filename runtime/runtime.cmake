@@ -8,6 +8,25 @@ if(NOT DEFINED PSXRECOMP_ROOT)
     get_filename_component(PSXRECOMP_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 endif()
 
+# Content-addressed compiler cache (ccache). git branch operations (checkout /
+# merge / new branch) rewrite working-tree file mtimes, which makes ninja treat
+# the ~279 MB generated-C objects as stale and recompile them (~15 min) even when
+# their content is byte-identical. ccache keys the object on the PREPROCESSED
+# SOURCE + compiler + flags (content, not mtime), so those recompiles collapse to
+# near-instant cache hits after any branch op. Completely no-op when ccache is not
+# on PATH, so builds still work without it. Set once, before any target is added.
+if(NOT DEFINED CMAKE_C_COMPILER_LAUNCHER)
+    find_program(CCACHE_PROGRAM ccache)
+    if(CCACHE_PROGRAM)
+        set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}" CACHE STRING "compiler launcher")
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}" CACHE STRING "compiler launcher")
+        message(STATUS "psxrecomp: ccache enabled (${CCACHE_PROGRAM}) — mtime-proof rebuilds")
+    else()
+        message(STATUS "psxrecomp: ccache not found; generated-C rebuilds after git "
+                       "branch ops will be slow. Install ccache on PATH to fix.")
+    endif()
+endif()
+
 # PSX_DEBUG_TOOLS: TCP debug server + heartbeat + per-block recording.
 # Defaults ON for Debug/RelWithDebInfo, OFF for Release/MinSizeRel so
 # a plain cmake -DCMAKE_BUILD_TYPE=Release gives a lean production binary
@@ -292,15 +311,11 @@ function(psxrecomp_add_runtime_target target)
     # once (shared across psx-runtime/psx-beetle); idempotent write avoids rebuilds.
     set(_codegen_hash_hdr ${PSXRECOMP_ROOT}/runtime/include/overlay_codegen_hash.h)
     if(NOT TARGET psxrecomp_codegen_hash)
-        set(_codegen_srcs
-            ${PSXRECOMP_ROOT}/recompiler/src/code_generator.cpp
-            ${PSXRECOMP_ROOT}/recompiler/src/mips_decoder.cpp
-            ${PSXRECOMP_ROOT}/recompiler/src/control_flow.cpp
-            ${PSXRECOMP_ROOT}/recompiler/src/basic_block.cpp
-            ${PSXRECOMP_ROOT}/recompiler/src/function_analysis.cpp
-            ${PSXRECOMP_ROOT}/recompiler/src/full_function_emitter.h
-            ${PSXRECOMP_ROOT}/recompiler/src/strict_translator.h
-            ${PSXRECOMP_ROOT}/recompiler/src/function_discovery.h)
+        # Canonical source list shared with recompiler/CMakeLists.txt (which bakes
+        # the SAME hash into psxrecomp-game for the --codegen-hash staleness guard).
+        set(PSXRECOMP_CODEGEN_HASH_ROOT ${PSXRECOMP_ROOT})
+        include(${PSXRECOMP_ROOT}/runtime/codegen_hash_sources.cmake)
+        set(_codegen_srcs ${PSXRECOMP_CODEGEN_HASH_SRCS})
         add_custom_command(
             OUTPUT  ${_codegen_hash_hdr}
             COMMAND ${CMAKE_COMMAND} -DOUT=${_codegen_hash_hdr} "-DSRCS=${_codegen_srcs}"

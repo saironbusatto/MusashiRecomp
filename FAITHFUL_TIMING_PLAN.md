@@ -213,6 +213,31 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-07-01 (Tomba pause-menu wedge RESOLVED — stale-recompiler shards, guard shipped):**
+  The post-merge Tomba menu wedge (loaded saves only) was NOT the IRQ-resume class the
+  prior handoff claimed. Added an always-on exception-EXIT half to irqctx_ring
+  (interrupts.c: take_pc/real_epc/exit_pc/exit_reason/same_thread/restored/v1/ra/redirects)
+  — it proved every VBLANK resume restores the interrupted GPRs correctly, and the
+  0x80016588 "spin" is the normal per-frame vsync wait. Real root cause: autocompiled
+  overlay shards were emitted by a recompiler binary (build-t2, 07:39) OLDER than the
+  09:28 emitter changes (553d993), yet stamped with the CURRENT cg tag (compile_overlays
+  derives the tag from --runtime-include, nothing verified the emitting binary). The
+  stale-emitter shards corrupted the display-list task queue (0x801FD800 slots) during
+  load-game at Stormy Mountain → menu drew nothing. Repro matrix (compiled/interp ×
+  newgame/load), cache-absent A/B, and RAM diff (empty OT 0x8009CA10 vs linked prims
+  @0x800Bxxxx) pinned it; recompiler mtime vs emitter commit time was the smoking gun.
+  FIXED: rebuilt recompiler, purged + regenerated build-cosim AND build-prod caches —
+  menu opens with cache fully enabled. GUARD (class-closing, general): psxrecomp-game
+  now bakes the emitter-source hash (shared canonical list
+  runtime/codegen_hash_sources.cmake + hash_codegen.cmake) and prints it via
+  `--codegen-hash`; compile_overlays.py HARD-FAILS when the binary hash ≠ the tag hash
+  (verified positive + negative, both cache and --static modes). Kept the
+  same_thread_resume GPR-restore refinement in interrupts.c (ring-verified equal-value
+  no-op in practice; faithful). Tooling gaps logged in memory
+  (divergence_tooling_gaps_2026_07_01). PENDING: MMX6 cutscene→gameplay gate
+  (interrupts.c changed), user validation of prod build (menu + title/save-menu lag —
+  lag likely the same stale-shard all-interp fallback + rehash churn).
+
 - **2026-06-27 (device-region MMIO read waits — DONE, branch wt/tomba2-mmio-waits off the
   I-cache tip):** Replaced the placeholder `region = (phys<RAM_SIZE)?3:0` in psx_cyc_readmem
   (memory.c) with the full Beetle MemRW device-region read-wait table (libretro.cpp:859-1131),

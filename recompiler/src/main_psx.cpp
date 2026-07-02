@@ -17,6 +17,21 @@
 #include "rabbitizer.hpp"
 #include "fmt/format.h"
 
+/* Baked emitter-source hash (recompiler/CMakeLists.txt custom command; same
+ * hash_codegen.cmake + canonical source list as the runtime's overlay cache
+ * tag). Exposed via --codegen-hash so compile_overlays.py can verify THIS
+ * binary was built from the same emitter sources as the cg tag it stamps —
+ * the stale-recompiler-binary guard. 0 when built without the bake (guard
+ * consumers treat that as "cannot verify" and fail loudly). */
+#if defined(__has_include)
+#  if __has_include("psxrecomp_baked_codegen_hash.h")
+#    include "psxrecomp_baked_codegen_hash.h"
+#  endif
+#endif
+#ifndef PSX_OVERLAY_CODEGEN_HASH
+#  define PSX_OVERLAY_CODEGEN_HASH 0u
+#endif
+
 namespace {
 
 struct AliasEntry { uint32_t addr, host_start, host_end; };
@@ -54,6 +69,17 @@ void materialize_alias_groups(PSXRecomp::FunctionAnalysisResult& result,
 } // namespace
 
 int main(int argc, char** argv) {
+    /* --codegen-hash: print the baked emitter-source hash and exit. Handled
+     * before the banner so the output is machine-parseable (one hex line).
+     * compile_overlays.py compares this to the hash from --runtime-include and
+     * refuses to build shards with a stale recompiler binary. */
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--codegen-hash") {
+            fmt::print("{:08x}\n", (unsigned)PSX_OVERLAY_CODEGEN_HASH);
+            return 0;
+        }
+    }
+
     fmt::print("PSXRecomp - PlayStation 1 Static Recompiler\n");
     fmt::print("============================================\n\n");
 
