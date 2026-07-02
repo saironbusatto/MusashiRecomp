@@ -78,3 +78,6 @@ __pycache__/
 # DuckStation oracle (local-only; private fork at git@github.com:mstan/duckstation.git)
 /duckstation/
 _wip/
+
+# Game discs/EXEs (copyrighted, not distributable)
+games/
