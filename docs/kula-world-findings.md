@@ -229,3 +229,28 @@ ReadTOC that breaks the game's CD reads. The oracle's shell never sets the
 flag. REMAINING: the single shell branch (in 0x30000-0x35DC8) that sends our
 shell down the 0x36000 path vs the oracle's 0x30000 path, and the hardware/
 memory input it reads. That input is the true first divergence.
+
+
+### Round 6 — version fix removes the spurious ReadTOC (boot now matches oracle)
+
+func_1FC1DF50 (the shell CD-init) sets [0xDFFC]=1 when the CD controller
+version byte (Test 0x20, response[0]) is >= 0x95. Our cdrom.c returned the
+PSone-era 0x97 0x01 0x10 0xC2 (copied from beetle, which hardcodes it for all
+BIOSes) — wrong for the SCPH-1001 BIOS, whose real 1994 sub-CPU reports
+0x94 0x09 0x19 0xC0 (high byte 0x94 < 0x95). Fixed cdrom.c Test 0x20 to the
+SCPH-1001 value.
+
+RESULT: [0xDFFC] no longer becomes 1 (reads 0x6458, a pointer, like the
+oracle's 0x3660); the frame-890 ReadTOC is GONE; the boot command stream now
+matches the oracle's (Setloc->SeekL->Setmode->ReadN->Pause x8, no ReadTOC).
+This is a genuine correctness fix and closes the boot-flow divergence.
+
+BUT the game still wedges: from ~frame 1039 the GAME's own CD driver (pc
+0x63A14, game code) loops GetStat/Init every ~150 frames and never proceeds
+to SeekL/ReadN. So the frame-890 ReadTOC was NOT the wedge cause (round 5's
+conclusion was wrong) — it was a real but separate inaccuracy. The true wedge
+is downstream, in the GAME's CD-init retry, and persists with the boot now
+oracle-matched. funcs still cycle (0xf40/0x2dbc) and frames advance, so it is
+a spin-wait: the game polls a condition its CD-init never satisfies. NEXT:
+diff the game-phase CD command/response sequence (pc 0x63A14) against the
+oracle's game, which does the same GetStat/Init but then proceeds to read.

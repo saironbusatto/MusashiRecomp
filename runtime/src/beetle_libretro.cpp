@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdarg>
+#include <csignal>
 
 #include "libretro.h"
 #include "mednafen/psx/psx.h"
@@ -67,6 +68,19 @@ static uint32_t s_cdcmd_seq = 0;
 static void cdcmd_trace_callback(uint8_t cmd, uint8_t nargs,
                                  uint8_t a0, uint8_t a1, uint8_t a2,
                                  uint32_t pc) {
+    /* Symmetric self-stop trap (mirror of the runtime's PSX_CD_TRAP_CMD):
+     * SIGSTOP on the Nth matching CD command so a debugger can freeze the
+     * oracle at the exact boot point and diff its state against ours. */
+    {
+        static long trap_cmd = -2, trap_nth = 1, hits = 0;
+        if (trap_cmd == -2) {
+            const char *e2 = getenv("PSX_CD_TRAP_CMD");
+            trap_cmd = (e2 && *e2) ? strtol(e2, NULL, 0) : -1;
+            const char *e3 = getenv("PSX_CD_TRAP_NTH");
+            if (e3 && *e3) trap_nth = strtol(e3, NULL, 0);
+        }
+        if ((long)cmd == trap_cmd && ++hits == trap_nth) raise(SIGSTOP);
+    }
     BeetleCdcmdEntry *e = &s_cdcmd_trace[s_cdcmd_idx];
     e->seq = s_cdcmd_seq++; e->pc = pc; e->cmd = cmd; e->nargs = nargs;
     e->a0 = a0; e->a1 = a1; e->a2 = a2;

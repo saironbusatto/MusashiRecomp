@@ -1213,10 +1213,19 @@ static void exec_command(uint8_t cmd) {
 
     case 0x19: /* Test */
         if (param_count >= 1 && param_fifo[0] == 0x20) {
-            response_push(0x97);
-            response_push(0x01);
-            response_push(0x10);
-            response_push(0xC2);
+            /* CD controller firmware version (BCD date + region). This BIOS is
+             * SCPH-1001, whose sub-CPU reports the 1994 controller: 94/09/19 C0.
+             * The value must be < 0x95 in the high byte — the shell's CD-init
+             * (func at ROM 0x1DF50) sets kernel flag [0xA000DFFC]=1 when the
+             * version byte >= 0x95, which later makes the boot CD-open
+             * (0xBFC0D570) issue a spurious ReadTOC that wedges the game's
+             * streaming reads. Beetle hardcodes the PSone-era 0x97 regardless of
+             * BIOS, which is wrong for SCPH-1001; matching the real 1994
+             * controller keeps the flag clear (Kula World demo-load wedge). */
+            response_push(0x94);
+            response_push(0x09);
+            response_push(0x19);
+            response_push(0xC0);
             set_irq(CDIRQ_ACK);
         } else {
             response_push(stat_reg);
