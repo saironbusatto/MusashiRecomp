@@ -1,3 +1,19 @@
+diff --git a/libretro.cpp b/libretro.cpp
+index d2e82bca..e9c867c8 100644
+--- a/libretro.cpp
++++ b/libretro.cpp
+@@ -508,6 +508,11 @@ PS_SPU *PSX_SPU = NULL;
+ PS_CDC *PSX_CDC = NULL;
+ FrontIO *PSX_FIO = NULL;
+ 
++/* PSXRecomp oracle hooks: NULL when no listener attached. */
++psxrecomp_wtrace_cb_t  g_psxrecomp_wtrace_cb  = NULL;
++psxrecomp_fntrace_cb_t g_psxrecomp_fntrace_cb = NULL;
++psxrecomp_cdcmd_cb_t   g_psxrecomp_cdcmd_cb   = NULL;
++
+ MultiAccessSizeMem<512 * 1024, uint32, false> *BIOSROM = NULL;
+ MultiAccessSizeMem<65536, uint32, false> *PIOMem = NULL;
+ MultiAccessSizeMem<2048 * 1024, uint32, false> *MainRAM = NULL;
 diff --git a/mednafen/psx/cdc.cpp b/mednafen/psx/cdc.cpp
 index 1daaa5b7..a6b31b66 100644
 --- a/mednafen/psx/cdc.cpp

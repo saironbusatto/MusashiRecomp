@@ -192,3 +192,40 @@ diff the first divergent command's call site. Then disassemble that
 site's branch (capstone is installed) and inspect its inputs on both
 sides. All tooling for this exists after this session: self-stop trap,
 command-history ring parse, oracle cdcmd dump, oracle wtrace/fntrace.
+
+
+### Round 5 — ROOT MECHANISM FOUND: kernel flag [0xDFFC] drives the frame-890 ReadTOC
+
+New tool: PSX_FNTRACE_ALL=1 records every dispatch from power-on (fntrace.c),
+so the ring holds the earliest boot execution for offline diffs.
+
+Full mechanistic chain of the wedge, traced with the self-stop trap +
+fntrace-all + a gdb watchpoint + capstone disassembly of the ROM:
+
+1. The frame-890 ReadTOC is issued by the kernel CD-open function at
+   0xBFC0D570 (called from the boot EXE-load path at 0xBFC06C78 / 0xBFC06E98,
+   a0=name ptr, a1=1). Its body:
+       lw   $t7, -0x2004($t6)   ; t7 = [0xA000DFFC]
+       beqz $t7, skip_readtoc   ; flag==0 -> SKIP ReadTOC
+       jal  0xBFC0D72C          ; flag!=0 -> ReadTOC (0x1E) then GetID
+2. Kernel flag [0xDFFC] (physical 0xDFFC, just below the kernel heap at
+   0xE000) is the discriminator:
+       ours   : [0xDFFC] = 1 at frame 890  -> ReadTOC -> wedge
+       oracle : [0xDFFC] = 0 at the decision -> skip -> reads continue
+   Confirmed: at frame 539 (first CD cmd) [0xDFFC]==0 on ours; it flips to 1
+   at frame 541.
+3. The setter is func_1FC1DF50 (ROM 0xBFC1DF50), called from SHELL code
+   (ra=0x80036024). Its store `sw $t6,-0x2004($t7)` with $t6=1 writes
+   [0xDFFC]=1 on the a2==7 path; a sibling path writes 0 (0xBFC1DF5C).
+4. The shells diverge: our shell runs functions at RAM 0x35000-0x39000
+   (reaching the flag-setter at 0x36024, issuing Test[0x20]/ReadTOC), while
+   the oracle's shell runs 0x30D00-0x33200 (issuing Init/GetTN) and never
+   calls the flag-setter. Same verbatim shell bytes (RAM 0x30D00 == ROM
+   0x18D00 confirmed) -> a BRANCH divergence, driven by an input, not code.
+
+So bug 3's root is: our shell takes a different early branch, calls the CD
+control func that sets [0xDFFC]=1, and the boot's CD-open then does an extra
+ReadTOC that breaks the game's CD reads. The oracle's shell never sets the
+flag. REMAINING: the single shell branch (in 0x30000-0x35DC8) that sends our
+shell down the 0x36000 path vs the oracle's 0x30000 path, and the hardware/
+memory input it reads. That input is the true first divergence.

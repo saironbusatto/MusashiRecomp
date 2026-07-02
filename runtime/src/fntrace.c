@@ -33,6 +33,13 @@ void fntrace_set_game_range(uint32_t lo, uint32_t hi) {
 int fntrace_is_game_started(void) { return s_game_started; }
 
 static inline int armed_match(uint32_t target) {
+    /* PSX_FNTRACE_ALL=1 records every dispatch from power-on — the ring
+     * then holds the earliest boot execution (before any TCP client can
+     * arm it) for offline first-divergence diffs. Checked once. */
+    static int boot_all = -1;
+    if (boot_all == -1) { const char *e = getenv("PSX_FNTRACE_ALL");
+                          boot_all = (e && *e && *e != '0') ? 1 : 0; }
+    if (boot_all) return 1;
     if (s_arm_record_all) return 1;
     /* Hot path: when nothing is armed, record nothing. Recording every
      * dispatch by default makes the ring fill in seconds and burns ~10%
