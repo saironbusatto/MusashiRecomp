@@ -84,3 +84,7 @@ _wip/
 games/*/*
 !games/*/game.toml
 !games/*/seeds.txt
+
+# Per-game memcards created at runtime
+*.mcr
+!dummy.*.mcr
