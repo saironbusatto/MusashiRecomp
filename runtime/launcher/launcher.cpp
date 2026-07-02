@@ -100,7 +100,8 @@ struct LauncherModel {
     int  crt             = 0;  // 0=raw,1=crt,2=composite,3=trinitron
     bool auto_skip_fmv   = false; // skip FMVs via the game's own skip
     bool turbo_loads     = true;  // fast-forward the machine through load screens (audio plays through); default on
-    bool fast_boot       = false;  // skip PSX BIOS via boot snapshot; default off
+    // (the old "Skip PSX BIOS" toggle is gone: the HLE boot shell-skip ships
+    // on by default via [runtime] bios_hle in the player game.toml)
     bool spu_hq          = false;
     int  aspect_index    = 0;  // index into kAspects (0 = 4:3 native)
     int  window_width    = 1280; // window size (height = width*den/num per aspect)
@@ -658,7 +659,6 @@ Result run(SDL_Window* window, void* gl_context,
     m.crt            = io.screen_kind;
     m.auto_skip_fmv  = io.auto_skip_fmv;
     m.turbo_loads    = io.turbo_loads;
-    m.fast_boot      = io.fast_boot;
     m.fullscreen     = io.fullscreen;
     m.skip_launcher  = io.skip_launcher;
     m.spu_hq         = io.spu_hq;
@@ -721,7 +721,6 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("antialiasing",   &m.antialiasing);
     c.Bind("auto_skip_fmv",  &m.auto_skip_fmv);
     c.Bind("turbo_loads",    &m.turbo_loads);
-    c.Bind("fast_boot",      &m.fast_boot);
     c.Bind("fullscreen",     &m.fullscreen);
     c.Bind("skip_launcher",  &m.skip_launcher);
     c.Bind("show_skip_modal",&m.show_skip_modal);
@@ -844,11 +843,6 @@ Result run(SDL_Window* window, void* gl_context,
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
             m.turbo_loads = !m.turbo_loads;
             handle.DirtyVariable("turbo_loads");
-        });
-    c.BindEventCallback("toggle_fast_boot",
-        [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
-            m.fast_boot = !m.fast_boot;
-            handle.DirtyVariable("fast_boot");
         });
     c.BindEventCallback("toggle_fullscreen",
         [&m, handle](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
@@ -1058,7 +1052,6 @@ Result run(SDL_Window* window, void* gl_context,
         io.screen_kind = m.crt;               io.has_screen_kind = true;
         io.auto_skip_fmv = m.auto_skip_fmv;   io.has_auto_skip_fmv = true;
         io.turbo_loads = m.turbo_loads;       io.has_turbo_loads = true;
-        io.fast_boot = m.fast_boot;           io.has_fast_boot = true;
         io.fullscreen = m.fullscreen;         io.has_fullscreen = true;
         io.skip_launcher = m.skip_launcher;   io.has_skip_launcher = true;
         io.spu_hq = m.spu_hq;                 io.has_spu_hq = true;
