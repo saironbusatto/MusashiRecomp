@@ -96,10 +96,29 @@ fix got the revalidation to PASS, but the post-revalidation CD state still
 breaks the resume. The oracle does not perform this mid-game revalidation in
 the same way, so it reads continuously.
 
-Next: diff the CD-controller state (stat, mode, position, motor/seek bits)
-immediately AFTER ReadTOC completes, ours vs the oracle. Check whether our
-ReadTOC leaves stat/position where the game's resume-read expects it, and
-whether the game's post-revalidation Setloc/SeekL is being answered such that
-it can re-enter the read state. Prime suspect: our ReadTOC (case 0x1E) is a
-bare stat+COMPLETE stub — it does not model the drive repositioning / the
-GetTN/GetTD track table the game may read next to recompute where to seek.
+### Sharper localization (DONE) — spurious BIOS disc re-identify
+
+Full oracle command trace confirms: the oracle NEVER issues ReadTOC (0x1E).
+Our runtime issues it at frame 890, from the BIOS (Pause@BFC05FE8 ->
+ReadTOC@BFC0D760 -> GetID@BFC0D7F0). The sector reads right before are clean
+(stat=0x22 motor+read, no error/shell/seek bits), so this is NOT triggered by
+a CD error we injected.
+
+Since BOTH runtimes execute the SAME BIOS bytes, our runtime reaching the
+BFC0Dxxx disc-identify path while the oracle never does means the BIOS/game
+takes a DIFFERENT BRANCH — driven by state, not by the CD hardware sim:
+  - most likely a kernel "disc already identified" flag that our earlier boot
+    left unset/cleared (so the BIOS re-identifies), where the oracle's is set;
+  - or a recompiler-level game-logic divergence that routes our game into a
+    BIOS disc service the oracle's run never calls.
+
+After the (now-passing) re-identify, the game's own CD driver cannot resume:
+it drops into GetStat/Init then Setloc(16)/Pause and never issues SeekL/ReadN
+again — the visible wedge.
+
+Next tool: instruction/branch-level first-divergence hunt between the two
+processes (CLAUDE.md's find_first_divergence) to find where the game/BIOS
+first branches differently around frame 890. Then either set/preserve the
+kernel disc-identify flag correctly, or fix the recompiled branch. The CD
+command hook (cdrom_cmd_dump) and the fntrace/wtrace rings on both sides are
+the instruments; this is a dedicated next-session task.
