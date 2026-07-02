@@ -6,6 +6,7 @@
 name = "CycleTestROM"
 id = "CYCT-00101"
 exe = "cycle_testrom.exe"
+disc = "disc/cyctest.cue"   # synthetic licensed disc (gen via tools/mkpsxiso)
 load_address = "0x80010000"
 entry_pc = "0x80010000"
 text_size = "0x00000800"

@@ -43,10 +43,99 @@ static void advance_devices(uint32_t c) {
     interrupts_advance_cycles(c);
 }
 
-void psx_advance_cycles(uint32_t cycles) {
-    { extern int g_ls_replay_active; if (g_ls_replay_active) return; }  /* lockstep replay: no global cycle/device mutation */
-    if (cycles == 0) return;
-    uint32_t charged_cycles = cycles;
+/* ===== Event-deadline device servicing (production fast path) =================
+ *
+ * The faithful core charges guest cycles PER INSTRUCTION (psx_cyc.h §1), and the
+ * legacy path below walked EVERY device on EVERY charge — ~10 host calls per
+ * guest instruction, ~300M calls/s: the whole prod build pegged a core inside
+ * psx_advance_cycles (gdb-sampled 14/14, leaves = timers/cdrom/dma/interrupts).
+ *
+ * FAITHFUL_TIMING_PLAN.md's target architecture is the fix: cycles accumulate
+ * into the ONE global counter cheaply; devices are only SERVICED when the next
+ * event deadline is reached (cycles_to_next_event(): min over vblank / timer /
+ * cdrom / dma / sio IRQ distances), or when guest code touches device MMIO
+ * (memory.c calls psx_devices_mmio_sync() so reads see current state and writes
+ * that re-arm a device force a deadline recompute).
+ *
+ * Guest-visible semantics are IDENTICAL: servicing rewinds psx_cycle_count to
+ * the devices' synced position and re-plays the gap through the SAME
+ * vblank-bounded chunk loop the legacy path used, so device code observes the
+ * exact same cycle values it always did, and no event can fire late because the
+ * deadline is by construction <= the earliest device event (hard-capped at
+ * DEADLINE_HARD_CAP for IRQ-masked device progress + frame pacing).
+ *
+ * The exact per-charge path is kept verbatim for PSX_COSIM builds (oracle
+ * determinism / checkpoint alignment) and for the g_event_step_conservative
+ * diagnostic toggle. */
+#define PSX_DEADLINE_HARD_CAP 16384u
+
+static uint64_t s_devices_synced_cycle = 0;  /* devices are advanced up to here */
+static uint64_t s_next_service_cycle   = 0;  /* absolute; 0 = dirty, recompute  */
+static int      s_in_device_service    = 0;  /* re-entrancy guard               */
+
+/* Distance to the nearest INTERNAL device event, mask-blind (i_mask =
+ * all-unmasked). This is the chunking bound for catch-up: the sio/cdrom/dma
+ * *_advance() functions fire at most ONE event boundary per call (their
+ * legacy caller stepped 1 cycle at a time), so every catch-up chunk must land
+ * exactly ON the nearest event so chained sequences (SIO byte -> ack -> next
+ * byte; CD sector trains) replay event-by-event, and so events armed while
+ * their IRQ is masked in I_MASK still process on time (games poll I_STAT). */
+static uint32_t devices_cycles_to_next_internal_event(void) {
+    uint32_t best = interrupts_cycles_to_vblank();   /* frame pacing always */
+    uint32_t t = timers_cycles_to_irq(0xFFFFFFFFu);  if (t < best) best = t;
+    uint32_t c = cdrom_cycles_to_irq(0xFFFFFFFFu);   if (c < best) best = c;
+    uint32_t d = dma_cycles_to_irq(0xFFFFFFFFu);     if (d < best) best = d;
+    uint32_t s = sio_cycles_to_irq(0xFFFFFFFFu);     if (s < best) best = s;
+    if (best == 0) best = 1;    /* due/overdue: process within one cycle */
+    return best;
+}
+
+static void psx_devices_recompute_deadline(void) {
+    uint32_t next = devices_cycles_to_next_internal_event();
+    if (next > PSX_DEADLINE_HARD_CAP) next = PSX_DEADLINE_HARD_CAP;
+    s_next_service_cycle = psx_cycle_count + (uint64_t)next;
+}
+
+static void psx_devices_service_to_now(void) {
+    if (s_in_device_service) return;                 /* device code charged cycles: absorb */
+    s_in_device_service = 1;
+    uint64_t target = psx_cycle_count;
+    if (s_devices_synced_cycle < target) {
+        /* Rewind and re-play the gap in event-bounded chunks so device
+         * callbacks see the same incremental psx_cycle_count they always did
+         * and no chunk ever skips OVER a device event boundary. */
+        psx_cycle_count = s_devices_synced_cycle;
+        interrupts_service_scheduled_events();
+        while (psx_cycle_count < target) {
+            uint32_t remaining = (uint32_t)(target - psx_cycle_count);
+            uint32_t step = remaining;
+            uint32_t to_ev = devices_cycles_to_next_internal_event();
+            if (to_ev > 0 && to_ev < step) step = to_ev;
+            if (step == 0) step = 1;
+            advance_devices(step);
+            interrupts_service_scheduled_events();
+        }
+        s_devices_synced_cycle = target;
+    }
+    psx_devices_recompute_deadline();
+    s_in_device_service = 0;
+}
+
+/* memory.c hook: called at the top of every device-MMIO read/write wrapper.
+ * Catch devices up so the handler sees current state, and mark the deadline
+ * dirty so a write that re-arms a device (timer target, CD command, DMA kick)
+ * can only shorten — never silently extend — the next service. */
+void psx_devices_mmio_sync(void) {
+    if (s_devices_synced_cycle != psx_cycle_count) {
+        psx_devices_service_to_now();
+    }
+    s_next_service_cycle = 0;   /* recompute on the next charge */
+}
+
+/* Exact per-charge path (legacy semantics). Used by PSX_COSIM builds and the
+ * g_event_step_conservative diagnostic; also keeps the deadline-path state
+ * coherent so the two can interleave (the runtime toggle flips mid-run). */
+static void psx_advance_cycles_exact(uint32_t cycles) {
 #ifdef PSX_COSIM
     /* First-divergence oracle: the guest-cycle counter is the ONLY clock both backends
      * share identically, so it is the alignment point for the full-state hash. */
@@ -73,6 +162,29 @@ void psx_advance_cycles(uint32_t cycles) {
         cosim_tick();
 #endif
     }
+    s_devices_synced_cycle = psx_cycle_count;
+    s_next_service_cycle   = 0;
+}
+
+void psx_advance_cycles(uint32_t cycles) {
+    { extern int g_ls_replay_active; if (g_ls_replay_active) return; }  /* lockstep replay: no global cycle/device mutation */
+    if (cycles == 0) return;
+    uint32_t charged_cycles = cycles;
+#ifdef PSX_COSIM
+    psx_advance_cycles_exact(cycles);
+#else
+    if (g_event_step_conservative) {
+        psx_advance_cycles_exact(cycles);
+    } else if (s_in_device_service) {
+        /* Charge from inside device servicing (defensive): count it, service later. */
+        psx_cycle_count += (uint64_t)cycles;
+    } else {
+        psx_cycle_count += (uint64_t)cycles;
+        if (s_next_service_cycle == 0 || psx_cycle_count >= s_next_service_cycle) {
+            psx_devices_service_to_now();
+        }
+    }
+#endif
     s_watchdog_throttle += charged_cycles;
     if (s_watchdog_throttle >= 65536u) {
         s_watchdog_throttle = 0;
@@ -91,6 +203,16 @@ void psx_advance_cycles(uint32_t cycles) {
 
 uint64_t psx_get_cycle_count(void) {
     return psx_cycle_count;
+}
+
+/* Save-state restore: psx_cycle_count was just overwritten from the snapshot, so
+ * the deadline-model bookkeeping (synced position + next deadline) is stale and
+ * would try to replay a bogus gap. Re-anchor devices at the restored cycle and
+ * force a fresh deadline on the next charge. */
+void psx_cycles_resync_after_restore(void) {
+    s_devices_synced_cycle = psx_cycle_count;
+    s_next_service_cycle   = 0;   /* recompute on next charge */
+    s_in_device_service    = 0;
 }
 
 /* ---- Mult/div completion-stall timing (faithful R3000A; Beetle muldiv_ts_done) ----

@@ -15,12 +15,23 @@ extern "C" {
  * counter remains 0 throughout a normal session. */
 extern uint64_t psx_cycle_count;
 
-/* Advance guest time. Negative or zero is a no-op. Phase 1.0e-a body
- * just updates the counter; 1.0e-b adds peripheral *_advance() calls. */
+/* Advance guest time. Negative or zero is a no-op. Charges accumulate into
+ * psx_cycle_count cheaply; devices are serviced at event deadlines (see
+ * psx_cycles.c "Event-deadline device servicing"). */
 void psx_advance_cycles(uint32_t cycles);
+
+/* Event-deadline device model (psx_cycles.c): catch every device up to the
+ * charged guest-cycle position and force a deadline recompute. memory.c calls
+ * this at the top of every device-MMIO read/write so handlers always see
+ * current device state and re-arming writes shorten the next service. */
+void psx_devices_mmio_sync(void);
 
 /* Read accessor for telemetry. */
 uint64_t psx_get_cycle_count(void);
+
+/* Save-state restore: re-anchor the deadline device model after psx_cycle_count
+ * is overwritten from a snapshot (call once, right after boot_state_load). */
+void psx_cycles_resync_after_restore(void);
 
 #ifdef __cplusplus
 }

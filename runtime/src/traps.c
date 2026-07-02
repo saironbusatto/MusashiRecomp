@@ -636,18 +636,54 @@ static int psx_request_thread_switch(CPUState* cpu, uint32_t target_tcb)
     return 1;                        /* unreachable */
 }
 
-/* Scheduler mode (hidden dev toggle). HLE = the deterministic TCB scheduler
+/* Save-state restore hook: unwind the entire guest native stack back to
+ * psx_scheduler_run and re-dispatch at `resume_pc` (the PC stored in the just-
+ * restored CPUState). Reuses the same structured-escape mechanism a same-thread
+ * RFE uses (PSX_RUN_RESUME_CURRENT) — abandons every suspended CPS continuation
+ * on the old stack (safe: the restored state is complete in CPUState/RAM/devices
+ * and every block leader is re-enterable). MUST be called on the scheduler fiber
+ * (HLE mode, default) at a block-leader boundary with in_exception == 0. */
+void psx_scheduler_resume_at(uint32_t resume_pc)
+{
+    if (!psx_is_dispatchable(resume_pc)) {
+        char b[96];
+        snprintf(b, sizeof(b),
+                 "savestate restore: non-dispatchable resume PC 0x%08X", (unsigned)resume_pc);
+        trap_crash(b);
+        return;
+    }
+    g_sched_escape.target_tcb = 0;
+    g_sched_escape.resume_pc  = resume_pc;
+    g_sched_escape.reason     = PSX_RUN_RESUME_CURRENT;
+    longjmp(g_scheduler_jmpbuf, 1); /* unwind to psx_scheduler_run; never returns */
+}
+
+/* Scheduler mode. HLE = the deterministic TCB scheduler
  * (psx_request_thread_switch, default); LLE = the legacy host-fiber bridge
- * (psx_change_thread_fiber). Read ONCE from PSX_HLE_SCHEDULER (default 1 = HLE)
- * so the mode can't flip mid-run — a thread suspended under one scheduler cannot
- * be resumed under the other (fibers keep a native stack; the TCB scheduler keeps
- * none). Keep HLE until the upstream 0x800CD3F8 wedge root is fixed. */
+ * (psx_change_thread_fiber). This is the HLE tier's standing SUBSYSTEM
+ * REPLACEMENT (CLAUDE.md §0 amendments 2026-06-29 + 2026-07-02): unlike the
+ * opt-in call-HLE in bios_hle.c it defaults ON in BOTH backends, because the
+ * LLE path it replaces (host fibers) has a genuine landmine — host-side
+ * non-determinism with no hardware analog. Config default via
+ * psx_hle_scheduler_set_default ([runtime] hle_scheduler, main.cpp);
+ * PSX_HLE_SCHEDULER env wins over config. Latched at first query so the mode
+ * can't flip mid-run — a thread suspended under one scheduler cannot be
+ * resumed under the other (fibers keep a native stack; the TCB scheduler
+ * keeps none). */
+static int s_hle_sched_default = 1;
+
+void psx_hle_scheduler_set_default(int on)
+{
+    s_hle_sched_default = on ? 1 : 0;
+}
+
 int psx_hle_scheduler_enabled(void)
 {
     static int s_mode = -1;
     if (s_mode < 0) {
         const char* e = getenv("PSX_HLE_SCHEDULER");
-        s_mode = (e && e[0] == '0') ? 0 : 1; /* default HLE */
+        if (e && e[0]) s_mode = (e[0] == '0') ? 0 : 1;
+        else           s_mode = s_hle_sched_default;
     }
     return s_mode;
 }

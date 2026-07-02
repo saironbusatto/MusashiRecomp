@@ -18,6 +18,7 @@
 #include "spu.h"
 #include "timers.h"
 #include "lockstep.h"
+#include "psx_cycles.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -455,12 +456,14 @@ static uint32_t mmio_read32_impl(uint32_t addr) {
  * single (side-effecting) read. Callers use mmio_read32; the body is _impl, so
  * the device read executes exactly once. */
 static uint32_t mmio_read32(uint32_t addr) {
+    psx_devices_mmio_sync();
     uint32_t v = mmio_read32_impl(addr);
     debug_server_trace_mmio_read(addr, v, 4);
     return v;
 }
 
 static void mmio_write32(uint32_t addr, uint32_t val) {
+    psx_devices_mmio_sync();
     SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, val, 4);
     /* Memory control: 0x1F801000..0x1F801020 */
@@ -560,12 +563,14 @@ static uint16_t mmio_read16_impl(uint32_t addr) {
 }
 
 static uint16_t mmio_read16(uint32_t addr) {
+    psx_devices_mmio_sync();
     uint16_t v = mmio_read16_impl(addr);
     debug_server_trace_mmio_read(addr, (uint32_t)v, 2);
     return v;
 }
 
 static void mmio_write16(uint32_t addr, uint16_t val) {
+    psx_devices_mmio_sync();
     SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, (uint32_t)val, 2);
     /* SIO: 0x1F801040..0x1F80105F */
@@ -654,12 +659,14 @@ static uint8_t mmio_read8_impl(uint32_t addr) {
 }
 
 static uint8_t mmio_read8(uint32_t addr) {
+    psx_devices_mmio_sync();
     uint8_t v = mmio_read8_impl(addr);
     debug_server_trace_mmio_read(addr, (uint32_t)v, 1);
     return v;
 }
 
 static void mmio_write8(uint32_t addr, uint8_t val) {
+    psx_devices_mmio_sync();
     SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, (uint32_t)val, 1);
     /* Interrupts: partial stores affect only the addressed byte lane. */
@@ -1066,6 +1073,19 @@ static inline void psx_cyc_readmem(CPUState* cpu, uint32_t phys, uint32_t size,
     cpu->ld_absorb = cost;
     psx_advance_cycles(cost);
     cpu->ld_which_t = (uint8_t)arm_rt;
+    /* PROOF GATE (PSX_POLL_PROOF=N, default 0/off): a FLAT, non-absorbed extra N
+     * cycles per main-RAM data read — replicates the historical "+6 cyc/main-RAM
+     * read" fix (mmx6_memcard_invalid_rootcause) that lengthened MMX6's card
+     * busy-poll so it outlasts the VBlank-paced async card op. Unlike the
+     * region+completion above (which arms ld_absorb and gets given back in a
+     * tight loop), this is pure added cost. If setting this makes the MMX6 save
+     * load, the card regression is confirmed as poll-vs-op timing. TEMPORARY —
+     * the faithful fix models the uncached data-read cost properly. */
+    if (phys < 0x00800000u) {
+        static int s_pp = -1;
+        if (s_pp < 0) { const char* e = getenv("PSX_POLL_PROOF"); s_pp = (e && e[0]) ? atoi(e) : 0; }
+        if (s_pp > 0) psx_advance_cycles((uint32_t)s_pp);
+    }
 }
 
 /* The interlock half of a load (§1+deps+(cancel)+DO_LDS+ReadMemory). Gated on

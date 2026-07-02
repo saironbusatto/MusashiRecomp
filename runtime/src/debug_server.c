@@ -1176,7 +1176,7 @@ static uint64_t s_call_focus_seq = 0;
  * during Tomba title/menu polling, so it rotates away the card-read setup
  * before we can inspect a later hang. This ring records only the BIOS public
  * card state machine and the low-level RAM card service boundary. */
-#define CARD_MGR_TRACE_CAP 8192
+#define CARD_MGR_TRACE_CAP 65536
 typedef struct {
     uint64_t seq;
     uint32_t func_addr;
@@ -1209,6 +1209,7 @@ typedef struct {
     uint32_t state_7558;
     uint32_t state_7568;
     uint32_t state_756c;
+    uint32_t repeat; /* spin-collapse: extra consecutive hits folded in */
     uint8_t  source; /* 0 = direct entry hook, 1 = dispatch hook */
     uint8_t  pad[3];
 } CardMgrTraceEntry;
@@ -1389,9 +1390,21 @@ static void fn_trace_filter_from_env(const char *env_name) {
 
 static int card_mgr_trace_target(uint32_t phys) {
     phys &= 0x1FFFFFFFu;
-    if (phys >= 0x1FC0B600u && phys < 0x1FC0C240u) return 1;
+    /* ROM card driver + bu-device layer: 0xBFC08600 (validators 0x884C/0x89C0,
+     * sync waits 0x895C) through dev_bu_open 0x996C / dirsearch 0xA754 /
+     * card ops 0xD970-0xDBC0 (was 0xB600..0xC240 — too narrow: the open()
+     * failure path lives in 0x8600..0xB600 and 0xC240..0xE000). */
+    if (phys >= 0x1FC08600u && phys < 0x1FC0E000u) return 1;
     if (phys >= 0x00004900u && phys < 0x00006C80u) return 1;
+    /* Kernel FCB/file layer: open 0x2958, FCB alloc 0x3060, devparse 0x31E8,
+     * firstfile 0x39A4, event funcs 0x1EC8+. Covers the B-call file API the
+     * game uses to reach the bu device. */
+    if (phys >= 0x00001000u && phys < 0x00004900u) return 1;
     if (phys == 0x00001B44u) return 1;
+    /* MMX6 game-side card manager (BU-op issuer 0x8001C1AC, event poll
+     * 0x8001C824, status poll caller 0x8001C64C). Covers the game half of
+     * the card conversation so game->BIOS decision points are visible. */
+    if (phys >= 0x0001C000u && phys < 0x0001D000u) return 1;
     return 0;
 }
 
@@ -1399,6 +1412,39 @@ static void card_mgr_trace_record(uint32_t func_addr, uint8_t source) {
     if (!debug_cpu_ptr) return;
     uint32_t phys = func_addr & 0x1FFFFFFFu;
     if (!card_mgr_trace_target(phys)) return;
+
+    /* Spin-collapse: a poll loop (e.g. the game's TestEvent spin at
+     * 0x8001C824) re-enters the same function millions of times and would
+     * wipe the ring. Fold a hit identical in (func, source, ra) to the
+     * previous entry into that entry's repeat count; refresh v0 so the
+     * final iteration's return value is the one preserved.
+     *
+     * TestEvent's body (B(0Bh) entry 0x1EC8, exit block 0x1F04, EvCB
+     * helpers 0x641C/0x659C) alternates funcs AND src0/src1 hooks every
+     * entry, so the identical-key fold never engages and one spinning
+     * frame floods the ring with ~12K entries (k-run measured), evicting
+     * the window under investigation. Fold ANY consecutive run of these
+     * spin-body funcs into one entry: rep then equals the total hook-hit
+     * count of the run (divide by 2 hooks/call for calls; /8 for full
+     * 4-descriptor poll iterations when 641C fires per call). Sequence
+     * boundaries stay visible because any non-body func (per-VBlank card
+     * machinery, delivers) cuts the run. */
+    if (s_card_mgr_trace_seq > 0) {
+        CardMgrTraceEntry *p =
+            &s_card_mgr_trace[(s_card_mgr_trace_seq - 1) % CARD_MGR_TRACE_CAP];
+        int body  = (phys == 0x1EC8u || phys == 0x1F04u ||
+                     phys == 0x641Cu || phys == 0x659Cu);
+        int pbody = (p->func_addr == 0x1EC8u || p->func_addr == 0x1F04u ||
+                     p->func_addr == 0x641Cu || p->func_addr == 0x659Cu);
+        if ((body && pbody) ||
+            (p->func_addr == phys && p->source == source &&
+             p->ra == debug_cpu_ptr->gpr[31])) {
+            p->repeat++;
+            p->v0    = debug_cpu_ptr->gpr[2];
+            p->frame = (uint32_t)s_frame_count;
+            return;
+        }
+    }
 
     CardMgrTraceEntry *e = &s_card_mgr_trace[s_card_mgr_trace_seq % CARD_MGR_TRACE_CAP];
     e->seq       = s_card_mgr_trace_seq++;
@@ -1437,6 +1483,7 @@ static void card_mgr_trace_record(uint32_t func_addr, uint8_t source) {
     e->state_7558 = psx_read_word(0x00007558u);
     e->state_7568 = psx_read_word(0x00007568u);
     e->state_756c = psx_read_word(0x0000756Cu);
+    e->repeat    = 0;
     e->source    = source;
 }
 
@@ -1656,6 +1703,27 @@ static void fn_record_exit(FnStackFrame *f) {
  * Distinguishing TAIL CALL from NEW CALL via $ra-change is what keeps the
  * shadow stack bounded under heavy code that uses fall-through dispatch. */
 static void function_trace_record(uint32_t target) {
+    /* EvCB walk ring: ALWAYS-ON (ring-buffer model — never arm-gated).
+     * Capture on DeliverEvent entry; record the matching EXIT snapshot when
+     * execution next dispatches to the stored return RA. Runs before the
+     * fntrace arm gate below so the ring covers every DeliverEvent from
+     * boot, whether or not the shadow-stack tracer is armed. */
+    if (debug_cpu_ptr) {
+        uint32_t ev_ra = debug_cpu_ptr->gpr[31];
+        if (target == EVCB_DELIVER_EVENT_ADDR) {
+            if (s_evcb_pending_active) {
+                s_evcb_unwound_count++;
+            }
+            s_evcb_pending_exit_ra   = ev_ra & 0x1FFFFFFFu;
+            s_evcb_pending_entry_seq = s_fn_entry_seq;
+            s_evcb_pending_active    = 1;
+            evcb_snapshot_capture(EVCB_TAG_ENTRY, s_fn_entry_seq);
+        } else if (s_evcb_pending_active && target == s_evcb_pending_exit_ra) {
+            evcb_snapshot_capture(EVCB_TAG_EXIT, s_evcb_pending_entry_seq);
+            s_evcb_pending_active = 0;
+        }
+    }
+
     if (!s_fn_trace_active) return;
     if (!s_fn_entry || !s_fn_exit || !debug_cpu_ptr) return;
 
@@ -1737,26 +1805,8 @@ static void function_trace_record(uint32_t target) {
         }
     }
 
-    /* EvCB ring: capture on DeliverEvent entry. Track the return RA so
-     * we can record an EXIT snapshot when execution next reaches it.
-     * cur_ra has the kernel-mode bit set (0x80000000); psx_dispatch passes
-     * `target` already masked to physical (& 0x1FFFFFFF). Mask before
-     * comparing. If a new DeliverEvent entry arrives first, the previous
-     * call was longjmp'd over (psx_restore_state_escape) — count it. */
-    if (target == EVCB_DELIVER_EVENT_ADDR) {
-        if (s_evcb_pending_active) {
-            s_evcb_unwound_count++;
-        }
-        s_evcb_pending_exit_ra   = cur_ra & 0x1FFFFFFFu;
-        s_evcb_pending_entry_seq = this_entry_seq;
-        s_evcb_pending_active    = 1;
-        evcb_snapshot_capture(EVCB_TAG_ENTRY, this_entry_seq);
-    }
-    /* DeliverEvent exit: dispatch matching the stored return RA (phys). */
-    else if (s_evcb_pending_active && target == s_evcb_pending_exit_ra) {
-        evcb_snapshot_capture(EVCB_TAG_EXIT, s_evcb_pending_entry_seq);
-        s_evcb_pending_active = 0;
-    }
+    /* EvCB ring capture moved to the top of this function (always-on,
+     * ahead of the fntrace arm gate) — see the block above. */
 
     s_fn_prev_ra = cur_ra;
 }
@@ -2621,6 +2671,7 @@ static void handle_dirty_insn_dump_file(int id, const char *json)
  * argument-passing chains, and answer "who called X with what args"
  * across processes (psx-runtime port 4370, psx-beetle port 4380). */
 #include "fntrace.h"
+#include "bios_hle.h"
 #include "parity_trace.h"
 #include "device_trace.h"
 
@@ -2920,6 +2971,61 @@ static void handle_bioscall_dump(int id, const char *json)
         if (have_table && s_bioscall_unique[i].table_base != want_table) continue;
         if (pos > BUF_SZ - 256) break;
         pos += snprintf(out + pos, BUF_SZ - pos, "%s{\"table\":\"0x%08X\",\"index\":%u,\"count\":%llu}", first ? "" : ",", s_bioscall_unique[i].table_base, s_bioscall_unique[i].index, (unsigned long long)s_bioscall_unique[i].count);
+        first = 0;
+    }
+    pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
+    debug_server_send_line(out); free(out);
+}
+
+/* hle_dump — query the BIOS-HLE tier's always-on call ring (bios_hle.c).
+ * Records every A0/B0/C0 vector dispatch seen by the HLE hook with its
+ * routing decision (0 = fell through to LLE, 1 = serviced in HLE, 2 = boot
+ * shell-skip), args, result, and guest cycle. Empty when the tier is off
+ * (LLE mode installs no hook; the bioscall ring covers that case).
+ *   {"cmd":"hle_dump","tail":N}          last N ring entries
+ *   {"cmd":"hle_dump"}                   status summary (mode + totals)
+ * Optional filters: "fn":N (t1 index), "route":0|1|2. */
+static void handle_hle_dump(int id, const char *json)
+{
+    int  tail       = json_get_int(json, "tail", 0);
+    long want_fn    = json_get_int(json, "fn", -1);
+    long want_route = json_get_int(json, "route", -1);
+    uint64_t total = psx_hle_ring_seq();
+    if (tail <= 0) {
+        char out[256];
+        snprintf(out, sizeof out,
+                 "{\"id\":%d,\"ok\":true,\"backend\":\"%s\",\"boot_skip\":%d,"
+                 "\"boot_turbo_active\":%d,\"total\":%llu}\n",
+                 id, psx_bios_hle_backend_name(),
+                 psx_bios_hle_boot_skip_enabled(),
+                 psx_bios_hle_boot_turbo_active(),
+                 (unsigned long long)total);
+        debug_server_send_line(out);
+        return;
+    }
+    if (tail > (int)PSX_HLE_RING_CAP) tail = PSX_HLE_RING_CAP;
+    uint64_t avail = (total < PSX_HLE_RING_CAP) ? total : PSX_HLE_RING_CAP;
+    if ((uint64_t)tail > avail) tail = (int)avail;
+    const size_t BUF_SZ = 2 * 1024 * 1024;
+    char *out = (char *)malloc(BUF_SZ); if (!out) { send_err(id, "oom"); return; }
+    size_t pos = 0;
+    pos += snprintf(out + pos, BUF_SZ - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"tail\":%d,\"entries\":[",
+                    id, (unsigned long long)total, tail);
+    uint64_t start = total - (uint64_t)tail; int first = 1;
+    for (int i = 0; i < tail; i++) {
+        const PsxHleCallEntry *e = psx_hle_ring_entry(start + (uint64_t)i);
+        if (!e) continue;
+        if (want_fn >= 0 && (long)e->fn != want_fn) continue;
+        if (want_route >= 0 && (long)e->route != want_route) continue;
+        if (pos > BUF_SZ - 512) break;
+        pos += snprintf(out + pos, BUF_SZ - pos,
+                        "%s{\"seq\":%llu,\"cycle\":%llu,\"vec\":\"0x%X\",\"fn\":\"0x%02X\","
+                        "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
+                        "\"ra\":\"0x%08X\",\"v0\":\"0x%08X\",\"route\":%u}",
+                        first ? "" : ",", (unsigned long long)e->seq,
+                        (unsigned long long)e->cycle, e->vector, e->fn,
+                        e->a0, e->a1, e->a2, e->a3, e->ra, e->v0, e->route);
         first = 0;
     }
     pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
@@ -4075,7 +4181,7 @@ void debug_server_send_line(const char *json)
     if (need > s_resp_cap) {
         size_t cap = s_resp_cap ? s_resp_cap : 65536;
         while (cap < need) cap *= 2;
-        if (cap > (8u * 1024u * 1024u)) {         /* hard cap: drop the overflow */
+        if (cap > (64u * 1024u * 1024u)) {        /* hard cap: drop the overflow */
             s_resp_overflow = 1;
             return;
         }
@@ -6321,6 +6427,24 @@ static void handle_mmx6_freshfix(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"freshfix\":%d,\"last_refill_cols\":%ld,"
              "\"validate_total\":%d,\"validate_bad\":%d}",
              id, gpu_ws_mmx6_freshfix_get(), gpu_ws_mmx6_refill_cols(), total, bad);
+}
+
+/* Save-state save/load via the debug server (mirrors the F1-F12 / Shift+F1-F12
+ * keys) so the flow can be driven headlessly. {"cmd":"savestate","op":"save"|
+ * "load","slot":N}. The request is staged and runs at the next block boundary
+ * (savestate_poll); a load unwinds the guest, so the ack is sent before it. */
+static void handle_savestate(int id, const char *json)
+{
+    extern void savestate_request_save(int slot);
+    extern void savestate_request_load(int slot);
+    int slot = json_get_int(json, "slot", -1);
+    if (slot < 0) { send_err(id, "missing slot"); return; }
+    char op[16];
+    if (!json_get_str(json, "op", op, sizeof(op))) { send_err(id, "missing op"); return; }
+    if      (!strcmp(op, "save")) savestate_request_save(slot);
+    else if (!strcmp(op, "load")) savestate_request_load(slot);
+    else { send_err(id, "op must be save|load"); return; }
+    send_fmt("{\"id\":%d,\"ok\":true,\"op\":\"%s\",\"slot\":%d}", id, op, slot);
 }
 
 static void handle_turbo(int id, const char *json)
@@ -8957,15 +9081,22 @@ static void handle_card_mgr_trace(int id, const char *json) {
     if (count < 1) count = 1;
     if (count > CARD_MGR_TRACE_CAP) count = CARD_MGR_TRACE_CAP;
     int newest = json_get_int(json, "newest", 0) != 0;
+    /* Paging: "before" (exclusive upper seq bound) returns the `count`
+     * entries ending just below it, so a client can walk the whole ring
+     * in chunks without hitting the response-size cap. */
+    int64_t before = (int64_t)json_get_int(json, "before", -1);
 
     uint64_t total = s_card_mgr_trace_seq;
     uint64_t oldest = (total > CARD_MGR_TRACE_CAP) ? total - CARD_MGR_TRACE_CAP : 0;
-    uint64_t available = total - oldest;
+    uint64_t end = total;
+    if (before >= 0 && (uint64_t)before < total) end = (uint64_t)before;
+    if (end < oldest) end = oldest;
+    uint64_t available = end - oldest;
     if ((uint64_t)count > available) count = (int)available;
-    uint64_t start = total - (uint64_t)count;
+    uint64_t start = end - (uint64_t)count;
     if (start < oldest) start = oldest;
 
-    size_t buf_sz = 256u + (size_t)count * 640u;
+    size_t buf_sz = 256u + (size_t)count * 688u;
     char *buf = (char *)malloc(buf_sz);
     if (!buf) { send_err(id, "oom"); return; }
     size_t pos = 0;
@@ -8974,13 +9105,13 @@ static void handle_card_mgr_trace(int id, const char *json) {
                     id, (unsigned long long)total, (unsigned long long)oldest);
 
     int first = 1;
-    for (int i = 0; i < count && pos < buf_sz - 640u; i++) {
-        uint64_t seq = newest ? (total - 1ull - (uint64_t)i) : (start + (uint64_t)i);
+    for (int i = 0; i < count && pos < buf_sz - 688u; i++) {
+        uint64_t seq = newest ? (end - 1ull - (uint64_t)i) : (start + (uint64_t)i);
         if (seq < oldest || seq >= total) continue;
         const CardMgrTraceEntry *e = &s_card_mgr_trace[seq % CARD_MGR_TRACE_CAP];
         if (e->seq != seq) continue;
         pos += snprintf(buf + pos, buf_sz - pos,
-            "%s{\"seq\":%llu,\"src\":%u,\"frame\":%u,\"func\":\"0x%08X\","
+            "%s{\"seq\":%llu,\"src\":%u,\"rep\":%u,\"frame\":%u,\"func\":\"0x%08X\","
             "\"pc\":\"0x%08X\",\"ra\":\"0x%08X\","
             "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
             "\"v0\":\"0x%08X\",\"t0\":\"0x%08X\",\"t1\":\"0x%08X\","
@@ -8994,7 +9125,7 @@ static void handle_card_mgr_trace(int id, const char *json) {
             "\"s7528\":\"0x%08X\",\"s752c\":\"0x%08X\",\"s7558\":\"0x%08X\","
             "\"s7568\":\"0x%08X\",\"s756c\":\"0x%08X\"}",
             first ? "" : ",",
-            (unsigned long long)e->seq, e->source, e->frame, e->func_addr,
+            (unsigned long long)e->seq, e->source, e->repeat, e->frame, e->func_addr,
             e->pc, e->ra, e->a0, e->a1, e->a2, e->a3, e->v0, e->t0, e->t1,
             e->state_9f20, e->state_9f24, e->state_9f28,
             e->state_9f2c, e->state_9f30, e->state_9f34,
@@ -10547,6 +10678,7 @@ static const CmdEntry s_commands[] = {
     { "fntrace_dump",      handle_fntrace_dump },
     { "unknown_dispatch_log", handle_unknown_dispatch_log },
     { "bioscall_dump",     handle_bioscall_dump },
+    { "hle_dump",          handle_hle_dump },
     { "card_trace_dump",   handle_card_trace_dump },
     { "card_txn_dump",     handle_card_txn_dump },
     { "card_read_summary", handle_card_read_summary },
@@ -10613,6 +10745,7 @@ static const CmdEntry s_commands[] = {
     { "press",             handle_press },
     { "pad_status",        handle_pad_status },
     { "clear_input",       handle_clear_input },
+    { "savestate",         handle_savestate },
     { "turbo",             handle_turbo },
     { "turbo_state",       handle_turbo_state },
     { "pause",             handle_pause },

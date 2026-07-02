@@ -13,6 +13,8 @@
 #include "cdrom.h"
 #include "fntrace.h"
 #include "boot_state.h"
+#include "bios_hle.h"
+#include "savestate.h"
 #include "overlay_capture.h"
 #include "overlay_loader.h"
 #include "autocompile.h"
@@ -134,7 +136,6 @@ static PlayerInput g_players[2];
  * 640*scale x 512*scale. Allocated once the supersampling scale is known
  * (sized for the native 640x512 when supersampling is off). */
 static uint32_t*     sdl_pixel_buf = nullptr;
-static int           s_fast_boot_active = 0;  /* cleared when game entry PC fires */
 
 /* [video] options, resolved from the game config (defaults: native + AA). */
 static int           g_video_scale = 1;     /* internal-resolution SSAA factor */
@@ -271,24 +272,44 @@ static std::filesystem::path find_upward(std::filesystem::path start,
     return {};
 }
 
+// The directory the running executable lives in — the SINGLE anchor for every
+// runtime file (game.toml, disc, BIOS, settings.toml, caches, memcards, sidecar
+// .cfg). Deliberately NEVER the current working directory: a game must launch
+// identically whether started from its own folder, a shortcut, a shell in some
+// other directory, or a debugger. On Windows GetModuleFileNameW is the
+// authoritative source (independent of argv[0], which can be relative/bare and
+// would otherwise get resolved against cwd by fs::absolute). $APPIMAGE and
+// argv[0] are non-Windows / fallback sources only.
 static std::filesystem::path exe_dir_from_argv(const char* argv0) {
     namespace fs = std::filesystem;
     std::error_code ec;
     fs::path exe_dir;
+#ifdef _WIN32
+    // Authoritative: the real image path, regardless of how we were invoked.
+    {
+        wchar_t buf[MAX_PATH * 4];
+        DWORD n = GetModuleFileNameW(NULL, buf, (DWORD)(sizeof(buf) / sizeof(buf[0])));
+        if (n > 0 && n < (DWORD)(sizeof(buf) / sizeof(buf[0]))) {
+            exe_dir = fs::path(std::wstring(buf, buf + n)).parent_path();
+        }
+    }
+#endif
     // Inside an AppImage the binary lives in a read-only mount and argv[0] can
     // be a bare name or symlink (launched via PATH / a .desktop file). $APPIMAGE
-    // is the .AppImage's own path, so settings.toml anchors next to it. Prefer
-    // it; fall back to argv[0], then cwd. (settings.toml is read/written ONLY
-    // here — one location next to the exe, no directory walk-up.)
-    if (const char* appimg = std::getenv("APPIMAGE"); appimg && appimg[0]) {
-        exe_dir = fs::absolute(appimg, ec).parent_path();
-        if (ec) exe_dir.clear();
+    // is the .AppImage's own path, so settings.toml anchors next to it.
+    if (exe_dir.empty()) {
+        if (const char* appimg = std::getenv("APPIMAGE"); appimg && appimg[0]) {
+            exe_dir = fs::absolute(appimg, ec).parent_path();
+            if (ec) exe_dir.clear();
+        }
     }
     if (exe_dir.empty() && argv0 && argv0[0]) {
         exe_dir = fs::absolute(argv0, ec).parent_path();
         if (ec) exe_dir.clear();
     }
-    if (exe_dir.empty()) exe_dir = fs::current_path();
+    // Last-ditch only (should be unreachable on a normal launch); a bare "." so
+    // we never silently resolve against an unrelated cwd deeper in the tree.
+    if (exe_dir.empty()) exe_dir = fs::path(".");
     return exe_dir;
 }
 
@@ -302,16 +323,12 @@ static std::filesystem::path resolve_existing_runtime_path(const char* requested
     if (fs::exists(p, ec)) return fs::absolute(p, ec);
     if (p.is_absolute()) return {};
 
-    std::vector<fs::path> roots;
-    roots.push_back(fs::current_path());
-    roots.push_back(exe_dir_from_argv(argv0));
-    for (const fs::path& root : roots) {
-        fs::path direct = root / p;
-        if (fs::exists(direct, ec)) return fs::absolute(direct, ec);
-
-        fs::path found = find_upward(root, p);
-        if (!found.empty()) return fs::absolute(found / p, ec);
-    }
+    // Anchor exclusively on the exe directory — never cwd (see exe_dir_from_argv).
+    const fs::path root = exe_dir_from_argv(argv0);
+    fs::path direct = root / p;
+    if (fs::exists(direct, ec)) return fs::absolute(direct, ec);
+    fs::path found = find_upward(root, p);
+    if (!found.empty()) return fs::absolute(found / p, ec);
     return {};
 }
 
@@ -339,14 +356,16 @@ static void write_cached_path(const char* argv0, const char* filename,
 static void launcher_warning(const char* title, const std::string& msg) {
     std::fprintf(stderr, "%s: %s\n", title, msg.c_str());
 #ifdef _WIN32
-    MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONWARNING);
+    // Headless (--headless / PSX_HEADLESS): NEVER pop a blocking modal — it would
+    // hang an unattended/CI/scripted run forever waiting for a click.
+    if (!g_headless) MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONWARNING);
 #endif
 }
 
 static void launcher_info(const char* title, const std::string& msg) {
     std::fprintf(stderr, "%s: %s\n", title, msg.c_str());
 #ifdef _WIN32
-    MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONINFORMATION);
+    if (!g_headless) MessageBoxA(NULL, msg.c_str(), title, MB_OK | MB_ICONINFORMATION);
 #endif
 }
 
@@ -356,6 +375,13 @@ static std::string s_picker_game_name = "PSXRecomp";
 
 static bool pick_runtime_file(const char* title, const char* filter,
                               std::filesystem::path& out) {
+    // Headless: never open an interactive file dialog (it blocks). Fail the
+    // resolve so boot aborts cleanly with the stderr message the caller printed.
+    if (g_headless) {
+        std::fprintf(stderr, "psxrecomp: headless — cannot prompt for '%s'; "
+                             "supply it via game.toml / --disc / --bios.\n", title);
+        return false;
+    }
 #ifdef _WIN32
     char path_buf[4096];
     std::memset(path_buf, 0, sizeof(path_buf));
@@ -513,9 +539,18 @@ static std::filesystem::path resolve_disc_for_runtime(const std::filesystem::pat
         return validate_disc_for_launch(p, game_id) ? p : std::filesystem::path{};
     }
 
-    if (!config_disc.empty() && std::filesystem::exists(config_disc) &&
-        validate_disc_for_launch(config_disc, game_id)) {
-        return config_disc;
+    // A relative disc path in game.toml resolves against the exe dir (never cwd);
+    // resolve_existing_runtime_path also walks up from there (build/ -> game dir),
+    // so an out-of-tree build layout still finds the bundled disc.
+    if (!config_disc.empty()) {
+        std::filesystem::path cd = config_disc;
+        if (cd.is_relative()) {
+            std::filesystem::path r = resolve_existing_runtime_path(config_disc.string().c_str(), argv0);
+            if (!r.empty()) cd = r;
+        }
+        if (std::filesystem::exists(cd) && validate_disc_for_launch(cd, game_id)) {
+            return cd;
+        }
     }
 
     std::filesystem::path cached = read_cached_path(argv0, "disc.cfg");
@@ -560,30 +595,17 @@ static std::filesystem::path resolve_bios_path(const char* requested, const char
     }
     if (p.is_absolute()) return p;
 
-    std::vector<fs::path> roots;
-    roots.push_back(fs::current_path());
-    if (argv0 && argv0[0]) roots.push_back(fs::absolute(argv0, ec).parent_path());
-
-    for (const fs::path& root : roots) {
-        fs::path found = find_upward(root, p);
-        if (!found.empty()) return found / p;
-    }
+    // Anchor on the exe directory — never cwd (see exe_dir_from_argv).
+    fs::path found = find_upward(exe_dir_from_argv(argv0), p);
+    if (!found.empty()) return found / p;
     return p;
 }
 
 // Fallback memcard directory used when no game config (or its [runtime]
-// block) specifies one. Prefer the executable's directory so saves live
-// next to the binary; fall back to the current working directory.
+// block) specifies one: the executable's directory (authoritative, never cwd —
+// see exe_dir_from_argv), so saves always live next to the binary.
 static std::filesystem::path default_memcard_dir(const char* argv0) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    fs::path exe_dir;
-    if (argv0 && argv0[0]) {
-        exe_dir = fs::absolute(argv0, ec).parent_path();
-        if (ec) exe_dir.clear();
-    }
-    if (exe_dir.empty()) exe_dir = fs::current_path();
-    return exe_dir;
+    return exe_dir_from_argv(argv0);
 }
 
 static void close_controller(void);
@@ -1444,13 +1466,20 @@ static void sdl_vblank_present(void) {
                     refresh_player_devices();
                 }
             } else if (ev.type == SDL_KEYDOWN) {
-                /* Fullscreen toggle: F11, Alt+Enter, or Cmd/Ctrl+F.
-                 * FULLSCREEN_DESKTOP keeps the desktop resolution; the
-                 * renderer's logical size letterboxes the 640x480 image. */
                 const Uint16 mod = ev.key.keysym.mod;
-                if (ev.key.keysym.sym == SDLK_F11 ||
-                    (ev.key.keysym.sym == SDLK_RETURN && (mod & KMOD_ALT)) ||
-                    (ev.key.keysym.sym == SDLK_f && (mod & (KMOD_GUI | KMOD_CTRL)))) {
+                /* Save states: Shift+F1-F12 = save slot 0-11, F1-F12 = load.
+                 * (F11 is a save slot per the user's spec, so fullscreen is
+                 * Alt+Enter / Cmd+Ctrl+F only — no F11.) */
+                if (ev.key.keysym.sym >= SDLK_F1 && ev.key.keysym.sym <= SDLK_F12) {
+                    int slot = (int)(ev.key.keysym.sym - SDLK_F1);   /* 0..11 */
+                    if (mod & KMOD_SHIFT) savestate_request_save(slot);
+                    else                  savestate_request_load(slot);
+                }
+                /* Fullscreen toggle: Alt+Enter or Cmd/Ctrl+F. FULLSCREEN_DESKTOP
+                 * keeps the desktop resolution; the renderer's logical size
+                 * letterboxes the 640x480 image. */
+                else if ((ev.key.keysym.sym == SDLK_RETURN && (mod & KMOD_ALT)) ||
+                         (ev.key.keysym.sym == SDLK_f && (mod & (KMOD_GUI | KMOD_CTRL)))) {
                     Uint32 is_fs = SDL_GetWindowFlags(sdl_window) &
                                    SDL_WINDOW_FULLSCREEN_DESKTOP;
                     SDL_SetWindowFullscreen(sdl_window,
@@ -1493,6 +1522,12 @@ static void sdl_vblank_present(void) {
         if (load_run >= TURBO_LOADS_ENGAGE_FRAMES)
             turbo_loads_active = 1;
     }
+    /* HLE boot-skip window: from reset until the game entry PC first
+     * dispatches, run unpaced so the (shell-skipped) BIOS kernel init +
+     * SYSTEM.CNF + game EXE load compress to host speed. This replaces the
+     * old fast_boot snapshot restore; all guest timing is authentic. */
+    if (psx_bios_hle_boot_turbo_active())
+        turbo_loads_active = 1;
 
     /* FMV auto-skip ([video] auto_skip_fmv). A streaming FMV is XA audio + MDEC
      * video together. Detect "MDEC produced a frame since the last vblank AND XA
@@ -1567,14 +1602,6 @@ static void sdl_vblank_present(void) {
         } else {
             turbo_skip = 0;
         }
-    }
-
-    /* Fast boot: run at full speed with no display until game entry PC fires.
-     * Kernel init and disc auth still execute; only logo rendering is skipped. */
-    if (s_fast_boot_active) {
-        extern int fntrace_is_game_started(void);
-        if (!fntrace_is_game_started()) return;
-        s_fast_boot_active = 0;
     }
 
     /* Turbo-through-loads (step 4, OPT-IN via game.toml [runtime]
@@ -1913,6 +1940,17 @@ int main(int argc, char** argv) {
             default_game_config_storage = default_game_config.string();
             game_config_path = default_game_config_storage.c_str();
         }
+    } else if (!std::filesystem::path(game_config_path).is_absolute()) {
+        // An explicit --game with a relative path must ALSO anchor on the exe
+        // dir, never cwd — otherwise the disc / memcard_dir / game_options.toml
+        // that resolve against this file's parent silently point at cwd. Resolve
+        // it the same way the default path is resolved.
+        std::filesystem::path resolved =
+            resolve_existing_runtime_path(game_config_path, argv[0]);
+        if (!resolved.empty()) {
+            default_game_config_storage = resolved.string();
+            game_config_path = default_game_config_storage.c_str();
+        }
     }
 
     std::filesystem::path memcard_dir;
@@ -1947,7 +1985,9 @@ int main(int argc, char** argv) {
     std::string disc_speed;   /* "1x" | "2x" | "4x" | "instant" */
     int        instant_rate  = 0;   /* 0 = cdrom.c built-in default */
     uint32_t   game_entry_pc = 0;
-    bool       fast_boot     = false;
+    bool       fast_boot     = false;  /* DEPRECATED alias: HLE boot-skip only */
+    bool       bios_hle      = false;  /* HLE kernel-service tier (bios_hle.c) */
+    bool       bios_hle_keep_intro = false;
 
     if (game_config_path) {
         try {
@@ -2014,6 +2054,11 @@ int main(int argc, char** argv) {
               if (e && e[0] && e[0] != '0') g_gl_fbo_present = 0; }
             game_entry_pc = gc.entry_pc;
             fast_boot     = gc.runtime.fast_boot;
+            bios_hle      = gc.runtime.bios_hle;
+            bios_hle_keep_intro = gc.runtime.bios_hle_keep_intro;
+            /* HLE-tier scheduler subsystem replacement default (env
+             * PSX_HLE_SCHEDULER still wins; latched at first dispatch). */
+            psx_hle_scheduler_set_default(gc.runtime.hle_scheduler ? 1 : 0);
             /* Pin the overlay-region floor to THIS game's main-EXE text end so
              * runtime-loaded overlays (which load just above it) are dispatched
              * via in-interpreter local-flow chaining, NOT the slow block-by-block
@@ -2167,6 +2212,7 @@ int main(int argc, char** argv) {
         if (us.has_auto_skip_fmv)  g_auto_skip_fmv   = us.auto_skip_fmv ? 1 : 0;
         if (us.has_turbo_loads)    g_turbo_loads_enabled = us.turbo_loads ? 1 : 0;
         if (us.has_fast_boot)      fast_boot = us.fast_boot;
+        if (us.has_bios_hle)       bios_hle  = us.bios_hle;
         if (us.has_fullscreen)     g_fullscreen      = us.fullscreen ? 1 : 0;
         if (us.has_aspect_ratio) {
             g_video_aspect_num = us.aspect_num;
@@ -2266,6 +2312,7 @@ int main(int argc, char** argv) {
             seed.auto_skip_fmv = (g_auto_skip_fmv != 0);  seed.has_auto_skip_fmv = true;
             seed.turbo_loads = (g_turbo_loads_enabled != 0); seed.has_turbo_loads = true;
             seed.fast_boot = fast_boot;                   seed.has_fast_boot = true;
+            seed.bios_hle  = bios_hle;                    seed.has_bios_hle  = true;
             seed.fullscreen = (g_fullscreen != 0);        seed.has_fullscreen = true;
             seed.aspect_num = g_video_aspect_num;
             seed.aspect_den = g_video_aspect_den;         seed.has_aspect_ratio = true;
@@ -2339,6 +2386,7 @@ int main(int argc, char** argv) {
                 g_auto_skip_fmv   = seed.auto_skip_fmv ? 1 : 0;
                 g_turbo_loads_enabled = seed.turbo_loads ? 1 : 0;
                 fast_boot = seed.fast_boot;
+                bios_hle  = seed.bios_hle;
                 g_fullscreen      = seed.fullscreen ? 1 : 0;
                 g_video_aspect_num = seed.aspect_num;
                 g_video_aspect_den = seed.aspect_den;
@@ -2711,31 +2759,41 @@ int main(int argc, char** argv) {
      * sljit isn't the active backend. */
     overlay_sljit_init_helpers(&cpu);
 
-    /* Fast boot: try to restore a previously-captured BIOS handoff snapshot.
-     * First launch runs BIOS normally (logos visible) and captures state at
-     * game handoff. Every subsequent launch restores and skips BIOS entirely. */
-    bool fast_boot_restored = false;
-    if (fast_boot && game_entry_pc != 0) {
-        uint32_t bios_cksum = memory_get_bios_checksum();
-        char snap_name[64];
-        std::snprintf(snap_name, sizeof(snap_name),
-                      "fast_boot_%08X_%08X.bin", bios_cksum, game_entry_pc);
-        std::filesystem::path snap_path =
-            resolved_bios.parent_path() / snap_name;
-        std::string snap_str = snap_path.string();
-        if (boot_state_load(snap_str.c_str(), bios_cksum, game_entry_pc, &cpu)) {
-            fast_boot_restored = true;
-        } else {
-            /* First run: show BIOS logos normally, capture state silently at
-             * game handoff. Subsequent launches use the snapshot. */
-            boot_state_set_capture(snap_str.c_str(), bios_cksum, game_entry_pc);
-        }
+    /* BIOS backend select (CLAUDE.md §0 amendment 2026-07-02): LLE (the
+     * recompiled BIOS — default, reference implementation, oracle) vs the
+     * opt-in HLE tier (implemented kernel services computed in-runtime, LLE
+     * fallback for everything else). Boot always starts at the real reset
+     * vector; with the HLE boot-skip on, the tier's dispatch hook intercepts
+     * the shell entry one-shot (the boot animation is skipped; kernel init +
+     * game EXE load still run in the real recompiled BIOS, unpaced) — this
+     * REPLACES the old fast_boot snapshot restore, and fast_boot=true now
+     * aliases the boot-skip alone. Env overrides: PSX_BIOS_HLE /
+     * PSX_BIOS_HLE_KEEP_INTRO ('0' = off, anything else = on). */
+    {
+        if (const char* e = std::getenv("PSX_BIOS_HLE"))
+            bios_hle = (e[0] && e[0] != '0');
+        if (const char* e = std::getenv("PSX_BIOS_HLE_KEEP_INTRO"))
+            bios_hle_keep_intro = (e[0] && e[0] != '0');
+        const bool boot_skip =
+            (bios_hle && !bios_hle_keep_intro) || fast_boot;
+        psx_bios_hle_configure(bios_hle ? 1 : 0,
+                               (boot_skip && game_entry_pc != 0) ? 1 : 0);
+        std::fprintf(stdout, "psxrecomp: bios_backend=%s  bios_boot=%s\n",
+                     psx_bios_hle_backend_name(),
+                     psx_bios_hle_boot_skip_enabled()
+                         ? "HLE (shell skipped)" : "LLE (real intro)");
     }
 
-    if (!fast_boot_restored) {
-        /* R3000A reset state. */
-        cpu.pc = 0xBFC00000u;
-        cpu.cop0[12] = 0x00400000u; /* SR: BEV=1 (boot exception vectors) */
+    /* R3000A reset state. */
+    cpu.pc = 0xBFC00000u;
+    cpu.cop0[12] = 0x00400000u; /* SR: BEV=1 (boot exception vectors) */
+
+    /* User save states (F1-F12 / Shift+F1-F12): slots live in the per-game
+     * memcard/save dir, keyed by entry_pc + guarded by the boot_state integrity
+     * key (codegen hash/abi/ver) so a stale/foreign state can never load. */
+    if (game_entry_pc != 0) {
+        savestate_configure(memcard_dir.string().c_str(),
+                            memory_get_bios_checksum(), game_entry_pc);
     }
 
     /* Let memory subsystem see SR for cache-isolation checks. */

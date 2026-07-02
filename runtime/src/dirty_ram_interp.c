@@ -749,8 +749,14 @@ int dirty_ram_re954_json(char *out, int cap) {
 extern uint32_t i_stat;   /* owned by memory.c */
 extern uint32_t i_mask;
 
-enum { XOP_JAL = 0, XOP_JALR = 1, XOP_JR = 2, XOP_J = 3, XOP_DD = 4, XOP_BR = 5 };
+enum { XOP_JAL = 0, XOP_JALR = 1, XOP_JR = 2, XOP_J = 3, XOP_DD = 4, XOP_BR = 5,
+       XOP_RES = 6 /* watched-target call RESOLUTION: site = path code (XRES_*),
+                      ds_insn = v0 after the path ran */ };
 enum { XSITE_INTERP = 0, XSITE_DD = 1 };
+/* XOP_RES path codes (in the `site` field). */
+enum { XRES_EC_BAIL = 2, XRES_EC_PC = 3, XRES_EC_CONTRACT = 4, XRES_EC_RET = 5,
+       XRES_OV_BAIL = 6, XRES_OV_PC = 7, XRES_OV_CONTRACT = 8, XRES_OV_RET = 9,
+       XRES_NONLOCAL = 10, XRES_PCCHAIN = 11, XRES_UNDECODABLE = 12 };
 
 int g_mixed_depth = 0;   /* best-effort interp→compiled nesting depth; reset per frame */
 
@@ -818,7 +824,22 @@ static void xprobe_flush_frame(void) {
  * (rich context), 0 for the dd-site (count + depth only). Runs the per-frame
  * flush on frame change (leak-proof reset of g_mixed_depth) and the early trip. */
 static int g_xprobe_watch(uint32_t t) {
-    return t == 0x8001A954u || t == 0x80046264u || t == 0x8004630Cu || t == 0x8004DFA0u;
+    return t == 0x8001A954u || t == 0x80046264u || t == 0x8004630Cu || t == 0x8004DFA0u
+        /* MMX6 card-load firstfile flow (mmx6_card_load_regression_state):
+         * the mount 0x8001C1AC (works) vs firstfile flow 0x8001C4C0 (its body
+         * never runs) — record every call event + resolution for both. */
+        || t == 0x8001C1ACu || t == 0x8001C4C0u;
+}
+static void xprobe_event(uint32_t src_pc, uint8_t op, uint8_t site, uint32_t target,
+                         uint32_t ds_insn, uint32_t sp, uint32_t ra, int want_detail);
+/* Watched-target call note for NON-interp call sites (overlay shard call-outs
+ * via dispatch_call / psx_sljit_call). phase 0 = before the call (ds = a0),
+ * phase 1 = after it returned (ds = v0). Recorded as XOP_RES with
+ * site = 20+phase so the `watched` dump shows the shard-side call + result. */
+void dirty_ram_xprobe_call_note(CPUState *cpu, uint32_t target, uint32_t ra, uint8_t phase) {
+    if (!g_xprobe_watch(target)) return;
+    xprobe_event(ra, XOP_RES, (uint8_t)(20u + phase), target,
+                 phase ? cpu->gpr[2] : cpu->gpr[4], cpu->gpr[29], cpu->gpr[31], 1);
 }
 static void xprobe_event(uint32_t src_pc, uint8_t op, uint8_t site, uint32_t target,
                          uint32_t ds_insn, uint32_t sp, uint32_t ra, int want_detail) {
@@ -871,6 +892,32 @@ int dirty_ram_xprobe_json(char *out, int cap) {
         s_xprobe_tripped, s_xf_frame, g_mixed_depth,
         s_xf_first_depth_frame, (unsigned long long)s_xf_first_depth_cycle,
         g_xprobe_frame_trip, g_xprobe_stk_kb, g_xprobe_warmup);
+
+    /* watched-target events FIRST (sparse, the highest-value content): the WHOLE
+     * ring filtered to g_xprobe_watch targets + every XOP_RES resolution record.
+     * Emitted before summary/detail so the 56KB response cap can never truncate
+     * it (it truncated to [] when this section trailed the detail dump). */
+    n += snprintf(out + n, cap - n, "    \"watched\": [");
+    {
+        static const char *opn2[] = {"JAL","JALR","JR","J","DD","BR","RES"};
+        uint64_t total = g_xdet_seq;
+        uint32_t avail = total < XDET_CAP ? (uint32_t)total : XDET_CAP;
+        uint64_t base  = total - avail;
+        int firstw = 1;
+        for (uint32_t i = 0; i < avail && n < cap - 240; i++) {
+            const XDetail *e = &g_xdet[(base + i) & (XDET_CAP - 1u)];
+            if (e->op != XOP_RES && !g_xprobe_watch(e->target)) continue;
+            n += snprintf(out + n, cap - n,
+                "%s{\"f\":%u,\"cyc\":%llu,\"op\":\"%s\",\"site\":%u,\"src\":\"0x%08X\","
+                "\"tgt\":\"0x%08X\",\"ds\":\"0x%08X\",\"sp\":\"0x%08X\",\"ra\":\"0x%08X\","
+                "\"d\":%u,\"stk\":%u}",
+                firstw ? "" : ",", e->frame, (unsigned long long)e->cycle,
+                e->op < 7 ? opn2[e->op] : "?", e->site, e->src_pc, e->target, e->ds_insn,
+                e->sp, e->ra, e->depth, e->stk_kb);
+            firstw = 0;
+        }
+    }
+    n += snprintf(out + n, cap - n, "],\n");
 
     /* per-frame summary (whole window in the ring) */
     n += snprintf(out + n, cap - n, "    \"summary\": [");
@@ -1294,15 +1341,19 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
         exec_delay_slot(cpu, pc + 4);
         cosim_exec_one_transfer_hook(pc + 4);
         uint32_t site_sp = cpu->gpr[29];  /* call contract: sp at the call */
+        int xw = g_xprobe_watch(target);  /* record RESOLUTION path for watched targets */
         xprobe_event(pc, XOP_JAL, XSITE_INTERP, target,
                      fetch_word((pc + 4) & 0x1FFFFFFFu), site_sp, cpu->gpr[31], 1);
+#define XRES(code) do { if (xw) xprobe_event(pc, XOP_RES, (uint8_t)(code), target, \
+                                             cpu->gpr[2], cpu->gpr[29], cpu->gpr[31], 1); } while (0)
         if (g_precise_mode || g_ls_replay_active) { cpu->pc = target; return 1; }  /* slice / lockstep-replay: plain transfer, never execute the callee */
 #ifdef PSX_HAS_GAME_DISPATCH
         cpu->pc = 0;
         if (interp_enter_compiled(cpu, target)) {
-            if (g_psx_call_bail) return 1;  /* wild unwind: cpu->pc = true target */
-            if (cpu->pc != 0) return 1;
-            if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
+            if (g_psx_call_bail) { XRES(XRES_EC_BAIL); return 1; }  /* wild unwind: cpu->pc = true target */
+            if (cpu->pc != 0)    { XRES(XRES_EC_PC); return 1; }
+            if (psx_call_contract(cpu, return_pc, site_sp)) { XRES(XRES_EC_CONTRACT); return 1; }
+            XRES(XRES_EC_RET);
             return dirty_ram_finish_call_return(cpu, return_pc, next_pc_out);
         }
 #endif
@@ -1316,20 +1367,25 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
             extern int overlay_loader_call_native(CPUState *cpu, uint32_t addr);
             cpu->pc = 0;
             if (overlay_loader_call_native(cpu, target)) {
-                if (g_psx_call_bail) return 1;
-                if (cpu->pc != 0) return 1;
-                if (psx_call_contract(cpu, return_pc, site_sp)) return 1;
+                if (g_psx_call_bail) { XRES(XRES_OV_BAIL); return 1; }
+                if (cpu->pc != 0)    { XRES(XRES_OV_PC); return 1; }
+                if (psx_call_contract(cpu, return_pc, site_sp)) { XRES(XRES_OV_CONTRACT); return 1; }
+                XRES(XRES_OV_RET);
                 return dirty_ram_finish_call_return(cpu, return_pc, next_pc_out);
             }
         }
         if (!is_local_dirty_target(target)) {
+            XRES(XRES_NONLOCAL);
             return dispatch_nonlocal_call(cpu, target, return_pc, next_pc_out);
         }
         if (!dirty_ram_word_looks_decodable(fetch_word(target & 0x1FFFFFFFu))) {
+            XRES(XRES_UNDECODABLE);
             return dispatch_nonlocal_call(cpu, target, return_pc, next_pc_out);
         }
+        XRES(XRES_PCCHAIN);
         cpu->pc = target;
         return 1;
+#undef XRES
     }
     case 0x04: { /* BEQ rs, rt, simm */
         int taken = (cpu->gpr[rs] == cpu->gpr[rt]);

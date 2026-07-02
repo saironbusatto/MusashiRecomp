@@ -603,6 +603,15 @@ void psx_check_interrupts(CPUState* cpu) {
 
     interrupts_service_scheduled_events();
 
+    /* User save states: this is a block-leader boundary with a known resume PC;
+     * only act outside the exception handler so a restore's stack-unwind can't
+     * strand a half-finished handler. Near-free when nothing is staged. A load
+     * longjmps to the scheduler and never returns here. */
+    if (!in_exception) {
+        extern void savestate_poll(CPUState* cpu, uint32_t resume_pc);
+        savestate_poll(cpu, s_last_interrupt_check_pc);
+    }
+
     /* Dispatch-loop maintenance only when NOT inside the exception handler. */
     if (!in_exception) {
 #if SIO_MODEL_CYCLE_PACED
@@ -794,6 +803,18 @@ void psx_check_interrupts(CPUState* cpu) {
     saved_hi = cpu->hi;
     saved_lo = cpu->lo;
 
+    /* Same-thread discriminator input (mmx6_card_load_regression_state): the
+     * kernel's CURRENT-TCB pointer at exception ENTRY. PCB ptr lives at kernel
+     * 0x108; PCB[0] = running thread's TCB. ChangeThread inside the handler
+     * moves PCB[0] to the new thread, so entry-vs-exit TCB equality is the
+     * STRUCTURAL "no thread switch happened" test — unlike PC equality, it is
+     * immune to two threads parked at the SAME guest PC (shared spin loops:
+     * MMX6's card poll), where the PC heuristic force-restores the OLD thread's
+     * GPRs into the NEW thread. */
+    extern uint32_t psx_read_word(uint32_t addr);   /* memory.c (plain RAM read) */
+    uint32_t entry_pcb = psx_read_word(0x108u);
+    uint32_t entry_tcb = entry_pcb ? psx_read_word(entry_pcb & 0x1FFFFFFFu) : 0u;
+
     /* Dispatch the BIOS exception handler.
      * BEV (SR bit 22) selects between 0x80000080 and 0xBFC00180.
      *
@@ -920,10 +941,41 @@ void psx_check_interrupts(CPUState* cpu) {
      * EPC); there the BIOS handler restored the NEW thread's GPRs from its TCB
      * and saved_gpr holds the thread that ENTERED the exception — restoring it
      * would reintroduce the MMX6 cooperative-thread corruption Fix B prevents. */
-    int same_thread_resume =
-        (g_exc_escape_reason != PSX_EXC_ESCAPE_LEGACY_SENTINEL) &&
-        g_exception_real_epc != 0u &&
-        same_guest_pc(cpu->pc, g_exception_real_epc);
+    /* Discriminator selector (verification + candidate fix,
+     * mmx6_card_load_regression_state — the PC heuristic below was BISECTED as
+     * the "A game data could not be found" regression B on MMX6 while being
+     * the fix for Tomba's pause menu):
+     *   PSX_SAME_THREAD_RESTORE=0  original Fix B (legacy-sentinel-only restore)
+     *   PSX_SAME_THREAD_RESTORE=1  PC-equality heuristic (13c5e0c behavior)
+     *   PSX_SAME_THREAD_RESTORE=2  kernel current-TCB equality (default;
+     *                              structural same-thread test — a genuine
+     *                              ChangeThread moves PCB[0] even when the new
+     *                              thread resumes at the SAME guest PC) */
+    static int s_str_mode = -1;
+    if (s_str_mode < 0) {
+        const char *e = getenv("PSX_SAME_THREAD_RESTORE");
+        s_str_mode = (e && *e) ? atoi(e) : 1;   /* default = 13c5e0c behavior;
+            mode 2 (TCB check) is the hardening candidate, pending a Tomba
+            pause-menu gate. The MMX6 "not found" this selector was built to
+            verify turned out to be a STALE GENERATED IMAGE artifact. */
+        if (s_str_mode < 0 || s_str_mode > 2) s_str_mode = 1;
+    }
+    extern uint32_t psx_read_word(uint32_t addr);   /* memory.c (plain RAM read) */
+    uint32_t exit_pcb = psx_read_word(0x108u);
+    uint32_t exit_tcb = exit_pcb ? psx_read_word(exit_pcb & 0x1FFFFFFFu) : 0u;
+    int same_thread_resume = 0;
+    if (s_str_mode == 1) {
+        same_thread_resume =
+            (g_exc_escape_reason != PSX_EXC_ESCAPE_LEGACY_SENTINEL) &&
+            g_exception_real_epc != 0u &&
+            same_guest_pc(cpu->pc, g_exception_real_epc);
+    } else if (s_str_mode == 2) {
+        same_thread_resume =
+            (g_exc_escape_reason != PSX_EXC_ESCAPE_LEGACY_SENTINEL) &&
+            g_exception_real_epc != 0u &&
+            same_guest_pc(cpu->pc, g_exception_real_epc) &&
+            entry_tcb != 0u && entry_tcb == exit_tcb;
+    }
     int do_restore =
         (g_exc_escape_reason == PSX_EXC_ESCAPE_LEGACY_SENTINEL || same_thread_resume);
     /* Ring exit-half: every delivery records which escape path it took and

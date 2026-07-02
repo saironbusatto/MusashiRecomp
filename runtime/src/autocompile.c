@@ -164,8 +164,12 @@ int autocompile_request(void) {
     si.hStdError  = wr;
     PROCESS_INFORMATION pi;
     memset(&pi, 0, sizeof(pi));
+    /* IDLE, not BELOW_NORMAL: the shard compile is pure background work and the
+     * emulation core is per-instruction cycle-accounted (host-CPU hungry);
+     * children (cmd -> python -> gcc) inherit the idle class, so a compile burst
+     * can never contend with the game for a core. */
     BOOL ok = CreateProcessA(NULL, full, NULL, NULL, TRUE,
-                             CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
+                             CREATE_NO_WINDOW | IDLE_PRIORITY_CLASS,
                              NULL, s_cwd[0] ? s_cwd : NULL, &si, &pi);
     CloseHandle(wr);
     if (!ok) {

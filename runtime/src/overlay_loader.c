@@ -1048,9 +1048,19 @@ static void overlay_post_dispatch_irq_pump(CPUState *cpu) {
     else psx_check_interrupts(cpu);
 }
 
+/* Probe wrapper (mmx6_card_load_regression_state): record shard-side calls to
+ * xprobe-watched targets (before + after) so overlay-DLL call-outs are visible
+ * in the xprobe `watched` dump the way interp JAL/JALR sites already are. */
+extern void dirty_ram_xprobe_call_note(CPUState *cpu, uint32_t target, uint32_t ra, uint8_t phase);
+static void overlay_dispatch_call_probed(CPUState *cpu, uint32_t addr, uint32_t ra) {
+    dirty_ram_xprobe_call_note(cpu, addr, ra, 0);
+    psx_dispatch_call(cpu, addr, ra);
+    dirty_ram_xprobe_call_note(cpu, addr, ra, 1);
+}
+
 static void init_callbacks(void) {
     extern void psx_restore_state_escape(void);
-    s_callbacks.dispatch_call        = psx_dispatch_call;
+    s_callbacks.dispatch_call        = overlay_dispatch_call_probed;
     s_callbacks.check_interrupts     = overlay_ci_wrapper;
     s_callbacks.check_interrupts_at  = overlay_ci_at_wrapper;
     { extern void psx_advance_cycles(uint32_t cycles);
@@ -2160,8 +2170,17 @@ int overlay_loader_call_native(CPUState *cpu, uint32_t addr) {
  * native shard cannot resume itself block-by-block, so a not-yet-native callee
  * is run as a UNIT via psx_dispatch_call (which handles interp/dirty callees to
  * the return contract) rather than the interpreter's pc-chain. See overlay_sljit.h. */
+static int psx_sljit_call_inner(CPUState *cpu, uint32_t target, uint32_t return_pc,
+                                int check_contract);
 int psx_sljit_call(CPUState *cpu, uint32_t target, uint32_t return_pc,
                    int check_contract) {
+    dirty_ram_xprobe_call_note(cpu, target, return_pc, 0);
+    int r = psx_sljit_call_inner(cpu, target, return_pc, check_contract);
+    dirty_ram_xprobe_call_note(cpu, target, return_pc, 1);
+    return r;
+}
+static int psx_sljit_call_inner(CPUState *cpu, uint32_t target, uint32_t return_pc,
+                                int check_contract) {
     uint32_t site_sp = cpu->gpr[29];   /* sp at the call (after the delay slot) */
 #ifdef PSX_HAS_GAME_DISPATCH
     /* Skip the compiled game function if its page is dirty (an overlay overwrote it
