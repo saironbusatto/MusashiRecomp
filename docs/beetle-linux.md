@@ -18,7 +18,12 @@ cd beetle-psx
 git checkout 5759277b          # "audit pass" — last C++-tree base we target
 patch -p1 < ../docs/beetle_wtrace_hook.patch
 patch -p1 < ../docs/beetle_sio_trace_hook.patch
+patch -p1 < ../docs/beetle_cdcmd_trace_hook.patch
 ```
+
+`beetle_cdcmd_trace_hook.patch` adds a CD-command trace callback (fires per
+command dispatch in cdc.cpp) exposed as the `cdrom_cmd_dump` / `cdrom_cmd_reset`
+debug commands — used to oracle-diff the Kula World CD read sequence.
 
 `beetle_sio_trace_hook.patch` adds `FrontIO::SetSIOTraceCallback` (fires per
 completed SIO byte exchange) — an integration hook beetle_libretro.cpp needs

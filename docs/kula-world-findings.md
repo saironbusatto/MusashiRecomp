@@ -69,19 +69,37 @@ The 2.5 s cadence is the tell: that is a retry-with-timeout, i.e. the game
 issues a command, waits ~2.5 s for a completion signal, times out, retries.
 The signal it waits for is what our controller/IRQ path delivers wrong.
 
-Next investigation options:
-  1. Live oracle-diff: rebuild psx-beetle WITH a CD-command trace hook
-     (mirror the SIO hook in beetle_sio_trace_hook.patch — add a callback
-     in cdc.cpp's command dispatch), boot it, and compare the boot->demo
-     CD command/IRQ sequence. Does the oracle's game issue the same
-     GetStat/Init loop and then proceed? What completion event breaks it
-     out that ours doesn't?
-  2. Game-side: find the CD-init state machine (caller of the command-issue
-     func_800639C8) and its "init complete" branch condition — which RAM
-     flag it polls, and which ISR path (game CD IRQ handler) is supposed to
-     set it. Then check our INT2-COMPLETE delivery for that command against
-     it (timing of present_cdrom_irq vs the game reading the response).
-  Suspicion: the second INT (INT2 COMPLETE) for Init/Pause is delivered but
-  the game's ISR misses latching its done-flag — a delivery-timing race in
-  present_cdrom_irq's generation latch, the same machinery bug 2's SeekL
-  fix (c146b95) touched.
+### Oracle-diff result (DONE — divergence localized)
+
+Built a CD-command trace hook into psx-beetle (beetle_cdcmd_trace_hook.patch:
+a callback in cdc.cpp's command dispatch + `cdrom_cmd_dump` / `cdrom_cmd_reset`
+debug commands on the oracle) and captured its boot->demo CD command stream.
+
+The oracle's game reads level data with a clean per-sector pattern:
+    Setloc(LBA) -> SeekL -> Setmode(0x80) -> ReadN -> Pause   (x22 ReadN)
+plus GetlocL (0x10) position polling (x89). It issues SeekL 18x and ReadN 22x.
+
+Our runtime's game, in the wedge window, issues **NEITHER SeekL NOR ReadN** —
+only GetStat/Init/Setloc/Pause. So our game took an error/retry branch the
+oracle never enters.
+
+CRUCIAL timeline fact: our runtime DID deliver 307 sectors successfully during
+early boot (so ReadN + sector-data delivery WORK). Reading only stops at
+frame ~890 — the moment the BIOS does its mid-game region revalidation
+(ReadTOC + GetID). After that revalidation the game can never resume reading;
+it drops into the GetStat/Init/Setloc/Pause retry loop and stays there.
+
+So the root cause is narrowed to: the BIOS ReadTOC+GetID revalidation (or the
+CD-controller state it leaves behind — drive repositioned to lead-in / TOC,
+stat/mode reset) prevents the game's CD driver from resuming reads. The region
+fix got the revalidation to PASS, but the post-revalidation CD state still
+breaks the resume. The oracle does not perform this mid-game revalidation in
+the same way, so it reads continuously.
+
+Next: diff the CD-controller state (stat, mode, position, motor/seek bits)
+immediately AFTER ReadTOC completes, ours vs the oracle. Check whether our
+ReadTOC leaves stat/position where the game's resume-read expects it, and
+whether the game's post-revalidation Setloc/SeekL is being answered such that
+it can re-enter the read state. Prime suspect: our ReadTOC (case 0x1E) is a
+bare stat+COMPLETE stub — it does not model the drive repositioning / the
+GetTN/GetTD track table the game may read next to recompute where to seek.

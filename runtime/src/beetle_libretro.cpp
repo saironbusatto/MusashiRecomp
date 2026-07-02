@@ -56,6 +56,22 @@ static void sio_trace_callback(uint8_t tx, uint8_t rx, uint16_t ctrl) {
     s_sio_trace_idx = (s_sio_trace_idx + 1) % BEETLE_SIO_TRACE_CAP;
 }
 
+/* ---- CD command trace (oracle-diff for the Kula World CD-init wedge) ---- */
+#define BEETLE_CDCMD_TRACE_CAP 8192
+struct BeetleCdcmdEntry {
+    uint32_t seq; uint8_t cmd, nargs, a0, a1, a2;
+};
+static BeetleCdcmdEntry s_cdcmd_trace[BEETLE_CDCMD_TRACE_CAP];
+static int      s_cdcmd_idx = 0;
+static uint32_t s_cdcmd_seq = 0;
+static void cdcmd_trace_callback(uint8_t cmd, uint8_t nargs,
+                                 uint8_t a0, uint8_t a1, uint8_t a2) {
+    BeetleCdcmdEntry *e = &s_cdcmd_trace[s_cdcmd_idx];
+    e->seq = s_cdcmd_seq++; e->cmd = cmd; e->nargs = nargs;
+    e->a0 = a0; e->a1 = a1; e->a2 = a2;
+    s_cdcmd_idx = (s_cdcmd_idx + 1) % BEETLE_CDCMD_TRACE_CAP;
+}
+
 /* ---- wtrace_all ring (ALWAYS-ON; no filter; captures every write) ----
  * Per global rule "ring buffers always-on": every write hits this ring
  * unconditionally so probes connected late can still query the last ~1s
@@ -434,7 +450,8 @@ extern "C" int beetle_init_with_disc(const char *bios_path, const char *disc_pat
 
     g_psxrecomp_wtrace_cb = wtrace_callback;
     g_psxrecomp_fntrace_cb = fntrace_callback;
-    std::fprintf(stderr, "[psx-beetle] wtrace + fntrace callbacks registered\n");
+    g_psxrecomp_cdcmd_cb = cdcmd_trace_callback;
+    std::fprintf(stderr, "[psx-beetle] wtrace + fntrace + cdcmd callbacks registered\n");
     std::fflush(stderr);
 
     return 0;
@@ -551,6 +568,34 @@ extern "C" void beetle_reset_sio_trace(void) {
     s_sio_trace_idx = 0;
     s_sio_trace_seq = 0;
     memset(s_sio_trace, 0, sizeof(s_sio_trace));
+}
+
+/* ---- CD command trace accessors ---- */
+extern "C" uint32_t beetle_get_cdcmd_trace(uint32_t *out_seq, uint8_t *out_cmd,
+                                           uint8_t *out_nargs, uint8_t *out_a0,
+                                           uint8_t *out_a1, uint8_t *out_a2,
+                                           int max_count)
+{
+    int avail = (int)(s_cdcmd_seq < (uint32_t)BEETLE_CDCMD_TRACE_CAP
+                      ? s_cdcmd_seq : BEETLE_CDCMD_TRACE_CAP);
+    int count = max_count < avail ? max_count : avail;
+    int start = (s_cdcmd_idx - count + BEETLE_CDCMD_TRACE_CAP) % BEETLE_CDCMD_TRACE_CAP;
+    for (int i = 0; i < count; i++) {
+        const BeetleCdcmdEntry *e = &s_cdcmd_trace[(start + i) % BEETLE_CDCMD_TRACE_CAP];
+        out_seq[i]   = e->seq;
+        out_cmd[i]   = e->cmd;
+        out_nargs[i] = e->nargs;
+        out_a0[i]    = e->a0;
+        out_a1[i]    = e->a1;
+        out_a2[i]    = e->a2;
+    }
+    return (uint32_t)count;
+}
+extern "C" uint32_t beetle_get_cdcmd_trace_total(void) { return s_cdcmd_seq; }
+extern "C" void beetle_reset_cdcmd_trace(void) {
+    s_cdcmd_idx = 0;
+    s_cdcmd_seq = 0;
+    memset(s_cdcmd_trace, 0, sizeof(s_cdcmd_trace));
 }
 
 /* ---- wtrace accessors ---- */
