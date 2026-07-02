@@ -116,7 +116,7 @@ first-class High-Level Emulation tier alongside LLE, modeled on
 
 1. **Two selectable backends, LLE default.** A null-by-default hook intercepts
    BIOS service dispatch before the recompiled BIOS runs; selection is
-   per-game config (`[bios] hle = true`) + CLI + env override, with a startup
+   per-game config (`[runtime] bios_hle = true`) + env override (PSX_BIOS_HLE), with a startup
    banner naming the active backend. With HLE off the build is byte-identical
    to a build without the tier.
 2. **LLE remains the reference implementation and the oracle.** It stays fully
@@ -232,8 +232,9 @@ At the start of every session, before any code change:
    concrete milestone is.
 3. Verify `docs/psx_bios_disasm.txt` exists (primary reference).
 4. Verify Ghidra MCP is reachable. If not, stop and ask.
-5. State out loud: "Architecture A is locked. No interpreter. No HLE.
-   No stubs. BIOS first. Game never until Phase 5."
+5. State out loud: "Architecture A is locked. No interpreter. No stubs.
+   LLE default + oracle; HLE only per the §0 amendments (opt-in tier,
+   LLE fallback, no fakes). BIOS first. Game never until Phase 5."
 
 If any of these fail, do not proceed with the user's task — surface
 the failure first.
