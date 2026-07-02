@@ -79,5 +79,7 @@ __pycache__/
 /duckstation/
 _wip/
 
-# Game discs/EXEs (copyrighted, not distributable)
-games/
+# Game discs/EXEs and recompiler output (copyrighted, not distributable).
+# Only the per-game config (game.toml) is tracked.
+games/*/*
+!games/*/game.toml
