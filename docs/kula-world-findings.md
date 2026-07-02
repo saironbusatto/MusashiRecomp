@@ -122,3 +122,44 @@ first branches differently around frame 890. Then either set/preserve the
 kernel disc-identify flag correctly, or fix the recompiled branch. The CD
 command hook (cdrom_cmd_dump) and the fntrace/wtrace rings on both sides are
 the instruments; this is a dedicated next-session task.
+
+
+### Round 3 narrowing (self-stop trap) — the boot flows diverge from power-on
+
+New tool: PSX_CD_TRAP_CMD=<byte> [PSX_CD_TRAP_NTH=<n>] makes the runtime
+SIGSTOP itself the instant the Nth matching CD command dispatches (gdb
+conditional breakpoints slow the emu ~100x; the self-stop costs nothing).
+Attach gdb to the frozen process at leisure.
+
+Findings from trapping ReadTOC #1 and #2 plus a full command-history dump
+(command_history ring, 8192 entries, survives the data-event flood):
+
+1. ReadTOC #1 (frame ~545) is the SHELL's disc check (pcs 0xBFC3Fxxx /
+   0xBFC40xxx; RAM at 0x56FF0 still holds shell bytes — EXE not loaded yet).
+   Legitimate.
+2. ReadTOC #2 (frame ~890, the pre-wedge one) is issued from the BIOS BOOT
+   FLOW itself — guest stack at the trap holds ONLY BIOS-ROM return
+   addresses (Main/StartKernel chain -> 0xBFC0D5A4 -> 0xBFC0D72C), zero game
+   frames. It is the boot's post-EXE-load disc re-check, not a game call.
+3. OUR full boot command stream (from power-on):
+     Test[20], GetStat, GetID, ReadTOC, GetStat, GetID,     <- shell check
+     license sectors LBA 4-5, GetID,
+     Init, PVD/dir reads, per-sector EXE load ... Pause(f889),
+     ReadTOC+GetID (f890, irq-masked, polled)               <- boot re-check
+   ORACLE's full stream (same SCPH1001 bytes!):
+     Init, Init, GetTN, GetID, Setmode(0), PVD/dir reads,
+     Init x3, per-sector EXE load ... -> game reads, NO Test, NO ReadTOC ever.
+4. So the divergence does NOT start at frame 890 — the flows differ from the
+   FIRST command: the oracle's kernel does an early CdInit (Init,Init,GetTN)
+   that our recompiled BIOS never issues, and our shell uses the
+   Test+ReadTOC-based check the oracle never runs. Same ROM bytes, different
+   path => either a recompiled-BIOS branch divergence in early boot, or a
+   hardware-sim input (timer/SPU/CD status read) steering an early branch
+   differently.
+
+Next session: first-divergence hunt anchored at the FIRST CD command
+(oracle: Init; ours: Test at f539). Instrument the early boot branch that
+selects between these kernel CD-init paths. The 0xBFC0Dxxx CD-driver region
+is not covered by docs/psx_bios_disasm.txt — needs Ghidra (source of truth
+#2) or manual decode of those ROM bytes. The game-side wedge (GetStat/Init
+retry loop) is downstream of this boot-flow divergence.

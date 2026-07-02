@@ -16,6 +16,9 @@
 #include "event_ring.h"
 #include <string.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#  include <signal.h>
+#endif
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
@@ -955,6 +958,24 @@ static void queue_or_exec_command(uint8_t cmd) {
 }
 
 static void exec_command(uint8_t cmd) {
+#if !defined(PSX_NO_DEBUG_TOOLS) && !defined(_WIN32)
+    /* Self-stop trap: PSX_CD_TRAP_CMD=<byte> makes the process SIGSTOP
+     * itself the moment that CD command dispatches, so a debugger can
+     * attach and read the full native+guest call chain at the exact
+     * instant with ZERO run-speed cost. (A gdb conditional breakpoint on
+     * this function slows the emu two orders of magnitude via ptrace —
+     * unusable for wedges that need minutes of healthy boot first.) */
+    {
+        static long trap_cmd = -2, trap_nth = 1, trap_hits = 0;
+        if (trap_cmd == -2) {
+            const char *e = getenv("PSX_CD_TRAP_CMD");
+            trap_cmd = (e && *e) ? strtol(e, NULL, 0) : -1;
+            e = getenv("PSX_CD_TRAP_NTH");   /* stop on the Nth match (default 1st) */
+            if (e && *e) trap_nth = strtol(e, NULL, 0);
+        }
+        if ((long)cmd == trap_cmd && ++trap_hits == trap_nth) raise(SIGSTOP);
+    }
+#endif
     trace_cdrom('C', 0, cmd, 0);
     /* ENQUEUE: a CD command was issued (aux = command byte). */
     event_ring_record_aux(EV_ENQ, (uint8_t)SRC_CD_CMD, (uint32_t)cmd);
