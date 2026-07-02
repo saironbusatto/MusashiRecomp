@@ -143,6 +143,23 @@ re-dispatches the guest's true target. Counters in
 
 ---
 
+## `hle_dump` — BIOS-HLE tier call ring (native only)
+
+Always-on ring (`runtime/src/bios_hle.c`, 16K entries) recording every
+A0/B0/C0 kernel-vector dispatch the HLE tier's hook observes, plus the boot
+shell-skip event. Empty in pure-LLE mode (the tier installs no hook there —
+use `bioscall_dump` for LLE-side vector observation).
+
+- `{"cmd":"hle_dump"}` — status: `backend` (`HLE (LLE fallback)` /
+  `LLE (recompiled BIOS)`), `boot_skip`, `boot_turbo_active`, `total`.
+- `{"cmd":"hle_dump","tail":N}` — last N entries: `seq`, `cycle` (guest
+  cycle), `vec` (0xA0/0xB0/0xC0, or 0x30000 for the boot skip), `fn` ($t1
+  function number), `a0..a3`, `ra`, `v0` (result when HLE-serviced), `route`
+  (0 = fell through to LLE, 1 = serviced in HLE, 2 = boot shell-skip).
+- Filters: `"fn":N`, `"route":0|1|2`.
+
+---
+
 ## Rule when the server can't answer your question
 
 If an inspection need isn't covered by the existing commands, **do not fall back to printf or log files**. Instead:

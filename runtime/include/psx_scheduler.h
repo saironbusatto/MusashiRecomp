@@ -78,10 +78,20 @@ int psx_is_dispatchable(uint32_t pc);
 struct CPUState;
 void psx_scheduler_run(struct CPUState* cpu);
 
-/* Hidden dev toggle (env PSX_HLE_SCHEDULER, default 1 = HLE). 1 = deterministic
- * TCB scheduler (carve-out); 0 = legacy host-fiber bridge (LLE). Read once at
- * first call; the mode cannot change mid-run. */
-int psx_hle_scheduler_enabled(void);
+/* Save-state restore: unwind to psx_scheduler_run and re-dispatch resume_pc
+ * (the restored CPUState's PC). Call on the scheduler fiber at a block-leader
+ * boundary, in_exception == 0. Never returns (longjmp). */
+void psx_scheduler_resume_at(uint32_t resume_pc);
+
+/* HLE-tier standing subsystem replacement (CLAUDE.md §0 amendments
+ * 2026-06-29 + 2026-07-02). 1 = deterministic TCB scheduler (default, both
+ * BIOS backends — the LLE host-fiber bridge it replaces is non-deterministic);
+ * 0 = legacy host-fiber bridge. Default from [runtime] hle_scheduler via
+ * psx_hle_scheduler_set_default (call before any dispatch); env
+ * PSX_HLE_SCHEDULER wins over config. Latched at first query; the mode cannot
+ * change mid-run. */
+void psx_hle_scheduler_set_default(int on);
+int  psx_hle_scheduler_enabled(void);
 
 #ifdef __cplusplus
 }

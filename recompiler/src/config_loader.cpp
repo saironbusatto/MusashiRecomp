@@ -129,6 +129,15 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
     if (runtime.contains("fast_boot")) {
         rt.fast_boot = toml::find<bool>(runtime, "fast_boot");
     }
+    if (runtime.contains("bios_hle")) {
+        rt.bios_hle = toml::find<bool>(runtime, "bios_hle");
+    }
+    if (runtime.contains("bios_hle_keep_intro")) {
+        rt.bios_hle_keep_intro = toml::find<bool>(runtime, "bios_hle_keep_intro");
+    }
+    if (runtime.contains("hle_scheduler")) {
+        rt.hle_scheduler = toml::find<bool>(runtime, "hle_scheduler");
+    }
     if (runtime.contains("overlay_cache")) {
         rt.overlay_cache = toml::find<bool>(runtime, "overlay_cache");
     }
@@ -833,6 +842,9 @@ UserSettings load_user_settings(const fs::path& path) {
         if (v.contains("fast_boot")) try_get([&]{
             s.fast_boot = toml::find<bool>(v, "fast_boot"); s.has_fast_boot = true;
         });
+        if (v.contains("bios_hle")) try_get([&]{
+            s.bios_hle = toml::find<bool>(v, "bios_hle"); s.has_bios_hle = true;
+        });
         if (v.contains("fullscreen")) try_get([&]{
             s.fullscreen = toml::find<bool>(v, "fullscreen"); s.has_fullscreen = true;
         });
@@ -983,6 +995,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "turbo_loads       = " << (s.turbo_loads ? "true" : "false") << "\n";
     if (s.has_fast_boot)
         f << "fast_boot         = " << (s.fast_boot ? "true" : "false") << "\n";
+    if (s.has_bios_hle)
+        f << "bios_hle          = " << (s.bios_hle ? "true" : "false") << "\n";
     if (s.has_fullscreen)
         f << "fullscreen        = " << (s.fullscreen ? "true" : "false") << "\n";
     if (s.has_low_latency_input)

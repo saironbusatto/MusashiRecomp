@@ -213,6 +213,31 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-07-02 (HLE PIVOT implemented — HLE as a first-class swappable tier, gbarecomp model):**
+  USER-DIRECTED pivot (supersedes "no HLE" §0; CLAUDE.md amended 2026-07-02, memory
+  hle_tier_architecture.md). Built the full stack this session: (1) EMITTER —
+  full_function_emitter.cpp now emits a null-by-default `g_psx_bios_hle_hook` consult at
+  the top of every psx_dispatch_impl iteration (pre-normalize phys, BEFORE the game/
+  dirty-RAM/static backends; handled ⇒ resume at $ra; NULL default = pure LLE,
+  dispatch-identical). (2) RUNTIME TIER — runtime/src/bios_hle.c(+.h): v1 call-HLE =
+  the B0 event family (DeliverEvent/OpenEvent/CloseEvent/TestEvent/EnableEvent/
+  DisableEvent) ground-truthed against the SCPH1001 kernel disassembly (Ghidra,
+  0xBFC11644..0xBFC11A84; EvCB [0x120]/[0x124], stride 0x1C), operating on the real
+  guest EvCBs, callback delivery via psx_dispatch_call with the kernel-true $ra
+  0x1720; everything else (WaitEvent/threads/pads/card/A0/C0) falls through to LLE.
+  (3) BOOT HLE — one-shot shell-entry intercept (RAM 0x30000; LoadRunShell's indirect
+  call always dispatches): real recompiled kernel init + SYSTEM.CNF + EXE load run
+  authentically under boot-turbo; only the shell (boot animation) is skipped. The old
+  fast_boot snapshot restore is REMOVED (fast_boot=true now aliases boot-skip only).
+  (4) SELECTION — [runtime] bios_hle / bios_hle_keep_intro / hle_scheduler in
+  config_loader (+ settings.toml bios_hle mirror), PSX_BIOS_HLE / PSX_BIOS_HLE_KEEP_INTRO
+  env, startup banner bios_backend=/bios_boot=. PSX_HLE_SCHEDULER spike folded in
+  (default via psx_hle_scheduler_set_default, env wins). (5) OBSERVABILITY — always-on
+  16K HLE ring (route LLE/HLE/boot-skip) + hle_dump TCP command (TCP_COMMANDS.md).
+  Regen era-consistent: BIOS + Tomba + MMX6 images (emitter changed). NEXT: Tomba
+  save+load validation under BOTH backends (user drives); overlay-shard cg-tag refresh
+  per title; grow the handler set (UnDeliverEvent, RCnt, A0 libc) with kernel-decompile
+  + Beetle checks per handler.
 - **2026-07-01 (Tomba pause-menu wedge RESOLVED — stale-recompiler shards, guard shipped):**
   The post-merge Tomba menu wedge (loaded saves only) was NOT the IRQ-resume class the
   prior handoff claimed. Added an always-on exception-EXIT half to irqctx_ring

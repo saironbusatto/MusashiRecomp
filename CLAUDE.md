@@ -106,8 +106,41 @@ faithful core is proven, the goals are accelerated load times (toward 0) and
 enhancements (widescreen), where per-game shims/hacks become legitimate
 (`ENHANCEMENTS.md`). Per-game hacks remain forbidden during foundation work.
 
+**AMENDMENT 2026-07-02 — HLE is a standing, swappable TIER (the gbarecomp
+model), not just a per-landmine carve-out.** This goes further than the
+2026-06-29 amendment (which permits HLE only as a targeted subsystem
+replacement at an LLE landmine). User-directed pivot: psxrecomp now carries a
+first-class High-Level Emulation tier alongside LLE, modeled on
+`F:/Projects/gbarecomp/gbarecomp` (`src/runtime/bios_hle.{h,cpp}`, commits
+23a57ce + 168e313):
+
+1. **Two selectable backends, LLE default.** A null-by-default hook intercepts
+   BIOS service dispatch before the recompiled BIOS runs; selection is
+   per-game config (`[bios] hle = true`) + CLI + env override, with a startup
+   banner naming the active backend. With HLE off the build is byte-identical
+   to a build without the tier.
+2. **LLE remains the reference implementation and the oracle.** It stays fully
+   linked, load-bearing, and selectable; every BIOS call the HLE layer does
+   not implement transparently falls through to the recompiled BIOS, so HLE is
+   never load-bearing beyond what it covers and never becomes the verification
+   oracle.
+3. **HLE boot is THE boot-skip mechanism.** Skipping BIOS boot = synthesize
+   the exact post-boot kernel handoff state (kernel tables, vectors, EvCB/TCB,
+   per-mode state) and jump to the game entry; the recompiled BIOS stays
+   linked for exception/IRQ dispatch and call fallback. This deprecates the
+   previous fast-boot mechanism. LLE always plays the real boot.
+4. **No-stubs still stands, unchanged.** Every HLE implementation must be a
+   real, validated implementation of the documented kernel mechanism
+   (`docs/psx_bios_disasm.txt` / PSX-SPX, Beetle-oracle-checked), operating on
+   the real guest structures — never a "return the answer the BIOS would have
+   produced" fake. The discriminator from the 2026-06-29 amendment applies to
+   every handler.
+5. **The HLE layer is an observability surface.** It carries always-on ring
+   buffers (calls, routes, arguments, results) queryable via the TCP debug
+   server, per rule 3 and the global ring-buffer rule.
+
 If you find yourself wanting to violate any of the above three
-paragraphs **beyond the narrow, oracle-validated amendment just above**,
+paragraphs **beyond the two amendments just above**,
 **stop and re-read PLAN.md**. Every prior attempt failed by
 violating exactly these rules under pressure.
 

@@ -71,10 +71,31 @@ struct RuntimeConfig {
     bool                  has_instant_max_per_frame = false;
     int                   instant_max_per_frame = 0;
 
-    // fast_boot: snapshot BIOS state at first game handoff and restore it on
-    // subsequent launches, skipping BIOS execution entirely. Default off;
-    // enable per-game in [runtime]. Snapshot is keyed on BIOS SHA256 + entry_pc.
+    // fast_boot: DEPRECATED alias for the HLE boot shell-skip (see bios_hle
+    // below). The old mechanism (snapshot BIOS state at first handoff, restore
+    // on later launches) is gone; fast_boot=true now skips only the BIOS shell
+    // (the boot animation) via the HLE tier's one-shot shell intercept, with
+    // kernel init + game EXE load still executed by the real recompiled BIOS
+    // at host speed. Kept so existing game.toml/settings.toml keep working.
     bool                  fast_boot = false;
+
+    // bios_hle: opt-in High-Level Emulation tier for BIOS kernel services
+    // (CLAUDE.md §0 amendment 2026-07-02, the gbarecomp model). Default off =
+    // LLE (the recompiled BIOS), which remains the reference implementation
+    // and the oracle. When on, implemented kernel services are computed
+    // in-runtime against the real guest kernel structures and every other
+    // call falls through to LLE. Implies the HLE boot shell-skip unless
+    // bios_hle_keep_intro. PSX_BIOS_HLE / PSX_BIOS_HLE_KEEP_INTRO env
+    // override at launch. Runtime: runtime/src/bios_hle.c.
+    bool                  bios_hle = false;
+    bool                  bios_hle_keep_intro = false;
+
+    // hle_scheduler: the HLE tier's standing SUBSYSTEM REPLACEMENT for guest
+    // thread switching (deterministic TCB scheduler vs the legacy
+    // non-deterministic host-fiber bridge). Default ON under BOTH BIOS
+    // backends (CLAUDE.md §0 amendment 2026-06-29 carve-out); PSX_HLE_SCHEDULER
+    // env wins over this key. Runtime: traps.c psx_hle_scheduler_enabled().
+    bool                  hle_scheduler = true;
 
     // overlay_cache: enable the overlay DLL cache + capture (Layer A). Off by
     // default. When true the runtime scans cache/<game_id>/ for precompiled
@@ -470,6 +491,8 @@ struct UserSettings {
     // settings.toml overrides it).
     bool has_turbo_loads    = false; bool turbo_loads    = true;
     bool has_fast_boot      = false; bool fast_boot      = false;
+    // HLE BIOS tier toggle (see RuntimeConfig::bios_hle). Overrides game.toml.
+    bool has_bios_hle       = false; bool bios_hle       = false;
     // [video] fullscreen: launch the game window in desktop fullscreen (the
     // launcher's "Fullscreen on launch" toggle; the in-game F11 / Alt+Enter
     // hotkey still toggles it live). false => windowed (default).
