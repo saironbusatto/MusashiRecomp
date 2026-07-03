@@ -948,6 +948,29 @@ void psx_gte_read(CPUState *cpu, uint32_t rt) {
 int psx_slice_block(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects) {
     return g_cbs.slice_block ? g_cbs.slice_block(cpu, block_addr, bcyc, side_effects) : 0;
 }
+/* GTE special-register accessors (ABI v10). The emitter routes mfc2/cfc2/mtc2/
+ * ctc2 on flag/IR/derived GTE regs through these as DIRECT calls, so any
+ * GTE-heavy overlay (Tomba2 lava / Trolley attract demos) fails to link
+ * without them — undefined gte_read_ctrl was the signature that silently
+ * blocked all new overlay coverage. GTE state is SHARED runtime state; a
+ * local fallback would fork the flag/IR timeline, so these forward
+ * unconditionally (ABI v10 hosts always supply them; the v10 gate rejects
+ * DLL/host mixes that don't).
+ * NOTE the plain-data fast paths (cpu->gte_data[i] / cpu->gte_ctrl[i]) stay
+ * direct CPUState accesses in emitted code — only the derived/flag registers
+ * come through here, matching code_generator.cpp's COP2 case. */
+uint32_t gte_read_data(CPUState *cpu, uint8_t reg) {
+    return g_cbs.gte_read_data(cpu, reg);
+}
+uint32_t gte_read_ctrl(CPUState *cpu, uint8_t reg) {
+    return g_cbs.gte_read_ctrl(cpu, reg);
+}
+void gte_write_data(CPUState *cpu, uint8_t reg, uint32_t value) {
+    g_cbs.gte_write_data(cpu, reg, value);
+}
+void gte_write_ctrl(CPUState *cpu, uint8_t reg, uint32_t value) {
+    g_cbs.gte_write_ctrl(cpu, reg, value);
+}
 /* g_debug_last_store_pc: a provenance breadcrumb the emitter writes before stores.
  * Overlays are built PSX_NO_DEBUG_TOOLS (the runtime's only consumer is debug tooling),
  * so a local definition satisfies the link; overlay-store provenance is simply not

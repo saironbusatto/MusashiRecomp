@@ -38,8 +38,12 @@
  *       checks can provide the real guest resume PC for async RFE recovery.
  *   v9: faithful-timing callbacks (cyc_load, icache_fetch, muldiv, mult_latency,
  *       gte, slice_block) so overlay code built with PSX_ENABLE_BLOCK_CYCLES links
- *       against the runtime's real timing impls (the cycle-accuracy rearchitecture). */
-#define PSX_OVERLAY_ABI_VERSION 9
+ *       against the runtime's real timing impls (the cycle-accuracy rearchitecture).
+ *   v10: GTE special-register accessors (gte_read_data/gte_read_ctrl/
+ *        gte_write_data/gte_write_ctrl) — the emitter emits direct calls for
+ *        flag/IR/derived GTE regs; GTE-heavy overlays failed to LINK without
+ *        shims (undefined gte_read_ctrl), silently blocking new coverage. */
+#define PSX_OVERLAY_ABI_VERSION 10
 
 /* Codegen flavor of the recompiled output the overlays + runtime were built
  * against. Overlays are keyed in the cache by guest-bytes CRC, which is
@@ -178,6 +182,17 @@ typedef struct {
     void     (*gte_stall)(CPUState *cpu);
     void     (*gte_read)(CPUState *cpu, uint32_t rt);
     int      (*slice_block)(CPUState *cpu, uint32_t block_addr, uint32_t bcyc, int side_effects);
+    /* GTE special-register accessors (ABI v10). The emitter routes mfc2/cfc2/
+     * mtc2/ctc2 on flag/IR/derived registers through these (code_generator.cpp
+     * COP2 case) — a GTE-heavy overlay (Tomba2 lava/Trolley attract demos)
+     * emits direct calls and its DLL link fails without shims (undefined
+     * gte_read_ctrl — the class that silently blocked ALL new overlay coverage
+     * after the v9 caches rotated). Appended last; ABI bump to 10 rejects any
+     * pre-shim DLL. */
+    uint32_t (*gte_read_data)(CPUState *cpu, uint8_t reg);
+    uint32_t (*gte_read_ctrl)(CPUState *cpu, uint8_t reg);
+    void     (*gte_write_data)(CPUState *cpu, uint8_t reg, uint32_t value);
+    void     (*gte_write_ctrl)(CPUState *cpu, uint8_t reg, uint32_t value);
 } OverlayCallbacks;
 
 #ifdef __cplusplus

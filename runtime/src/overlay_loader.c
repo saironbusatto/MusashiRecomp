@@ -1116,6 +1116,19 @@ static void init_callbacks(void) {
         s_callbacks.gte_stall      = psx_gte_stall;
         s_callbacks.gte_read       = psx_gte_read;
         s_callbacks.slice_block    = psx_slice_block;
+        /* ABI v10: GTE special-register accessors — the emitter emits direct
+         * calls for flag/IR/derived GTE regs (mfc2/cfc2/mtc2/ctc2); a GTE-heavy
+         * overlay DLL cannot link without these forwarded. */
+        {
+            extern uint32_t gte_read_data(CPUState*, uint8_t);
+            extern uint32_t gte_read_ctrl(CPUState*, uint8_t);
+            extern void     gte_write_data(CPUState*, uint8_t, uint32_t);
+            extern void     gte_write_ctrl(CPUState*, uint8_t, uint32_t);
+            s_callbacks.gte_read_data  = gte_read_data;
+            s_callbacks.gte_read_ctrl  = gte_read_ctrl;
+            s_callbacks.gte_write_data = gte_write_data;
+            s_callbacks.gte_write_ctrl = gte_write_ctrl;
+        }
     }
 }
 
