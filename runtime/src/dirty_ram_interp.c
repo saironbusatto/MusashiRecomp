@@ -1456,6 +1456,23 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     enum { MAX_INSNS_PER_DISPATCH = 1000000 };
     uint32_t pc = addr;
     int insns_executed = 0;
+    /* Async-interrupt latency fix. A guest wait loop that lives ENTIRELY in
+     * dirty RAM (e.g. libcd's CdSync spin, as in Kula World) re-enters this
+     * interpreter once per short (~7-insn) block and exits before the
+     * per-invocation `(insns_executed & 0xFFF)` gate below can fire — so a
+     * pending, IEc+IM2-enabled interrupt is never taken and the loop spins for
+     * seconds while the CD IRQ that would set its wait-flag is never serviced.
+     * Poll on a GLOBAL invocation counter so short-block loops still yield to
+     * interrupts (this is the interpreter analogue of a block-leader poll in
+     * static code). psx_check_interrupts runs the handler and returns with
+     * registers restored, so continuing the loop afterward is safe. */
+    {
+        static uint32_t s_interp_entry_poll = 0;
+        if ((++s_interp_entry_poll & 0x3Fu) == 0) {
+            cpu->pc = pc;
+            psx_check_interrupts(cpu);
+        }
+    }
     for (int i = 0; i < MAX_INSNS_PER_DISPATCH; i++) {
         uint32_t next_pc = 0;
         uint32_t insn = fetch_word(pc & 0x1FFFFFFFu);
