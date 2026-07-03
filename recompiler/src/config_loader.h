@@ -202,6 +202,17 @@ struct RuntimeConfig {
     uint32_t              video_fmv_skip_movie_id    = 0;
     int                   video_fmv_skip_end_total   = 0;  // 0 => runtime default (3)
 
+    // fmv_skip_no_xa: broaden FMV detection to MDEC-decode activity ALONE (no
+    // XA-stream requirement). Some movies are silent and fully preloaded into
+    // RAM (Tomba2's Whoopee Camp logo: no CD sectors, no XA during playback),
+    // so the default MDEC+XA detector never fires and neither skip mechanism is
+    // even attempted. With this on, such movies enter the same skip path:
+    // pacing/presents suppressed (fast-forward at host speed), audio muted,
+    // skip button held. The movie still executes every frame — presentation-
+    // side only, guest timeline untouched. Per-game opt-in because MDEC use
+    // outside movies (loading-screen stills) would briefly trigger it.
+    bool                  video_fmv_skip_no_xa = false;
+
     // aspect_ratio: display aspect "W:H" (default "4:3" = native). A wider
     // aspect (e.g. "16:9") enables the widescreen hack: the GTE squashes
     // screen-X by (4*H)/(3*W) around the game's projection centre and the

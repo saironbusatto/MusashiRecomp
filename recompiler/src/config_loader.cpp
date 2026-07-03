@@ -218,6 +218,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
             rt.video_fmv_skip_end_total =
                 (int)toml::find<int64_t>(video, "fmv_skip_end_total");
         }
+        if (video.contains("fmv_skip_no_xa")) {
+            rt.video_fmv_skip_no_xa = toml::find<bool>(video, "fmv_skip_no_xa");
+        }
         if (video.contains("low_latency_input")) {
             rt.video_low_latency_input = toml::find<bool>(video, "low_latency_input");
         }

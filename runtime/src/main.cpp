@@ -158,6 +158,10 @@ static int           g_headless       = 0;   /* debug/CI frontend: no SDL window
 static uint32_t      g_fmv_skip_total_table = 0;
 static uint32_t      g_fmv_skip_movie_id    = 0;
 static int           g_fmv_skip_end_total   = 3;
+/* fmv_skip_no_xa: detect FMVs on MDEC activity alone (silent RAM-preloaded
+ * movies never stream XA, so the default MDEC+XA detector misses them —
+ * Tomba2's Whoopee Camp logo). Presentation-side fast-forward only. */
+static int           g_fmv_skip_no_xa       = 0;
 /* Low-latency present options (see [video] in config_loader). Measured on a
  * 60Hz box the dominant input->photon cost is NOT vsync at the swap (that
  * blocks ~tens of us) but that input is sampled ~one pacer-wait (~13.6ms)
@@ -1551,9 +1555,13 @@ static void sdl_vblank_present(void) {
         int mdec_decoding = (mc != s_last_mdec);
         s_last_mdec = mc;
         int xa = cdrom_xa_stream_active();
-        if (mdec_decoding && xa) s_fmv_hold = 4;
+        /* fmv_skip_no_xa: silent RAM-preloaded movies (no XA stream) never
+         * satisfy the MDEC+XA detector; with the per-game opt-in, MDEC
+         * activity alone qualifies. */
+        int detected = mdec_decoding && (xa || g_fmv_skip_no_xa);
+        if (detected) s_fmv_hold = 4;
         else if (s_fmv_hold > 0) s_fmv_hold--;
-        fmv_skip_active = (s_fmv_hold > 0) && xa;
+        fmv_skip_active = (s_fmv_hold > 0) && (xa || g_fmv_skip_no_xa);
         if (fmv_skip_active) {
             if (g_fmv_skip_total_table) {
                 /* End the active movie via its own frame-count teardown. */
@@ -2020,6 +2028,7 @@ int main(int argc, char** argv) {
             g_fmv_skip_movie_id    = gc.runtime.video_fmv_skip_movie_id;
             if (gc.runtime.video_fmv_skip_end_total)
                 g_fmv_skip_end_total = gc.runtime.video_fmv_skip_end_total;
+            g_fmv_skip_no_xa       = gc.runtime.video_fmv_skip_no_xa ? 1 : 0;
             g_ws_anchor_addr   = gc.ws_sprite_anchor_addr;
             g_ws_hud_sprt      = gc.ws_hud_sprt_squash;
             /* [widescreen] full_2d — opt a pure-2D sprite game (MMX6) into the
