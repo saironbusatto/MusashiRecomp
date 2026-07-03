@@ -228,6 +228,10 @@ static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
 static uint32_t mem_ctrl[16];   /* indices 0..15 → addresses 0x1F801000..0x1F80103C */
 static uint32_t ram_size_reg;   /* 0x1F801060 */
 
+/* KSEG2 no-op access telemetry (see the guards in the accessors). */
+uint64_t g_kseg2_ignored_reads;
+uint64_t g_kseg2_ignored_writes;
+
 /* Cache control register (KSEG2: 0xFFFE0130). */
 static uint32_t cache_ctrl;
 
@@ -375,6 +379,17 @@ void memory_init(const char* bios_path) {
         s_bios_checksum += ((const uint32_t*)bios_rom)[i];
 }
 
+/* Unmapped-register access INSIDE the I/O window (0x1F801000..0x1F803FFF):
+ * real hardware open-buses these (reads return garbage, writes vanish; no
+ * fault) and games genuinely hit them — Tomba2's late attract sweeps a wild
+ * byte loop across the whole window (bzero/read over a 0xDF80xxxx pointer).
+ * Beetle returns 0 / ignores. Match it: count + (already ring-traced by the
+ * callers' mmio trace hooks) + open-bus. Genuinely unknown-DEVICE reads are
+ * still observable via the always-on MMIO rings and these counters — probes
+ * query the rings, per the ring-buffer doctrine. mmio_fatal is retired. */
+uint64_t g_io_openbus_reads;
+uint64_t g_io_openbus_writes;
+
 static void mmio_fatal(uint32_t vaddr, uint32_t phys, const char* op) {
     static char reason[96];
     snprintf(reason, sizeof(reason), "MMIO %s @ 0x%08X (phys 0x%08X)", op, vaddr, phys);
@@ -448,7 +463,7 @@ static uint32_t mmio_read32_impl(uint32_t addr) {
     if (addr >= 0x1F802000u && addr <= 0x1F802FFFu) {
         return 0;
     }
-    mmio_fatal(addr, addr, "READ32");
+    { /* open-bus (Beetle parity) */ g_io_openbus_reads++;  return 0;; }
     return 0;
 }
 
@@ -521,11 +536,21 @@ static void mmio_write32(uint32_t addr, uint32_t val) {
     if (addr >= 0x1F802000u && addr <= 0x1F802FFFu) {
         return; /* POST port — ignore */
     }
-    mmio_fatal(addr, addr, "WRITE32");
+    { /* open-bus (Beetle parity) */ g_io_openbus_writes++; return;; }
 }
 
 static uint16_t mmio_read16_impl(uint32_t addr) {
     SHADOW_NOTE_MMIO();
+    /* Memory control: 0x1F801000..0x1F80103C — halfword lane of the 32-bit
+     * register (games touch EXP1/EXP2 config with sub-word accesses; Tomba2's
+     * late attract byte-writes 0x1F801000). */
+    if (addr >= 0x1F801000u && addr <= 0x1F80103Fu) {
+        uint32_t v = mem_ctrl[(addr - 0x1F801000u) >> 2];
+        return (uint16_t)(v >> (8u * (addr & 2u)));
+    }
+    if (addr >= 0x1F801060u && addr <= 0x1F801063u) {
+        return (uint16_t)(ram_size_reg >> (8u * (addr & 2u)));
+    }
     /* SIO: 0x1F801040..0x1F80105F */
     if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
         return (uint16_t)sio_read(addr);
@@ -558,7 +583,7 @@ static uint16_t mmio_read16_impl(uint32_t addr) {
     if (addr >= 0x1F801C00u && addr <= 0x1F801FFFu) {
         return (uint16_t)spu_read(addr);
     }
-    mmio_fatal(addr, addr, "READ16");
+    { /* open-bus (Beetle parity) */ g_io_openbus_reads++;  return 0;; }
     return 0;
 }
 
@@ -573,6 +598,21 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
     psx_devices_mmio_sync();
     SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, (uint32_t)val, 2);
+    /* Memory control: 0x1F801000..0x1F80103C — halfword lane RMW. */
+    if (addr >= 0x1F801000u && addr <= 0x1F80103Fu) {
+        uint32_t idx = (addr - 0x1F801000u) >> 2;
+        uint32_t shift = 8u * (addr & 2u);
+        mem_ctrl[idx] = (mem_ctrl[idx] & ~(0xFFFFu << shift))
+                      | ((uint32_t)val << shift);
+        return;
+    }
+    /* RAM size register: 0x1F801060 — halfword lane RMW. */
+    if (addr >= 0x1F801060u && addr <= 0x1F801063u) {
+        uint32_t shift = 8u * (addr & 2u);
+        ram_size_reg = (ram_size_reg & ~(0xFFFFu << shift))
+                     | ((uint32_t)val << shift);
+        return;
+    }
     /* SIO: 0x1F801040..0x1F80105F */
     if (addr >= 0x1F801040u && addr <= 0x1F80105Fu) {
         sio_write(addr, val);
@@ -618,11 +658,19 @@ static void mmio_write16(uint32_t addr, uint16_t val) {
         spu_write(addr, val);
         return;
     }
-    mmio_fatal(addr, addr, "WRITE16");
+    { /* open-bus (Beetle parity) */ g_io_openbus_writes++; return;; }
 }
 
 static uint8_t mmio_read8_impl(uint32_t addr) {
     SHADOW_NOTE_MMIO();
+    /* Memory control: 0x1F801000..0x1F80103C — byte lane of the 32-bit reg. */
+    if (addr >= 0x1F801000u && addr <= 0x1F80103Fu) {
+        uint32_t v = mem_ctrl[(addr - 0x1F801000u) >> 2];
+        return (uint8_t)(v >> (8u * (addr & 3u)));
+    }
+    if (addr >= 0x1F801060u && addr <= 0x1F801063u) {
+        return (uint8_t)(ram_size_reg >> (8u * (addr & 3u)));
+    }
     /* Interrupts: 0x1F801070..0x1F801077 (I_STAT, I_MASK) */
     if (addr >= 0x1F801070u && addr <= 0x1F801077u) {
         if (addr < 0x1F801074u) sio_tick(0);
@@ -654,7 +702,7 @@ static uint8_t mmio_read8_impl(uint32_t addr) {
     if (addr >= 0x1F802000u && addr <= 0x1F802FFFu) {
         return 0;
     }
-    mmio_fatal(addr, addr, "READ8");
+    { /* open-bus (Beetle parity) */ g_io_openbus_reads++;  return 0;; }
     return 0;
 }
 
@@ -669,6 +717,23 @@ static void mmio_write8(uint32_t addr, uint8_t val) {
     psx_devices_mmio_sync();
     SHADOW_NOTE_MMIO();
     debug_server_trace_mmio_write(addr, (uint32_t)val, 1);
+    /* Memory control: 0x1F801000..0x1F80103C — byte lane RMW. Tomba2's late
+     * attract byte-writes the EXP1 base register at 0x1F801000; only the
+     * 32-bit path covered the block and the byte path fatal'd. */
+    if (addr >= 0x1F801000u && addr <= 0x1F80103Fu) {
+        uint32_t idx = (addr - 0x1F801000u) >> 2;
+        uint32_t shift = 8u * (addr & 3u);
+        mem_ctrl[idx] = (mem_ctrl[idx] & ~(0xFFu << shift))
+                      | ((uint32_t)val << shift);
+        return;
+    }
+    /* RAM size register: 0x1F801060 — byte lane RMW (Tomba2 late attract). */
+    if (addr >= 0x1F801060u && addr <= 0x1F801063u) {
+        uint32_t shift = 8u * (addr & 3u);
+        ram_size_reg = (ram_size_reg & ~(0xFFu << shift))
+                     | ((uint32_t)val << shift);
+        return;
+    }
     /* Interrupts: partial stores affect only the addressed byte lane. */
     if (addr >= 0x1F801070u && addr <= 0x1F801073u) {
         uint32_t shift = 8u * (addr & 3u);
@@ -724,7 +789,7 @@ static void mmio_write8(uint32_t addr, uint8_t val) {
     if (addr >= 0x1F802000u && addr <= 0x1F802FFFu) {
         return;
     }
-    mmio_fatal(addr, addr, "WRITE8");
+    { /* open-bus (Beetle parity) */ g_io_openbus_writes++; return;; }
 }
 
 /* --- Read functions --- */
@@ -751,6 +816,15 @@ uint32_t psx_read_word(uint32_t addr) {
 static uint32_t psx_read_word_raw(uint32_t addr) {
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) return cache_ctrl;
+    /* KSEG2 (0xC0000000+): only cache control (0xFFFE0130, above where
+     * applicable) exists there. Real hardware maps NOTHING else — Beetle
+     * (cpu.cpp addr_mask[6..7]=0xFFFFFFFF) leaves KSEG2 addresses unmasked
+     * so they fall to unmapped space and the access is a no-op. Our flat
+     * 0x1FFFFFFF masking routed KSEG2 garbage onto LIVE registers: Tomba2's
+     * attract runs a BIOS bzero over a wild 0xDF80xxxx pointer, which zeroed
+     * the SIO/memctrl I/O block byte-by-byte and then hit the unmapped-MMIO
+     * fatal (frame 9705). Ignore writes, read as 0, count for telemetry. */
+    if (addr >= 0xC0000000u) { g_kseg2_ignored_reads++; return 0; }
 
     uint32_t phys = addr & 0x1FFFFFFFu;
 
@@ -835,6 +909,8 @@ void psx_write_word(uint32_t addr, uint32_t val) {
 static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) { cache_ctrl = val; return; }
+    /* KSEG2 guard — see psx_read_word_raw. */
+    if (addr >= 0xC0000000u) { g_kseg2_ignored_writes++; return; }
 
     /* IsC (Isolate Cache): when set, writes go to D-cache only.
      * We have no cache model, so silently discard RAM/scratchpad writes. */
@@ -896,6 +972,8 @@ uint16_t psx_read_half(uint32_t addr) {
     return v;
 }
 static uint16_t psx_read_half_raw(uint32_t addr) {
+        /* KSEG2 guard — see psx_read_word_raw. */
+    if (addr >= 0xC0000000u) { g_kseg2_ignored_reads++; return 0; }
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
@@ -929,6 +1007,8 @@ void psx_write_half(uint32_t addr, uint16_t val) {
 static void psx_write_half_raw(uint32_t addr, uint16_t val) {
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
+        /* KSEG2 guard — see psx_read_word_raw. */
+    if (addr >= 0xC0000000u) { g_kseg2_ignored_writes++; return; }
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
@@ -975,6 +1055,8 @@ uint8_t psx_read_byte(uint32_t addr) {
     return v;
 }
 static uint8_t psx_read_byte_raw(uint32_t addr) {
+        /* KSEG2 guard — see psx_read_word_raw. */
+    if (addr >= 0xC0000000u) { g_kseg2_ignored_reads++; return 0; }
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {
@@ -1152,6 +1234,8 @@ void psx_write_byte(uint32_t addr, uint8_t val) {
 static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
+        /* KSEG2 guard — see psx_read_word_raw. */
+    if (addr >= 0xC0000000u) { g_kseg2_ignored_writes++; return; }
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     if (phys < RAM_SIZE) {

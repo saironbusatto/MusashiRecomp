@@ -943,10 +943,13 @@ uint32_t dma_read(uint32_t addr) {
     }
 
 bad:
+    /* Unmapped words inside the DMA register block (0x1F8010F8/0xFC, channel
+     * reg offset 0x0C variants): real hardware open-buses them and Tomba2's
+     * late-attract wild I/O sweep (BIOS bzero/read over a 0xDF80xxxx pointer)
+     * reads straight through here. Beetle parity: return 0, no fault. */
     {
-        static char reason[64];
-        snprintf(reason, sizeof(reason), "DMA read from unknown address 0x%08X", addr);
-        psx_fatal_halt(reason);
+        extern uint64_t g_io_openbus_reads;
+        g_io_openbus_reads++;
     }
     return 0;
 }
@@ -1009,11 +1012,10 @@ void dma_write_masked(uint32_t addr, uint32_t val, uint32_t mask) {
     }
 
 bad:
+    /* See the read-side note: open-bus, Beetle parity. */
     {
-        static char reason[80];
-        snprintf(reason, sizeof(reason),
-                 "DMA write to unknown address 0x%08X = 0x%08X", addr, val);
-        psx_fatal_halt(reason);
+        extern uint64_t g_io_openbus_writes;
+        g_io_openbus_writes++;
     }
 }
 
