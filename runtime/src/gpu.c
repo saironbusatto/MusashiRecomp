@@ -2831,8 +2831,17 @@ void gpu_write_gp0(uint32_t val) {
 
     /* State: mono polyline — each word is a vertex (or terminator) */
     if (gp0_state == GP0_POLYLINE_MONO) {
-        if (val & 0xF000F000u) {
-            /* Terminator: bit pattern has high bits set in both halfwords */
+        if ((val & 0xF000F000u) == 0x50005000u) {
+            /* Terminator: hardware ends a polyline ONLY when the masked word
+             * matches 0x50005000 (the 0x55555555 terminator) — Beetle
+             * gpu.cpp:1030, psx-spx. The old `(val & 0xF000F000) != 0` test
+             * also fired on any NEGATIVE vertex coordinate (Y=0xFFxx) and, at
+             * shaded color positions, on any color component >= 0x10 in the
+             * G byte — ending the polyline early and re-parsing its remaining
+             * words as new GP0 commands. That de-phased the whole command
+             * stream: garbage prims all over the Tomba2 attract (texture
+             * garble) and eventually a legit texcoord word 0xFE65FE58 parsed
+             * in IDLE state -> "GP0 unknown command 0xFE" fatal (village). */
             gp0_state = GP0_IDLE;
             return;
         }
@@ -2863,8 +2872,9 @@ void gpu_write_gp0(uint32_t val) {
             return;
         }
         if (polyline_has_prev == 1) {
-            /* Expecting color word (or terminator) */
-            if (val & 0xF000F000u) {
+            /* Expecting color word (or terminator). Same hardware rule as the
+             * mono case: ONLY the masked 0x50005000 pattern terminates. */
+            if ((val & 0xF000F000u) == 0x50005000u) {
                 gp0_state = GP0_IDLE;
                 return;
             }
@@ -2912,7 +2922,7 @@ void gpu_write_gp0(uint32_t val) {
         /* Variable-length polyline command.
          * Mono  (0x48-0x4F): [cmd+color] [v0] [v1] ... [terminator]
          * Shaded(0x58-0x5F): [cmd+C0] [v0] [C1] [v1] ... [terminator]
-         * Terminator: word with bit 31 set (0x5xxx or 0xFFFF). */
+         * Terminator: (word & 0xF000F000) == 0x50005000 (0x55555555). */
         int shaded = (opcode & 0x10) != 0;  /* 0x58+ = shaded, 0x48+ = mono */
         polyline_semi_trans = (val >> 25) & 1;
         polyline_color = rgb888_to_rgb555(val & 0xFFFFFFu);
