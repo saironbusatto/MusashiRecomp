@@ -53,6 +53,32 @@ game-agnostic framework improvements (see `docs/kula-world-findings.md`):
 5. **CD controller version** returned the PSone `0x97`; the SCPH-1001 sub-CPU
    reports `0x94 09 19 C0`, which the shell's CD-init requires.
 
+### Now also on macOS (Apple Silicon)
+
+Those **five runtime fixes** are what got *Kula World* actually *playing* — and
+they are game-agnostic, so they benefit every target, not just this one. On top
+of the earlier Windows→Linux POSIX port, bringing the same build up on **macOS
+(Apple Silicon / arm64, AppleClang)** needed only **one** extra build fix plus a
+small POSIX cleanup — the recompiler and runtime are otherwise portable C:
+
+1. `runtime/src/autocompile.c` — added `#include <stdlib.h>` for `getenv`
+   (glibc and `windows.h` leak that declaration; the macOS SDK does not).
+2. `recompiler/src/main_bios.cpp` — the compiler-probe's `>NUL` (Windows null
+   device) is now `#ifdef`'d to `/dev/null` on POSIX (it was misdirecting the
+   redirect and dropping a stray `NUL` file).
+
+The ucontext fiber backend already had the `_XOPEN_SOURCE`/`_DARWIN_C_SOURCE`
+guards it needs on macOS, and SDL2 (Homebrew) picks the **Metal** backend
+automatically. Result: BIOS → title → menu → a 3D level that rolls under
+control, running natively on Apple Silicon. Full macOS steps in
+[`docs/MACOS_BUILD_KULA.md`](docs/MACOS_BUILD_KULA.md).
+
+<p align="center">
+  <img src="docs/assets/kula-world-macos.png" alt="Kula World running natively on macOS (Apple Silicon)" width="480">
+  <br>
+  <em>Kula World, statically recompiled, running natively on macOS (Apple Silicon).</em>
+</p>
+
 ## Philosophy — toward 100% static recompilation
 
 The goal is simple and absolute: **a PS1 game should run as native code, not be

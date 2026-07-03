@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>   /* getenv — declared here; glibc/windows.h leak it, macOS SDK does not */
 #include <string.h>
 
 #ifdef _WIN32

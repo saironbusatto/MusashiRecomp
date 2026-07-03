@@ -88,3 +88,6 @@ games/*/*
 # Per-game memcards created at runtime
 *.mcr
 !dummy.*.mcr
+
+# macOS .app bundle (contains recompiled BIOS-derived binary — not distributable)
+/dist/
