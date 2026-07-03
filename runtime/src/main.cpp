@@ -1755,7 +1755,17 @@ static void sdl_vblank_present(void) {
          * window has no SDL_Renderer, so we must never fall through below. */
         if (g_vk_active) {
             if (di.depth24) {
-                vk_renderer_present_cpu(NULL, (int)present_w, (int)h,
+                /* 24-bit (FMV) frames: the packed RGB bytes live in the CPU
+                 * VRAM mirror (transfer path keeps it current; sync_cpu folds
+                 * down any GPU-drawn content). Compose the ARGB frame exactly
+                 * like the software present, then hand it to the Vulkan CPU
+                 * present (staging image -> swapchain blit). */
+                vk_renderer_sync_cpu();
+                for (uint32_t y = 0; y < h; y++)
+                    for (uint32_t x = 0; x < present_w; x++)
+                        sdl_pixel_buf[y * present_w + x] =
+                            gpu_display_pixel_argb(&di, x, y);
+                vk_renderer_present_cpu(sdl_pixel_buf, (int)present_w, (int)h,
                                         g_video_aa ? 1 : 0, fmv_frame ? 1 : 0);
             } else if (wide_present &&
                        vk_renderer_present_wide((int)di.display_x, (int)di.display_y,
@@ -2450,6 +2460,17 @@ int main(int argc, char** argv) {
 
     std::fprintf(stdout, "psxrecomp runtime: loading BIOS from %s\n", bios_path_str.c_str());
     memory_init(bios_path_str.c_str());
+#ifndef PSX_HAVE_VULKAN
+    /* Vulkan was not compiled in (PSX_ENABLE_VULKAN=OFF or no SDK found).
+     * Refuse a vulkan request from ANY source (config / CLI / launcher seed)
+     * and fall back to OpenGL, so the window is never created with
+     * SDL_WINDOW_VULKAN against an inert backend stub. */
+    if (g_video_renderer == 2) {
+        std::fprintf(stdout, "psxrecomp: Vulkan renderer is not available in this build "
+                             "(PSX_ENABLE_VULKAN=OFF); using OpenGL instead.\n");
+        g_video_renderer = 1;
+    }
+#endif
     /* Select the renderer backend BEFORE gpu_init() (which runs gr_init ->
      * the backend's init on the VRAM buffer). Software is the default and the
      * fallback; an unavailable OpenGL backend reverts to software. */

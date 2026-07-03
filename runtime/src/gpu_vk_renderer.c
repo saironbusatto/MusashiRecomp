@@ -287,14 +287,17 @@ static VkPipelineLayout s_pl_blit;
 static VkPipelineLayout s_pl_pack;
 static VkPipeline       s_pipe_pack;      /* compute */
 
-/* Lazy graphics-pipeline cache keyed by (program, topology, blend, stencil).
- * program: 0 GEO, 1 TEX, 2 BLIT. blend: 0 off, 1..4 = PS1 modes 0..3 (+1).
- * stencil: 0 SET (always+replace, dyn ref), 1 CHECK keep, 2 CHECK invert. */
+/* Lazy graphics-pipeline cache keyed by (program, topology, blend, stencil,
+ * cmask). program: 0 GEO, 1 TEX, 2 BLIT. blend: 0 off, 1..4 = PS1 modes 0..3
+ * (+1). stencil: 0 SET (always+replace, dyn ref), 1 CHECK keep, 2 CHECK
+ * invert. cmask: 0 writes colour, 1 disables ALL colour writes (stencil-only
+ * fixup pass of an opaque textured batch — mirrors GL's glColorMask off). */
 #define PIPE_PROGS 3
 #define PIPE_TOPOS 2   /* 0 TRIANGLE_LIST, 1 LINE_LIST */
 #define PIPE_BLENDS 5
 #define PIPE_STENCILS 3
-#define PIPE_CACHE_N (PIPE_PROGS * PIPE_TOPOS * PIPE_BLENDS * PIPE_STENCILS)
+#define PIPE_CMASKS 2
+#define PIPE_CACHE_N (PIPE_PROGS * PIPE_TOPOS * PIPE_BLENDS * PIPE_STENCILS * PIPE_CMASKS)
 static VkPipeline s_pipe_cache[PIPE_CACHE_N];
 static VkShaderModule s_mod_geo_v, s_mod_geo_f, s_mod_tex_v, s_mod_tex_f, s_mod_blit_v, s_mod_blit_f;
 
@@ -305,6 +308,13 @@ static VkBuffer       s_vbuf;
 static VkDeviceMemory s_vbuf_mem;
 static Vert          *s_vmap;             /* persistently mapped host-visible */
 static uint32_t       s_vcount;           /* verts accumulated this batch */
+/* Draws are SUBMITTED without waiting (deferred-submit model), so a flushed
+ * batch's vertices may still be read by the GPU when the next batch begins.
+ * Rewriting the buffer from offset 0 per batch raced that read and shredded
+ * whole batches on screen (terrain/mesh chunks missing or drawn with another
+ * batch's vertices). Batches therefore SUB-ALLOCATE: each flush draws
+ * [base, base+count) and bumps base; gpu_sync (queue idle) recycles to 0. */
+static uint32_t       s_vbase;            /* first vertex of the open batch */
 static int            s_geo_semi = -2;    /* open untextured batch keys */
 static int            s_geo_mask = 0, s_geo_check = 0;
 
@@ -316,11 +326,13 @@ static VkBuffer       s_tbuf;
 static VkDeviceMemory s_tbuf_mem;
 static TexVert       *s_tmap;
 static uint32_t       s_tcount;
+static uint32_t       s_tbase;            /* first vertex of the open batch */
 static int            s_tb_semi = -2, s_tb_mask = 0, s_tb_check = 0, s_tb_filter = 0;
 static int            s_tb_twin[4] = {0,0,0,0};
 
 static void flush_geometry(void);         /* commit pending untextured batch */
 static void flush_tex_batch(void);        /* commit pending textured batch */
+static void flush_cpu_upload(void);       /* pending CPU writes -> GPU images */
 static void pack_flush(void);             /* hr -> raw mirror (dirty rect) */
 static void flush_pack_if_sampling(int tpx, int tpy, int depth, int clx, int cly);
 static void vram_upload_block(int x, int y, int w, int h, const uint16_t *data);
@@ -342,6 +354,14 @@ static int s_mod_r = 128, s_mod_g = 128, s_mod_b = 128, s_mod_raw = 0;
 typedef struct { int set, x0, y0, x1, y1; } DirtyRect;
 static DirtyRect s_pack_dirty;
 static int       s_gpu_dirty;
+/* CPU-side VRAM writes (GP0 A0 transfers, DMA, fills, single pokes) land in
+ * the CPU array immediately and accumulate here; ONE batched upload flushes
+ * them before the next GPU op that could observe them (mirrors the GL
+ * backend's s_up_pending). Eager per-op uploads are the transition-stall:
+ * each PIXEL cost 2 vkAllocateMemory + 2 vkQueueSubmit + a 2-draw blit pass,
+ * so a single GP0 A0 texture upload wedged the main thread for minutes inside
+ * the driver (freeze dump: 8/8 samples in D3DKMTCreateAllocation churn). */
+static DirtyRect s_up_pending;
 
 static void rect_clear(DirtyRect *r) { r->set = 0; }
 static void rect_add(DirtyRect *r, int x0, int y0, int x1, int y1) {
@@ -427,6 +447,19 @@ static void vk_gpu_sync_internal(void) {
     }
     s_pending_n = 0;
     s_ds_blit_idx = 0;
+    /* Queue idle: every submitted draw has consumed its vertex-buffer region,
+     * so recycle the sub-allocation cursors. An OPEN (unflushed) batch's
+     * vertices move to offset 0 so its eventual draw stays contiguous. */
+    if (s_vmap) {
+        if (s_vcount && s_vbase)
+            memmove(s_vmap, s_vmap + s_vbase, (size_t)s_vcount * sizeof(Vert));
+        s_vbase = 0;
+    }
+    if (s_tmap) {
+        if (s_tcount && s_tbase)
+            memmove(s_tmap, s_tmap + s_tbase, (size_t)s_tcount * sizeof(TexVert));
+        s_tbase = 0;
+    }
 }
 #define gpu_sync() vk_gpu_sync_internal()
 
@@ -979,14 +1012,20 @@ static int create_render_targets(void) {
                               &s_tbuf, &s_tbuf_mem, (void**)&s_tmap)) return 0;
     gpu_sync();   /* complete the init clears (VRAM/raw/stencil) before any frame */
     s_ready = 1;
+    /* CPU VRAM writes made before the context existed (facade routed to us
+     * since gr_init, s_ready was 0) accumulated only in the CPU array — seed
+     * a full-frame upload so the GPU images start coherent with it. */
+    rect_add(&s_up_pending, 0, 0, VRAM_W - 1, VRAM_H - 1);
+    flush_cpu_upload();
     return 1;
 }
 
 /* Lazily build + cache a graphics pipeline for (program, topology, blend,
  * stencil). prog 0 GEO / 1 TEX / 2 BLIT; topo 0 tri / 1 line; blend 0 off else
  * PS1 mode+1; stencil 0 SET / 1 CHECK-keep / 2 CHECK-invert. */
-static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil) {
-    int key = ((prog * PIPE_TOPOS + topo) * PIPE_BLENDS + blend) * PIPE_STENCILS + stencil;
+static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil, int cmask) {
+    int key = (((prog * PIPE_TOPOS + topo) * PIPE_BLENDS + blend) * PIPE_STENCILS + stencil)
+              * PIPE_CMASKS + cmask;
     if (s_pipe_cache[key]) return s_pipe_cache[key];
 
     VkShaderModule vs, fs; VkPipelineLayout layout;
@@ -1041,7 +1080,7 @@ static VkPipeline get_pipeline(int prog, int topo, int blend, int stencil) {
     /* Blend (PS1 modes). Alpha always replaced so the colour-alpha mask mirror
      * is exact (src ONE / dst ZERO). */
     VkPipelineColorBlendAttachmentState cba = {0};
-    cba.colorWriteMask = 0xF;
+    cba.colorWriteMask = cmask ? 0 : 0xF;
     float bc[4] = {1,1,1,1};
     if (blend == 0) {
         cba.blendEnable = VK_FALSE;
@@ -1271,6 +1310,7 @@ static void letterbox(int sw, int sh, int aw, int ah, VkOffset3D off[2]) {
 int vk_renderer_present_vram(int disp_x, int disp_y, int w, int h,
                              int linear, int force_4_3) {
     if (!s_ctx_ok) return 0;
+    flush_cpu_upload();   /* displayed VRAM may include pending CPU writes */
     flush_tex_batch(); flush_geometry(); gpu_sync();   /* drain all draws; VRAM in TRANSFER_SRC */
     VkImage sc; VkCommandBuffer cb; uint32_t idx, fr;
     if (!acquire_present(&sc, &cb, &idx, &fr)) return 1; /* frame skipped/recreated */
@@ -1453,7 +1493,14 @@ static void begin_geo_pass(VkCommandBuffer cb) {
  * INVERT (write_val!=0) or leave (write_val==0), ref=0. */
 static void bind_masked(VkCommandBuffer cb, int prog, int topo, int blend, int check, int write_val) {
     int stencil = !check ? 0 : (write_val ? 2 : 1);
-    VkPipeline p = get_pipeline(prog, topo, blend, stencil);
+    VkPipeline p = get_pipeline(prog, topo, blend, stencil, 0);
+    p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    p_vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, check ? 0u : (uint32_t)write_val);
+}
+/* Like bind_masked but with ALL colour writes disabled (stencil-only pass). */
+static void bind_masked_stencil_only(VkCommandBuffer cb, int prog, int topo, int check, int write_val) {
+    int stencil = !check ? 0 : (write_val ? 2 : 1);
+    VkPipeline p = get_pipeline(prog, topo, 0, stencil, 1);
     p_vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     p_vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, check ? 0u : (uint32_t)write_val);
 }
@@ -1611,9 +1658,34 @@ static void vram_upload_block(int x, int y, int w, int h, const uint16_t *data) 
     }
 }
 
+/* CPU -> GPU: flush accumulated CPU-side VRAM writes as ONE upload (see
+ * s_up_pending). vram_upload_block drains the draw batches first, so PS1
+ * submission order is preserved: every draw appended before these writes has
+ * landed by the time the upload writes VRAM, and every GPU-op entry point
+ * calls this before touching VRAM so the writes land before later ops. */
+static void flush_cpu_upload(void) {
+    if (!s_up_pending.set || !s_ready || !s_vram) return;
+    int x = s_up_pending.x0, y = s_up_pending.y0;
+    int w = s_up_pending.x1 - s_up_pending.x0 + 1;
+    int h = s_up_pending.y1 - s_up_pending.y0 + 1;
+    rect_clear(&s_up_pending);
+    if (w == VRAM_W) {                    /* full-width rect: rows contiguous */
+        vram_upload_block(x, y, w, h, s_vram + (size_t)y * VRAM_W);
+    } else {
+        uint16_t *tmp = (uint16_t*)malloc((size_t)w * h * 2);
+        if (!tmp) return;
+        for (int row = 0; row < h; row++)
+            memcpy(tmp + (size_t)row * w,
+                   s_vram + (size_t)(y + row) * VRAM_W + x, (size_t)w * 2);
+        vram_upload_block(x, y, w, h, tmp);
+        free(tmp);
+    }
+}
+
 /* GPU -> CPU mirror: drain batches, pack, copy the whole raw mirror down. */
 static void ensure_cpu(void) {
     if (!s_ready || !s_gpu_dirty || !s_vram) return;
+    flush_cpu_upload();   /* readback overwrites s_vram: pending writes land first */
     flush_tex_batch(); flush_geometry();
     /* Readback must reflect ALL current hr content, not just the incremental
      * s_pack_dirty rect. pack_flush() packs only that rect and early-returns if
@@ -1664,34 +1736,26 @@ static void vkb_get_draw_area(int *x1, int *y1, int *x2, int *y2) {
 }
 static void vkb_set_draw_offset(int x, int y) { s_off_x = x; s_off_y = y; }
 
-/* GP0 02h fill: set a VRAM rect to a solid 1555 colour. vkCmdClearColorImage
- * clears whole subresource ranges only, so fill via a solid-colour staging
- * upload (reuses vram_upload_block). Also writes the CPU mirror. */
+/* GP0 02h fill: set a VRAM rect to a solid 1555 colour. The write lands in
+ * the CPU array immediately (like every CPU-side VRAM write) and rides the
+ * batched s_up_pending upload — the old per-fill staging upload was part of
+ * the per-op alloc/submit churn. */
 static void vkb_fill_rect(int x, int y, int w, int h, uint16_t color) {
+    sw_fill_rect(x, y, w, h, color);
     if (!s_ctx_ok) return;
-    flush_geometry();
     if (x < 0) { w += x; x = 0; } if (y < 0) { h += y; y = 0; }
     if (x + w > VRAM_W) w = VRAM_W - x; if (y + h > VRAM_H) h = VRAM_H - y;
     if (w <= 0 || h <= 0) return;
-    uint16_t *tmp = (uint16_t*)malloc((size_t)w * h * 2);
-    if (!tmp) return;
-    for (int i = 0; i < w * h; i++) tmp[i] = color;
-    vram_upload_block(x, y, w, h, tmp);
-    free(tmp);
-    if (s_vram)
-        for (int row = 0; row < h; row++)
-            for (int col = 0; col < w; col++)
-                s_vram[(y + row) * VRAM_W + (x + col)] = color;
+    rect_add(&s_up_pending, x, y, x + w - 1, y + h - 1);
 }
 
 static void vkb_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
+    sw_vram_transfer_in(x, y, w, h, data);
     if (!s_ctx_ok) return;
-    flush_geometry();
-    vram_upload_block(x, y, w, h, data);
-    if (s_vram)
-        for (int row = 0; row < h; row++)
-            for (int col = 0; col < w; col++)
-                s_vram[(y + row) * VRAM_W + (x + col)] = data[row * w + col];
+    if (x + w > VRAM_W || y + h > VRAM_H)
+        rect_add(&s_up_pending, 0, 0, VRAM_W - 1, VRAM_H - 1);  /* wrapped: take all */
+    else
+        rect_add(&s_up_pending, x, y, x + w - 1, y + h - 1);
 }
 static void vkb_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
     ensure_cpu();   /* sync GPU-rendered content down to the CPU mirror first */
@@ -1700,24 +1764,26 @@ static void vkb_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
             data[row * w + col] = s_vram ? s_vram[(y + row) * VRAM_W + (x + col)] : 0;
 }
 static void vkb_vram_write(int x, int y, uint16_t pixel) {
+    sw_vram_write(x, y, pixel);
     if (!s_ctx_ok) return;
-    flush_geometry();
-    uint16_t one = pixel; vram_upload_block(x, y, 1, 1, &one);
-    if (s_vram) s_vram[y * VRAM_W + x] = pixel;
+    rect_add(&s_up_pending, x & (VRAM_W - 1), y & (VRAM_H - 1),
+                            x & (VRAM_W - 1), y & (VRAM_H - 1));
 }
 static uint16_t vkb_vram_read(int x, int y) {
     ensure_cpu();   /* gated by s_gpu_dirty; cheap when nothing was drawn */
     return s_vram ? s_vram[y * VRAM_W + x] : 0;
 }
 
-/* render_display: CPU readout path. Phase 3 adds GPU->CPU readback; the GPU
- * present path (vk_renderer_present_vram) is the normal route and bypasses
- * this. Returning 0 tells the caller nothing was produced. */
+/* render_display: CPU readout path (screenshots / debug server / the 24-bit
+ * FMV present). Sync the GPU-authoritative VRAM down, then read out via the
+ * software renderer on the shared array — mirrors the GL backend exactly. */
 static int vkb_render_display(uint32_t *o, int p, int dx, int dy, int dw, int dh) {
-    (void)o;(void)p;(void)dx;(void)dy;(void)dw;(void)dh; return 0;
+    ensure_cpu();
+    return sw_render_display(o, p, dx, dy, dw, dh);
 }
 static int vkb_render_display_hires(uint32_t *o, int p, int dx, int dy, int dw, int dh) {
-    (void)o;(void)p;(void)dx;(void)dy;(void)dw;(void)dh; return 0;
+    ensure_cpu();
+    return sw_render_display_hires(o, p, dx, dy, dw, dh);
 }
 
 /* ---- geometry batch (Phase 2) ------------------------------------------ */
@@ -1743,7 +1809,8 @@ static DirtyRect s_geo_bbox;
 static void flush_geometry(void) {
     if (s_vcount == 0 || !s_ready) return;
     s_perf_cur.geo_flushes++;
-    uint32_t n = s_vcount; s_vcount = 0;
+    uint32_t base = s_vbase, n = s_vcount;
+    s_vbase += n; s_vcount = 0;   /* consumed region stays untouched until gpu_sync */
     int semi = s_geo_semi, blend = (semi < 0) ? 0 : (semi + 1);
     VkCommandBuffer cb = begin_oneshot();
     vram_to(cb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
@@ -1754,7 +1821,7 @@ static void flush_geometry(void) {
     p_vkCmdPushConstants(cb, s_pl_geo, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof gp, &gp);
     VkDeviceSize off = 0;
     p_vkCmdBindVertexBuffers(cb, 0, 1, &s_vbuf, &off);
-    p_vkCmdDraw(cb, n, 1, 0, 0);
+    p_vkCmdDraw(cb, n, 1, base, 0);
     p_vkCmdEndRenderPass(cb);
     vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     end_oneshot(cb);
@@ -1780,19 +1847,24 @@ static inline void col888(uint32_t c, float out[3]) {
     out[2] = ((c >> 16) & 0xFF) / 255.0f;
 }
 static inline void push_vert(float x, float y, const float rgb[3]) {
-    Vert *v = &s_vmap[s_vcount++];
+    Vert *v = &s_vmap[s_vbase + s_vcount++];
     v->x = x; v->y = y; v->r = rgb[0]; v->g = rgb[1]; v->b = rgb[2];
     v->a = (float)s_geo_mask;
     rect_add(&s_geo_bbox, (int)floorf(x), (int)floorf(y), (int)ceilf(x), (int)ceilf(y));
 }
 /* Ensure room for `need` verts (flush mid-batch only between primitives). */
 static void ensure_room(uint32_t need) {
-    if (s_vcount + need > VK_VBUF_VERTS) flush_geometry();
+    if (s_vbase + s_vcount + need > VK_VBUF_VERTS) {
+        flush_geometry();
+        if (s_vbase + need > VK_VBUF_VERTS)
+            gpu_sync();   /* buffer exhausted: wait idle, cursors recycle to 0 */
+    }
 }
 /* Open / continue an untextured batch with the current blend/mask state; drains
  * the textured batch and any differently-keyed untextured batch first (PS1
  * submission order). */
 static void geo_prim_begin(void) {
+    flush_cpu_upload();   /* pending CPU writes precede this prim (PS1 order) */
     flush_tex_batch();
     int semi = s_semi_en ? s_semi_mode : -1;
     if (s_vcount > 0 && (semi != s_geo_semi || s_mask_set != s_geo_mask || s_mask_check != s_geo_check))
@@ -1870,7 +1942,8 @@ static void vkb_draw_shaded_line(int x0,int y0,uint16_t c0,int x1,int y1,uint16_
 static void flush_tex_batch(void) {
     if (s_tcount == 0 || !s_ready) return;
     s_perf_cur.tex_flushes++;
-    uint32_t n = s_tcount; s_tcount = 0;
+    uint32_t base = s_tbase, n = s_tcount;
+    s_tbase += n; s_tcount = 0;   /* consumed region stays untouched until gpu_sync */
     int semi = s_tb_semi, blend = (semi < 0) ? 0 : (semi + 1);
     VkCommandBuffer cb = begin_oneshot();
     img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
@@ -1884,16 +1957,37 @@ static void flush_tex_batch(void) {
     tp.shift = px_shift(); tp.xoff = 0.0f; tp.xhalf = 512.0f;
     tp.maskset = s_tb_mask; tp.filter = s_tb_filter;
     tp.twin[0] = s_tb_twin[0]; tp.twin[1] = s_tb_twin[1]; tp.twin[2] = s_tb_twin[2]; tp.twin[3] = s_tb_twin[3];
-    /* pass 1: STP=0 texels, blend off, write s_tb_mask to stencil */
-    bind_masked(cb, 1, 0, 0, s_tb_check, s_tb_mask);
-    tp.semipass = 1;
-    p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
-    p_vkCmdDraw(cb, n, 1, 0, 0);
-    /* pass 2: STP=1 texels, PS1 blend, write 1 to stencil */
-    bind_masked(cb, 1, 0, blend, s_tb_check, 1);
-    tp.semipass = 2;
-    p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
-    p_vkCmdDraw(cb, n, 1, 0, 0);
+    if (semi < 0) {
+        /* OPAQUE batch: the STP bit does not gate COLOUR (every texel is
+         * opaque), so colour draws in ONE ordered pass over all texels —
+         * painter's order across the batch is exact — followed by a
+         * COLOUR-MASKED pass that only fixes the STENCIL for STP=1 texels.
+         * (The old whole-batch STP-split let a behind prim's STP=1 texels
+         * paint OVER a front prim's STP=0 colour — the water-sparkle field
+         * speckled every hill in the Tomba2 attract demo. Mirrors GL's
+         * tex_batch_draw_passes.) */
+        bind_masked(cb, 1, 0, 0, s_tb_check, s_tb_mask);
+        tp.semipass = 0;
+        p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
+        p_vkCmdDraw(cb, n, 1, base, 0);
+        bind_masked_stencil_only(cb, 1, 0, s_tb_check, 1);
+        tp.semipass = 2;
+        p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
+        p_vkCmdDraw(cb, n, 1, base, 0);
+    } else {
+        /* SEMI batch: genuine two-pass — STP=0 texels opaque, STP=1 texels
+         * blended per the PSX mode. Cross-prim order is kept by isolating
+         * semi prims to one per batch (gpu_textured_triangle), so the two
+         * passes never straddle overlapping prims. */
+        bind_masked(cb, 1, 0, 0, s_tb_check, s_tb_mask);
+        tp.semipass = 1;
+        p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
+        p_vkCmdDraw(cb, n, 1, base, 0);
+        bind_masked(cb, 1, 0, blend, s_tb_check, 1);
+        tp.semipass = 2;
+        p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
+        p_vkCmdDraw(cb, n, 1, base, 0);
+    }
     p_vkCmdEndRenderPass(cb);
     vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     end_oneshot(cb);
@@ -1937,22 +2031,32 @@ static void gpu_textured_triangle(const int *xs, const int *ys, const int *us, c
     int depth  = (texpage >> 7) & 3; if (depth > 2) depth = 2;
 
     flush_geometry();   /* drain untextured (PS1 order) */
+    flush_cpu_upload(); /* uploaded texels/CLUTs must be sampleable + order */
     flush_pack_if_sampling(base_x, base_y, depth, clut_x, clut_y);
 
     int twx = s_tw_mask_x, twy = s_tw_mask_y, tox = s_tw_off_x, toy = s_tw_off_y;
+    /* A semi-transparent prim must NOT coalesce with its neighbours (its two
+     * STP passes would straddle overlapping prims — painter's-order violation;
+     * see flush_tex_batch). It drains the open batch and draws alone; the next
+     * append flushes it out again. Opaque prims keep batching. */
+    int isolate = (semi >= 0);
     if (s_tcount > 0 &&
-        (semi != s_tb_semi || s_mask_set != s_tb_mask || s_mask_check != s_tb_check ||
+        (isolate || semi != s_tb_semi || s_mask_set != s_tb_mask || s_mask_check != s_tb_check ||
          s_texfilter != s_tb_filter ||
          twx != s_tb_twin[0] || twy != s_tb_twin[1] || tox != s_tb_twin[2] || toy != s_tb_twin[3]))
         flush_tex_batch();
-    if (s_tcount + 3 > VK_TBUF_VERTS) flush_tex_batch();
+    if (s_tbase + s_tcount + 3 > VK_TBUF_VERTS) {
+        flush_tex_batch();
+        if (s_tbase + 3 > VK_TBUF_VERTS)
+            gpu_sync();   /* buffer exhausted: wait idle, cursors recycle to 0 */
+    }
     if (s_tcount == 0) {
         s_tb_semi = semi; s_tb_mask = s_mask_set; s_tb_check = s_mask_check; s_tb_filter = s_texfilter;
         s_tb_twin[0] = twx; s_tb_twin[1] = twy; s_tb_twin[2] = tox; s_tb_twin[3] = toy;
     }
     int bx0 = xs[0], bx1 = xs[0], by0 = ys[0], by1 = ys[0];
     for (int i = 0; i < 3; i++) {
-        float *vp = s_tmap[s_tcount + i].v;
+        float *vp = s_tmap[s_tbase + s_tcount + i].v;
         vp[0] = (float)xs[i];   vp[1] = (float)ys[i];
         vp[2] = (float)us[i];   vp[3] = (float)vs[i];
         vp[4] = col[i*3+0];     vp[5] = col[i*3+1];     vp[6] = col[i*3+2]; vp[7] = 1.0f;
@@ -2020,6 +2124,7 @@ static void vkb_draw_textured_rect_scaled(int x,int y,int w,int h,int u0,int v0,
  * then blit scratch -> dest with STP/mask split. Mirrors the GL backend. */
 static void vkb_copy_rect(int sx,int sy,int dx,int dy,int w,int h){
     if (!s_ctx_ok || w <= 0 || h <= 0) return;
+    flush_cpu_upload();   /* the copy source may include pending CPU writes */
     flush_tex_batch(); flush_geometry();
     if (sx + w > VRAM_W) w = VRAM_W - sx;
     if (dx + w > VRAM_W) w = VRAM_W - dx;
