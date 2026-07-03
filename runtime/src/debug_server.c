@@ -11015,7 +11015,20 @@ static void process_command(const char *line)
 
     for (const CmdEntry *e = s_commands; e->name; e++) {
         if (strcmp(cmd, e->name) == 0) {
+            /* Suppress lockstep memory recording for the WHOLE handler.
+             * Commands run at debug_server_poll() safe points on the emu
+             * thread, which can land inside an armed lockstep record window
+             * (leader-to-leader). Any handler that reads guest RAM for
+             * diagnostics (read_ram's psx_read_byte loop, probes, disasm)
+             * would otherwise leak observer ops into the recorded trace as
+             * phantom guest ops -> false compiled-vs-interp divergence
+             * (seen live: a read_ram poll of 0x8006FC24 flagged block
+             * 0x62FE8 as "read-addr"). Chokepoint here so no individual
+             * handler can forget; nested per-handler suppress calls are
+             * fine (counter). */
+            ls_suppress_begin();
             e->handler(id, line);
+            ls_suppress_end();
             return;
         }
     }
