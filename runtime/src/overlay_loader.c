@@ -567,7 +567,11 @@ const char *overlay_loader_last_msg(void) { return s_last_msg; }
 
 /* ---- Cache index: region_start -> dll path ----------------------------- */
 
-#define CACHE_IDX_CAP 256
+/* 256 -> 4096 (2026-07-03): Tomba2's cache crossed 256 DLLs and the index
+ * TRUNCATED SILENTLY — every entry past the cap was invisible to the loader
+ * (region ran interpreted forever, no diagnostic). Found by the ABI-sweep
+ * negative test. scan_one_cache_dir now shouts if even 4096 is hit. */
+#define CACHE_IDX_CAP 4096
 typedef struct { uint32_t region_start; char path[768]; } CacheEntry;
 static CacheEntry s_cache_idx[CACHE_IDX_CAP];
 static int        s_cache_idx_count = 0;
@@ -638,7 +642,14 @@ static void scan_one_cache_dir(const char *dir) {
         }
         if (!valid) continue;
         uint32_t addr = (uint32_t)strtoul(fd.cFileName, NULL, 16);
-        if (s_cache_idx_count >= CACHE_IDX_CAP) break;
+        if (s_cache_idx_count >= CACHE_IDX_CAP) {
+            /* Never-again (the silent-256 truncation): overflowing the index
+             * means real native coverage is being IGNORED. Shout once. */
+            loader_log("*** CACHE INDEX FULL (%d): further DLLs in %s are being "
+                       "IGNORED — their regions will run interpreted. Raise "
+                       "CACHE_IDX_CAP.", CACHE_IDX_CAP, dir);
+            break;
+        }
         char full[768];
         snprintf(full, sizeof(full), "%s/%s", dir, fd.cFileName);
         /* skip if this region+crc is already indexed (rescan idempotence, AND a
@@ -702,6 +713,79 @@ static void warn_on_cgtag_mismatch(const char *tier) {
 #endif
 }
 
+/* ---- ABI pre-flight sweep (batch purge) ----------------------------------
+ * A contract-ABI bump (e.g. v9 -> v10) invalidates EVERY cached DLL at once.
+ * The lazy path handled that per-dispatch: try_load_region -> LoadLibrary ->
+ * ABI reject -> DeleteFile -> retry next dispatch — thousands of file ops on
+ * the EMULATION thread (which owns the window pump). On a large cache this
+ * presented as a "(Not Responding)" black window for minutes (MMX6, 136-DLL
+ * cache, the v10 migration, 2026-07-03 regression gate).
+ *
+ * Instead, sweep ONCE at scan time: load each indexed DLL, check overlay_abi,
+ * delete mismatches (DLL + .ranges) and drop them from the index. A marker
+ * file (.abi_<tag>.ok) per cache dir records a completed sweep, so healthy
+ * caches skip the sweep entirely on later boots — steady-state cost is one
+ * stat per dir. Autocompile only ever writes current-ABI DLLs, so the marker
+ * stays truthful; the per-load ABI gate in load_overlay_dll remains as
+ * defense in depth. */
+static void abi_preflight_sweep(const char *dir) {
+#ifdef _WIN32
+    char marker[900];
+    snprintf(marker, sizeof marker, "%s/.abi_%08x.ok", dir, (unsigned)PSX_OVERLAY_ABI_TAG);
+    if (GetFileAttributesA(marker) != INVALID_FILE_ATTRIBUTES) return;  /* swept */
+
+    /* Enumerate the DIRECTORY, not the index: the index is capacity-bounded
+     * and dedup-filtered, so sweeping it alone can leave stale files behind
+     * while the marker claims a complete sweep (found by the negative test —
+     * the planted v6 DLL survived behind the old 256-entry index cap). */
+    int purged = 0, kept = 0;
+    char pattern[900];
+    snprintf(pattern, sizeof pattern, "%s/*_*.dll", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE hf = FindFirstFileA(pattern, &fd);
+    if (hf != INVALID_HANDLE_VALUE) {
+        do {
+            char full[900];
+            snprintf(full, sizeof full, "%s/%s", dir, fd.cFileName);
+            HMODULE h = LoadLibraryA(full);
+            if (h) {
+                typedef int (*AbiFn)(void);
+                AbiFn abi_fn = (AbiFn)GetProcAddress(h, "overlay_abi");
+                int abi = abi_fn ? abi_fn() : 0;
+                FreeLibrary(h);
+                if (abi == PSX_OVERLAY_ABI_TAG) { kept++; continue; }
+            }
+            /* Unloadable or wrong ABI: purge DLL + its .ranges + index entry. */
+            DeleteFileA(full);
+            char ranges[912];
+            size_t n = strlen(full);
+            if (n > 4 && n + 4 < sizeof ranges) {
+                memcpy(ranges, full, n - 4);
+                memcpy(ranges + n - 4, ".ranges", 8);
+                DeleteFileA(ranges);
+            }
+            purged++;
+            for (int i = 0; i < s_cache_idx_count; i++) {
+                if (strcmp(s_cache_idx[i].path, full) == 0) {
+                    s_cache_idx[i] = s_cache_idx[--s_cache_idx_count];
+                    break;
+                }
+            }
+        } while (FindNextFileA(hf, &fd));
+        FindClose(hf);
+    }
+    if (purged)
+        loader_log("abi preflight: purged %d stale DLL(s), kept %d in %s",
+                   purged, kept, dir);
+    /* Mark the sweep complete (even if nothing purged) so later boots skip it. */
+    HANDLE m = CreateFileA(marker, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (m != INVALID_HANDLE_VALUE) CloseHandle(m);
+#else
+    (void)dir;
+#endif
+}
+
 static void scan_cache_dir(void) {
     char dir[768];
     /* Tier order: scan gcc/ FIRST (highest native priority — the dev/production
@@ -712,10 +796,12 @@ static void scan_cache_dir(void) {
              s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
              (unsigned)PSX_OVERLAY_CODEGEN_HASH);
     scan_one_cache_dir(dir);
+    abi_preflight_sweep(dir);
     snprintf(dir, sizeof(dir), "%s/%s/tcc/%s/cg%d_%08x",
              s_cache_dir, s_game_id, PSX_OVERLAY_ARCH_ABI, PSX_OVERLAY_CODEGEN_VER,
              (unsigned)PSX_OVERLAY_CODEGEN_HASH);
     scan_one_cache_dir(dir);
+    abi_preflight_sweep(dir);
 
     /* Never-again guard: if we loaded NOTHING but wrong-hash shards exist, shout. */
     if (s_cache_idx_count == 0) {
