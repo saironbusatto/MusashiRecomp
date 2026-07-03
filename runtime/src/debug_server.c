@@ -4239,12 +4239,27 @@ void debug_server_send_line(const char *json)
 
 void debug_server_send_fmt(const char *fmt, ...)
 {
+    /* No fixed-size truncation: lines larger than the stack buffer (e.g. a
+     * full gl_coh_ring dump) are heap-formatted at their exact size. A 64KB
+     * vsnprintf cap here used to silently truncate big ring responses into
+     * unparseable JSON. */
     char buf[65536];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
+    int need = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    debug_server_send_line(buf);
+    if (need >= 0 && (size_t)need < sizeof(buf)) {
+        debug_server_send_line(buf);
+        return;
+    }
+    if (need < 0) return;
+    char *big = (char *)malloc((size_t)need + 1);
+    if (!big) return;
+    va_start(ap, fmt);
+    vsnprintf(big, (size_t)need + 1, fmt, ap);
+    va_end(ap);
+    debug_server_send_line(big);
+    free(big);
 }
 
 #define send_line  debug_server_send_line
@@ -6978,6 +6993,10 @@ static void handle_screenshot_file(int id, const char *json)
      * the main (GL-context) thread. */
     extern void gl_renderer_sync_cpu(void);
     gl_renderer_sync_cpu();
+    /* Same staleness class for the Vulkan backend (GPU-authoritative VRAM
+     * image + lazy CPU mirror): sync it down too. No-op when inactive. */
+    extern void vk_renderer_sync_cpu(void);
+    vk_renderer_sync_cpu();
 
     GpuDisplayInfo di;
     gpu_get_display_info(&di);
@@ -7248,6 +7267,46 @@ static void handle_gl_coh_ring(int id, const char *json)
                         "%s[%llu,%u,\"%s\",%d,%d,%d,%d]",
                         first ? "" : ",", (unsigned long long)s, e.frame,
                         gl_coh_kind_name(e.kind), e.x0, e.y0, e.x1, e.y1);
+        first = 0;
+    }
+    pos += snprintf(buf + pos, bufsz - pos, "]}");
+    send_fmt("%s", buf);
+    free(buf);
+}
+
+/* GL present ring: every SwapWindow with path, source rect, letterbox rect,
+ * glGetError, wall-clock ms and the backbuffer centre pixel sampled right
+ * before the swap. Always-on capture; this just reads a window.
+ *   {"cmd":"gl_present_ring","n":600}
+ * -> events: [seq, frame, path, t_ms, [dx,dy,w,h], [lx,ly,lw,lh],
+ *             [r,g,b], glerr] */
+extern uint64_t gl_renderer_pres_total(void);
+
+static void handle_gl_present_ring(int id, const char *json)
+{
+    static const char *path_name[4] = { "vram", "wide", "cpu", "blank" };
+    int n = json_get_int(json, "n", 300);
+    if (n < 1) n = 1;
+    if (n > 4096) n = 4096;
+    uint64_t total = gl_renderer_pres_total();
+    uint64_t start = total > (uint64_t)n ? total - (uint64_t)n : 0;
+    int bufsz = 96 + n * 112;
+    char *buf = (char *)malloc((size_t)bufsz);
+    if (!buf) { send_err(id, "alloc failed"); return; }
+    int pos = snprintf(buf, bufsz,
+                       "{\"id\":%d,\"ok\":true,\"total\":%llu,\"now_ms\":%u,\"events\":[",
+                       id, (unsigned long long)total, (unsigned)SDL_GetTicks());
+    int first = 1;
+    for (uint64_t s = start; s < total && pos < bufsz - 160; s++) {
+        GlPresEvent e;
+        if (!gl_renderer_pres_get(s, &e)) continue;
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s[%llu,%u,\"%s\",%u,[%d,%d,%d,%d],[%d,%d,%d,%d],[%u,%u,%u],%u,[%u,%u,%u,%u]]",
+                        first ? "" : ",", (unsigned long long)s, e.frame,
+                        e.path < 4 ? path_name[e.path] : "?", e.t_ms,
+                        e.dx, e.dy, e.w, e.h, e.lx, e.ly, e.lw, e.lh,
+                        e.px_r, e.px_g, e.px_b, e.glerr,
+                        e.src_r, e.src_g, e.src_b, e.src_valid);
         first = 0;
     }
     pos += snprintf(buf + pos, bufsz - pos, "]}");
@@ -10672,6 +10731,7 @@ static const CmdEntry s_commands[] = {
     { "mem_words",         handle_mem_words },
     { "vram_peek",         handle_vram_peek },
     { "gl_coh_ring",       handle_gl_coh_ring },
+    { "gl_present_ring",   handle_gl_present_ring },
     { "frame_perf",        handle_frame_perf },
     { "synth_recurse",     handle_synth_recurse },
     { "gl_fbo_peek",       handle_gl_fbo_peek },

@@ -348,7 +348,27 @@ static int           s_gpu_dirty = 0;      /* CPU VRAM array may be stale    */
 /* Dirty-rect unions, native VRAM coords, inclusive bounds. */
 typedef struct { int x0, y0, x1, y1, set; } DirtyRect;
 static DirtyRect s_pack_dirty;             /* hr FBO content not in raw mirror */
-static DirtyRect s_up_pending;             /* CPU writes not yet in the FBO    */
+
+/* CPU writes not yet in the FBO — an EXACT rect list, NOT a single union.
+ *
+ * THE FLICKER CLASS BUG (MMX6 GL black-frame flicker, ISSUES.md #7): the old
+ * single-union s_up_pending merged DISJOINT uploads (e.g. a sprite column at
+ * x>=320 and a tile row at y>=480) into one bounding box that covered the
+ * framebuffers in between; flush_cpu_upload then painted that whole box from
+ * the CPU VRAM array — which is STALE under GL (the FBO is authoritative,
+ * ensure_cpu only syncs on demand) — stomping freshly-rendered framebuffer
+ * content with stale (typically black) pixels for 1-2 presents until the game
+ * redrew each buffer. Fix: track the exact uploaded rects and flush each one;
+ * only pixels the CPU actually wrote are ever painted. Merging is allowed only
+ * when it adds NO uncovered pixels (containment / same-band extension). On
+ * overflow the pending set is flushed and the new rect starts a fresh list —
+ * order-preserving and still batched for the common poke patterns.
+ * (Pre-context, s_raster_ok == 0, the CPU array is fully authoritative — the
+ * software rasterizer mirrors every draw — so union-merging is harmless and
+ * used as the overflow strategy there.) */
+#define UP_RECTS_MAX 16
+static DirtyRect s_up_rects[UP_RECTS_MAX];
+static int       s_up_nrects = 0;
 
 /* Draw state mirrored from the vtable set_* calls. */
 static int s_off_x = 0, s_off_y = 0;
@@ -401,6 +421,83 @@ static int rect_intersects(const DirtyRect *r, int x0, int y0, int x1, int y1) {
     return !(x1 < r->x0 || x0 > r->x1 || y1 < r->y0 || y0 > r->y1);
 }
 
+/* ---- exact pending-upload rect list (see s_up_rects comment) ------------- */
+static void flush_cpu_upload(void);   /* fwd: overflow flushes then re-adds */
+
+/* Add an uploaded rect. Merges ONLY when the merge adds no uncovered pixels:
+ * containment either way, or an extension within the same row-band / column-
+ * band (equal y-range with touching/overlapping x-ranges, or equal x-range
+ * with touching/overlapping y-ranges — the row-scan / column-scan poke
+ * patterns). Never unions disjoint rects post-init (that was the flicker bug). */
+static void up_add(int x0, int y0, int x1, int y1) {
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > VRAM_W - 1) x1 = VRAM_W - 1;
+    if (y1 > VRAM_H - 1) y1 = VRAM_H - 1;
+    if (x0 > x1 || y0 > y1) return;
+    for (int i = 0; i < s_up_nrects; i++) {
+        DirtyRect *r = &s_up_rects[i];
+        if (x0 >= r->x0 && x1 <= r->x1 && y0 >= r->y0 && y1 <= r->y1)
+            return;                                   /* contained */
+        if (x0 <= r->x0 && x1 >= r->x1 && y0 <= r->y0 && y1 >= r->y1) {
+            r->x0 = x0; r->y0 = y0; r->x1 = x1; r->y1 = y1;  /* contains */
+            return;
+        }
+        if (y0 == r->y0 && y1 == r->y1 &&
+            x0 <= r->x1 + 1 && x1 >= r->x0 - 1) {     /* same row-band extension */
+            if (x0 < r->x0) r->x0 = x0;
+            if (x1 > r->x1) r->x1 = x1;
+            return;
+        }
+        if (x0 == r->x0 && x1 == r->x1 &&
+            y0 <= r->y1 + 1 && y1 >= r->y0 - 1) {     /* same column-band extension */
+            if (y0 < r->y0) r->y0 = y0;
+            if (y1 > r->y1) r->y1 = y1;
+            return;
+        }
+    }
+    if (s_up_nrects >= UP_RECTS_MAX) {
+        if (s_raster_ok) {
+            flush_cpu_upload();       /* order-preserving: land the old ones */
+        } else {
+            /* Pre-context: the CPU array is fully authoritative (software
+             * rasterizer mirrors every op), so a union is harmless. */
+            DirtyRect *r = &s_up_rects[0];
+            for (int i = 1; i < s_up_nrects; i++) {
+                if (s_up_rects[i].x0 < r->x0) r->x0 = s_up_rects[i].x0;
+                if (s_up_rects[i].y0 < r->y0) r->y0 = s_up_rects[i].y0;
+                if (s_up_rects[i].x1 > r->x1) r->x1 = s_up_rects[i].x1;
+                if (s_up_rects[i].y1 > r->y1) r->y1 = s_up_rects[i].y1;
+            }
+            if (x0 < r->x0) r->x0 = x0;
+            if (y0 < r->y0) r->y0 = y0;
+            if (x1 > r->x1) r->x1 = x1;
+            if (y1 > r->y1) r->y1 = y1;
+            s_up_nrects = 1;
+            return;
+        }
+    }
+    DirtyRect *r = &s_up_rects[s_up_nrects++];
+    r->x0 = x0; r->y0 = y0; r->x1 = x1; r->y1 = y1; r->set = 1;
+}
+
+/* Add a GP0(A0) transfer's exact touched region. The software reference wraps
+ * per pixel (px = (x+col) & 1023, py = (y+row) & 511), so a wrapping transfer
+ * touches up to four exact rects — NOT all of VRAM (the old "wrapped: take
+ * all" full-VRAM union painted stale CPU content over the framebuffers). */
+static void up_add_transfer(int x, int y, int w, int h) {
+    x &= VRAM_W - 1; y &= VRAM_H - 1;
+    if (w > VRAM_W) w = VRAM_W;
+    if (h > VRAM_H) h = VRAM_H;
+    if (w <= 0 || h <= 0) return;
+    int w1 = w, w2 = 0, h1 = h, h2 = 0;
+    if (x + w > VRAM_W) { w1 = VRAM_W - x; w2 = w - w1; }
+    if (y + h > VRAM_H) { h1 = VRAM_H - y; h2 = h - h1; }
+    up_add(x, y, x + w1 - 1, y + h1 - 1);
+    if (w2)       up_add(0, y, w2 - 1, y + h1 - 1);
+    if (h2)       up_add(x, 0, x + w1 - 1, h2 - 1);
+    if (w2 && h2) up_add(0, 0, w2 - 1, h2 - 1);
+}
+
 /* ---- coherency event ring (always-on, debug server "gl_coh_ring") -------- */
 /* Every coherency-relevant operation — upload flushes, fills, copies, draw
  * bboxes, packs, full readbacks, presents, and probe perturbations — is
@@ -429,6 +526,62 @@ int gl_renderer_coh_get(uint64_t seq, GlCohEvent *out) {
     if (seq >= s_coh_seq) return 0;
     if (s_coh_seq - seq > GL_COH_RING_CAP) return 0;  /* evicted */
     *out = s_coh_ring[seq % GL_COH_RING_CAP];
+    return 1;
+}
+
+/* ---- present ring (always-on, debug server "gl_present_ring") ------------ */
+/* Records EVERY SwapWindow (all four paths — vram/wide/cpu/blank), with the
+ * source + letterbox rects, a drained glGetError, and a 1px backbuffer sample
+ * at the letterbox centre taken right before the swap: the ground truth for
+ * "did this swap present black". Per the ring-buffer rule: always-on capture,
+ * observers query a window after the fact. */
+#define GL_PRES_RING_CAP 4096
+static GlPresEvent s_pres_ring[GL_PRES_RING_CAP];
+static uint64_t    s_pres_seq = 0;
+
+static void pres_record(int path, int dx, int dy, int w, int h,
+                        int lx, int ly, int lw, int lh) {
+    GlPresEvent *e = &s_pres_ring[s_pres_seq % GL_PRES_RING_CAP];
+    e->frame = (uint32_t)s_frame_count;
+    e->t_ms  = (uint32_t)SDL_GetTicks();
+    e->path  = (uint8_t)path;
+    e->glerr = (uint16_t)glGetError();   /* drain the sticky error */
+    e->dx = (int16_t)dx; e->dy = (int16_t)dy;
+    e->w  = (int16_t)w;  e->h  = (int16_t)h;
+    e->lx = (int16_t)lx; e->ly = (int16_t)ly;
+    e->lw = (int16_t)lw; e->lh = (int16_t)lh;
+    /* Backbuffer sample at the letterbox centre (GL bottom-origin; the rects
+     * we pass in are already bottom-origin GL window coords). */
+    uint8_t px[3] = { 0, 0, 0 };
+    if (lw > 0 && lh > 0) {
+        glReadBuffer(GL_BACK);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(lx + lw / 2, ly + lh / 2, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, px);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+    }
+    e->px_r = px[0]; e->px_g = px[1]; e->px_b = px[2];
+    /* Blit-source sample: the hr FBO pixel at the display-rect centre. Splits
+     * "FBO content was black" from "the blit malfunctioned". */
+    uint8_t sp[3] = { 0, 0, 0 };
+    e->src_valid = 0;
+    if ((path == GL_PRES_VRAM) && w > 0 && h > 0 && s_hr_fbo) {
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels((dx + w / 2) * s_scale, (dy + h / 2) * s_scale,
+                     1, 1, GL_RGB, GL_UNSIGNED_BYTE, sp);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+        e->src_valid = 1;
+    }
+    e->src_r = sp[0]; e->src_g = sp[1]; e->src_b = sp[2];
+    s_pres_seq++;
+}
+
+uint64_t gl_renderer_pres_total(void) { return s_pres_seq; }
+int gl_renderer_pres_get(uint64_t seq, GlPresEvent *out) {
+    if (seq >= s_pres_seq) return 0;
+    if (s_pres_seq - seq > GL_PRES_RING_CAP) return 0;  /* evicted */
+    *out = s_pres_ring[seq % GL_PRES_RING_CAP];
     return 1;
 }
 
@@ -738,40 +891,50 @@ static void hr_end(void) {
 
 /* ---- coherency: CPU -> GPU upload flush --------------------------------- */
 /* CPU-side VRAM writes (GP0 A0 transfers, DMA, single pixel pokes) land in
- * the CPU array immediately and accumulate s_up_pending. Flushing before the
+ * the CPU array immediately and accumulate s_up_rects. Flushing before the
  * next GPU op (or readback/present) preserves PS1 command order. */
 static void flush_cpu_upload(void) {
-    if (!s_raster_ok || !s_up_pending.set) return;
+    if (!s_raster_ok || s_up_nrects == 0) return;
     flush_tex_batch();   /* queued draws must land before this upload writes VRAM */
-    int x = s_up_pending.x0, y = s_up_pending.y0;
-    int w = s_up_pending.x1 - s_up_pending.x0 + 1;
-    int h = s_up_pending.y1 - s_up_pending.y0 + 1;
-    rect_clear(&s_up_pending);
-    coh_record(GL_COH_FLUSH, x, y, x + w - 1, y + h - 1);
+    /* Snapshot + clear first (re-entrancy safe; up_add overflow calls back in). */
+    DirtyRect rects[UP_RECTS_MAX];
+    int nrects = s_up_nrects;
+    memcpy(rects, s_up_rects, (size_t)nrects * sizeof(DirtyRect));
+    s_up_nrects = 0;
 
-    /* RGBA8 staging for the hr quad draw. */
-    for (int row = 0; row < h; row++) {
-        const uint16_t *src = s_vram + (size_t)(y + row) * VRAM_W + x;
-        uint32_t *dst = s_conv + (size_t)row * w;
-        for (int col = 0; col < w; col++) dst[col] = conv_1555_to_rgba8(src[col]);
+    /* Stage every rect's CPU data first (texture uploads outside the FBO
+     * bracket), then draw all the quads in one bracket. Only the exact
+     * uploaded rects are painted — never the union bounding box (stale-CPU
+     * flicker class bug, see s_up_rects). */
+    for (int i = 0; i < nrects; i++) {
+        int x = rects[i].x0, y = rects[i].y0;
+        int w = rects[i].x1 - rects[i].x0 + 1;
+        int h = rects[i].y1 - rects[i].y0 + 1;
+        coh_record(GL_COH_FLUSH, x, y, x + w - 1, y + h - 1);
+
+        /* RGBA8 staging for the hr quad draw. */
+        for (int row = 0; row < h; row++) {
+            const uint16_t *src = s_vram + (size_t)(y + row) * VRAM_W + x;
+            uint32_t *dst = s_conv + (size_t)row * w;
+            for (int col = 0; col < w; col++) dst[col] = conv_1555_to_rgba8(src[col]);
+        }
+        glBindTexture(GL_TEXTURE_2D, s_up_tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, s_conv);
+
+        /* Raw mirror takes the CPU data directly — current for this rect, so no
+         * pack is needed for uploaded content. */
+        glBindTexture(GL_TEXTURE_2D, s_raw_tex);
+        glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, VRAM_W);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h,
+                        PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT,
+                        s_vram + (size_t)y * VRAM_W + x);
+        glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, 0);
     }
-    glBindTexture(GL_TEXTURE_2D, s_up_tex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, s_conv);
 
-    /* Raw mirror takes the CPU data directly — current for this rect, so no
-     * pack is needed for uploaded content. */
-    glBindTexture(GL_TEXTURE_2D, s_raw_tex);
-    glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, VRAM_W);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, w, h,
-                    PSXGL_RED_INTEGER, GL_UNSIGNED_SHORT,
-                    s_vram + (size_t)y * VRAM_W + x);
-    glPixelStorei(PSXGL_UNPACK_ROW_LENGTH, 0);
-
-    /* Quad into the hr FBO; two passes split by bit15 so the stencil mirror
+    /* Quads into the hr FBO; two passes split by bit15 so the stencil mirror
      * stays exact. gpu.c applied mask set/check per pixel already — no check
      * here, the data is final. up_tex is VRAM-aligned: src texel = frag/S. */
     hr_begin(0);
-    glScissor(x * s_scale, y * s_scale, w * s_scale, h * s_scale);
     glDisable(GL_BLEND);
     p_glUseProgram(s_blit_prog);
     p_glActiveTexture(PSXGL_TEXTURE0);
@@ -780,16 +943,22 @@ static void flush_cpu_upload(void) {
     p_glUniform1i(s_uBlitMaskset, 0);
     p_glUniform1i(s_uBlitSrcDiv, s_scale);
     p_glUniform2i(s_uBlitSrcOff, 0, 0);
-    float fx0 = (float)x, fy0 = (float)y, fx1 = (float)(x + w), fy1 = (float)(y + h);
-    float verts[6 * 2] = {
-        fx0, fy0,  fx1, fy0,  fx0, fy1,
-        fx1, fy0,  fx0, fy1,  fx1, fy1,
-    };
     p_glBindVertexArray(s_blit_vao);
     p_glBindBuffer(PSXGL_ARRAY_BUFFER, s_blit_vbo);
-    p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
-    plain_stencil(0); p_glUniform1i(s_uBlitPass, 1); glDrawArrays(GL_TRIANGLES, 0, 6);
-    plain_stencil(1); p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
+    for (int i = 0; i < nrects; i++) {
+        int x = rects[i].x0, y = rects[i].y0;
+        int w = rects[i].x1 - rects[i].x0 + 1;
+        int h = rects[i].y1 - rects[i].y0 + 1;
+        glScissor(x * s_scale, y * s_scale, w * s_scale, h * s_scale);
+        float fx0 = (float)x, fy0 = (float)y, fx1 = (float)(x + w), fy1 = (float)(y + h);
+        float verts[6 * 2] = {
+            fx0, fy0,  fx1, fy0,  fx0, fy1,
+            fx1, fy0,  fx0, fy1,  fx1, fy1,
+        };
+        p_glBufferData(PSXGL_ARRAY_BUFFER, sizeof verts, verts, PSXGL_STREAM_DRAW);
+        plain_stencil(0); p_glUniform1i(s_uBlitPass, 1); glDrawArrays(GL_TRIANGLES, 0, 6);
+        plain_stencil(1); p_glUniform1i(s_uBlitPass, 2); glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
     hr_end();
 }
 
@@ -1476,15 +1645,12 @@ static int  glb_render_display(uint32_t *o,int p,int dx,int dy,int dw,int dh){ e
 static int  glb_render_display_hires(uint32_t *o,int p,int dx,int dy,int dw,int dh){ ensure_cpu(); return sw_render_display_hires(o,p,dx,dy,dw,dh); }
 static void glb_vram_write(int x,int y,uint16_t px){
     sw_vram_write(x,y,px);
-    rect_add(&s_up_pending, x & (VRAM_W-1), y & (VRAM_H-1), x & (VRAM_W-1), y & (VRAM_H-1));
+    up_add(x & (VRAM_W-1), y & (VRAM_H-1), x & (VRAM_W-1), y & (VRAM_H-1));
 }
 static uint16_t glb_vram_read(int x,int y){ ensure_cpu(); return sw_vram_read(x,y); }
 static void glb_vram_transfer_in(int x,int y,int w,int h,const uint16_t *d){
     sw_vram_transfer_in(x,y,w,h,d);
-    if (x + w > VRAM_W || y + h > VRAM_H)
-        rect_add(&s_up_pending, 0, 0, VRAM_W-1, VRAM_H-1);  /* wrapped: take all */
-    else
-        rect_add(&s_up_pending, x, y, x+w-1, y+h-1);
+    up_add_transfer(x, y, w, h);   /* exact touched rects, incl. per-pixel wrap */
     coh_record(GL_COH_UPLOAD, x, y, x+w-1, y+h-1);
 }
 static void glb_vram_transfer_out(int x,int y,int w,int h,uint16_t *d){ ensure_cpu(); sw_vram_transfer_out(x,y,w,h,d); }
@@ -1684,8 +1850,8 @@ static int init_gpu_raster(void) {
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     rect_clear(&s_pack_dirty);
-    rect_clear(&s_up_pending);
-    rect_add(&s_up_pending, 0, 0, VRAM_W - 1, VRAM_H - 1);
+    s_up_nrects = 0;
+    up_add(0, 0, VRAM_W - 1, VRAM_H - 1);
     s_gpu_dirty = 0;
 
     /* Native-wide compositor surfaces start unallocated (lazily created when a
@@ -1791,6 +1957,7 @@ void gl_renderer_present(const uint32_t *pixels, int src_w, int src_h, int linea
     p_glUseProgram(s_present_prog); p_glUniform1i(s_present_uTex, 0);
     p_glBindVertexArray(s_present_vao); glDrawArrays(GL_TRIANGLES, 0, 3);
     p_glBindVertexArray(0); p_glUseProgram(0);
+    pres_record(GL_PRES_CPU, 0, 0, src_w, src_h, lx, ly, lw, lh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -1801,6 +1968,7 @@ void gl_renderer_present_blank(void) {
     int ww = 0, wh = 0; SDL_GL_GetDrawableSize(s_win, &ww, &wh);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh); glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
+    pres_record(GL_PRES_BLANK, 0, 0, 0, 0, 0, 0, ww, wh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -1878,9 +2046,21 @@ int gl_renderer_vram_diff(uint32_t *count, int bbox[4],
 void gl_renderer_diag(int *gpu_dirty, int pending[5], int pack[5]) {
     if (gpu_dirty) *gpu_dirty = s_gpu_dirty;
     if (pending) {
-        pending[0] = s_up_pending.set;
-        pending[1] = s_up_pending.x0; pending[2] = s_up_pending.y0;
-        pending[3] = s_up_pending.x1; pending[4] = s_up_pending.y1;
+        /* [0] = pending rect count; [1..4] = union bbox (diagnostic only —
+         * the flush itself paints the exact rects, never this union). */
+        pending[0] = s_up_nrects;
+        pending[1] = pending[2] = pending[3] = pending[4] = 0;
+        for (int i = 0; i < s_up_nrects; i++) {
+            if (i == 0) {
+                pending[1] = s_up_rects[i].x0; pending[2] = s_up_rects[i].y0;
+                pending[3] = s_up_rects[i].x1; pending[4] = s_up_rects[i].y1;
+            } else {
+                if (s_up_rects[i].x0 < pending[1]) pending[1] = s_up_rects[i].x0;
+                if (s_up_rects[i].y0 < pending[2]) pending[2] = s_up_rects[i].y0;
+                if (s_up_rects[i].x1 > pending[3]) pending[3] = s_up_rects[i].x1;
+                if (s_up_rects[i].y1 > pending[4]) pending[4] = s_up_rects[i].y1;
+            }
+        }
     }
     if (pack) {
         pack[0] = s_pack_dirty.set;
@@ -2215,6 +2395,7 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                         lx, ly + lh, lx + lw, ly,
                         GL_COLOR_BUFFER_BIT, linear ? GL_LINEAR : GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);
@@ -2253,6 +2434,7 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
                         lx, ly + lh, lx + lw, ly,
                         GL_COLOR_BUFFER_BIT, linear ? GL_LINEAR : GL_NEAREST);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+    pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
     latency_ring_mark(LAT_SWAP_BEGIN);
     SDL_GL_SwapWindow(s_win);
     latency_ring_mark(LAT_SWAP_END);

@@ -91,6 +91,34 @@ uint64_t gl_renderer_coh_total(void);
 /* Fetch event by absolute sequence number; 0 if evicted or out of range. */
 int gl_renderer_coh_get(uint64_t seq, GlCohEvent *out);
 
+/* Always-on present ring (debug server "gl_present_ring"): EVERY SwapWindow —
+ * including blank (display-disabled) and CPU-quad presents, which the coherency
+ * ring does not record — with the path taken, source display rect, letterbox
+ * dest rect, a glGetError sample, wall-clock ms, and a backbuffer pixel sampled
+ * at the letterbox centre right before the swap (the ground truth for "did this
+ * swap present black"). */
+enum {
+    GL_PRES_VRAM  = 0,   /* 15-bit FBO blit present (gl_renderer_present_vram) */
+    GL_PRES_WIDE  = 1,   /* native-wide FBO blit present                       */
+    GL_PRES_CPU   = 2,   /* CPU-readout quad present (24-bit FMV / forced)     */
+    GL_PRES_BLANK = 3,   /* display-disabled black present                     */
+};
+
+typedef struct {
+    uint32_t frame;        /* s_frame_count at swap                        */
+    uint32_t t_ms;         /* SDL_GetTicks() at swap                       */
+    uint8_t  path;         /* GL_PRES_*                                    */
+    uint8_t  px_r, px_g, px_b; /* backbuffer sample at letterbox centre    */
+    uint16_t glerr;        /* glGetError() drained just before the swap    */
+    int16_t  dx, dy, w, h; /* source display rect (native px; 0 for blank) */
+    int16_t  lx, ly, lw, lh; /* letterbox dest rect (window px)            */
+    uint8_t  src_r, src_g, src_b, src_valid; /* blit SOURCE (hr FBO) sample
+                                              * at the display-rect centre  */
+} GlPresEvent;
+
+uint64_t gl_renderer_pres_total(void);
+int gl_renderer_pres_get(uint64_t seq, GlPresEvent *out);
+
 /* frame_perf: aggregate the per-frame GPU/CPU phase-timing ring (debug server
  * "frame_perf"). wide_filter: -1 = all frames, 0 = 4:3 present, 1 = native-wide.
  * Fills out[9]: [0]=count, [1]=total_ms avg, [2]=total_ms max, [3]=emu_cpu_ms avg
