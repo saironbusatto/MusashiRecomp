@@ -1172,14 +1172,27 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
         psx_unknown_dispatch_record(addr, phys, cpu->gpr[31],
                                     cpu->gpr[4], cpu->gpr[5]);
 
-        /* Fail-fast mode: silent no-op masks bugs by leaving stale
-         * register state. When PSX_FAIL_FAST_UNKNOWN_DISPATCH=1, dump
-         * the crash report and exit so the first miss surfaces full
-         * context instead of accumulating 60 silent stale-v0 returns. */
+        /* LOUD BY DEFAULT. A miss that reaches this point is a real,
+         * unresolvable dispatch target — a recompiler discovery bug (ROM
+         * code the static pass never found) or corrupt guest state. The
+         * old default silently no-op'd it, leaving stale register state
+         * and a broken call chain; that masked the MMX6 memset miss
+         * (A0:2B -> ROM 0xBFC02B8C) for weeks while the symptom was
+         * chased as an event/timing bug (2026-07-02). Per CLAUDE.md §0
+         * a function is either fully implemented or it aborts fatally —
+         * so the first miss dumps a full crash report and halts.
+         *
+         * PSX_FAIL_FAST_UNKNOWN_DISPATCH=0 opts OUT for diagnostic
+         * sessions that need to survive misses to enumerate them (the
+         * miss is still ring-recorded either way; see
+         * unknown_dispatch_log). No interp fallback here on purpose:
+         * the dirty-RAM interpreter is reserved for runtime-written
+         * code (Rule 18); interpreting around a static-discovery hole
+         * would hide it exactly like the silent no-op did. */
         static int s_fail_fast = -1;
         if (s_fail_fast < 0) {
             const char *e = getenv("PSX_FAIL_FAST_UNKNOWN_DISPATCH");
-            s_fail_fast = (e && *e == '1') ? 1 : 0;
+            s_fail_fast = (e && *e == '0') ? 0 : 1;
         }
         if (s_fail_fast) {
             extern void psx_crash_trace_dump(const char *reason, void *seh_info);
@@ -1187,13 +1200,18 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
             char msg[256];
             snprintf(msg, sizeof(msg),
                 "FAIL-FAST unknown dispatch: addr=0x%08X phys=0x%08X ra=0x%08X "
-                "a0=0x%08X a1=0x%08X — see psx_last_run_report.json\n",
+                "a0=0x%08X a1=0x%08X — see psx_last_run_report.json\n"
+                "(recompiler discovery gap: if addr is BIOS ROM, seed it — "
+                "recompiler/seeds/ — and regen; PSX_FAIL_FAST_UNKNOWN_DISPATCH=0 "
+                "to survive-and-log instead)\n",
                 addr, phys, cpu->gpr[31], cpu->gpr[4], cpu->gpr[5]);
             trap_crash(msg);
             exit(1);
         }
 
-        /* Return without executing — function is a no-op. */
+        /* Opt-out path: return without executing (function is a no-op),
+         * ring-recorded above. Stale registers WILL corrupt the caller —
+         * diagnostic use only. */
         g_pc0_reason = PSX_PC0_DISPATCH_MISS;
         cpu->pc = 0;
     }

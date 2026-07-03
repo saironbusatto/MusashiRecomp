@@ -252,6 +252,7 @@ function(psxrecomp_add_runtime_target target)
         WINDOW_TITLE
         DEFAULT_BIOS_PATH
         DEFAULT_GAME_CONFIG_PATH
+        EXE_NAME
     )
     set(multiValueArgs EXTRAS_SOURCES)
     cmake_parse_arguments(PSXRT "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
@@ -303,6 +304,15 @@ function(psxrecomp_add_runtime_target target)
         ${generated_sources}
         ${PSXRT_EXTRAS_SOURCES}
     )
+
+    # Per-game process name (EXE_NAME "mmx6-runtime" -> mmx6-runtime.exe).
+    # Every game repo shipping the default "psx-runtime.exe" means one game's
+    # `taskkill /IM psx-runtime.exe` dev loop kills every other game's instance.
+    # All copy/pack steps use $<TARGET_FILE...> generator expressions, so only
+    # by-name references (docs, kill commands) need to know the per-game name.
+    if(PSXRT_EXE_NAME)
+        set_target_properties(${target} PROPERTIES OUTPUT_NAME "${PSXRT_EXE_NAME}")
+    endif()
 
     # ---- overlay codegen hash (auto cache key) -----------------------------
     # Hash the recompiler's codegen sources into runtime/include/overlay_codegen_hash.h
