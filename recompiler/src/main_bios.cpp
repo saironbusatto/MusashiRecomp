@@ -304,7 +304,15 @@ std::string find_c_compiler(const std::optional<std::string>& cli_override) {
     static const std::array<const char*, 3> candidates = { "gcc", "clang", "cl" };
     for (const char* c : candidates) {
         // Probe with --version. We don't parse output; non-zero exit means not present.
-        const std::string probe = std::string(c) + " --version >NUL 2>&1";
+        // The null device differs by platform: NUL on Windows, /dev/null on
+        // POSIX. Using ">NUL" on macOS/Linux both misdirects the redirect and
+        // leaves a stray file named "NUL" in the cwd.
+#ifdef _WIN32
+        const std::string null_dev = "NUL";
+#else
+        const std::string null_dev = "/dev/null";
+#endif
+        const std::string probe = std::string(c) + " --version >" + null_dev + " 2>&1";
         if (std::system(probe.c_str()) == 0) {
             return c;
         }
