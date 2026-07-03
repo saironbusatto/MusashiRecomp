@@ -68,27 +68,40 @@ def merge_captures(vault_json, src_json):
     return new_variants, new_pcs
 
 def merge_cache(vault_cache, src_cache):
+    """Mirror compiled DLLs/.ranges into the vault, PRESERVING the relative
+    layout (<compiler>/<arch-abi>/cg<N>_<hash>/file). The layout is load-
+    bearing: the same content-keyed filename exists under different cg dirs
+    with DIFFERENT compiled bytes (per-emitter generations), so a flat copy
+    would mix generations. The original flat listdir() also simply never
+    matched anything — the cache has always been nested — so the vault's DLL
+    mirror sat empty (found 2026-07-03)."""
     if not src_cache or not os.path.isdir(src_cache):
         return 0
-    os.makedirs(vault_cache, exist_ok=True)
     added = 0
-    for fn in os.listdir(src_cache):
-        if not (fn.endswith(".dll") or fn.endswith(".ranges")):
-            continue
-        src = os.path.join(src_cache, fn)
-        dst = os.path.join(vault_cache, fn)
-        if not os.path.exists(dst) or os.path.getmtime(src) > os.path.getmtime(dst) + 1:
-            shutil.copy2(src, dst)
-            if fn.endswith(".dll"):
-                added += 1
+    for root, _dirs, files in os.walk(src_cache):
+        rel = os.path.relpath(root, src_cache)
+        for fn in files:
+            if not (fn.endswith(".dll") or fn.endswith(".ranges")):
+                continue
+            src = os.path.join(root, fn)
+            dstdir = os.path.join(vault_cache, rel) if rel != "." else vault_cache
+            dst = os.path.join(dstdir, fn)
+            os.makedirs(dstdir, exist_ok=True)
+            if not os.path.exists(dst) or os.path.getmtime(src) > os.path.getmtime(dst) + 1:
+                shutil.copy2(src, dst)
+                if fn.endswith(".dll"):
+                    added += 1
     return added
 
 def cmd_stats(vault):
     cj = os.path.join(vault, CAP_NAME)
     regs = _load_list(cj)
     pcs = sum(len(r.get("executed_pcs", [])) for r in regs)
-    dlls = [f for f in os.listdir(os.path.join(vault, CACHE_SUB))] if os.path.isdir(os.path.join(vault, CACHE_SUB)) else []
-    ndll = len([f for f in dlls if f.endswith(".dll")])
+    ndll = 0
+    vc = os.path.join(vault, CACHE_SUB)
+    if os.path.isdir(vc):
+        for _root, _dirs, files in os.walk(vc):
+            ndll += sum(1 for f in files if f.endswith(".dll"))
     print("vault: %s" % vault)
     print("  captures: %d variant(s), %d executed PC(s)" % (len(regs), pcs))
     print("  cache:    %d DLL(s)" % ndll)
