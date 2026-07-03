@@ -168,13 +168,16 @@ uint64_t              g_dirty_ram_insn_log_seq = 0;
 /* Current frame counter, defined in debug_server.c. */
 extern uint64_t s_frame_count;
 
-/* Linear-probed insert/lookup keyed on entry PC.  Table is small (64) and
- * the working set of install-stub PCs is tiny (handful), so this stays
- * O(1) in practice.  Returns NULL if the table is full — caller treats
- * that as "stop tracking" rather than failing. */
+/* Linear-probed insert/lookup keyed on entry PC.  Probe length is HARD
+ * BOUNDED: a saturated table must degrade to "stop tracking" (NULL) at O(1)
+ * cost, never to an O(table) scan per lookup.  Tomba2's Trolley attract demo
+ * overflowed the old unbounded probe (working set > table size) and burned
+ * ~99% of the host emu thread rescanning 64K slots per executed instruction
+ * (0.3 fps).  128 probes keeps misses vanishingly rare below ~85% fill with
+ * this hash; past that the tracking data was already degrading anyway. */
 static DirtyRamPcEntry *pc_table_get_or_insert_in(DirtyRamPcEntry *table, uint32_t pc) {
     uint32_t h = (pc * 2654435761u) & (DIRTY_RAM_PC_TABLE_SIZE - 1);
-    for (uint32_t i = 0; i < DIRTY_RAM_PC_TABLE_SIZE; i++) {
+    for (uint32_t i = 0; i < 128u; i++) {
         uint32_t idx = (h + i) & (DIRTY_RAM_PC_TABLE_SIZE - 1);
         DirtyRamPcEntry *e = &table[idx];
         if (e->pc == pc) return e;
