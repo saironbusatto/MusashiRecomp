@@ -3006,29 +3006,42 @@ static void handle_hle_dump(int id, const char *json)
     if (tail > (int)PSX_HLE_RING_CAP) tail = PSX_HLE_RING_CAP;
     uint64_t avail = (total < PSX_HLE_RING_CAP) ? total : PSX_HLE_RING_CAP;
     if ((uint64_t)tail > avail) tail = (int)avail;
-    const size_t BUF_SZ = 2 * 1024 * 1024;
+    /* "since": absolute start seq (paging anchor). Overrides tail's implicit
+     * start so a fast-moving ring can be read from a known point instead of
+     * hoping the tail hasn't slid past it. Clamped to the retained window. */
+    long long since = json_get_int(json, "since", -1);
+    uint64_t start = total - (uint64_t)tail;
+    if (since >= 0) {
+        start = (uint64_t)since;
+        if (start + PSX_HLE_RING_CAP < total) start = total - PSX_HLE_RING_CAP;
+    }
+    const size_t BUF_SZ = 8 * 1024 * 1024;
     char *out = (char *)malloc(BUF_SZ); if (!out) { send_err(id, "oom"); return; }
     size_t pos = 0;
     pos += snprintf(out + pos, BUF_SZ - pos,
-                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"tail\":%d,\"entries\":[",
-                    id, (unsigned long long)total, tail);
-    uint64_t start = total - (uint64_t)tail; int first = 1;
-    for (int i = 0; i < tail; i++) {
-        const PsxHleCallEntry *e = psx_hle_ring_entry(start + (uint64_t)i);
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"start\":%llu,\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)start);
+    int first = 1; int truncated = 0;
+    for (uint64_t s = start; s < total; s++) {
+        const PsxHleCallEntry *e = psx_hle_ring_entry(s);
         if (!e) continue;
         if (want_fn >= 0 && (long)e->fn != want_fn) continue;
         if (want_route >= 0 && (long)e->route != want_route) continue;
-        if (pos > BUF_SZ - 512) break;
+        if (pos > BUF_SZ - 512) { truncated = 1; break; }
         pos += snprintf(out + pos, BUF_SZ - pos,
-                        "%s{\"seq\":%llu,\"cycle\":%llu,\"vec\":\"0x%X\",\"fn\":\"0x%02X\","
+                        "%s{\"seq\":%llu,\"cycle\":%llu,\"cycle_last\":%llu,"
+                        "\"vec\":\"0x%X\",\"fn\":\"0x%02X\","
                         "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
-                        "\"ra\":\"0x%08X\",\"v0\":\"0x%08X\",\"route\":%u}",
+                        "\"ra\":\"0x%08X\",\"v0\":\"0x%08X\",\"repeat\":%u,"
+                        "\"tcb\":\"0x%08X\",\"exc\":%u,\"route\":%u}",
                         first ? "" : ",", (unsigned long long)e->seq,
-                        (unsigned long long)e->cycle, e->vector, e->fn,
-                        e->a0, e->a1, e->a2, e->a3, e->ra, e->v0, e->route);
+                        (unsigned long long)e->cycle, (unsigned long long)e->cycle_last,
+                        e->vector, e->fn,
+                        e->a0, e->a1, e->a2, e->a3, e->ra, e->v0, e->repeat,
+                        e->tcb, e->in_exc, e->route);
         first = 0;
     }
-    pos += snprintf(out + pos, BUF_SZ - pos, "]}\n");
+    pos += snprintf(out + pos, BUF_SZ - pos, "],\"truncated\":%d}\n", truncated);
     debug_server_send_line(out); free(out);
 }
 
@@ -7347,7 +7360,10 @@ static inline int is_card_critical_addr(uint32_t phys) {
            (phys >= 0x000072F0u && phys < 0x000072F4u) ||
            (phys >= 0x00007520u && phys < 0x00007524u) ||
            (phys >= 0x00007528u && phys < 0x00007530u) ||
-           (phys >= 0x0000E044u && phys < 0x0000E0D0u);
+           /* All 7 card EvCB slots (0xE028 + i*0x1C, i=0..6). The old range
+            * started at slot 1 and stopped before slot 6, leaving SwCARD-IOE
+            * (slot 0 — the success event) and HwCARD-NEW invisible. */
+           (phys >= 0x0000E028u && phys < 0x0000E0ECu);
 }
 static void card_trace_record(uint32_t phys, uint32_t old_val, uint32_t new_val, uint8_t width) {
     uint64_t seq = s_card_trace_seq++;

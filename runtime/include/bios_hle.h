@@ -80,13 +80,17 @@ enum {
 
 typedef struct PsxHleCallEntry {
     uint64_t seq;
-    uint64_t cycle;      /* psx_cycle_count at record time */
+    uint64_t cycle;      /* psx_cycle_count at record time (first occurrence) */
+    uint64_t cycle_last; /* psx_cycle_count of the most recent collapsed repeat */
     uint32_t vector;     /* 0xA0/0xB0/0xC0, or 0x30000 for the boot skip */
     uint32_t fn;         /* $t1 function number (0 for boot skip) */
     uint32_t a0, a1, a2, a3;
     uint32_t ra;
     uint32_t v0;         /* result for HLE-serviced calls (0 otherwise) */
+    uint32_t repeat;     /* consecutive identical calls collapsed into this entry */
+    uint32_t tcb;        /* current guest thread: [[0x108]] at call time (0 if unset) */
     uint8_t  route;      /* PSX_HLE_ROUTE_* */
+    uint8_t  in_exc;     /* recorded inside guest exception context */
 } PsxHleCallEntry;
 
 #define PSX_HLE_RING_CAP 16384  /* power of two */

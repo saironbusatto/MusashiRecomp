@@ -89,9 +89,41 @@ static uint64_t        s_ring_seq = 0;
 static void hle_record(uint32_t vector, uint32_t fn, const CPUState* cpu,
                        uint32_t v0, uint8_t route)
 {
+    /* Thread attribution: current TCB via the kernel's process block chain
+     * (0x108 -> PCB, PCB[0] -> running TCB; SCPH1001 layout, stable across
+     * kernel versions). Distinguishes which guest thread issued each call —
+     * load-bearing for event-consumption races (MMX6 card check). */
+    uint32_t pcb = cpu->read_word(0xA0000108u);
+    uint32_t pcb_phys = pcb & 0x1FFFFFFFu;
+    uint32_t tcb = (pcb != 0u && pcb_phys < 0x200000u)
+                       ? cpu->read_word(0xA0000000u | pcb_phys) : 0u;
+    extern int psx_get_in_exception(void);
+    uint8_t in_exc = (uint8_t)(psx_get_in_exception() ? 1u : 0u);
+
+    /* Collapse tight polling cycles: guest code that spins on a handful of
+     * calls (e.g. MMX6's 4-way TestEvent card poll at ~175K calls/s) would
+     * otherwise flush the whole ring in ~0.1s. If an identical call
+     * (vector/fn/args/ra/result/route/thread) exists among the last 8
+     * entries, count it there. The first and last occurrence cycles plus the
+     * exact repeat count survive; any change in args, result, or issuing
+     * thread appends a fresh entry, so every TRANSITION is ring-ordered. */
+    uint64_t back = s_ring_seq < 8 ? s_ring_seq : 8;
+    for (uint64_t k = 1; k <= back; k++) {
+        PsxHleCallEntry* p = &s_ring[(s_ring_seq - k) & (PSX_HLE_RING_CAP - 1)];
+        if (p->vector == vector && p->fn == fn && p->route == route &&
+            p->a0 == cpu->gpr[4] && p->a1 == cpu->gpr[5] &&
+            p->a2 == cpu->gpr[6] && p->a3 == cpu->gpr[7] &&
+            p->ra == cpu->gpr[31] && p->v0 == v0 &&
+            p->tcb == tcb && p->in_exc == in_exc) {
+            p->repeat++;
+            p->cycle_last = psx_get_cycle_count();
+            return;
+        }
+    }
     PsxHleCallEntry* e = &s_ring[s_ring_seq & (PSX_HLE_RING_CAP - 1)];
     e->seq    = s_ring_seq;
     e->cycle  = psx_get_cycle_count();
+    e->cycle_last = e->cycle;
     e->vector = vector;
     e->fn     = fn;
     e->a0     = cpu->gpr[4];
@@ -100,7 +132,10 @@ static void hle_record(uint32_t vector, uint32_t fn, const CPUState* cpu,
     e->a3     = cpu->gpr[7];
     e->ra     = cpu->gpr[31];
     e->v0     = v0;
+    e->repeat = 1;
+    e->tcb    = tcb;
     e->route  = route;
+    e->in_exc = in_exc;
     s_ring_seq++;
 }
 
