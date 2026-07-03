@@ -343,11 +343,6 @@ static uint64_t exception_entries_total;
  * something is calling psx_check_interrupts from inside the recompiled
  * exception handler tree. */
 static uint64_t exception_reentry_blocks;
-/* Nested-exception depth (0 = not in exception). in_exception stays the
- * boolean the rest of the runtime reads; this tracks how deep the
- * synchronous-handler recursion is so the nested-delivery path (hardware
- * IEc-re-enabled semantics, see the gate below) can cap host-stack use. */
-static int exception_nest_depth;
 
 /* After the exception handler returns, suppress the next interrupt delivery
  * to give the interrupted code at least one block of execution — matching
@@ -492,7 +487,6 @@ void psx_get_freeze_diag(uint64_t *out_total_checks,
 void interrupts_init(void) {
     dispatch_count = 0;
     in_exception = 0;
-    exception_nest_depth = 0;
     g_psx_dispatch_depth = 0;
     total_checks = 0;
     post_exception_cooldown = 0;
@@ -648,42 +642,13 @@ void psx_check_interrupts(CPUState* cpu) {
 
     /* Check if any interrupts are pending. */
     if ((i_stat & i_mask) == 0) { irq_record_outcome(EV_NONE, 0, 0); PSX_CHECK_INTERRUPTS_RETURN(); }
-    /* Nested delivery (hardware semantics). Real R3000A has no 'in exception'
-     * gate — delivery is governed by SR alone. The handler normally runs with
-     * IEc=0 (hardware bit-shift on entry), so the SR gates below block
-     * re-entry faithfully on their own. A game that RE-ENABLES IEc inside the
-     * handler is asking for a nested interrupt and real hardware delivers it:
-     * Tomba2's lava attract demo parks in the kernel event-poll INSIDE the
-     * VBlank handler waiting for the NEXT VBlank — the old unconditional
-     * in_exception block starved it to ~1 fps (VBlank pending+unmasked,
-     * ~1100 reentry blocks/s, 1 delivery/s). The synchronous-handler
-     * machinery below is nesting-safe: the interrupted-context save
-     * (saved_gpr/hi/lo) and owner state (prev_owner_fiber, prev_pending,
-     * dispatch depth) are host-stack locals restored on unwind, and
-     * in_exception is restored to its pre-delivery value at the epilogue.
-     * Depth cap: a pathological IEc-re-enable loop would recurse the host
-     * stack; real hardware would wedge the guest instead — we stop nesting
-     * there (counted) so the rings expose it. */
     if (in_exception) {
-        /* Refinements over plain SR gating (first attempt wedged BOOT at
-         * f436): (1) never nest while an RFE/escape unwind is in flight —
-         * the guest's RFE pops SR (IEc back to 1) BEFORE the host escape
-         * completes, and a delivery in that window lands in half-unwound
-         * machinery; (2) one nesting level only — enough for the
-         * wait-inside-handler idiom, no host-stack pyramids. */
-        if (exception_nest_depth >= 2 ||
-            g_rfe_escape_pending ||
-            g_exc_escape_reason != PSX_EXC_ESCAPE_NONE ||
-            !(cpu->cop0[COP0_SR] & 0x01)) {
-            exception_reentry_blocks++;
-            irq_record_outcome(EV_IRQ_GATE, GATE_IN_EXCEPTION, 0);
+        exception_reentry_blocks++;
+        irq_record_outcome(EV_IRQ_GATE, GATE_IN_EXCEPTION, 0);
 #ifdef PSX_COSIM
-            COSIM_IRQ_NOTE(2u);
+        COSIM_IRQ_NOTE(2u);
 #endif
-            PSX_CHECK_INTERRUPTS_RETURN();
-        }
-        /* IEc re-enabled inside the handler: fall through to the SR gates
-         * and deliver a nested exception, as hardware would. */
+        PSX_CHECK_INTERRUPTS_RETURN();
     }
 
     /* Post-exception cooldown: let at least one block execute after RFE. */
@@ -747,12 +712,7 @@ void psx_check_interrupts(CPUState* cpu) {
         g_irqctx_seq++;
     }
     ls_note_exception_entry();
-    /* Nested delivery: remember whether we interrupted an OUTER handler so
-     * the epilogue restores in_exception to the pre-delivery value instead
-     * of clearing it (a nested level-2 exit must leave level-1 flagged). */
-    int prev_in_exception = in_exception;
     in_exception = 1;
-    exception_nest_depth++;
     exception_entries_total++;
     uint32_t pre_handler_istat = i_stat;  /* snapshot for cooldown decision */
 
@@ -1044,9 +1004,7 @@ void psx_check_interrupts(CPUState* cpu) {
         cpu->cop0[COP0_SR] = (sr2 & 0xFFFFFFC0u) | ((sr2 >> 2) & 0x0Fu);
     }
 
-    /* Nested delivery: a level-2 exit must leave level-1 flagged. */
-    in_exception = prev_in_exception;
-    if (exception_nest_depth > 0) exception_nest_depth--;
+    in_exception = 0;
 
     /* Adaptive cooldown: if the handler acknowledged the interrupt (cleared
      * some I_STAT bits), the interrupt won't immediately re-fire and we need
