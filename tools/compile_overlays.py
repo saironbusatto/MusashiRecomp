@@ -114,14 +114,29 @@ def verify_recompiler_matches_tag(recompiler: str, tag_hash: int) -> None:
     print(f'recompiler codegen hash verified: {baked} == cg tag hash')
 
 
+def is_windows() -> bool:
+    """True on native Windows AND under MSYS/Cygwin/MinGW pythons.
+    platform.system() there returns 'MSYS_NT-...'/'CYGWIN_NT-...', NOT
+    'Windows' — the naive check filed a whole session's overlay DLLs under
+    gcc/linux-x64/ while the Windows loader read gcc/win-x64/: the runtime
+    interpreted 'covered' functions forever (Tomba2 attract ran ~half its
+    instruction volume on the interpreter, 2026-07-02) while autocompile
+    kept reporting 'already covered - no new native code to build'."""
+    return (os.name == 'nt'
+            or platform.system() == 'Windows'
+            or platform.system().startswith(('MSYS', 'CYGWIN', 'MINGW')))
+
+
 def cache_arch_abi() -> str:
     """Canonical cache arch-abi tag, IDENTICAL to overlay_loader.c's
     PSX_OVERLAY_ARCH_ABI ("<os>-<arch>": win|linux|macos + x64|arm64|x86).
     gcc DLLs are namespaced under <game_id>/gcc/<arch-abi>/ so same-OS
     different-arch caches (and, later, sljit blobs) never comingle. Keep this
     mapping in lockstep with overlay_loader.c."""
-    sysname = platform.system()
-    os_tag = {'Windows': 'win', 'Darwin': 'macos'}.get(sysname, 'linux')
+    if is_windows():
+        os_tag = 'win'
+    else:
+        os_tag = {'Darwin': 'macos'}.get(platform.system(), 'linux')
     m = platform.machine().lower()
     if m in ('amd64', 'x86_64', 'x64'):
         arch = 'x64'
@@ -1448,7 +1463,7 @@ def compile_dll(c_path: str, out_dll: str, include_dirs: list[str],
     includes = [f'-I{os.path.abspath(d)}' for d in include_dirs]
     # On Windows, DLLs use PE relocations — -fPIC triggers GCC CRT init
     # that conflicts with the host process. Use -shared without -fPIC.
-    pic_flag = [] if platform.system() == 'Windows' else ['-fPIC']
+    pic_flag = [] if is_windows() else ['-fPIC']
     cmd = [
         gcc, '-shared', *pic_flag, '-O2',
         '-DPSX_OVERLAY_DLL_BUILD',
