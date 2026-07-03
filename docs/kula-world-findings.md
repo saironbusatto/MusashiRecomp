@@ -1,7 +1,8 @@
 # Kula World (SCES-01000) — bring-up findings
 
-Status as of this session: boots on the Linux runtime, past the region
-wedge, stalls before the demo level renders. Two bugs found; one fixed.
+Status: SOLVED — Kula World boots to its title screen + menu (Arcade / Time
+Trial / Load Game). Five bugs found and fixed this session; the final one was
+the wedge.
 
 ## Setup
 
@@ -290,3 +291,41 @@ and ack is being dispatched at all).
 Tooling built: null-dispatch fntrace freeze, PSX_CD_TRAP_CMD self-stop trap
 (runtime + oracle), PSX_FNTRACE_ALL boot trace, oracle cdrom_cmd_dump hook,
 Linux port of runtime+oracle, beetle-linux build docs + patches.
+
+
+### Round 8 — ROOT CAUSE FOUND AND FIXED: dirty-RAM interpreter interrupt latency
+
+The wedge: at ~frame 1039 the game froze in bursts of ~14s, then advanced.
+During each freeze:
+  SR = 0x40000401 (IEc=1, IM2=1)   -> interrupts enabled + hw line unmasked
+  Cause = 0x400 (IP2=1)            -> hardware interrupt pending
+  i_stat & i_mask = 0x5            -> VBLANK + CDROM pending and enabled
+  in_exception=0, cooldown irrelevant
+  total_checks FROZEN              -> psx_check_interrupts is NOT being called
+  g_dirty_ram_insns_run advancing ~15M/s, blocks_run ~2M/s
+
+So the MIPS interrupt-take condition (IEc && IM2 && IP2) was fully satisfied,
+yet no interrupt was taken because psx_check_interrupts was never called. The
+CPU was in the DIRTY-RAM INTERPRETER running libcd's CdSync spin-wait (a guest
+loop that lives entirely in dirty RAM), re-entering the interpreter once per
+short (~7-insn) block. The interpreter's only interrupt poll was on the
+local-dirty-flow path gated by the PER-INVOCATION `(insns_executed & 0xFFF)`
+counter, which for short blocks never reaches 0x1000 and, when the loop exits
+to dispatch each iteration, is never reached at all. So the spin ran millions
+of instructions with no interrupt poll; the CD IRQ that sets libcd's wait-flag
+was never serviced; the loop only broke when a rare timeout re-dispatched.
+
+FIX (runtime/src/dirty_ram_interp.c): poll interrupts at the interpreter's
+per-invocation entry, gated by a GLOBAL invocation counter (every 64 entries),
+with cpu->pc set so the resume is coherent. This is the interpreter analogue
+of a static block-leader poll. psx_check_interrupts runs the handler and
+returns with registers restored, so the loop safely continues and immediately
+sees its wait-flag set.
+
+RESULT: Kula World boots to the title screen and menu (Arcade / Time Trial /
+Load Game / Back). Pixels on screen — bug 3 SOLVED.
+
+Why this only bit Kula and not Tomba/MMX6: Kula uses the BIOS/libcd CD path
+whose CdSync spin-waits in a dirty-RAM loop; the working titles use their own
+CD drivers / loop shapes that hit the interrupt poll differently. This fix is
+general — any dirty-RAM guest spin-loop now yields to interrupts.
