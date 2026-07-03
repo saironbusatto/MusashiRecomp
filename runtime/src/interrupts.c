@@ -348,6 +348,9 @@ static uint64_t exception_reentry_blocks;
  * synchronous-handler recursion is so the nested-delivery path (hardware
  * IEc-re-enabled semantics, see the gate below) can cap host-stack use. */
 static int exception_nest_depth;
+/* Nested-delivery gate veto attribution (freeze_check). One counter per guard
+ * in the refinement gate below; first-true-wins ordering matches the gate. */
+uint64_t g_nestgate_depth, g_nestgate_rfepend, g_nestgate_escreason, g_nestgate_iec;
 
 /* After the exception handler returns, suppress the next interrupt delivery
  * to give the interrupted code at least one block of execution — matching
@@ -675,6 +678,14 @@ void psx_check_interrupts(CPUState* cpu) {
             g_rfe_escape_pending ||
             g_exc_escape_reason != PSX_EXC_ESCAPE_NONE ||
             !(cpu->cop0[COP0_SR] & 0x01)) {
+            /* Per-guard veto attribution (always-on counters, freeze_check):
+             * which refinement is actually vetoing nested delivery. A wedge
+             * where ONE guard dominates for thousands of frames names the
+             * false veto (Tomba2 Whoopee-logo forensics 2026-07-03). */
+            if (exception_nest_depth >= 2)                        g_nestgate_depth++;
+            else if (g_rfe_escape_pending)                        g_nestgate_rfepend++;
+            else if (g_exc_escape_reason != PSX_EXC_ESCAPE_NONE)  g_nestgate_escreason++;
+            else                                                  g_nestgate_iec++;
             exception_reentry_blocks++;
             irq_record_outcome(EV_IRQ_GATE, GATE_IN_EXCEPTION, 0);
 #ifdef PSX_COSIM

@@ -7853,6 +7853,8 @@ static void handle_freeze_check(int id, const char *json)
     extern uint64_t g_sentinel_reach_dirty;
     extern uint64_t g_sentinel_reach_traps;
     extern uint32_t g_sentinel_reach_async;
+    extern uint64_t g_nestgate_depth, g_nestgate_rfepend,
+                    g_nestgate_escreason, g_nestgate_iec;
 
     /* Top-K fn_entry histogram over the last `window` slots. */
     typedef struct { uint32_t func; uint32_t count; } HistBucket;
@@ -7973,6 +7975,10 @@ static void handle_freeze_check(int id, const char *json)
                     "\"pczero_in_exc\":%u,"
                     "\"pczero_async_rfe\":\"0x%08X\","
                     "\"pczero_dirty_safe\":\"0x%08X\","
+                    "\"nestgate_depth\":%llu,"
+                    "\"nestgate_rfepend\":%llu,"
+                    "\"nestgate_escreason\":%llu,"
+                    "\"nestgate_iec\":%llu,"
                     "\"hist\":[",
                     id,
                     g_debug_current_func_addr,
@@ -8031,7 +8037,11 @@ static void handle_freeze_check(int id, const char *json)
                     g_pczero_ra,
                     g_pczero_in_exc,
                     g_pczero_async_rfe,
-                    g_pczero_dirty_safe);
+                    g_pczero_dirty_safe,
+                    (unsigned long long)g_nestgate_depth,
+                    (unsigned long long)g_nestgate_rfepend,
+                    (unsigned long long)g_nestgate_escreason,
+                    (unsigned long long)g_nestgate_iec);
     for (int i = 0; i < hist_n && pos < sizeof(buf) - 64; i++) {
         pos += snprintf(buf + pos, sizeof(buf) - pos,
                         "%s{\"func\":\"0x%08X\",\"count\":%u}",
