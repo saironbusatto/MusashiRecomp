@@ -110,7 +110,12 @@ extern const char *g_dirty_ram_last_unsupported_reason;
  * stubs actually fire — a single noisy spurious-dispatch site can mask
  * a legitimate handler that never runs.  This open-addressed table keys
  * on the entry PC of each interpreted block. */
-#define DIRTY_RAM_PC_TABLE_SIZE 65536
+/* 65536 -> 262144 (2026-07-03): Tomba2's Trolley attract demo interprets a
+ * working set past 64K distinct PCs; a full table degraded every lookup to a
+ * full-table scan (0.3 fps host burn in pc_table_get_or_insert_in) and
+ * silently truncated overlay-capture seed lists (MAX_CAPTURE_PCS aliases
+ * this). Probe length is bounded in pc_table_get_or_insert_in either way. */
+#define DIRTY_RAM_PC_TABLE_SIZE 262144
 typedef struct {
     uint32_t pc;         /* entry PC, 0 = empty slot */
     uint64_t hits;       /* number of times dispatched here */
