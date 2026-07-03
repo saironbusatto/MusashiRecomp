@@ -4083,15 +4083,44 @@ static const char *json_get_str(const char *json, const char *key,
         while (*p && *p != ',' && *p != '}' && *p != ' ' && i < out_sz - 1)
             out[i++] = *p++;
         out[i] = '\0';
+        /* A BARE json number is DECIMAL by JSON semantics, but nearly every
+         * string consumer here feeds hex_to_u32 / strtoul(base 0|16) under the
+         * quoted-hex wire convention. A client that forgets to hex-format an
+         * address (python json.dumps of an int emits bare decimal) used to get
+         * it parsed AS HEX — 10-digit decimals saturate strtoul to 0xFFFFFFFF
+         * and the server silently read junk (burned an evidence chain
+         * 2026-07-02). Normalize bare pure-decimal values to "0x%llX" so both
+         * hex_to_u32 and base-0 consumers recover the intended value. Bare
+         * booleans / 0x-prefixed / hex-lettered values pass through unchanged.
+         * (json_get_int does NOT share this path — it scans raw JSON itself.) */
+        if (i > 0) {
+            int all_dec = 1;
+            for (int k = 0; k < i; k++)
+                if (out[k] < '0' || out[k] > '9') { all_dec = 0; break; }
+            if (all_dec) {
+                unsigned long long v = strtoull(out, NULL, 10);
+                snprintf(out, (size_t)out_sz, "0x%llX", v);
+            }
+        }
         return out;
     }
 }
 
 static int json_get_int(const char *json, const char *key, int def)
 {
-    char buf[64];
-    if (!json_get_str(json, key, buf, sizeof(buf))) return def;
-    return atoi(buf);
+    /* Raw scan (NOT via json_get_str): integer fields keep bare-decimal
+     * semantics and must not go through the hex normalization above.
+     * Quoted numbers are accepted too (base 0 handles "123" and "0x7B"). */
+    char pattern[128];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return def;
+    p += strlen(pattern);
+    while (*p == ' ' || *p == ':') p++;
+    if (*p == '"') p++;
+    if (*p == '-' || (*p >= '0' && *p <= '9'))
+        return (int)strtol(p, NULL, 0);
+    return def;
 }
 
 static uint32_t hex_to_u32(const char *s)
