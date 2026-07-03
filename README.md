@@ -27,6 +27,32 @@ targets are:
 - [TombaRecomp](https://github.com/mstan/TombaRecomp) — *Tomba!*
 - [MegaManX6Recomp](https://github.com/mstan/MegaManX6Recomp) — *Mega Man X6*
 
+### This fork — *Kula World* (SCES-01000) on Linux
+
+This fork brings up *Kula World* (a.k.a. *Roll Away*) as a new end-to-end
+target and ports the framework (recompiler + runtime + Beetle-PSX oracle) to
+Linux. It boots to the title screen and menu, recompiled + interpreted, no
+HLE:
+
+<p align="center">
+  <img src="docs/assets/kula-world-titlescreen.png" alt="Kula World title screen running on PSXRecomp" width="480">
+</p>
+
+The bring-up surfaced and fixed five runtime bugs — most of them
+game-agnostic framework improvements (see `docs/kula-world-findings.md`):
+
+1. **Dirty-RAM interpreter interrupt latency** — a guest spin-wait living in
+   dirty RAM (libcd `CdSync`) never polled interrupts, so a pending, enabled
+   CD IRQ was never taken and the game wedged. Now the interpreter polls at
+   its per-invocation entry on a global counter — general to any dirty-RAM
+   spin-loop.
+2. **Main-RAM 4× mirror** not modeled (crt0 parks `$sp` at `0x807FFFF8`).
+3. **GetID region** hard-coded to `SCEI`; now derived from the disc serial
+   (Tomba/MMX6 get correct `SCEA` too).
+4. **CD status bits** ADPBUSY/BUSYSTS corrected against the oracle.
+5. **CD controller version** returned the PSone `0x97`; the SCPH-1001 sub-CPU
+   reports `0x94 09 19 C0`, which the shell's CD-init requires.
+
 ## Philosophy — toward 100% static recompilation
 
 The goal is simple and absolute: **a PS1 game should run as native code, not be
