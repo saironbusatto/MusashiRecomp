@@ -290,11 +290,21 @@ static inline uint32_t fetch_word(uint32_t phys) {
  * function boundaries, so we scan a +/-512-byte window around the site (clamped
  * to main RAM) via the shared psx_ws_func_has_screen_cull, cached per-PC so a
  * hot render loop pays the scan once. Single-threaded interp => static buffers ok. */
+/* Per-PC site caches: FULL-PC tagged, sized for a whole overlay's working set
+ * (the old 256-slot direct map thrashed on any two hot PCs 1 KB apart — the
+ * ±512-byte rescan then ran per EXECUTED INSTRUCTION and collapsed native-wide
+ * 16:9 to ~12fps, entirely CPU-side). Entries carry the dirty-RAM code
+ * generation (memory.c g_dirty_ram_code_gen) so an overlay reload re-derives
+ * every classification instead of trusting a stale kind. */
+extern uint32_t g_dirty_ram_code_gen;
+#define WS_SITE_CACHE_SLOTS 8192u             /* 32 KB of code coverage per cache */
+
 static int ws_cull_site(uint32_t pc) {
     enum { WIN = 128 };                       /* +/- 128 words = +/- 512 bytes */
-    static struct { uint32_t pc; int8_t flag; } cache[256];
-    uint32_t slot = (pc >> 2) & 255u;
-    if (cache[slot].pc == pc) return cache[slot].flag;
+    static struct { uint32_t pc; uint32_t gen; int8_t flag; } cache[WS_SITE_CACHE_SLOTS];
+    uint32_t slot = (pc >> 2) & (WS_SITE_CACHE_SLOTS - 1u);
+    if (cache[slot].pc == pc && cache[slot].gen == g_dirty_ram_code_gen)
+        return cache[slot].flag;
     uint32_t phys = pc & 0x1FFFFFFFu;
     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
     uint32_t hi = phys + (uint32_t)(WIN * 4);
@@ -304,7 +314,7 @@ static int ws_cull_site(uint32_t pc) {
     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
         words[n++] = fetch_word(a);
     int flag = psx_ws_func_has_screen_cull(words, n);
-    cache[slot].pc = pc; cache[slot].flag = (int8_t)flag;
+    cache[slot].pc = pc; cache[slot].gen = g_dirty_ram_code_gen; cache[slot].flag = (int8_t)flag;
     return flag;
 }
 
@@ -318,9 +328,12 @@ static int ws_cull_site(uint32_t pc) {
  * WS_BD_END_WIDEN. Single-threaded interp => static buffers are safe. */
 static int ws_backdrop_site_kind(uint32_t pc, int *out_cols) {
     enum { WIN = 128 };                          /* +/- 128 words = +/- 512 bytes */
-    static struct { uint32_t pc; int8_t kind; int16_t cols; } cache[256];
-    uint32_t slot = (pc >> 2) & 255u;
-    if (cache[slot].pc == pc) { if (out_cols) *out_cols = cache[slot].cols; return cache[slot].kind; }
+    static struct { uint32_t pc; uint32_t gen; int8_t kind; int16_t cols; } cache[WS_SITE_CACHE_SLOTS];
+    uint32_t slot = (pc >> 2) & (WS_SITE_CACHE_SLOTS - 1u);
+    if (cache[slot].pc == pc && cache[slot].gen == g_dirty_ram_code_gen) {
+        if (out_cols) *out_cols = cache[slot].cols;
+        return cache[slot].kind;
+    }
     uint32_t phys = pc & 0x1FFFFFFFu;
     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
     uint32_t hi = phys + (uint32_t)(WIN * 4 + 4);
@@ -331,7 +344,8 @@ static int ws_backdrop_site_kind(uint32_t pc, int *out_cols) {
         words[n++] = fetch_word(a);
     int cols = 0;
     int kind = psx_ws_backdrop_kind_at(words, n, lo, phys, &cols);  /* all physical-space */
-    cache[slot].pc = pc; cache[slot].kind = (int8_t)kind; cache[slot].cols = (int16_t)cols;
+    cache[slot].pc = pc; cache[slot].gen = g_dirty_ram_code_gen;
+    cache[slot].kind = (int8_t)kind; cache[slot].cols = (int16_t)cols;
     if (out_cols) *out_cols = cols;
     return kind;
 }
@@ -1083,7 +1097,14 @@ static int exec_one(CPUState *cpu, uint32_t pc, uint32_t *next_pc_out) {
      * complete. Gated on the runtime predicate first => 4:3 pays nothing. Each
      * rewrite is recorded to the always-on backdrop ring with the live extent
      * (s7), camera-X (scratchpad 0x176) and DL count for `ws_backdrop_ring`. */
-    if (psx_ws_backdrop_preload()) {
+    /* Opcode pre-filter FIRST: only addu/or/addi/addiu can be a rewrite site
+     * (the detector below rewrites exactly one GPR-writing move/addiu). The old
+     * order ran the ±512-byte site scan for EVERY interpreted instruction; with
+     * the small direct-mapped cache thrashing, that was the mechanism of the
+     * native-wide 16:9 CPU collapse (Tomba2 attract 12fps, stack-sampled). */
+    if (((opc == 0x00u && (fnt == 0x21u || fnt == 0x25u)) ||
+         opc == 0x09u || opc == 0x08u) &&
+        psx_ws_backdrop_preload()) {
         int wcols = 0;
         int bk = ws_backdrop_site_kind(pc, &wcols);
         if (bk != WS_BD_NONE) {

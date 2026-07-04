@@ -63,10 +63,23 @@ uint8_t *memory_get_scratchpad_ptr(void) { return scratchpad; }
 #define DIRTY_RAM_BITMAP_WORDS  ((DIRTY_RAM_PAGE_COUNT + 31u) / 32u)
 static uint32_t dirty_ram_bitmap[DIRTY_RAM_BITMAP_WORDS];
 
+/* Monotonic generation for RAM-resident CODE changes (kernel install-stub
+ * writes + DMA/EXE loads that mark executable ranges). Consumers that cache
+ * per-PC classifications of RAM instructions (the interp's widescreen
+ * cull/backdrop site caches) compare against this and re-derive after any
+ * code change — a cached kind must never survive an overlay reload. */
+uint32_t g_dirty_ram_code_gen = 1;
+
 static inline void dirty_ram_mark_page(uint32_t phys) {
     if (phys >= RAM_SIZE) return;
     uint32_t page = phys >> DIRTY_RAM_PAGE_SHIFT;
-    dirty_ram_bitmap[page >> 5] |= (1u << (page & 31u));
+    uint32_t bit = 1u << (page & 31u);
+    /* Generation bumps on the clean->dirty TRANSITION only: kernel-window data
+     * writes land here on every guest store, and bumping per write would
+     * invalidate the per-PC site caches continuously. Overlay (re)loads always
+     * bump via dirty_ram_mark_executable_range. */
+    if (!(dirty_ram_bitmap[page >> 5] & bit)) g_dirty_ram_code_gen++;
+    dirty_ram_bitmap[page >> 5] |= bit;
 }
 
 static inline void dirty_ram_mark_kernel_write(uint32_t phys) {
@@ -106,6 +119,7 @@ void dirty_ram_mark_executable_range(uint32_t phys, uint32_t len) {
     for (uint32_t page = first_page; page <= last_page; page++) {
         dirty_ram_bitmap[page >> 5] |= (1u << (page & 31u));
     }
+    g_dirty_ram_code_gen++;
 }
 
 /* Force-interp mode (tooling): PSX_FORCE_INTERP=1 makes ALL RAM above the kernel
