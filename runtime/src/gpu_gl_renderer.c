@@ -1074,17 +1074,28 @@ static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
  * caller stays inside hr_begin/hr_end; hr_end unbinds and the next hr_begin
  * resets the viewport, so no viewport restore is needed mid-function.
  *
- * The scissor is the FULL wide surface (NOT the draw area): the SW reference
- * (rt_wide()) clips the wide pass only to the surface bounds, deliberately
- * letting the shifted geometry fill the revealed 16:9 margins that lie OUTSIDE
- * the game's 4:3 draw-area x-range. Scissoring to the (translated) draw area
- * would crop exactly the margin content native-wide exists to reveal. */
+ * The scissor X is the FULL wide surface (NOT the draw area): the SW reference
+ * (rt_wide()) deliberately lets the shifted geometry fill the revealed 16:9
+ * margins that lie OUTSIDE the game's 4:3 draw-area x-range; scissoring X to
+ * the (translated) draw area would crop exactly the margin content native-wide
+ * exists to reveal. The scissor Y stays clamped to the DRAW AREA, exactly like
+ * rt_wide() (t.cy1/cy2 = g_clip_y1/y2): native-wide only widens X. A full-height
+ * Y scissor let draws that canonically clip at a vertical double-buffer band
+ * boundary (MMX6: draw area alternates y=0/y=240, both bands in ONE wide
+ * surface) bleed into the OTHER band's rows — presented one frame later as
+ * top/bottom edge flicker (16:9 GL only). */
 static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
     if (s_ws_ablate != 3)   /* ablate 3: no FBO rebind (draws land in hr — perf probe) */
         p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
     glViewport(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
     glEnable(GL_SCISSOR_TEST);
-    glScissor(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
+    {
+        int sy = s_area_y1, sh = s_area_y2 - s_area_y1 + 1;
+        if (sy < 0) { sh += sy; sy = 0; }
+        if (sy + sh > VRAM_H) sh = VRAM_H - sy;
+        if (sh < 0) sh = 0;
+        glScissor(0, sy * s_scale, g_wide_w * s_scale, sh * s_scale);
+    }
     p_glUniform1f(uXoff, (float)dx);
     p_glUniform1f(uXhalf, (float)g_wide_w / 2.0f);
 }
