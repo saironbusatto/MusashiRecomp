@@ -2142,7 +2142,10 @@ typedef struct {
     uint32_t func_addr;
     uint32_t sp_val;       /* CPU $sp at time of A0 header */
     uint32_t ra_val;       /* CPU $ra register at time of A0 header */
-    uint32_t s1_val;       /* CPU $s1 = source data pointer in func_1FC38524 */
+    uint32_t s1_val;       /* CPU $s1 = LoadImage RECT ptr (x/y/w/h) in FUN_80069dfc */
+    uint32_t s2_val;       /* CPU $s2 = TRUE source pixel ptr (`move s2,a1` at entry) */
+    uint32_t a0_val;       /* CPU $a0 at capture (RECT arg; may be clobbered) */
+    uint32_t a1_val;       /* CPU $a1 at capture (source arg; may be clobbered) */
     uint32_t stack[10];    /* first 10 words from sp (sp+32=saved $s1, sp+36=saved $ra) */
 } A0HistEntry;
 static A0HistEntry a0_history[A0_HISTORY_CAP];
@@ -2170,6 +2173,14 @@ int gpu_get_a0_extra(int index, uint32_t *func, uint32_t *sp, uint32_t *ra,
     *ra = a0_history[index].ra_val;
     *s1 = a0_history[index].s1_val;
     memcpy(stack10, a0_history[index].stack, 10 * sizeof(uint32_t));
+    return 1;
+}
+/* True source pointer + arg regs for the LoadImage upload (s2 = pixel source). */
+int gpu_get_a0_src(int index, uint32_t *s2, uint32_t *a0, uint32_t *a1) {
+    if (index < 0 || index >= a0_history_count) return 0;
+    *s2 = a0_history[index].s2_val;
+    *a0 = a0_history[index].a0_val;
+    *a1 = a0_history[index].a1_val;
     return 1;
 }
 
@@ -2203,12 +2214,18 @@ static void gp0_exec_cpu_to_vram(void) {
         a0_history[slot].sp_val = 0;
         a0_history[slot].ra_val = 0;
         a0_history[slot].s1_val = 0;
+        a0_history[slot].s2_val = 0;
+        a0_history[slot].a0_val = 0;
+        a0_history[slot].a1_val = 0;
         memset(a0_history[slot].stack, 0, sizeof(a0_history[slot].stack));
         if (debug_cpu_ptr) {
             uint32_t sp = debug_cpu_ptr->gpr[29];
             a0_history[slot].sp_val = sp;
             a0_history[slot].ra_val = debug_cpu_ptr->gpr[31];
             a0_history[slot].s1_val = debug_cpu_ptr->gpr[17]; /* $s1 */
+            a0_history[slot].s2_val = debug_cpu_ptr->gpr[18]; /* $s2 = source ptr */
+            a0_history[slot].a0_val = debug_cpu_ptr->gpr[4];  /* $a0 */
+            a0_history[slot].a1_val = debug_cpu_ptr->gpr[5];  /* $a1 */
             uint32_t sp_phys = sp & 0x1FFFFFu;
             for (int si = 0; si < 10 && sp_phys + (si + 1) * 4 <= 0x200000u; si++)
                 a0_history[slot].stack[si] = psx_read_word(sp + si * 4);
