@@ -301,11 +301,17 @@ extern uint32_t g_dirty_ram_code_gen;
 
 static int ws_cull_site(uint32_t pc) {
     enum { WIN = 128 };                       /* +/- 128 words = +/- 512 bytes */
-    static struct { uint32_t pc; uint32_t gen; int8_t flag; } cache[WS_SITE_CACHE_SLOTS];
+    static struct { uint32_t pc; uint32_t gen; uint32_t word; int8_t flag; } cache[WS_SITE_CACHE_SLOTS];
     uint32_t slot = (pc >> 2) & (WS_SITE_CACHE_SLOTS - 1u);
-    if (cache[slot].pc == pc && cache[slot].gen == g_dirty_ram_code_gen)
-        return cache[slot].flag;
     uint32_t phys = pc & 0x1FFFFFFFu;
+    /* Entry valid iff pc + generation + the SITE'S OWN INSTRUCTION WORD all
+     * match. The word tag catches code replaced by plain CPU stores (loader
+     * memcpy), which never routes through the page-marking hooks the
+     * generation counter sees — a stale verdict here REWRITES a live GPR and
+     * corrupts the guest (wild-jump fatal). */
+    if (cache[slot].pc == pc && cache[slot].gen == g_dirty_ram_code_gen &&
+        cache[slot].word == fetch_word(phys))
+        return cache[slot].flag;
     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
     uint32_t hi = phys + (uint32_t)(WIN * 4);
     if (hi > 0x200000u) hi = 0x200000u;       /* 2 MB main RAM */
@@ -314,7 +320,8 @@ static int ws_cull_site(uint32_t pc) {
     for (uint32_t a = lo; a + 4u <= hi && n < (int)(2 * WIN + 1); a += 4u)
         words[n++] = fetch_word(a);
     int flag = psx_ws_func_has_screen_cull(words, n);
-    cache[slot].pc = pc; cache[slot].gen = g_dirty_ram_code_gen; cache[slot].flag = (int8_t)flag;
+    cache[slot].pc = pc; cache[slot].gen = g_dirty_ram_code_gen;
+    cache[slot].word = fetch_word(phys); cache[slot].flag = (int8_t)flag;
     return flag;
 }
 
@@ -328,13 +335,18 @@ static int ws_cull_site(uint32_t pc) {
  * WS_BD_END_WIDEN. Single-threaded interp => static buffers are safe. */
 static int ws_backdrop_site_kind(uint32_t pc, int *out_cols) {
     enum { WIN = 128 };                          /* +/- 128 words = +/- 512 bytes */
-    static struct { uint32_t pc; uint32_t gen; int8_t kind; int16_t cols; } cache[WS_SITE_CACHE_SLOTS];
+    static struct { uint32_t pc; uint32_t gen; uint32_t word; int8_t kind; int16_t cols; } cache[WS_SITE_CACHE_SLOTS];
     uint32_t slot = (pc >> 2) & (WS_SITE_CACHE_SLOTS - 1u);
-    if (cache[slot].pc == pc && cache[slot].gen == g_dirty_ram_code_gen) {
+    uint32_t phys = pc & 0x1FFFFFFFu;
+    /* pc + generation + site instruction word — see ws_cull_site: the word tag
+     * is what protects against CPU-store code reloads the generation counter
+     * cannot see. A stale KIND here is worse than a stale cull flag: it
+     * substitutes a GPR value and skips the real instruction. */
+    if (cache[slot].pc == pc && cache[slot].gen == g_dirty_ram_code_gen &&
+        cache[slot].word == fetch_word(phys)) {
         if (out_cols) *out_cols = cache[slot].cols;
         return cache[slot].kind;
     }
-    uint32_t phys = pc & 0x1FFFFFFFu;
     uint32_t lo = (phys > (uint32_t)(WIN * 4)) ? phys - (uint32_t)(WIN * 4) : 0u;
     uint32_t hi = phys + (uint32_t)(WIN * 4 + 4);
     if (hi > 0x200000u) hi = 0x200000u;          /* 2 MB main RAM */
@@ -345,6 +357,7 @@ static int ws_backdrop_site_kind(uint32_t pc, int *out_cols) {
     int cols = 0;
     int kind = psx_ws_backdrop_kind_at(words, n, lo, phys, &cols);  /* all physical-space */
     cache[slot].pc = pc; cache[slot].gen = g_dirty_ram_code_gen;
+    cache[slot].word = fetch_word(phys);
     cache[slot].kind = (int8_t)kind; cache[slot].cols = (int16_t)cols;
     if (out_cols) *out_cols = cols;
     return kind;
