@@ -127,7 +127,10 @@ extern uint64_t g_vblank_raise_count;
 
 /* Reentrancy guard: prevent interrupt handler from triggering interrupts. */
 static int in_exception;
-static int post_exception_cooldown;
+/* Guest-cycle deadline: IRQ delivery is blocked while psx_get_cycle_count() is
+ * below this. 0 = no cooldown active. Counted in guest cycles (not calls) so both
+ * backends make the identical delivery decision — see the cooldown constants. */
+static uint64_t post_exception_cooldown_until;
 
 static uint32_t last_sio_seq_seen;
 static uint64_t last_sio_progress_cycle;
@@ -185,7 +188,11 @@ static void cosim_irq_note(CPUState *cpu,
     e->func = g_debug_current_func_addr;
     e->block = cosim_last_block();
     e->native = overlay_loader_get_inprogress();
-    e->cooldown = post_exception_cooldown;
+    {   /* remaining cooldown cycles (0 = inactive) for the cosim ring display */
+        uint64_t now = psx_get_cycle_count();
+        e->cooldown = (post_exception_cooldown_until > now)
+                    ? (int32_t)(post_exception_cooldown_until - now) : 0;
+    }
     e->dirty_site = g_cosim_dirty_pump_site;
 }
 
@@ -376,8 +383,22 @@ extern uint64_t g_vblank_ack_count;   /* defined in memory.c */
  * exception before the block body executes, so under a fast-disc DMA flood the
  * main code is pinned at one PC forever (reentry-storm freeze). A few blocks
  * guarantee the interrupted block — and the field loop — advance between
- * deliveries. SIO is exempt (card reads need immediate back-to-back IRQs). */
-#define CLAIMED_PROGRESS_QUANTUM 8
+ * deliveries. SIO is exempt (card reads need immediate back-to-back IRQs).
+ *
+ * FAITHFULNESS (MMX5 cp-3259 fork, 2026-07-04): the cooldown window is counted
+ * in GUEST CYCLES, not psx_check_interrupts CALLS. A call is a backend-dependent
+ * unit — the compiled path checks at block edges, the dirty-RAM interp checks
+ * per-instruction, and compiled has extra check sites (e.g. at a `jr ra` return
+ * transition) the interp lacks. A per-call countdown therefore reached zero at a
+ * DIFFERENT guest cycle in each backend → IRQ delivered at a different cycle/EPC
+ * → the two backends forked (cosim first-divergence cp 3259 @ cyc ~213.5M). Guest
+ * cycles are advanced identically by both backends (shared cycle-cost model, ruler-
+ * validated), so a guest-cycle deadline makes the delivery decision backend-
+ * independent. Magnitudes below preserve the old behavior's breathing room: the
+ * claimed window ~= the old "8 blocks", the unclaimed ~= the old "500 blocks"
+ * (a compiled block edge ~= one psx_check_interrupts call ~= ~15 guest cycles). */
+#define POST_EXC_CLAIMED_COOLDOWN_CYCLES   128u   /* claimed non-SIO: a few blocks */
+#define POST_EXC_UNCLAIMED_COOLDOWN_CYCLES 8192u  /* unclaimed: generous boot window */
 
 /* setjmp target for ReturnFromException during handler dispatch.
  *
@@ -487,7 +508,11 @@ void psx_get_freeze_diag(uint64_t *out_total_checks,
     if (out_total_checks)        *out_total_checks       = total_checks;
     if (out_dispatch_count)      *out_dispatch_count     = dispatch_count;
     if (out_in_exception)        *out_in_exception       = in_exception;
-    if (out_post_exc_cooldown)   *out_post_exc_cooldown  = post_exception_cooldown;
+    if (out_post_exc_cooldown) {
+        uint64_t now = psx_get_cycle_count();
+        *out_post_exc_cooldown = (post_exception_cooldown_until > now)
+                               ? (int)(post_exception_cooldown_until - now) : 0;
+    }
     if (out_exc_entries)         *out_exc_entries        = exception_entries_total;
     if (out_exc_reentry_blocks)  *out_exc_reentry_blocks = exception_reentry_blocks;
 }
@@ -498,7 +523,7 @@ void interrupts_init(void) {
     exception_nest_depth = 0;
     g_psx_dispatch_depth = 0;
     total_checks = 0;
-    post_exception_cooldown = 0;
+    post_exception_cooldown_until = 0;
     exception_entries_total = 0;
     exception_reentry_blocks = 0;
     cycles_since_vblank = 0;
@@ -697,14 +722,18 @@ void psx_check_interrupts(CPUState* cpu) {
          * and deliver a nested exception, as hardware would. */
     }
 
-    /* Post-exception cooldown: let at least one block execute after RFE. */
-    if (post_exception_cooldown > 0) {
-        post_exception_cooldown--;
-        irq_record_outcome(EV_IRQ_GATE, GATE_COOLDOWN, 0);
+    /* Post-exception cooldown: let at least one block of guest time elapse after
+     * RFE before the next delivery. Gated on the guest-cycle deadline (not a
+     * per-call countdown) so compiled and interp agree on the delivery cycle. */
+    if (post_exception_cooldown_until != 0) {
+        if (psx_get_cycle_count() < post_exception_cooldown_until) {
+            irq_record_outcome(EV_IRQ_GATE, GATE_COOLDOWN, 0);
 #ifdef PSX_COSIM
-        COSIM_IRQ_NOTE(3u);
+            COSIM_IRQ_NOTE(3u);
 #endif
-        PSX_CHECK_INTERRUPTS_RETURN();
+            PSX_CHECK_INTERRUPTS_RETURN();
+        }
+        post_exception_cooldown_until = 0;  /* window elapsed */
     }
 
     /* Check COP0 SR: IEc (bit 0) must be set, and IM2 (bit 10) must be set. */
@@ -1068,7 +1097,8 @@ void psx_check_interrupts(CPUState* cpu) {
      * each "block" is many instructions, but the handler also consumes
      * hundreds of sub-dispatches per invocation. */
     if ((i_stat & i_mask) != 0 && i_stat == pre_handler_istat) {
-        post_exception_cooldown = 500;  /* unclaimed: give main code time */
+        /* unclaimed: give main code guest-time to install handlers */
+        post_exception_cooldown_until = psx_get_cycle_count() + POST_EXC_UNCLAIMED_COOLDOWN_CYCLES;
     } else {
         /* Claimed: the handler acknowledged at least one I_STAT bit. Per-source
          * policy (this used to be a blanket cooldown=0 — commit 6d2cb65 — which
@@ -1080,7 +1110,9 @@ void psx_check_interrupts(CPUState* cpu) {
          *     progress between deliveries so a flood can't starve the loop. */
         uint32_t claimed = pre_handler_istat & ~i_stat;            /* bits handler cleared */
         uint32_t sio_active = (claimed | (i_stat & i_mask)) & (1u << IRQ_SIO0);
-        post_exception_cooldown = sio_active ? 0 : CLAIMED_PROGRESS_QUANTUM;
+        post_exception_cooldown_until = sio_active
+            ? 0  /* SIO: no cooldown — card reads need immediate back-to-back IRQs */
+            : psx_get_cycle_count() + POST_EXC_CLAIMED_COOLDOWN_CYCLES;
     }
     if (g_ls_suppress_record > 0) g_ls_suppress_record--;
 #ifdef PSX_COSIM

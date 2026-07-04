@@ -7384,9 +7384,21 @@ static void wtrace_fill_entry(WriteTraceEntry *e, uint64_t seq,
 }
 
 /* Record a single write into the RAM trace ring buffer. */
+/* Capture-freeze frame: when non-zero, the deep high-traffic rings (wtrace RAM
+ * writes, MMIO read/write traces) stop appending once s_frame_count reaches it.
+ * This preserves a causal window whose tail would otherwise be evicted by a
+ * post-window event storm (e.g. a CD re-load livelock) faster than a probe can
+ * read it — the "keep the ring covering the window" fix, not arm-and-hope. 0=off. */
+static uint32_t g_capture_freeze_frame = 0;
+static inline int capture_frozen(void) {
+    return g_capture_freeze_frame != 0 &&
+           (uint32_t)s_frame_count >= g_capture_freeze_frame;
+}
+
 static void wtrace_record(uint32_t phys, uint32_t old_val, uint32_t new_val, uint8_t width)
 {
     if (!s_wtrace) return;
+    if (capture_frozen()) return;
     WriteTraceEntry *e = &s_wtrace[s_wtrace_head];
     wtrace_fill_entry(e, s_wtrace_seq++, phys, old_val, new_val, width);
     s_wtrace_head = (s_wtrace_head + 1) % WRITE_TRACE_CAP;
@@ -7587,6 +7599,7 @@ void debug_server_trace_mmio_write(uint32_t addr, uint32_t val, uint8_t width)
     rec_event(REC_KIND_MMIO_W, addr, val, g_debug_last_store_pc,
               debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0);
     if (!s_mmio_trace) return;
+    if (capture_frozen()) return;
     MmioTraceEntry *e = &s_mmio_trace[s_mmio_trace_head];
     e->seq       = s_mmio_trace_seq++;
     e->addr      = addr;
@@ -7631,6 +7644,7 @@ void debug_server_trace_mmio_read(uint32_t addr, uint32_t val, uint8_t width)
     return;
 #endif
     if (!s_mmio_rtrace || s_mmio_rtrace_range_count == 0) return;
+    if (capture_frozen()) return;
     uint32_t phys = addr & 0x1FFFFFFFu;
     int hit = 0;
     for (int i = 0; i < s_mmio_rtrace_range_count; i++) {
@@ -8778,6 +8792,12 @@ static void handle_wtrace_dump(int id, const char *json)
     if (json_get_str(json, "addr_hi", hi_str, sizeof(hi_str)))
         filter_hi = hex_to_u32(hi_str) & 0x1FFFFFFFu;
 
+    /* Optional frame-window filter — the "query the ring for the window of
+     * interest" primitive.  Lets a caller reach entries in the MIDDLE of a deep,
+     * high-traffic ring (which oldest-N / newest-N paging cannot). -1 = unbounded. */
+    int frame_lo = json_get_int(json, "frame_lo", -1);
+    int frame_hi = json_get_int(json, "frame_hi", -1);
+
     uint64_t total = s_wtrace_seq;
     uint32_t avail = (total < WRITE_TRACE_CAP) ? (uint32_t)total : WRITE_TRACE_CAP;
     uint32_t start = (total < WRITE_TRACE_CAP) ? 0 : s_wtrace_head;
@@ -8807,6 +8827,8 @@ static void handle_wtrace_dump(int id, const char *json)
         }
         WriteTraceEntry *e = &s_wtrace[idx];
         if (e->addr < filter_lo || e->addr >= filter_hi) continue;
+        if (frame_lo >= 0 && (int)e->frame < frame_lo) continue;
+        if (frame_hi >= 0 && (int)e->frame > frame_hi) continue;
         pos += snprintf(buf + pos, BUF_SZ - pos,
                         "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"old\":\"0x%08X\","
                         "\"new\":\"0x%08X\",\"ra\":\"0x%08X\",\"func\":\"0x%08X\","
@@ -8840,6 +8862,8 @@ static void handle_mmio_dump(int id, const char *json)
     uint32_t filter_addr = 0;
     int has_filter = json_get_str(json, "addr", addr_str, sizeof(addr_str)) != NULL;
     if (has_filter) filter_addr = hex_to_u32(addr_str);
+    int frame_lo = json_get_int(json, "frame_lo", -1);
+    int frame_hi = json_get_int(json, "frame_hi", -1);
 
     uint64_t total = s_mmio_trace_seq;
     uint32_t avail = (total < MMIO_TRACE_CAP) ? (uint32_t)total : MMIO_TRACE_CAP;
@@ -8870,6 +8894,8 @@ static void handle_mmio_dump(int id, const char *json)
         }
         MmioTraceEntry *e = &s_mmio_trace[idx];
         if (has_filter && e->addr != filter_addr) continue;
+        if (frame_lo >= 0 && (int)e->frame < frame_lo) continue;
+        if (frame_hi >= 0 && (int)e->frame > frame_hi) continue;
         pos += snprintf(buf + pos, BUF_SZ - pos,
                         "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"val\":\"0x%08X\","
                         "\"func\":\"0x%08X\",\"pc\":\"0x%08X\",\"cpu_pc\":\"0x%08X\","
@@ -8901,6 +8927,18 @@ static void handle_mmio_clear(int id, const char *json)
     send_ok(id);
 }
 
+/* capture_freeze: freeze the deep high-traffic rings (wtrace RAM writes, MMIO
+ * read/write traces) at frame N so a post-window event storm cannot evict the
+ * causal window before a probe reads it. {"frame":N} arms; {"frame":0} clears.
+ * The always-on rings keep everything up to N; the game keeps running. */
+static void handle_capture_freeze(int id, const char *json)
+{
+    int frame = json_get_int(json, "frame", -1);
+    if (frame >= 0) g_capture_freeze_frame = (uint32_t)frame;
+    send_fmt("{\"id\":%d,\"ok\":true,\"freeze_frame\":%u,\"cur_frame\":%u,\"frozen\":%d}",
+             id, g_capture_freeze_frame, (uint32_t)s_frame_count, capture_frozen() ? 1 : 0);
+}
+
 /* ---- rtrace (MMIO-READ trace) command handlers ----
  * Field names of the dumped entries are a SUPERSET of the oracle's rtrace_dump
  * (addr/val/pc/ra/frame/w common; func/cpu_pc/sr/epc/i_stat/i_mask extra) so a
@@ -8913,6 +8951,8 @@ static void handle_rtrace_dump(int id, const char *json)
     uint32_t filter_addr = 0;
     int has_filter = json_get_str(json, "addr", addr_str, sizeof(addr_str)) != NULL;
     if (has_filter) filter_addr = hex_to_u32(addr_str);
+    int frame_lo = json_get_int(json, "frame_lo", -1);
+    int frame_hi = json_get_int(json, "frame_hi", -1);
 
     uint64_t total = s_mmio_rtrace_seq;
     uint32_t avail = (total < MMIO_TRACE_CAP) ? (uint32_t)total : MMIO_TRACE_CAP;
@@ -8943,6 +8983,8 @@ static void handle_rtrace_dump(int id, const char *json)
         }
         MmioTraceEntry *e = &s_mmio_rtrace[idx];
         if (has_filter && e->addr != filter_addr) continue;
+        if (frame_lo >= 0 && (int)e->frame < frame_lo) continue;
+        if (frame_hi >= 0 && (int)e->frame > frame_hi) continue;
         pos += snprintf(buf + pos, BUF_SZ - pos,
                         "%s{\"seq\":%llu,\"addr\":\"0x%08X\",\"val\":\"0x%08X\","
                         "\"func\":\"0x%08X\",\"pc\":\"0x%08X\",\"cpu_pc\":\"0x%08X\","
@@ -10918,6 +10960,7 @@ static const CmdEntry s_commands[] = {
     { "cyc_watch_clear",   handle_cyc_watch_clear },
     { "mmio_dump",         handle_mmio_dump },
     { "mmio_clear",        handle_mmio_clear },
+    { "capture_freeze",    handle_capture_freeze },
     { "rtrace_dump",       handle_rtrace_dump },
     { "rtrace_clear",      handle_rtrace_clear },
     { "rtrace_arm",        handle_rtrace_arm },

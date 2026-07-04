@@ -1158,8 +1158,10 @@ static uint32_t gpustat_poll_count;
 
 /* ---- Initialization ---- */
 
-void gpu_init(void) {
-    memset(vram, 0, sizeof(vram));
+static void gpu_reset_state(int clear_vram) {
+    if (clear_vram) {
+        memset(vram, 0, sizeof(vram));
+    }
     gr_init(vram);
 
     /* Reset GP0 state machine */
@@ -1211,6 +1213,10 @@ void gpu_init(void) {
 
     gpuread_latch = 0;
     gpustat_poll_count = 0;
+}
+
+void gpu_init(void) {
+    gpu_reset_state(1);
 }
 
 /* ---- GPUSTAT read (0x1F801814) ---- */
@@ -2976,8 +2982,10 @@ void gpu_write_gp0(uint32_t val) {
 /* ---- GP1 write (0x1F801814 write) ---- */
 
 static void gp1_reset(void) {
-    /* GP1(00h): Reset GPU — clears FIFO, resets all state, display off */
-    gpu_init();
+    /* GP1(00h): Reset GPU — clears FIFO/control state and disables display.
+     * VRAM contents survive a GPU reset on real hardware; only power-on init
+     * clears our backing store. */
+    gpu_reset_state(0);
 }
 
 static void gp1_reset_command_buffer(void) {
