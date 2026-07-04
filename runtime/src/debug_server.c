@@ -5030,7 +5030,7 @@ extern int gpu_get_a0_history(int index, int *x, int *y, int *w, int *h,
                               uint32_t *fw0, uint32_t *fw1, int *wcount);
 extern int gpu_get_a0_extra(int index, uint32_t *func, uint32_t *sp, uint32_t *ra,
                             uint32_t *s1, uint32_t *stack10);
-extern int gpu_get_a0_src(int index, uint32_t *s2, uint32_t *a0, uint32_t *a1);
+extern int gpu_get_a0_src(int index, uint32_t *s2, uint32_t *a0, uint32_t *a1, uint32_t *frame);
 
 static void handle_a0_history(int id, const char *json)
 {
@@ -5044,20 +5044,20 @@ static void handle_a0_history(int id, const char *json)
     for (int i = 0; i < count && pos < bufsz - 500; i++) {
         int x, y, w, h, wcount;
         uint32_t fw0, fw1, func, sp, ra, s1, stk[10];
-        uint32_t s2 = 0, a0r = 0, a1r = 0;
+        uint32_t s2 = 0, a0r = 0, a1r = 0, aframe = 0;
         gpu_get_a0_history(i, &x, &y, &w, &h, &fw0, &fw1, &wcount);
         gpu_get_a0_extra(i, &func, &sp, &ra, &s1, stk);
-        gpu_get_a0_src(i, &s2, &a0r, &a1r);
+        gpu_get_a0_src(i, &s2, &a0r, &a1r, &aframe);
         pos += snprintf(buf + pos, bufsz - pos,
             "%s{\"i\":%d,\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,"
             "\"fw0\":\"0x%08X\",\"fw1\":\"0x%08X\",\"words\":%d,"
             "\"func\":\"0x%08X\",\"sp\":\"0x%08X\",\"ra\":\"0x%08X\","
-            "\"s1\":\"0x%08X\",\"s2\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+            "\"s1\":\"0x%08X\",\"s2\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\",\"frame\":%u,"
             "\"stk\":[\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\","
             "\"0x%08X\",\"0x%08X\",\"0x%08X\",\"0x%08X\","
             "\"0x%08X\",\"0x%08X\"]}",
             i ? "," : "", i, x, y, w, h, fw0, fw1, wcount,
-            func, sp, ra, s1, s2, a0r, a1r,
+            func, sp, ra, s1, s2, a0r, a1r, aframe,
             stk[0], stk[1], stk[2], stk[3], stk[4], stk[5], stk[6], stk[7],
             stk[8], stk[9]);
     }
