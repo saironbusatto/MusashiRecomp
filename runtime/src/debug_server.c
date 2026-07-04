@@ -337,7 +337,9 @@ typedef struct {
     uint32_t t1;
     uint32_t frame;      /* VBlank frame number */
     uint8_t  width;      /* 1, 2, or 4 */
-    uint8_t  pad[3];     /* align to 8 bytes */
+    int8_t   dma_ch;     /* DMA channel that produced this write (0-6), or -1 = CPU store.
+                          * When >=0, `pc` is the DMA kick PC, not g_debug_last_store_pc. */
+    uint8_t  pad[2];     /* align to 8 bytes */
 } WriteTraceEntry;
 static WriteTraceEntry *s_wtrace = NULL;
 static uint64_t s_wtrace_seq  = 0;  /* total writes ever recorded */
@@ -7348,6 +7350,9 @@ static void wtrace_fill_entry(WriteTraceEntry *e, uint64_t seq,
                               uint32_t phys, uint32_t old_val,
                               uint32_t new_val, uint8_t width)
 {
+    extern int      g_dma_exec_depth;   /* >0 while a DMA moves data (dma.c) */
+    extern int      g_dma_cur_ch;       /* in-flight DMA channel, or -1 */
+    extern uint32_t g_dma_initiator_pc; /* guest PC that kicked the DMA */
     uint32_t ra = debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0;
     e->seq       = seq;
     e->addr      = phys;
@@ -7356,6 +7361,14 @@ static void wtrace_fill_entry(WriteTraceEntry *e, uint64_t seq,
     e->ra        = ra;
     e->func_addr = g_debug_current_func_addr;
     e->pc        = g_debug_last_store_pc;
+    /* DMA-sourced write: tag the channel and attribute to the DMA kick PC
+     * instead of the stale last-CPU-store PC (which is meaningless mid-DMA). */
+    if (g_dma_exec_depth > 0) {
+        e->dma_ch = (int8_t)g_dma_cur_ch;
+        if (g_dma_initiator_pc) e->pc = g_dma_initiator_pc;
+    } else {
+        e->dma_ch = -1;
+    }
     e->cpu_pc    = debug_cpu_ptr ? debug_cpu_ptr->pc      : 0;
     e->sp        = debug_cpu_ptr ? debug_cpu_ptr->gpr[29] : 0;
     e->v0        = debug_cpu_ptr ? debug_cpu_ptr->gpr[2]  : 0;
@@ -8802,13 +8815,13 @@ static void handle_wtrace_dump(int id, const char *json)
                         "\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
                         "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
                         "\"t0\":\"0x%08X\",\"t1\":\"0x%08X\","
-                        "\"frame\":%u,\"w\":%u}",
+                        "\"frame\":%u,\"w\":%u,\"dma_ch\":%d}",
                         (emitted == 0) ? "" : ",",
                         (unsigned long long)e->seq,
                         e->addr, e->old_val, e->new_val, e->ra, e->func_addr,
                         e->pc, e->cpu_pc, e->sp,
                         e->v0, e->v1, e->a0, e->a1, e->a2, e->a3, e->t0, e->t1,
-                        e->frame, (unsigned)e->width);
+                        e->frame, (unsigned)e->width, (int)e->dma_ch);
         emitted++;
     }
     pos += snprintf(buf + pos, BUF_SZ - pos, "],\"emitted\":%u}", emitted);

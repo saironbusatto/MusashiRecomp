@@ -117,6 +117,14 @@ int      g_dma_exec_depth = 0;
 int      g_dma_cur_ch     = -1;
 uint32_t g_dma_cur_madr   = 0;
 uint32_t g_dma_cur_bcr    = 0;
+/* Guest PC that kicked the in-flight DMA (the CHCR store that set start/busy),
+ * so write-provenance (wtrace / parity note_write) attributes DMA-sourced RAM
+ * writes to the code that INITIATED the transfer, not to g_debug_last_store_pc
+ * (which for an async transfer is a stale, unrelated CPU store). Captured at the
+ * kick in trigger_dma_transfer and re-published for async channels whose RAM
+ * writes run in a later advance_*() step. 0 = unknown. */
+uint32_t g_dma_initiator_pc = 0;
+static uint32_t s_dma_ch_initiator_pc[7] = {0};
 
 typedef struct {
     uint8_t active;
@@ -529,12 +537,22 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
 
     uint32_t addr = channels[ch].madr & 0x1FFFFCu;
     uint32_t moved = 0;
+    /* ch1 (MDEC→RAM) writes guest RAM here in a deferred step; mark it as
+     * DMA-sourced so write-provenance tags these writes with ch1 + the kick PC
+     * (ch0 only reads RAM, so it needs no marking). Mirrors the CDROM async. */
+    int mdec_writes_ram = (ch == 1);
+    if (mdec_writes_ram) {
+        g_dma_exec_depth++;
+        g_dma_cur_ch = 1; g_dma_cur_bcr = channels[1].bcr;
+        g_dma_initiator_pc = s_dma_ch_initiator_pc[1];
+    }
     while (a->remaining_words > 0 && words_budget > 0) {
         if (ch == 0) {
             if (!mdec_dma_write_ready()) break;
             mdec_dma_write_word(psx_read_word(addr));
         } else {
             if (!mdec_dma_read_ready()) break;
+            g_dma_cur_madr = addr;
             psx_write_word(addr, mdec_dma_read_word());
         }
 
@@ -543,6 +561,7 @@ static void advance_mdec_channel(int ch, uint32_t cycles) {
         words_budget--;
         moved++;
     }
+    if (mdec_writes_ram) { g_dma_cur_ch = -1; g_dma_exec_depth--; }
 
     if (moved == 0) return;
 
@@ -780,6 +799,10 @@ static void try_execute(int ch) {
     /* After the kick is in the rings, refuse corrupt-length transfers. */
     validate_transfer_length(ch);
 
+    /* Capture the kick PC (this CHCR store) so both the immediate (sync) writes
+     * below and any deferred async writes for this channel attribute to it. */
+    s_dma_ch_initiator_pc[ch] = g_debug_last_store_pc;
+    g_dma_initiator_pc        = g_debug_last_store_pc;
     g_dma_exec_depth++;
     g_dma_cur_ch = ch; g_dma_cur_madr = channels[ch].madr; g_dma_cur_bcr = channels[ch].bcr;
     switch (ch) {
@@ -878,6 +901,7 @@ void dma_advance(uint32_t cycles) {
             uint32_t addr = channels[3].madr & 0x1FFFFCu;
             uint32_t moved = 0;
             g_dma_cur_ch = 3; g_dma_cur_bcr = channels[3].bcr;
+            g_dma_initiator_pc = s_dma_ch_initiator_pc[3];  /* deferred: restore kick PC */
             while (a->remaining_words > 0 && words_budget > 0 && cdrom_dma_ready()) {
                 uint32_t word = cdrom_dma_read();
                 g_dma_cur_madr = addr;
