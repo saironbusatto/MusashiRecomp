@@ -176,3 +176,51 @@ only a 26-line build-guard needed salvaging from the retired _wt-vulkan worktree
 
 **Validation targets:** MMX6 + Tomba2, agent does initial (window-capture series
 + frame-aligned cross-backend diffs), user does final.
+
+---
+
+## R3 — Validation sweep + merge (2026-07-03, USER-DRIVEN)
+
+Full 3-title x 3-config playthrough validation (agent launched each config windowed
++ confirmed on-screen via window_capture; user drove input + gave the verdict):
+
+| Title  | OpenGL 4:3 | Vulkan 4:3 | OpenGL 16:9 |
+|--------|:----------:|:----------:|:-----------:|
+| Tomba1 | PASS       | YELLOW     | PASS        |
+| MMX6   | PASS       | YELLOW     | YELLOW      |
+| Tomba2 | PASS*      | PASS*      | FAIL*       |
+
+\* Tomba2 = experimental / not production-ready; not merge-blocking. (Vulkan 16:9
+was intentionally skipped — user directive: all 16:9 in OpenGL only.)
+
+Findings (tracked for the next work cycle):
+- **OpenGL 4:3 is the strong, shippable path on all titles.** This is the win.
+- **Vulkan 4:3 = YELLOW everywhere** (why it ships hidden/experimental):
+  - Tomba2: sluggish FMV, minor speech-audio fidelity loss, in-game slowdown
+    (possibly progressive), text boxes don't dismiss, HUD weapon icon renders in
+    all 3 slots (only center should show).
+  - Tomba1: minor horizontal bar artifact at top of the load screen; dwarf
+    village sluggish (the known overlay-heavy scene; perf only, renders correct).
+  - MMX6: significant slowdown in Rainy Turtloid's RAIN AREA even at 4:3 —
+    VULKAN-SPECIFIC (on GL 4:3 it is subtle at most). Renders correct; perf only.
+- **OpenGL 16:9:** Tomba1 clean PASS. MMX6 YELLOW (rain-area lag evident at 16:9;
+  same Rainy Turtloid perf hot-spot). Tomba2 FAIL — widescreen does NOT engage
+  (renders 4:3 pillarboxed in the wide window + slow); expected, master Tomba2
+  has no sprite-tag ws hooks (ws work parked at 4:3).
+
+**Policy gates confirmed already in-tree (no code change needed for the merge):**
+- Vulkan is hidden by default: launcher offers only Software<->OpenGL
+  (launcher.cpp:347/776); PSX_ENABLE_VULKAN defaults OFF (runtime.cmake:484);
+  runtime downgrades renderer=vulkan -> opengl when not compiled (main.cpp:2463).
+  Vulkan stays a dev/CLI-only backend (--renderer vulkan on a VK-enabled build).
+- Widescreen carries an EXPERIMENTAL tag in the RmlUi launcher (launcher.rml:362).
+
+**MERGED to master 2026-07-03** (runtime-only; codegen hash unchanged, no regen).
+Game pins bumped to the new psxrecomp master. No release builds cut (user directive).
+
+**Open follow-ups (next cycle):** VK perf (MMX6 rain-area, dwarf village, Tomba2
+in-game — likely the CPU-bound dirty-RAM ws classifier path and/or VK per-submit
+cost); VK correctness (Tomba2 persistent text boxes + 3-slot HUD icon; Tomba1 load
+bar artifact); Tomba2 widescreen sprite-tag hooks; MMX6 Rainy Turtloid perf even on
+GL 16:9; and the pending MMX6 shipping-default flip software->opengl to close
+MegaManX6Recomp ISSUES.md #7 (GL validated this session).
