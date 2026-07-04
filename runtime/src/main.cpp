@@ -83,6 +83,9 @@ extern "C" uint64_t gte_get_exec_count(void);
 extern "C" void     memory_init(const char* bios_path);
 extern "C" void     memory_set_sr_ptr(const uint32_t *p);
 extern "C" uint32_t memory_get_bios_checksum(void);
+extern "C" void     dirty_ram_register_text_image(uint32_t phys_lo,
+                                                  const uint8_t *bytes,
+                                                  uint32_t len);
 
 /* dma.c */
 extern "C" void dma_init(void);
@@ -2075,6 +2078,34 @@ int main(int argc, char** argv) {
             fast_boot     = gc.runtime.fast_boot;
             bios_hle      = gc.runtime.bios_hle;
             bios_hle_keep_intro = gc.runtime.bios_hle_keep_intro;
+            /* Let the dispatch layer distinguish "dirty because text was
+             * loaded" from "diverged because runtime wrote different code over
+             * the original EXE image". Packed/self-modifying games can rewrite
+             * their own text; those pages must execute from live RAM, not stale
+             * static native code. Best effort: without the local EXE file, the
+             * guard remains on the existing dirty-page behavior. */
+            if (!gc.exe_path.empty()) {
+                std::ifstream ef(gc.exe_path, std::ios::binary | std::ios::ate);
+                if (ef) {
+                    std::streamsize sz = ef.tellg();
+                    if (sz > 2048) {
+                        uint32_t img_len = (uint32_t)(sz - 2048);
+                        uint8_t *img = (uint8_t *)std::malloc(img_len);
+                        if (img) {
+                            ef.seekg(2048, std::ios::beg);
+                            if (ef.read((char *)img, img_len)) {
+                                dirty_ram_register_text_image(
+                                    gc.load_address & 0x1FFFFFFFu, img, img_len);
+                                std::fprintf(stdout,
+                                    "psxrecomp: text image guard armed (0x%08X..0x%08X)\n",
+                                    gc.load_address, gc.load_address + img_len);
+                            } else {
+                                std::free(img);
+                            }
+                        }
+                    }
+                }
+            }
             /* HLE-tier scheduler subsystem replacement default (env
              * PSX_HLE_SCHEDULER still wins; latched at first dispatch). */
             psx_hle_scheduler_set_default(gc.runtime.hle_scheduler ? 1 : 0);
