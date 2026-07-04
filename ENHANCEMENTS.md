@@ -35,12 +35,21 @@ game repos' ISSUES.md until a framework tracker exists.
   visual anomalies. Tomba1 build-gl rebuilt with the fix, boots clean (full
   Tomba1 attract soak still owed).
 
+**Validation COMPLETE (2026-07-03, both titles):**
+- MMX6: ~18-min attract soak, ~1600 window captures, zero isolated black
+  frames (agent, ring-correlated).
+- Tomba1: 24-iteration/720-capture attract soak (2 flags, both multi-frame
+  FMV content cuts) + the definitive pass: 23,807 CONSECUTIVE presents
+  (gapless, seq-verified) over a full attract cycle via gl_present_ring —
+  ZERO isolated dark presents, zero GL errors. The capture-level flags do
+  not exist at the swap level.
+
 **Remaining to close R1:**
-1. Tomba1 full attract-cycle GL soak (village, FMV, HUD).
-2. USER eyeball at the MMX6 Rainy Turtloid standing-still spot (the original
-   repro; MMX6 build-modern settings.toml is left on renderer="opengl").
-3. Flip MMX6's shipping default software→opengl + close ISSUES.md #7.
-4. The same union-upload bug exists in the Vulkan backend (see R2 item 1).
+1. USER final validation at the MMX6 Rainy Turtloid standing-still spot (the
+   original repro; MMX6 build-modern settings.toml is left on
+   renderer="opengl").
+2. Flip MMX6's shipping default software→opengl + close ISSUES.md #7.
+3. The same union-upload bug exists in the Vulkan backend (see R2 item 1).
 
 ## R2 — Vulkan renderer (3rd backend): RENDERS GAMEPLAY AT SPEED, gaps cataloged
 
