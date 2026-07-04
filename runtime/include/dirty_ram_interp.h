@@ -87,6 +87,11 @@ uint32_t dirty_ram_get_bitmap(void);
 uint32_t dirty_ram_get_bitmap_word(uint32_t word_index);
 uint32_t dirty_ram_get_bitmap_word_count(void);
 void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
+void     dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
+                                       uint32_t len);
+int      dirty_ram_text_native_ok(uint32_t phys);
+uint64_t dirty_ram_text_native_blocked(void);
+uint32_t dirty_ram_text_diverged_pages(void);
 
 /* Counters for visibility / TCP debug.  Increment in interpreter; expose
  * via debug_server.c if helpful. */
