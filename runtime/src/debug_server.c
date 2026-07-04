@@ -6276,7 +6276,7 @@ static void handle_synth_recurse(int id, const char *json)
 static void handle_frame_perf(int id, const char *json)
 {
     (void)json;
-    double all[10], wide[10], n43[10];
+    double all[13], wide[13], n43[13];
     int na = gl_renderer_perf_aggregate(-1, all);
     gl_renderer_perf_aggregate(1, wide);
     gl_renderer_perf_aggregate(0, n43);
@@ -6285,22 +6285,40 @@ static void handle_frame_perf(int id, const char *json)
      * bound (batching wins); low => per-triangle/fill bound. */
     double wpp = wide[9] > 0 ? wide[5] * 1000.0 / wide[9] : 0.0;
     double npp = n43[9]  > 0 ? n43[5]  * 1000.0 / n43[9]  : 0.0;
+    /* mirror split (wide frames only): canon = scene_gpu minus the mirror
+     * passes; mirror_pass_us = mirror GPU time per mirror pass. */
+    double wcanon = wide[5] - wide[10]; if (wcanon < 0) wcanon = 0;
+    double wmpp   = wide[12] > 0 ? wide[10] * 1000.0 / wide[12] : 0.0;
     double tex_frac = 0.0; gl_renderer_perf_prim_split(&tex_frac);
     send_fmt("{\"id\":%d,\"ok\":true,\"samples\":%d,\"wide_frames\":%d,\"frames_4_3\":%d,"
-             "\"tex_frac\":%.3f,"
+             "\"tex_frac\":%.3f,\"ws_ablate\":%d,"
              "\"all\":{\"total_ms_avg\":%.3f,\"total_ms_max\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
              "\"present_wall_ms_avg\":%.3f,\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,"
              "\"present_gpu_ms_avg\":%.3f,\"present_gpu_ms_max\":%.3f,\"prims_avg\":%.0f},"
              "\"wide_16_9\":{\"n\":%d,\"total_ms_avg\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
              "\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,\"present_gpu_ms_avg\":%.3f,"
-             "\"prims_avg\":%.0f,\"per_prim_us\":%.3f},"
+             "\"prims_avg\":%.0f,\"per_prim_us\":%.3f,"
+             "\"mirror_gpu_ms_avg\":%.3f,\"mirror_gpu_ms_max\":%.3f,\"canon_gpu_ms_avg\":%.3f,"
+             "\"mirror_passes_avg\":%.1f,\"mirror_pass_us\":%.3f},"
              "\"a4_3\":{\"n\":%d,\"total_ms_avg\":%.3f,\"emu_cpu_ms_avg\":%.3f,"
              "\"scene_gpu_ms_avg\":%.3f,\"scene_gpu_ms_max\":%.3f,\"present_gpu_ms_avg\":%.3f,"
              "\"prims_avg\":%.0f,\"per_prim_us\":%.3f}}",
-             id, na, (int)wide[0], (int)n43[0], tex_frac,
+             id, na, (int)wide[0], (int)n43[0], tex_frac, gl_renderer_get_ws_ablate(),
              all[1], all[2], all[3], all[4], all[5], all[6], all[7], all[8], all[9],
              (int)wide[0], wide[1], wide[3], wide[5], wide[6], wide[7], wide[9], wpp,
+             wide[10], wide[11], wcanon, wide[12], wmpp,
              (int)n43[0], n43[1], n43[3], n43[5], n43[6], n43[7], n43[9], npp);
+}
+
+/* gl_ws_ablate mode=<0..3>: native-wide mirror ablation for perf attribution.
+ * 0 normal | 1 skip mirror passes (incl. wide_clear) | 2 mirror state churn, no
+ * draws | 3 mirror draws stay on the hr FBO (no per-pass FBO rebind; corrupts
+ * content — probe only). No mode= just reports. */
+static void handle_gl_ws_ablate(int id, const char *json)
+{
+    int mode = json_get_int(json, "mode", -1);
+    if (mode >= 0) gl_renderer_set_ws_ablate(mode);
+    send_fmt("{\"id\":%d,\"ok\":true,\"mode\":%d}", id, gl_renderer_get_ws_ablate());
 }
 
 /* Live GTE widescreen-squash toggle (diagnostic for 8C far-backdrop void):
@@ -10733,6 +10751,7 @@ static const CmdEntry s_commands[] = {
     { "gl_coh_ring",       handle_gl_coh_ring },
     { "gl_present_ring",   handle_gl_present_ring },
     { "frame_perf",        handle_frame_perf },
+    { "gl_ws_ablate",      handle_gl_ws_ablate },
     { "synth_recurse",     handle_synth_recurse },
     { "gl_fbo_peek",       handle_gl_fbo_peek },
     { "gl_vram_diff",      handle_gl_vram_diff },

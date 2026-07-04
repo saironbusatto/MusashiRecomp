@@ -161,8 +161,12 @@ typedef void   (APIENTRY *PFN_glBeginQuery)(GLenum, GLuint);
 typedef void   (APIENTRY *PFN_glEndQuery)(GLenum);
 typedef void   (APIENTRY *PFN_glGetQueryObjectui64v)(GLuint, GLenum, GLuint64 *);
 typedef void   (APIENTRY *PFN_glGetQueryObjectiv)(GLuint, GLenum, GLint *);
+typedef void   (APIENTRY *PFN_glQueryCounter)(GLuint, GLenum);
 #ifndef GL_TIME_ELAPSED
 #define GL_TIME_ELAPSED            0x88BF
+#endif
+#ifndef GL_TIMESTAMP
+#define GL_TIMESTAMP               0x8E28
 #endif
 #ifndef GL_QUERY_RESULT
 #define GL_QUERY_RESULT            0x8866
@@ -211,7 +215,15 @@ static PFN_glBeginQuery          p_glBeginQuery;
 static PFN_glEndQuery            p_glEndQuery;
 static PFN_glGetQueryObjectui64v p_glGetQueryObjectui64v;
 static PFN_glGetQueryObjectiv    p_glGetQueryObjectiv;
+static PFN_glQueryCounter        p_glQueryCounter;
 static void gl_perf_init(void);   /* frame_perf — defined below, called from init_gpu_raster */
+static void gl_perf_mirror_begin(void); /* frame_perf: GPU-time bracket around ONE native-wide */
+static void gl_perf_mirror_end(void);   /* mirror pass (timestamp pair; splits scene canonical/mirror) */
+/* Native-wide mirror ABLATION (perf attribution, debug cmd gl_ws_ablate):
+ * 0 = normal, 1 = skip the whole mirror pass, 2 = full mirror state churn but no
+ * draw calls, 3 = mirror draws land in the hr FBO (no per-pass FBO rebind; wide
+ * margins go stale + hr gets garbage — perf probe only). */
+static int s_ws_ablate = 0;
 static void flush_tex_batch(void); /* textured-prim batch — defined below, flushed from coherency points */
 static PFN_glGenRenderbuffers  p_glGenRenderbuffers;
 static PFN_glBindRenderbuffer  p_glBindRenderbuffer;
@@ -255,6 +267,7 @@ static int load_modern_gl(void) {
     p_glEndQuery            = (void *)SDL_GL_GetProcAddress("glEndQuery");
     p_glGetQueryObjectui64v = (void *)SDL_GL_GetProcAddress("glGetQueryObjectui64v");
     p_glGetQueryObjectiv    = (void *)SDL_GL_GetProcAddress("glGetQueryObjectiv");
+    p_glQueryCounter        = (void *)SDL_GL_GetProcAddress("glQueryCounter");
 #undef LOAD
     return ok;
 }
@@ -1067,7 +1080,8 @@ static void mark_prim_dirty(const int *xs, const int *ys, int n, int textured) {
  * the game's 4:3 draw-area x-range. Scissoring to the (translated) draw area
  * would crop exactly the margin content native-wide exists to reveal. */
 static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
+    if (s_ws_ablate != 3)   /* ablate 3: no FBO rebind (draws land in hr — perf probe) */
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, g_wide_cur);
     glViewport(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
     glEnable(GL_SCISSOR_TEST);
     glScissor(0, 0, g_wide_w * s_scale, VRAM_H * s_scale);
@@ -1077,7 +1091,8 @@ static void wide_target_begin(int dx, GLint uXoff, GLint uXhalf) {
 static void wide_target_end(GLint uXoff, GLint uXhalf) {
     p_glUniform1f(uXoff, 0.0f);
     p_glUniform1f(uXhalf, 512.0f);
-    p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
+    if (s_ws_ablate != 3)
+        p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_hr_fbo);
 }
 
 extern int psx_ws_prim_is_tagged(void);   /* gpu.c: is the current GP0 prim sprite-tagged? */
@@ -1199,14 +1214,16 @@ static void flush_tex_batch(void) {
 
     tex_batch_draw_passes(nverts, semi);
 
-    if (g_wide_cur) {                       /* native-wide mirror */
+    if (g_wide_cur && s_ws_ablate != 1) {   /* native-wide mirror */
         int dx = wide_dx();
         s_bd_gate = s_tb_gate;              /* this batch is uniform-gate (flushed on change) */
+        gl_perf_mirror_begin();
         wide_target_begin(dx, s_tex_uXoff, s_tex_uXhalf);
         wide_set_bd_scale(s_tex_uXscale, s_tex_uXcenter);
-        tex_batch_draw_passes(nverts, semi);
+        if (s_ws_ablate != 2) tex_batch_draw_passes(nverts, semi);
         wide_clear_bd_scale(s_tex_uXscale, s_tex_uXcenter);
         wide_target_end(s_tex_uXoff, s_tex_uXhalf);
+        gl_perf_mirror_end();
     }
     hr_end();
 }
@@ -1243,14 +1260,16 @@ static void gpu_geometry(GLenum mode, const int *xs, const int *ys,
      * bound). Geometry positions are unchanged on the host side — the x shift
      * is applied in the vertex shader via u_xoff, and the wider clip via
      * u_xhalf. Canonical pass above is untouched (u_xoff=0/u_xhalf=512). */
-    if (g_wide_cur && !s_wide_suppress) {
+    if (g_wide_cur && !s_wide_suppress && s_ws_ablate != 1) {
         int dx = wide_dx();
         s_bd_gate = bd_prim_gate(xs, n);   /* flat prims are immediate -> gate per prim */
+        gl_perf_mirror_begin();
         wide_target_begin(dx, s_geo_uXoff, s_geo_uXhalf);
         wide_set_bd_scale(s_geo_uXscale, s_geo_uXcenter);
-        glDrawArrays(mode, 0, n);
+        if (s_ws_ablate != 2) glDrawArrays(mode, 0, n);
         wide_clear_bd_scale(s_geo_uXscale, s_geo_uXcenter);
         wide_target_end(s_geo_uXoff, s_geo_uXhalf);
+        gl_perf_mirror_end();
     }
     hr_end();
 }
@@ -1428,9 +1447,13 @@ static void gpu_flat_rect(int x,int y,int w,int h,uint16_t c,int semi) {
          * gpu_triangle ran its own hr_begin/hr_end). Re-open the bracket just
          * for the full-width wide pass so blend/scissor/program state is
          * clean. */
-        hr_begin(0);
-        wide_flat_rect_direct(0, y, g_wide_w, h, c, semi);
-        hr_end();
+        if (s_ws_ablate != 1) {
+            hr_begin(0);
+            gl_perf_mirror_begin();
+            wide_flat_rect_direct(0, y, g_wide_w, h, c, semi);
+            gl_perf_mirror_end();
+            hr_end();
+        }
     }
 }
 
@@ -2142,10 +2165,11 @@ static void glb_wide_disable_target(void) { flush_tex_batch(); g_wide_cur = 0; }
  * surface for base_x, so the revealed margins are clean. Mirrors sw_wide_clear:
  * a scissored glClear with the 1555 color converted to RGBA8 (alpha = bit15). */
 static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
-    if (!s_raster_ok) return;
+    if (!s_raster_ok || s_ws_ablate == 1) return;
     flush_tex_batch();
     GLuint fbo = wide_fbo_for(base_x);
     if (!fbo) return;
+    gl_perf_mirror_begin();
     int H = VRAM_H * s_scale;
     int y0 = y * s_scale, y1 = (y + h) * s_scale;
     if (y0 < 0) y0 = 0;
@@ -2163,6 +2187,7 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
     glClear(GL_COLOR_BUFFER_BIT);
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
+    gl_perf_mirror_end();
 }
 
 /* Present source: read the wide FBO for the displayed buffer (base_x) into the
@@ -2245,10 +2270,24 @@ typedef struct {
     double   present_wall_ms; /* CPU wall time inside the present call         */
     double   scene_gpu_ms;    /* GPU: all scene draws this frame               */
     double   present_gpu_ms;  /* GPU: the present clear+blit                   */
+    double   mirror_gpu_ms;   /* GPU: of scene_gpu, the native-wide mirror passes */
     double   prims;           /* scene primitives submitted this frame         */
+    double   mirror_passes;   /* mirror passes this frame (measured + overflow) */
     int      wide;            /* 1 = native-wide (16:9) present, 0 = 4:3       */
     uint64_t frame;
 } GlPerfSample;
+
+/* Native-wide mirror-pass GPU attribution: the scene TIME_ELAPSED query spans
+ * the whole frame (queries of one target cannot nest), so each mirror pass is
+ * bracketed with a GL_TIMESTAMP pair instead (glQueryCounter does not conflict
+ * with an active TIME_ELAPSED query). Pairs are pooled per buffered frame and
+ * summed at readback, splitting scene_gpu into canonical vs mirror cost. */
+#define GLPERF_MIRQ 1024               /* measured mirror passes per frame */
+static GLuint s_mq_q[GLPERF_NBUF][GLPERF_MIRQ * 2];
+static int    s_mq_n[GLPERF_NBUF];     /* pairs recorded this frame        */
+static int    s_mq_over[GLPERF_NBUF];  /* passes beyond the pool (counted, untimed) */
+static int    s_mq_open = 0;           /* begin issued, end pending        */
+static int    s_mq_ok = 0;             /* glQueryCounter available         */
 
 static int      s_pf_on = 0;
 static GLuint   s_pf_scene_q[GLPERF_NBUF];
@@ -2274,11 +2313,35 @@ static void gl_perf_init(void) {
     if (!p_glGenQueries || !p_glBeginQuery || !p_glEndQuery || !p_glGetQueryObjectui64v) return;
     p_glGenQueries(GLPERF_NBUF, s_pf_scene_q);
     p_glGenQueries(GLPERF_NBUF, s_pf_present_q);
+    s_mq_ok = (p_glQueryCounter != NULL);
+    if (s_mq_ok)
+        for (int i = 0; i < GLPERF_NBUF; i++) {
+            p_glGenQueries(GLPERF_MIRQ * 2, s_mq_q[i]);
+            s_mq_n[i] = 0; s_mq_over[i] = 0;
+        }
+    s_mq_open = 0;
     s_pf_freq = SDL_GetPerformanceFrequency();
     if (!s_pf_freq) s_pf_freq = 1;
     s_pf_b = 0; s_pf_scene_active = 0; s_pf_count = 0; s_pf_ring_seq = 0;
     s_pf_last_enter = 0;
     s_pf_on = 1;
+}
+
+/* Bracket ONE native-wide mirror pass (called from the wide-mirror draw sites).
+ * Timestamp pairs, not TIME_ELAPSED — see the pool comment above. */
+static void gl_perf_mirror_begin(void) {
+    if (!s_pf_on || !s_mq_ok) return;
+    int b = s_pf_b;
+    if (s_mq_n[b] >= GLPERF_MIRQ) { s_mq_over[b]++; return; }
+    p_glQueryCounter(s_mq_q[b][s_mq_n[b] * 2], GL_TIMESTAMP);
+    s_mq_open = 1;
+}
+static void gl_perf_mirror_end(void) {
+    if (!s_pf_on || !s_mq_ok || !s_mq_open) return;
+    int b = s_pf_b;
+    p_glQueryCounter(s_mq_q[b][s_mq_n[b] * 2 + 1], GL_TIMESTAMP);
+    s_mq_n[b]++;
+    s_mq_open = 0;
 }
 
 /* Top of present (after flush_cpu_upload, before clear/blit). */
@@ -2320,16 +2383,26 @@ static void gl_perf_present_exit(int wide) {
         GLuint64 sc = 0, pr = 0;
         p_glGetQueryObjectui64v(s_pf_scene_q[rd],   GL_QUERY_RESULT, &sc);
         p_glGetQueryObjectui64v(s_pf_present_q[rd], GL_QUERY_RESULT, &pr);
+        double mir = 0.0;
+        for (int i = 0; i < s_mq_n[rd]; i++) {   /* sum that frame's mirror pairs */
+            GLuint64 t0 = 0, t1 = 0;
+            p_glGetQueryObjectui64v(s_mq_q[rd][i * 2],     GL_QUERY_RESULT, &t0);
+            p_glGetQueryObjectui64v(s_mq_q[rd][i * 2 + 1], GL_QUERY_RESULT, &t1);
+            if (t1 > t0) mir += (double)(t1 - t0);
+        }
         GlPerfSample *s = &s_pf_ring[s_pf_ring_seq % GLPERF_RING];
         s->total_ms        = s_pf_buf_total[rd];
         s->present_wall_ms = s_pf_buf_pwall[rd];
         s->scene_gpu_ms    = (double)sc / 1.0e6;
         s->present_gpu_ms  = (double)pr / 1.0e6;
+        s->mirror_gpu_ms   = mir / 1.0e6;
         s->prims           = s_pf_buf_prims[rd];
+        s->mirror_passes   = (double)(s_mq_n[rd] + s_mq_over[rd]);
         s->wide            = s_pf_buf_wide[rd];
         s->frame           = s_pf_buf_frame[rd];
         s_pf_ring_seq++;
     }
+    s_mq_n[rd] = 0; s_mq_over[rd] = 0;   /* rd becomes the next frame's buffer */
     s_pf_count++;
     s_pf_b = rd;                                          /* reuse oldest for next frame */
     p_glBeginQuery(GL_TIME_ELAPSED, s_pf_scene_q[s_pf_b]); /* open next frame's scene draws */
@@ -2347,8 +2420,8 @@ uint64_t gl_renderer_perf_prim_split(double *out_tex_frac) {
     return s_scene_prims;
 }
 
-int gl_renderer_perf_aggregate(int wide_filter, double out[10]) {
-    for (int i = 0; i < 10; i++) out[i] = 0.0;
+int gl_renderer_perf_aggregate(int wide_filter, double out[13]) {
+    for (int i = 0; i < 13; i++) out[i] = 0.0;
     if (!s_pf_on) return 0;
     int navail = (int)(s_pf_ring_seq < (uint64_t)GLPERF_RING ? s_pf_ring_seq : GLPERF_RING);
     uint64_t start = s_pf_ring_seq - (uint64_t)navail;
@@ -2363,12 +2436,18 @@ int gl_renderer_perf_aggregate(int wide_filter, double out[10]) {
         out[5] += s->scene_gpu_ms;   if (s->scene_gpu_ms > out[6]) out[6] = s->scene_gpu_ms;
         out[7] += s->present_gpu_ms; if (s->present_gpu_ms > out[8]) out[8] = s->present_gpu_ms;
         out[9] += s->prims;
+        out[10] += s->mirror_gpu_ms; if (s->mirror_gpu_ms > out[11]) out[11] = s->mirror_gpu_ms;
+        out[12] += s->mirror_passes;
         n++;
     }
-    if (n) { out[1]/=n; out[3]/=n; out[4]/=n; out[5]/=n; out[7]/=n; out[9]/=n; }
+    if (n) { out[1]/=n; out[3]/=n; out[4]/=n; out[5]/=n; out[7]/=n; out[9]/=n; out[10]/=n; out[12]/=n; }
     out[0] = (double)n;
     return n;
 }
+
+/* Native-wide mirror ablation (perf attribution): see s_ws_ablate. */
+void gl_renderer_set_ws_ablate(int mode) { s_ws_ablate = (mode >= 0 && mode <= 3) ? mode : 0; }
+int  gl_renderer_get_ws_ablate(void)     { return s_ws_ablate; }
 
 void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
                               int force_4_3) {

@@ -121,12 +121,21 @@ int gl_renderer_pres_get(uint64_t seq, GlPresEvent *out);
 
 /* frame_perf: aggregate the per-frame GPU/CPU phase-timing ring (debug server
  * "frame_perf"). wide_filter: -1 = all frames, 0 = 4:3 present, 1 = native-wide.
- * Fills out[9]: [0]=count, [1]=total_ms avg, [2]=total_ms max, [3]=emu_cpu_ms avg
+ * Fills out[13]: [0]=count, [1]=total_ms avg, [2]=total_ms max, [3]=emu_cpu_ms avg
  * (frame minus the present call), [4]=present_wall_ms avg, [5]=scene_gpu_ms avg,
  * [6]=scene_gpu_ms max, [7]=present_gpu_ms avg, [8]=present_gpu_ms max,
- * [9]=scene primitives/frame avg (pre double-draw). GPU phases are true
- * GL_TIME_ELAPSED times (CPU-overhead independent). Returns the count. */
-int gl_renderer_perf_aggregate(int wide_filter, double out[10]);
+ * [9]=scene primitives/frame avg (pre double-draw), [10]=mirror_gpu_ms avg (of
+ * scene_gpu, the native-wide mirror passes; GL_TIMESTAMP pairs), [11]=mirror_gpu_ms
+ * max, [12]=mirror passes/frame avg. GPU phases are true GL_TIME_ELAPSED times
+ * (CPU-overhead independent). Returns the count. */
+int gl_renderer_perf_aggregate(int wide_filter, double out[13]);
+
+/* Native-wide mirror ablation (perf attribution, debug cmd gl_ws_ablate):
+ * 0 = normal, 1 = skip the whole mirror pass (incl. wide_clear), 2 = full mirror
+ * state churn without the draw calls, 3 = mirror draws stay on the hr FBO (no
+ * per-pass FBO rebind; diagnostic only — corrupts both surfaces' content). */
+void gl_renderer_set_ws_ablate(int mode);
+int  gl_renderer_get_ws_ablate(void);
 
 /* Cumulative textured fraction of scene primitives since boot (flat vs textured
  * batching decision). Sets *out_tex_frac; returns total prim count. */
