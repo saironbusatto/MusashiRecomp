@@ -99,11 +99,26 @@ void parity_trace_record(parity_kind_t kind, uint32_t pc, uint32_t ra,
  * the writer is the running thread). */
 void parity_trace_note_write(uint32_t addr, uint32_t width, uint32_t writer_pc);
 
+/* Read-side counterpart of parity_trace_note_write: record the EXACT load PC that
+ * last consumed each watch word (read provenance), so a diverging value can be
+ * traced to the last reader as well as the last writer. addr may be guest-virtual
+ * or physical (masked internally); value is the loaded word; reader_pc is the load
+ * instruction PC. No-op unless armed and not frozen. Called from both processes'
+ * read paths so read provenance is directly comparable. */
+void parity_trace_note_read(uint32_t addr, uint32_t value, uint32_t reader_pc);
+
 /* Readback (matches the beetle_fntrace_get pattern): copies up to max_rows
  * NEWEST entries, oldest-first, into out[]; returns the count copied. */
 uint32_t parity_trace_get(ParityEntry* out, uint32_t max_rows);
 uint64_t parity_trace_total(void);
 const char* parity_kind_str(uint32_t kind);
+
+/* Readback for the dedicated READ ring (parity_trace_note_read). Same shape as
+ * parity_trace_get/total: newest rows oldest-first. Each row's pc = load PC,
+ * epc = read address, target/watch[slot] = loaded value, watch_w* = the last
+ * writer of that word at read time. Backs the debug server's parity_dump reads=1. */
+uint32_t parity_trace_reads_get(ParityEntry* out, uint32_t max_rows);
+uint64_t parity_trace_reads_total(void);
 
 #ifdef __cplusplus
 }

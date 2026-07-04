@@ -27,6 +27,14 @@ static uint32_t    s_wframe[PARITY_WATCH_MAX];
 static uint32_t    s_wtcb[PARITY_WATCH_MAX];
 static uint32_t    s_last_current_tcb = 0; /* writer-TCB attribution for note_write */
 
+/* Dedicated READ ring (see parity_trace_note_read). One ParityEntry per read of a
+ * watched word, byte-identical wire format to the write ring so tools diff both.
+ * Each row carries reader provenance (pc/cycle/frame + addr in epc, value in target
+ * & the matched watch slot) AND the current last-WRITER metadata for that slot, so
+ * a single read row answers "who read what value, that whom last wrote". */
+static ParityEntry s_rring[PARITY_RING_CAP];
+static uint64_t    s_rseq = 0;
+
 /* Frame + guest-cycle stamps: each host process defines these accessors
  * (decoupled so this single TU compiles into both). cycle = absolute guest CPU
  * cycles since boot — the deterministic ruler for native<->Beetle drift. */
@@ -48,12 +56,16 @@ void parity_trace_config(uint32_t watched_tcb, uint32_t trigger_target,
         s_watch[i] = (watch_addrs && i < watch_count) ? watch_addrs[i] : 0;
         s_wpc[i] = 0; s_wcycle[i] = 0; s_wframe[i] = 0; s_wtcb[i] = 0;
     }
+    s_rseq = 0;
 }
 
 void parity_trace_arm(int on)        { s_armed = on ? 1u : 0u; }
 void parity_trace_reset(void)        {
     s_seq = 0; s_frozen = 0; memset(s_ring, 0, sizeof(s_ring));
-    for (int i = 0; i < PARITY_WATCH_MAX; i++) { s_wpc[i] = 0; s_wcycle[i] = 0; s_wframe[i] = 0; s_wtcb[i] = 0; }
+    s_rseq = 0; memset(s_rring, 0, sizeof(s_rring));
+    for (int i = 0; i < PARITY_WATCH_MAX; i++) {
+        s_wpc[i] = 0; s_wcycle[i] = 0; s_wframe[i] = 0; s_wtcb[i] = 0;
+    }
     s_last_current_tcb = 0;
 }
 int  parity_trace_is_armed(void)     { return (int)s_armed; }
@@ -137,6 +149,37 @@ void parity_trace_note_write(uint32_t addr, uint32_t width, uint32_t writer_pc)
     }
 }
 
+void parity_trace_note_read(uint32_t addr, uint32_t value, uint32_t reader_pc)
+{
+    if (!s_armed || s_frozen) return;
+    uint32_t pa = addr & 0x1FFFFFFFu;
+    for (int i = 0; i < s_watch_count; i++) {
+        if (!s_watch[i]) continue;
+        uint32_t wa = s_watch[i] & 0x1FFFFFFFu;   /* watch word occupies [wa, wa+4) */
+        if (pa < wa + 4u && pa + 4u > wa) {
+            ParityEntry* e = &s_rring[s_rseq & (PARITY_RING_CAP - 1u)];
+            memset(e, 0, sizeof(*e));
+            e->seq    = s_rseq;
+            e->frame  = parity_host_frame();
+            e->cycle  = parity_host_cycle();
+            e->kind   = (uint32_t)PARITY_KIND_DISPATCH; /* reads share the dispatch
+                          * wire; the reads=1 dump names them — no read-only kind. */
+            e->pc     = reader_pc;   /* the load instruction */
+            e->epc    = addr;        /* read address (carried in the epc slot) */
+            e->target = value;       /* the loaded word */
+            /* Mirror value into the matched watch slot and attach that slot's
+             * current last-WRITER provenance, so one read row shows read + write. */
+            e->watch[i]        = value;
+            e->watch_wpc[i]    = s_wpc[i];
+            e->watch_wcycle[i] = s_wcycle[i];
+            e->watch_wframe[i] = s_wframe[i];
+            e->watch_wtcb[i]   = s_wtcb[i];
+            s_rseq++;
+            return; /* one row per read even if it straddles two watch words */
+        }
+    }
+}
+
 uint32_t parity_trace_get(ParityEntry* out, uint32_t max_rows)
 {
     if (!out || max_rows == 0) return 0;
@@ -146,5 +189,19 @@ uint32_t parity_trace_get(ParityEntry* out, uint32_t max_rows)
     uint64_t start = total - n;
     for (uint32_t i = 0; i < n; i++)
         out[i] = s_ring[(start + i) & (PARITY_RING_CAP - 1u)];
+    return n;
+}
+
+uint64_t parity_trace_reads_total(void) { return s_rseq; }
+
+uint32_t parity_trace_reads_get(ParityEntry* out, uint32_t max_rows)
+{
+    if (!out || max_rows == 0) return 0;
+    uint64_t total = s_rseq;
+    uint32_t avail = (total < PARITY_RING_CAP) ? (uint32_t)total : PARITY_RING_CAP;
+    uint32_t n = (avail < max_rows) ? avail : max_rows;
+    uint64_t start = total - n;
+    for (uint32_t i = 0; i < n; i++)
+        out[i] = s_rring[(start + i) & (PARITY_RING_CAP - 1u)];
     return n;
 }
