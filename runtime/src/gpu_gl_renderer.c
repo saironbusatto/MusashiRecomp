@@ -151,6 +151,7 @@ typedef void   (APIENTRY *PFN_glFramebufferTexture2D)(GLenum, GLenum, GLenum, GL
 typedef GLenum (APIENTRY *PFN_glCheckFramebufferStatus)(GLenum);
 typedef void   (APIENTRY *PFN_glBlitFramebuffer)(GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLbitfield,GLenum);
 typedef void   (APIENTRY *PFN_glGenRenderbuffers)(GLsizei, GLuint *);
+typedef void   (APIENTRY *PFN_glDeleteRenderbuffers)(GLsizei, const GLuint *);
 typedef void   (APIENTRY *PFN_glBindRenderbuffer)(GLenum, GLuint);
 typedef void   (APIENTRY *PFN_glRenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
 typedef void   (APIENTRY *PFN_glFramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
@@ -226,6 +227,7 @@ static void gl_perf_mirror_end(void);   /* mirror pass (timestamp pair; splits s
 static int s_ws_ablate = 0;
 static void flush_tex_batch(void); /* textured-prim batch — defined below, flushed from coherency points */
 static PFN_glGenRenderbuffers  p_glGenRenderbuffers;
+static PFN_glDeleteRenderbuffers p_glDeleteRenderbuffers;
 static PFN_glBindRenderbuffer  p_glBindRenderbuffer;
 static PFN_glRenderbufferStorage p_glRenderbufferStorage;
 static PFN_glFramebufferRenderbuffer p_glFramebufferRenderbuffer;
@@ -256,6 +258,7 @@ static int load_modern_gl(void) {
     LOAD(p_glCheckFramebufferStatus, "glCheckFramebufferStatus");
     LOAD(p_glBlitFramebuffer, "glBlitFramebuffer");
     LOAD(p_glGenRenderbuffers, "glGenRenderbuffers");
+    LOAD(p_glDeleteRenderbuffers, "glDeleteRenderbuffers");
     LOAD(p_glBindRenderbuffer, "glBindRenderbuffer");
     LOAD(p_glRenderbufferStorage, "glRenderbufferStorage");
     LOAD(p_glFramebufferRenderbuffer, "glFramebufferRenderbuffer");
@@ -402,6 +405,13 @@ static int s_tex_filter = 0;
 #define WIDE_MAX_SURF 4
 static GLuint s_wide_tex[WIDE_MAX_SURF];     /* color tex per surface (0 = free) */
 static GLuint s_wide_fbo[WIDE_MAX_SURF];     /* FBO per surface */
+static GLuint s_wide_rb[WIDE_MAX_SURF];      /* depth-stencil RB per surface (mask
+                                              * mirror, same as hr). PERF-CRITICAL:
+                                              * a stencil-less wide FBO made every
+                                              * stencil-enabled mirror draw cost
+                                              * ~0.6ms of driver work (Tomba2 16:9
+                                              * collapsed to 12fps); with the RB
+                                              * attached the pass costs ~2us. */
 static int    s_wide_base[WIDE_MAX_SURF];    /* base_x per surface (-1 = free) */
 static int    g_wide_w        = 0;           /* wide width (native px); 0 = disabled */
 static int    g_wide_off      = 0;           /* centering OFFSET (native px) */
@@ -2138,6 +2148,7 @@ static void wide_free_all(void) {
     for (int i = 0; i < WIDE_MAX_SURF; i++) {
         if (s_wide_fbo[i]) { p_glDeleteFramebuffers(1, &s_wide_fbo[i]); s_wide_fbo[i] = 0; }
         if (s_wide_tex[i]) { glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0; }
+        if (s_wide_rb[i])  { p_glDeleteRenderbuffers(1, &s_wide_rb[i]); s_wide_rb[i] = 0; }
         s_wide_base[i] = -1;
     }
     g_wide_cur = 0;
@@ -2154,15 +2165,25 @@ static GLuint wide_fbo_for(int base_x) {
             int w = g_wide_w * s_scale, h = VRAM_H * s_scale;
             s_cw_fbo_creates++;
             s_wide_tex[i] = make_tex(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
-            if (!make_fbo(&s_wide_fbo[i], s_wide_tex[i], 0)) {
+            /* Depth-stencil RB, same as the hr FBO: the stencil carries the
+             * PSX mask-bit mirror for the wide surface, and (the hard lesson)
+             * a stencil-less FBO turns every stencil-enabled mirror draw into
+             * ~0.6ms of driver-side work — the 16:9 GL perf collapse. */
+            p_glGenRenderbuffers(1, &s_wide_rb[i]);
+            p_glBindRenderbuffer(PSXGL_RENDERBUFFER, s_wide_rb[i]);
+            p_glRenderbufferStorage(PSXGL_RENDERBUFFER, PSXGL_DEPTH24_STENCIL8, w, h);
+            if (!make_fbo(&s_wide_fbo[i], s_wide_tex[i], s_wide_rb[i])) {
                 glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0;
+                p_glDeleteRenderbuffers(1, &s_wide_rb[i]); s_wide_rb[i] = 0;
                 return 0;
             }
             /* Clear to black so unwritten margins are clean (not stale). */
             p_glBindFramebuffer(PSXGL_FRAMEBUFFER, s_wide_fbo[i]);
             glDisable(GL_SCISSOR_TEST);
             glClearColor(0, 0, 0, 0);
-            glClear(GL_COLOR_BUFFER_BIT);
+            glClearStencil(0);
+            glStencilMask(0xFF);
+            glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
             p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
             s_wide_base[i] = base_x;
             return s_wide_fbo[i];
@@ -2222,7 +2243,9 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
     glEnable(GL_SCISSOR_TEST);
     glScissor(0, y0, g_wide_w * s_scale, y1 - y0);
     glClearColor(r, g, b, a);
-    glClear(GL_COLOR_BUFFER_BIT);
+    glClearStencil((color >> 15) & 1);   /* stencil mirrors bit15, like the color alpha */
+    glStencilMask(0xFF);
+    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     gl_perf_mirror_end();
