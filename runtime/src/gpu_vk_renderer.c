@@ -153,7 +153,8 @@ static PFN_vkGetDeviceProcAddr   p_vkGetDeviceProcAddr;
     X(vkCmdSetScissor) \
     X(vkCmdSetStencilReference) \
     X(vkCmdDispatch) \
-    X(vkCmdDraw)
+    X(vkCmdDraw) \
+    X(vkCmdClearAttachments)
 
 #define DECL_FP(n) static PFN_##n p_##n;
 VK_GLOBAL_FUNCS(DECL_FP)
@@ -242,6 +243,31 @@ static VkImageView     s_up_view;
 static VkImageLayout   s_up_layout = VK_IMAGE_LAYOUT_UNDEFINED;
 
 /* Samplers + descriptor sets. One nearest sampler serves every fetch. */
+/* ---- native-wide compositor surfaces (mirrors the GL backend) -----------
+ * Canonical VRAM (the hr image) stays 100% faithful; framebuffer-targeting
+ * batches are ALSO drawn into a per-base_x wide surface, x-translated in the
+ * vertex shader via the existing u_xoff/u_xhalf push constants. Each surface
+ * carries its OWN depth-stencil image (PSX mask-bit mirror; Part-A lesson:
+ * never render stencil-enabled passes into a stencil-less target) and its own
+ * VkFramebuffer on the SHARED render pass, so every existing pipeline works
+ * unchanged. The mirror is appended to the SAME one-shot command buffer as the
+ * canonical pass — one extra render pass per flushed batch, no extra submits. */
+#define VK_WIDE_MAX_SURF 4
+static VkImage        s_wide_img[VK_WIDE_MAX_SURF];
+static VkDeviceMemory s_wide_mem[VK_WIDE_MAX_SURF];
+static VkImageView    s_wide_view[VK_WIDE_MAX_SURF];
+static VkImage        s_wide_ds_img[VK_WIDE_MAX_SURF];
+static VkDeviceMemory s_wide_ds_mem[VK_WIDE_MAX_SURF];
+static VkImageView    s_wide_ds_view[VK_WIDE_MAX_SURF];
+static VkFramebuffer  s_wide_fb[VK_WIDE_MAX_SURF];
+static VkImageLayout  s_wide_layout[VK_WIDE_MAX_SURF];
+static int            s_wide_base[VK_WIDE_MAX_SURF] = { -1, -1, -1, -1 };
+static int            s_wide_w = 0;        /* wide width (native px); 0 = disabled */
+static int            s_wide_offset = 0;   /* centering OFFSET (native px) */
+static int            s_wide_cur = -1;     /* active mirror surface index, -1 = none */
+static int            s_wide_cur_base = 0;
+static void wide_free_all(void);           /* defined with the wide helpers below */
+
 static VkSampler       s_samp;
 static VkDescriptorPool s_dpool;
 static VkDescriptorSetLayout s_dsl_tex;   /* binding0: raw usampler2D (frag) */
@@ -265,7 +291,8 @@ static int s_ds_blit_idx;
 typedef struct {
     uint32_t present_idx;
     uint32_t allocs, alloc_kb, oneshots, submits, syncs, pack_flushes,
-             blits, upload_blocks, copy_rects, geo_flushes, tex_flushes;
+             blits, upload_blocks, copy_rects, geo_flushes, tex_flushes,
+             wide_passes, wide_clears;
 } VkPerf;
 #define VK_PERF_RING 256
 static VkPerf s_perf_ring[VK_PERF_RING];
@@ -317,6 +344,9 @@ static uint32_t       s_vcount;           /* verts accumulated this batch */
 static uint32_t       s_vbase;            /* first vertex of the open batch */
 static int            s_geo_semi = -2;    /* open untextured batch keys */
 static int            s_geo_mask = 0, s_geo_check = 0;
+static int            s_geo_mirror_suppress = 0;   /* open batch: skip the wide mirror
+                                                    * (full-screen overlay rect draws its
+                                                    * own full-width wide pass instead) */
 
 /* Textured batch: 18 floats/vert (pos,uv,col,tpage,clut,depth,raw,limits). */
 #define TEXV 18
@@ -1281,6 +1311,7 @@ void vk_renderer_shutdown(void) {
     p_vkDeviceWaitIdle(s_dev);
     vk_gpu_sync_internal();   /* reclaim deferred staging before tearing down */
     cpres_cache_free();       /* FMV CPU-present cached image + staging */
+    wide_free_all();          /* native-wide surfaces (color + DS + framebuffers) */
     for (int i = 0; i < PIPE_CACHE_N; i++)
         if (s_pipe_cache[i]) p_vkDestroyPipeline(s_dev, s_pipe_cache[i], NULL);
     if (s_pipe_pack)   p_vkDestroyPipeline(s_dev, s_pipe_pack, NULL);
@@ -1545,9 +1576,61 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
     perf_snapshot_present();
 }
 
+/* GPU-direct native-wide present: blit the displayed buffer's wide surface
+ * band straight to the swapchain (no readback), mirroring
+ * gl_renderer_present_wide_fbo. Letterbox aspect generalises past 16:9:
+ * the 4:3 native frame widened by EXTRA presents at (4*wide_w : 3*native_w).
+ * Returns 0 when no wide surface exists for disp_x (caller falls back). */
 int vk_renderer_present_wide(int disp_x, int disp_y, int disp_h, int linear) {
-    (void)disp_x; (void)disp_y; (void)disp_h; (void)linear;
-    return 0;  /* native-wide compositor: Phase 4 */
+    if (!s_ctx_ok || !s_ready || s_wide_w <= 0) return 0;
+    int i = -1;
+    for (int k = 0; k < VK_WIDE_MAX_SURF; k++)
+        if (s_wide_img[k] && s_wide_base[k] == disp_x) { i = k; break; }
+    if (i < 0) return 0;
+    flush_cpu_upload();
+    flush_tex_batch(); flush_geometry(); gpu_sync();
+    VkImage sc; VkCommandBuffer cb; uint32_t idx, fr;
+    if (!acquire_present(&sc, &cb, &idx, &fr)) return 1;  /* frame skipped/recreated */
+
+    int S = s_scale;
+    img_barrier(cb, sc, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    VkClearColorValue black = {{0, 0, 0, 1}};
+    VkImageSubresourceRange rng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    p_vkCmdClearColorImage(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &rng);
+
+    img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+
+    int native_w = s_wide_w - 2 * s_wide_offset;
+    if (native_w <= 0) native_w = s_wide_w;
+    VkOffset3D dst[2];
+    letterbox((int)s_sc_extent.width, (int)s_sc_extent.height,
+              4 * s_wide_w, 3 * native_w, dst);
+
+    int sy0 = disp_y * S, sy1 = (disp_y + disp_h) * S;
+    if (sy0 < 0) sy0 = 0;
+    if (sy1 > VRAM_H * S) sy1 = VRAM_H * S;
+    VkImageBlit blit = {0};
+    blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.srcSubresource.layerCount = 1;
+    blit.srcOffsets[0].x = 0;              blit.srcOffsets[0].y = sy0;
+    blit.srcOffsets[1].x = s_wide_w * S;   blit.srcOffsets[1].y = sy1;
+    blit.srcOffsets[1].z = 1;
+    blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    blit.dstSubresource.layerCount = 1;
+    blit.dstOffsets[0] = dst[0]; blit.dstOffsets[1] = dst[1];
+    p_vkCmdBlitImage(cb, s_wide_img[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                     sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     1, &blit, linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    img_barrier(cb, sc, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                VK_ACCESS_TRANSFER_WRITE_BIT, 0,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+    submit_present(cb, idx, fr);
+    perf_snapshot_present();
+    return 1;
 }
 
 void vk_renderer_sync_cpu(void) {
@@ -1569,11 +1652,11 @@ int vk_perf_json(char *out, int cap, int count) {
         o += snprintf(out + o, cap - o,
             "%s{\"f\":%u,\"alloc\":%u,\"alloc_kb\":%u,\"oneshot\":%u,\"submit\":%u,"
             "\"sync\":%u,\"pack\":%u,\"blit\":%u,\"upload\":%u,\"copy\":%u,"
-            "\"geo\":%u,\"tex\":%u}",
+            "\"geo\":%u,\"tex\":%u,\"wide\":%u,\"wclr\":%u}",
             i ? "," : "",
             p->present_idx, p->allocs, p->alloc_kb, p->oneshots, p->submits,
             p->syncs, p->pack_flushes, p->blits, p->upload_blocks, p->copy_rects,
-            p->geo_flushes, p->tex_flushes);
+            p->geo_flushes, p->tex_flushes, p->wide_passes, p->wide_clears);
         if (o >= cap - 256) break;
     }
     o += snprintf(out + o, cap - o, "]");
@@ -2036,6 +2119,127 @@ static void set_vp_scissor(VkCommandBuffer cb) {
     p_vkCmdSetScissor(cb, 0, 1, &sc);
 }
 
+/* ---- native-wide compositor helpers ------------------------------------- */
+/* X-translation (native px) from canonical VRAM space into the active wide
+ * surface: local_x = vram_x - base_x + OFFSET. Same as GL/SW wide_dx(). */
+static int wide_dx(void) { return s_wide_offset - s_wide_cur_base; }
+
+static void wide_free_all(void) {
+    int any = 0;
+    for (int i = 0; i < VK_WIDE_MAX_SURF; i++) any |= (s_wide_img[i] != VK_NULL_HANDLE);
+    if (any) p_vkQueueWaitIdle(s_queue);   /* surfaces may be referenced in flight */
+    for (int i = 0; i < VK_WIDE_MAX_SURF; i++) {
+        if (s_wide_fb[i])      { p_vkDestroyFramebuffer(s_dev, s_wide_fb[i], NULL); s_wide_fb[i] = VK_NULL_HANDLE; }
+        if (s_wide_view[i])    { p_vkDestroyImageView(s_dev, s_wide_view[i], NULL); s_wide_view[i] = VK_NULL_HANDLE; }
+        if (s_wide_img[i])     { p_vkDestroyImage(s_dev, s_wide_img[i], NULL); s_wide_img[i] = VK_NULL_HANDLE; }
+        if (s_wide_mem[i])     { p_vkFreeMemory(s_dev, s_wide_mem[i], NULL); s_wide_mem[i] = VK_NULL_HANDLE; }
+        if (s_wide_ds_view[i]) { p_vkDestroyImageView(s_dev, s_wide_ds_view[i], NULL); s_wide_ds_view[i] = VK_NULL_HANDLE; }
+        if (s_wide_ds_img[i])  { p_vkDestroyImage(s_dev, s_wide_ds_img[i], NULL); s_wide_ds_img[i] = VK_NULL_HANDLE; }
+        if (s_wide_ds_mem[i])  { p_vkFreeMemory(s_dev, s_wide_ds_mem[i], NULL); s_wide_ds_mem[i] = VK_NULL_HANDLE; }
+        s_wide_layout[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+        s_wide_base[i] = -1;
+    }
+    s_wide_cur = -1;
+}
+
+/* Find (or lazily create) the wide surface for base_x. Returns the surface
+ * index or -1. A new surface = RGBA8 color image (attachment + blit src/dst)
+ * + its own stencil image + a framebuffer on the SHARED render pass; color is
+ * cleared black, stencil to 0, then both are parked in the layouts the render
+ * pass expects (color/DS ATTACHMENT_OPTIMAL). */
+static int wide_surf_for(int base_x) {
+    if (s_wide_w <= 0 || !s_ready) return -1;
+    for (int i = 0; i < VK_WIDE_MAX_SURF; i++)
+        if (s_wide_img[i] && s_wide_base[i] == base_x) return i;
+    for (int i = 0; i < VK_WIDE_MAX_SURF; i++) {
+        if (s_wide_img[i]) continue;
+        int S = s_scale, w = s_wide_w * S, h = VRAM_H * S;
+        if (!make_image(VK_FORMAT_R8G8B8A8_UNORM, w, h,
+                        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT, &s_wide_img[i], &s_wide_mem[i], &s_wide_view[i]))
+            return -1;
+        if (!make_image(s_ds_format, w, h,
+                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                        VK_IMAGE_ASPECT_STENCIL_BIT, &s_wide_ds_img[i], &s_wide_ds_mem[i], &s_wide_ds_view[i]))
+            return -1;
+        VkImageView views[2] = { s_wide_view[i], s_wide_ds_view[i] };
+        VkFramebufferCreateInfo fi = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
+        fi.renderPass = s_rpass; fi.attachmentCount = 2; fi.pAttachments = views;
+        fi.width = (uint32_t)w; fi.height = (uint32_t)h; fi.layers = 1;
+        if (p_vkCreateFramebuffer(s_dev, &fi, NULL, &s_wide_fb[i]) != VK_SUCCESS)
+            return -1;
+        /* Clear + park in attachment layouts (mirrors the s_ds init chain). */
+        VkCommandBuffer cb = begin_oneshot();
+        s_wide_layout[i] = VK_IMAGE_LAYOUT_UNDEFINED;
+        img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkClearColorValue black = {{0, 0, 0, 0}};
+        VkImageSubresourceRange crng = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        p_vkCmdClearColorImage(cb, s_wide_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &crng);
+        img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        VkImageMemoryBarrier db = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        db.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; db.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        db.image = s_wide_ds_img[i]; db.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+        db.subresourceRange.levelCount = 1; db.subresourceRange.layerCount = 1;
+        p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               0, 0, NULL, 0, NULL, 1, &db);
+        VkClearDepthStencilValue dsv = { 0.0f, 0 };
+        VkImageSubresourceRange srng = { VK_IMAGE_ASPECT_STENCIL_BIT, 0, 1, 0, 1 };
+        p_vkCmdClearDepthStencilImage(cb, s_wide_ds_img[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dsv, 1, &srng);
+        db.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        db.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        db.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        db.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        p_vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                               VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, 0, 0, NULL, 0, NULL, 1, &db);
+        end_oneshot(cb);
+        s_wide_base[i] = base_x;
+        return i;
+    }
+    return -1;  /* more distinct buffers than VK_WIDE_MAX_SURF — shouldn't happen */
+}
+
+/* Begin the mirror render pass on the active wide surface inside an already-
+ * recording one-shot CB (canonical pass already ended). Sets the wide viewport
+ * and the mirror scissor: FULL width X (the margins are the point) but the
+ * DRAW-AREA Y band — native-wide only widens X; a full-height Y let draws bleed
+ * across a vertical double-buffer band boundary (the GL band-flicker lesson). */
+static void wide_pass_begin(VkCommandBuffer cb) {
+    int i = s_wide_cur, S = s_scale;
+    s_perf_cur.wide_passes++;
+    img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    /* Stencil self-barrier for the WIDE DS image (same hazard class as
+     * begin_geo_pass covers for the canonical DS across one-shot submits). */
+    VkImageMemoryBarrier db = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    db.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    db.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    db.image = s_wide_ds_img[i];
+    db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    db.subresourceRange.levelCount = 1; db.subresourceRange.layerCount = 1;
+    db.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    db.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    p_vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+        0, 0, NULL, 0, NULL, 1, &db);
+    VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rp.renderPass = s_rpass; rp.framebuffer = s_wide_fb[i];
+    rp.renderArea.extent.width = (uint32_t)(s_wide_w * S);
+    rp.renderArea.extent.height = (uint32_t)(VRAM_H * S);
+    p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport vp = { 0.f, 0.f, (float)(s_wide_w * S), (float)(VRAM_H * S), 0.f, 1.f };
+    p_vkCmdSetViewport(cb, 0, 1, &vp);
+    int y1 = s_da_y1 < 0 ? 0 : s_da_y1;
+    int y2 = s_da_y2 >= VRAM_H ? VRAM_H - 1 : s_da_y2;
+    int hh = y2 - y1 + 1; if (hh < 0) hh = 0;
+    VkRect2D sc = { { 0, y1 * S }, { (uint32_t)(s_wide_w * S), (uint32_t)(hh * S) } };
+    p_vkCmdSetScissor(cb, 0, 1, &sc);
+}
+
 /* Tight bbox of the open untextured batch (added to s_pack_dirty at flush). */
 static DirtyRect s_geo_bbox;
 
@@ -2058,6 +2262,15 @@ static void flush_geometry(void) {
     p_vkCmdBindVertexBuffers(cb, 0, 1, &s_vbuf, &off);
     p_vkCmdDraw(cb, n, 1, base, 0);
     p_vkCmdEndRenderPass(cb);
+    if (s_wide_cur >= 0 && !s_geo_mirror_suppress) {   /* native-wide mirror pass (same CB) */
+        wide_pass_begin(cb);
+        bind_masked(cb, 0, 0, blend, s_geo_check, s_geo_mask);
+        GeoPush wgp = { px_shift(), (float)wide_dx(), (float)s_wide_w / 2.0f };
+        p_vkCmdPushConstants(cb, s_pl_geo, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof wgp, &wgp);
+        p_vkCmdDraw(cb, n, 1, base, 0);
+        p_vkCmdEndRenderPass(cb);
+    }
+    s_geo_mirror_suppress = 0;
     vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     end_oneshot(cb);
     if (s_geo_bbox.set) {
@@ -2143,10 +2356,59 @@ static void vkb_draw_gouraud_triangle(int x0,int y0,uint16_t c0,int x1,int y1,ui
     float a[3],b[3],cc[3]; col555(c0,a); col555(c1,b); col555(c2,cc);
     tri3((float)x0,(float)y0,a, (float)x1,(float)y1,b, (float)x2,(float)y2,cc);
 }
+/* Full-screen-overlay wide pass (pause gray-filter / load fade): draw a flat
+ * rect covering the FULL wide width [0, wide_w) x [y, y+h) directly into the
+ * active wide surface (positions already wide-space, u_xoff = 0). Mirrors GL's
+ * wide_flat_rect_direct: full-surface scissor (the overlay must dim the
+ * revealed margins too). The 6 verts are consumed privately (s_vbase bumped)
+ * so they never join a canonical batch. */
+static void wide_overlay_rect(int y, int h, uint16_t c, int semi) {
+    if (s_wide_cur < 0 || !s_ready) return;
+    ensure_room(6);
+    float col[3]; col555(c, col);
+    uint32_t base = s_vbase + s_vcount;   /* == s_vbase (batches drained) */
+    float x0 = 0.0f, x1 = (float)s_wide_w, fy0 = (float)y, fy1 = (float)(y + h);
+    push_vert(x0, fy0, col); push_vert(x1, fy0, col); push_vert(x1, fy1, col);
+    push_vert(x0, fy0, col); push_vert(x1, fy1, col); push_vert(x0, fy1, col);
+    s_vbase += s_vcount; s_vcount = 0;    /* consume privately */
+    int blend = (semi < 0) ? 0 : (semi + 1);
+    int S = s_scale;
+    VkCommandBuffer cb = begin_oneshot();
+    wide_pass_begin(cb);
+    /* Overlay covers the whole surface: override the band scissor. */
+    VkRect2D sc = { { 0, 0 }, { (uint32_t)(s_wide_w * S), (uint32_t)(VRAM_H * S) } };
+    p_vkCmdSetScissor(cb, 0, 1, &sc);
+    bind_masked(cb, 0, 0, blend, s_mask_check, s_mask_set);
+    GeoPush gp = { px_shift(), 0.0f, (float)s_wide_w / 2.0f };
+    p_vkCmdPushConstants(cb, s_pl_geo, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof gp, &gp);
+    VkDeviceSize off = 0;
+    p_vkCmdBindVertexBuffers(cb, 0, 1, &s_vbuf, &off);
+    p_vkCmdDraw(cb, 6, 1, base, 0);
+    p_vkCmdEndRenderPass(cb);
+    end_oneshot(cb);
+}
+
 static void vkb_draw_flat_rect(int x,int y,int w,int h,uint16_t c){
+    /* Full-screen 2D overlay under native-wide: the canonical rect must NOT
+     * mirror 1:1 (it would cover only the translated 4:3 span) — suppress the
+     * batch mirror and emit one full-wide-width rect instead, so the revealed
+     * margins are dimmed/faded too. Same detection as GL/SW. */
+    int overlay = 0;
+    if (s_wide_cur >= 0) {
+        int native_w = s_wide_w - 2 * s_wide_offset;
+        int lx = x - s_wide_cur_base, rx = x + w - s_wide_cur_base;
+        overlay = (native_w > 0 && lx <= 0 && rx >= native_w);
+    }
+    if (overlay) { flush_tex_batch(); flush_geometry(); }
     geo_prim_begin();
     float col[3]; col555(c, col);
+    if (overlay) s_geo_mirror_suppress = 1;
     quad((float)x,(float)y,(float)(x+w),(float)y,(float)(x+w),(float)(y+h),(float)x,(float)(y+h),col);
+    if (overlay) {
+        int semi = s_semi_en ? s_semi_mode : -1;
+        flush_geometry();                  /* canonical only (mirror suppressed) */
+        wide_overlay_rect(y, h, c, semi);
+    }
 }
 /* 1px line as a thin quad along the segment. */
 static void line_quad(int x0,int y0,int x1,int y1,const float ca[3],const float cb_[3]){
@@ -2224,6 +2486,30 @@ static void flush_tex_batch(void) {
         p_vkCmdDraw(cb, n, 1, base, 0);
     }
     p_vkCmdEndRenderPass(cb);
+    if (s_wide_cur >= 0) {                 /* native-wide mirror pass (same CB) */
+        wide_pass_begin(cb);
+        tp.xoff = (float)wide_dx(); tp.xhalf = (float)s_wide_w / 2.0f;
+        if (semi < 0) {
+            bind_masked(cb, 1, 0, 0, s_tb_check, s_tb_mask);
+            tp.semipass = 0;
+            p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
+            p_vkCmdDraw(cb, n, 1, base, 0);
+            bind_masked_stencil_only(cb, 1, 0, s_tb_check, 1);
+            tp.semipass = 2;
+            p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
+            p_vkCmdDraw(cb, n, 1, base, 0);
+        } else {
+            bind_masked(cb, 1, 0, 0, s_tb_check, s_tb_mask);
+            tp.semipass = 1;
+            p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
+            p_vkCmdDraw(cb, n, 1, base, 0);
+            bind_masked(cb, 1, 0, blend, s_tb_check, 1);
+            tp.semipass = 2;
+            p_vkCmdPushConstants(cb, s_pl_tex, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof tp, &tp);
+            p_vkCmdDraw(cb, n, 1, base, 0);
+        }
+        p_vkCmdEndRenderPass(cb);
+    }
     vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     end_oneshot(cb);
     s_gpu_dirty = 1;
@@ -2394,6 +2680,120 @@ static void vkb_copy_rect(int sx,int sy,int dx,int dy,int w,int h){
     }
 }
 
+/* ---- native-wide vtable entry points ------------------------------------ */
+/* Enable native-wide with a wide width + centering offset (native px), or
+ * disable (wide_w <= 0). No-ops when nothing changed (gpu.c calls this on
+ * every draw-area set via ws_nw_sync_target — Part-A lesson: the wide entry
+ * points sit inside guest emulation, keep the common path free). */
+static void vkb_wide_configure(int wide_w, int offset) {
+    if (!s_ready) return;
+    if (wide_w == s_wide_w && offset == s_wide_offset) return;
+    flush_tex_batch(); flush_geometry();
+    if (wide_w <= 0) { wide_free_all(); s_wide_w = 0; s_wide_offset = 0; return; }
+    if (wide_w != s_wide_w) wide_free_all();
+    s_wide_w = wide_w;
+    s_wide_offset = offset;
+}
+
+/* Select the wide surface to mirror into for the back buffer at base_x. */
+static void vkb_wide_set_target(int base_x) {
+    if (!s_ready) { s_wide_cur = -1; return; }
+    if (s_wide_cur >= 0 && s_wide_base[s_wide_cur] == base_x) { s_wide_cur_base = base_x; return; }
+    flush_tex_batch(); flush_geometry();   /* drain into the OLD target first */
+    s_wide_cur = wide_surf_for(base_x);
+    s_wide_cur_base = base_x;
+}
+
+/* Stop mirroring (offscreen draws that don't target a framebuffer). */
+static void vkb_wide_disable_target(void) {
+    if (s_wide_cur < 0) return;
+    flush_tex_batch(); flush_geometry();
+    s_wide_cur = -1;
+}
+
+/* Mirror a framebuffer clear: fill the full wide width over [y, y+h) of the
+ * surface for base_x (revealed margins stay clean). Stencil clears to bit15,
+ * like the canonical fill path. */
+static void vkb_wide_clear(int base_x, int y, int h, uint16_t color) {
+    if (!s_ready || s_wide_w <= 0) return;
+    flush_tex_batch(); flush_geometry();
+    int i = wide_surf_for(base_x);
+    if (i < 0) return;
+    s_perf_cur.wide_clears++;
+    int S = s_scale, H = VRAM_H * S;
+    int y0 = y * S, y1 = (y + h) * S;
+    if (y0 < 0) y0 = 0;
+    if (y1 > H) y1 = H;
+    if (y1 <= y0) return;
+    VkCommandBuffer cb = begin_oneshot();
+    img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
+    rp.renderPass = s_rpass; rp.framebuffer = s_wide_fb[i];
+    rp.renderArea.extent.width = (uint32_t)(s_wide_w * S);
+    rp.renderArea.extent.height = (uint32_t)H;
+    p_vkCmdBeginRenderPass(cb, &rp, VK_SUBPASS_CONTENTS_INLINE);
+    VkClearAttachment ca[2] = {0};
+    ca[0].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ca[0].colorAttachment = 0;
+    ca[0].clearValue.color.float32[0] = (float)((color)       & 0x1F) / 31.0f;
+    ca[0].clearValue.color.float32[1] = (float)((color >> 5)  & 0x1F) / 31.0f;
+    ca[0].clearValue.color.float32[2] = (float)((color >> 10) & 0x1F) / 31.0f;
+    ca[0].clearValue.color.float32[3] = (color >> 15) & 1 ? 1.0f : 0.0f;
+    ca[1].aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    ca[1].clearValue.depthStencil.depth = 0.0f;
+    ca[1].clearValue.depthStencil.stencil = (color >> 15) & 1;
+    VkClearRect cr = { { { 0, y0 }, { (uint32_t)(s_wide_w * S), (uint32_t)(y1 - y0) } }, 0, 1 };
+    p_vkCmdClearAttachments(cb, 2, ca, 1, &cr);
+    p_vkCmdEndRenderPass(cb);
+    end_oneshot(cb);
+}
+
+/* Present source (CPU): read the wide surface band for the displayed buffer
+ * into an ARGB8888 buffer, byte-compatible with sw_render_wide_display — used
+ * by the shared CPU present fallback and the ws debug dump. The GPU-direct
+ * vk_renderer_present_wide is the per-frame path; this readback is cold. */
+static int vkb_render_wide_display(uint32_t *out, int pitch, int base_x,
+                                   int disp_y, int disp_h) {
+    if (!s_ready || s_wide_w <= 0) return 0;
+    int i = -1;
+    for (int k = 0; k < VK_WIDE_MAX_SURF; k++)
+        if (s_wide_img[k] && s_wide_base[k] == base_x) { i = k; break; }
+    if (i < 0) return 0;
+    flush_cpu_upload(); flush_tex_batch(); flush_geometry();
+    int S = s_scale, W = s_wide_w * S, H = VRAM_H * S;
+    int out_h = disp_h * S, ry0 = disp_y * S;
+    if (ry0 < 0) ry0 = 0;
+    if (ry0 + out_h > H) out_h = H - ry0;
+    if (out_h <= 0) return 0;
+    VkBuffer buf; VkDeviceMemory mem; void *map;
+    if (!make_staging((VkDeviceSize)W * out_h * 4, &buf, &mem, &map)) return 0;
+    VkCommandBuffer cb = begin_oneshot();
+    img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy rc = {0};
+    rc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    rc.imageSubresource.layerCount = 1;
+    rc.imageOffset.y = ry0;
+    rc.imageExtent.width = (uint32_t)W; rc.imageExtent.height = (uint32_t)out_h;
+    rc.imageExtent.depth = 1;
+    p_vkCmdCopyImageToBuffer(cb, s_wide_img[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &rc);
+    img_to(cb, s_wide_img[i], &s_wide_layout[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    end_oneshot(cb);
+    gpu_sync();   /* readback must be complete before the CPU reads it */
+    const uint8_t *src = (const uint8_t *)map;
+    int count = 0;
+    for (int row = 0; row < out_h; row++) {
+        uint32_t *dst = (uint32_t *)((uint8_t *)out + (size_t)row * pitch);
+        const uint8_t *s8 = src + (size_t)row * W * 4;
+        for (int col = 0; col < W; col++) {   /* RGBA8 -> 0xAARRGGBB, alpha forced */
+            dst[col] = 0xFF000000u | ((uint32_t)s8[col * 4 + 0] << 16)
+                     | ((uint32_t)s8[col * 4 + 1] << 8) | s8[col * 4 + 2];
+            count++;
+        }
+    }
+    free_staging(buf, mem);
+    return count;
+}
+
 static const GpuRenderBackend VK_BACKEND = {
     .name                          = "vulkan",
     .init                          = vkb_init,
@@ -2425,7 +2825,11 @@ static const GpuRenderBackend VK_BACKEND = {
     .set_draw_area                 = vkb_set_draw_area,
     .get_draw_area                 = vkb_get_draw_area,
     .set_draw_offset               = vkb_set_draw_offset,
-    /* wide_* left NULL until Phase 4 (facade reports gr_wide_supported()==0) */
+    .wide_configure                = vkb_wide_configure,
+    .wide_set_target               = vkb_wide_set_target,
+    .wide_disable_target           = vkb_wide_disable_target,
+    .wide_clear                    = vkb_wide_clear,
+    .render_wide_display           = vkb_render_wide_display,
 };
 
 /* Returned unconditionally (like gl_backend_get): the table is selected before
