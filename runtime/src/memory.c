@@ -351,6 +351,16 @@ extern uint32_t g_debug_last_store_pc;
  * unless the parity ring is armed. */
 extern void parity_trace_note_write(uint32_t addr, uint32_t width, uint32_t writer_pc);
 
+/* Effective writer PC for provenance: during a DMA transfer the last CPU-store
+ * PC is stale/unrelated, so attribute DMA-sourced RAM writes to the PC that
+ * kicked the DMA (dma.c). Matches the wtrace recorder's DMA attribution. */
+extern int      g_dma_exec_depth;
+extern uint32_t g_dma_initiator_pc;
+static inline uint32_t effective_store_pc(void) {
+    return (g_dma_exec_depth > 0 && g_dma_initiator_pc) ? g_dma_initiator_pc
+                                                        : g_debug_last_store_pc;
+}
+
 /* Card-byte destination capture (Phase 3 audit). Always-on. */
 extern int card_data_writes_check(uint32_t phys, uint32_t value, uint8_t width);
 
@@ -935,7 +945,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
     if (phys < RAM_SIZE) {
         if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
         debug_server_trace_write_check(phys, read_ram_word(phys), val, 4);
-        parity_trace_note_write(phys, 4, g_debug_last_store_pc);
+        parity_trace_note_write(phys, 4, effective_store_pc());
         card_data_writes_check(phys, val, 4);
         dirty_ram_mark_kernel_write(phys);
         overlay_watch_note_write(phys, 4);
@@ -1027,7 +1037,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
-        parity_trace_note_write(phys, 2, g_debug_last_store_pc);
+        parity_trace_note_write(phys, 2, effective_store_pc());
         card_data_writes_check(phys, (uint32_t)val, 2);
         dirty_ram_mark_kernel_write(phys);
         overlay_watch_note_write(phys, 2);
@@ -1254,7 +1264,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
-        parity_trace_note_write(phys, 1, g_debug_last_store_pc);
+        parity_trace_note_write(phys, 1, effective_store_pc());
         card_data_writes_check(phys, (uint32_t)val, 1);
         dirty_ram_mark_kernel_write(phys);
         overlay_watch_note_write(phys, 1);
