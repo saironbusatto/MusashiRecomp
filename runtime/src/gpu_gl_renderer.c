@@ -1206,10 +1206,30 @@ static void tex_batch_draw_passes(int nverts, int semi) {
     }
 }
 
+/* ---- frame_perf CPU attribution (native-wide wedge hunt) ----------------- *
+ * Per-frame CPU wall time spent inside the GL submission paths (driver CPU
+ * cost surfaces INSIDE our gl* calls) + counters for the wide plumbing, so a
+ * CPU-bound wide frame (emu_cpu >> scene_gpu) can be attributed without a
+ * sampling profiler. Reset at present enter; reported by frame_perf. */
+static double cw_ms(void) {
+    static double freq = 0.0;
+    if (freq == 0.0) {
+        uint64_t f = SDL_GetPerformanceFrequency();
+        freq = f ? (double)f : 1.0;
+    }
+    return (double)SDL_GetPerformanceCounter() * 1000.0 / freq;
+}
+static double s_cw_flush_ms = 0.0;   /* CPU wall inside flush_tex_batch        */
+static double s_cw_wide_ms  = 0.0;   /* CPU wall inside glb_wide_* entry points */
+static int    s_cw_batches = 0, s_cw_wide_sets = 0, s_cw_wide_cfgs = 0,
+              s_cw_wide_clears = 0, s_cw_fbo_creates = 0, s_cw_flush_depth = 0;
+
 static void flush_tex_batch(void) {
     if (s_tb_n == 0) return;
     int nverts = s_tb_n, semi = s_tb_semi;
     s_tb_n = 0;                             /* clear first: re-entrancy safe */
+    double cw_t0 = cw_ms();
+    s_cw_batches++; s_cw_flush_depth++;
 
     hr_begin(1);
     p_glUseProgram(s_tex_prog);
@@ -1237,6 +1257,7 @@ static void flush_tex_batch(void) {
         gl_perf_mirror_end();
     }
     hr_end();
+    if (--s_cw_flush_depth == 0) s_cw_flush_ms += cw_ms() - cw_t0;
 }
 
 /* Flat / gouraud triangles and lines share the GEO program. mode: GL_TRIANGLES
@@ -2131,6 +2152,7 @@ static GLuint wide_fbo_for(int base_x) {
     for (int i = 0; i < WIDE_MAX_SURF; i++) {
         if (!s_wide_fbo[i]) {
             int w = g_wide_w * s_scale, h = VRAM_H * s_scale;
+            s_cw_fbo_creates++;
             s_wide_tex[i] = make_tex(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
             if (!make_fbo(&s_wide_fbo[i], s_wide_tex[i], 0)) {
                 glDeleteTextures(1, &s_wide_tex[i]); s_wide_tex[i] = 0;
@@ -2154,19 +2176,23 @@ static GLuint wide_fbo_for(int base_x) {
  * sw_wide_configure. */
 static void glb_wide_configure(int wide_w, int offset) {
     if (!s_raster_ok) return;
+    double t0 = cw_ms(); s_cw_wide_cfgs++;
     flush_tex_batch();   /* a queued batch's wide mirror targets the CURRENT surfaces */
-    if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; return; }
+    if (wide_w <= 0) { wide_free_all(); g_wide_w = 0; g_wide_off = 0; s_cw_wide_ms += cw_ms() - t0; return; }
     if (wide_w != g_wide_w) wide_free_all();
     g_wide_w = wide_w;
     g_wide_off = offset;
+    s_cw_wide_ms += cw_ms() - t0;
 }
 
 /* Select the wide surface to mirror into for the back buffer at base_x. */
 static void glb_wide_set_target(int base_x) {
     if (!s_raster_ok) { g_wide_cur = 0; return; }
+    double t0 = cw_ms(); s_cw_wide_sets++;
     flush_tex_batch();   /* drain into the OLD target before switching */
     g_wide_cur = wide_fbo_for(base_x);
     g_wide_cur_base = base_x;
+    s_cw_wide_ms += cw_ms() - t0;
 }
 
 /* Stop mirroring (offscreen draws that don't target a framebuffer). */
@@ -2177,9 +2203,10 @@ static void glb_wide_disable_target(void) { flush_tex_batch(); g_wide_cur = 0; }
  * a scissored glClear with the 1555 color converted to RGBA8 (alpha = bit15). */
 static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
     if (!s_raster_ok || s_ws_ablate == 1) return;
+    double t0 = cw_ms(); s_cw_wide_clears++;
     flush_tex_batch();
     GLuint fbo = wide_fbo_for(base_x);
-    if (!fbo) return;
+    if (!fbo) { s_cw_wide_ms += cw_ms() - t0; return; }
     gl_perf_mirror_begin();
     int H = VRAM_H * s_scale;
     int y0 = y * s_scale, y1 = (y + h) * s_scale;
@@ -2199,6 +2226,7 @@ static void glb_wide_clear(int base_x, int y, int h, uint16_t color) {
     glDisable(GL_SCISSOR_TEST);
     p_glBindFramebuffer(PSXGL_FRAMEBUFFER, 0);
     gl_perf_mirror_end();
+    s_cw_wide_ms += cw_ms() - t0;
 }
 
 /* Present source: read the wide FBO for the displayed buffer (base_x) into the
@@ -2284,6 +2312,11 @@ typedef struct {
     double   mirror_gpu_ms;   /* GPU: of scene_gpu, the native-wide mirror passes */
     double   prims;           /* scene primitives submitted this frame         */
     double   mirror_passes;   /* mirror passes this frame (measured + overflow) */
+    double   cw_flush_ms;     /* CPU wall inside flush_tex_batch this frame    */
+    double   cw_wide_ms;      /* CPU wall inside glb_wide_* this frame         */
+    double   batches;         /* flush_tex_batch draws this frame              */
+    double   wide_sets;       /* glb_wide_set_target calls this frame          */
+    double   fbo_creates;     /* wide FBO+tex creations this frame             */
     int      wide;            /* 1 = native-wide (16:9) present, 0 = 4:3       */
     uint64_t frame;
 } GlPerfSample;
@@ -2317,6 +2350,8 @@ static int      s_pf_buf_wide[GLPERF_NBUF];
 static uint64_t s_pf_buf_frame[GLPERF_NBUF];
 static uint64_t s_pf_prims_last = 0;
 static double   s_pf_prims_pending = 0.0;
+static double   s_pf_cw_pending[5];            /* flush_ms, wide_ms, batches, wide_sets, fbo_creates */
+static double   s_pf_buf_cw[GLPERF_NBUF][5];
 static GlPerfSample s_pf_ring[GLPERF_RING];
 static uint64_t     s_pf_ring_seq = 0;
 
@@ -2375,6 +2410,13 @@ static void gl_perf_present_enter(void) {
     s_pf_last_enter = now;
     s_pf_prims_pending = (double)(s_scene_prims - s_pf_prims_last);   /* prims drawn this frame */
     s_pf_prims_last = s_scene_prims;
+    s_pf_cw_pending[0] = s_cw_flush_ms;  s_pf_cw_pending[1] = s_cw_wide_ms;
+    s_pf_cw_pending[2] = (double)s_cw_batches;
+    s_pf_cw_pending[3] = (double)s_cw_wide_sets;
+    s_pf_cw_pending[4] = (double)s_cw_fbo_creates;
+    s_cw_flush_ms = 0.0; s_cw_wide_ms = 0.0;
+    s_cw_batches = 0; s_cw_wide_sets = 0; s_cw_wide_cfgs = 0;
+    s_cw_wide_clears = 0; s_cw_fbo_creates = 0;
     if (s_pf_scene_active) { p_glEndQuery(GL_TIME_ELAPSED); s_pf_scene_active = 0; } /* end frame b's scene draws */
     p_glBeginQuery(GL_TIME_ELAPSED, s_pf_present_q[s_pf_b]);                         /* time frame b's present */
 }
@@ -2387,6 +2429,7 @@ static void gl_perf_present_exit(int wide) {
     s_pf_buf_total[s_pf_b] = s_pf_total_pending;
     s_pf_buf_pwall[s_pf_b] = (double)(now - s_pf_enter) * 1000.0 / (double)s_pf_freq;
     s_pf_buf_prims[s_pf_b] = s_pf_prims_pending;
+    for (int ci = 0; ci < 5; ci++) s_pf_buf_cw[s_pf_b][ci] = s_pf_cw_pending[ci];
     s_pf_buf_wide[s_pf_b]  = wide;
     s_pf_buf_frame[s_pf_b] = s_pf_count;
     int rd = (s_pf_b + 1) % GLPERF_NBUF;   /* oldest buffer (frame count+1-NBUF), now done */
@@ -2409,6 +2452,11 @@ static void gl_perf_present_exit(int wide) {
         s->mirror_gpu_ms   = mir / 1.0e6;
         s->prims           = s_pf_buf_prims[rd];
         s->mirror_passes   = (double)(s_mq_n[rd] + s_mq_over[rd]);
+        s->cw_flush_ms     = s_pf_buf_cw[rd][0];
+        s->cw_wide_ms      = s_pf_buf_cw[rd][1];
+        s->batches         = s_pf_buf_cw[rd][2];
+        s->wide_sets       = s_pf_buf_cw[rd][3];
+        s->fbo_creates     = s_pf_buf_cw[rd][4];
         s->wide            = s_pf_buf_wide[rd];
         s->frame           = s_pf_buf_frame[rd];
         s_pf_ring_seq++;
@@ -2431,8 +2479,8 @@ uint64_t gl_renderer_perf_prim_split(double *out_tex_frac) {
     return s_scene_prims;
 }
 
-int gl_renderer_perf_aggregate(int wide_filter, double out[13]) {
-    for (int i = 0; i < 13; i++) out[i] = 0.0;
+int gl_renderer_perf_aggregate(int wide_filter, double out[18]) {
+    for (int i = 0; i < 18; i++) out[i] = 0.0;
     if (!s_pf_on) return 0;
     int navail = (int)(s_pf_ring_seq < (uint64_t)GLPERF_RING ? s_pf_ring_seq : GLPERF_RING);
     uint64_t start = s_pf_ring_seq - (uint64_t)navail;
@@ -2449,9 +2497,17 @@ int gl_renderer_perf_aggregate(int wide_filter, double out[13]) {
         out[9] += s->prims;
         out[10] += s->mirror_gpu_ms; if (s->mirror_gpu_ms > out[11]) out[11] = s->mirror_gpu_ms;
         out[12] += s->mirror_passes;
+        out[13] += s->cw_flush_ms;
+        out[14] += s->cw_wide_ms;
+        out[15] += s->batches;
+        out[16] += s->wide_sets;
+        out[17] += s->fbo_creates;
         n++;
     }
-    if (n) { out[1]/=n; out[3]/=n; out[4]/=n; out[5]/=n; out[7]/=n; out[9]/=n; out[10]/=n; out[12]/=n; }
+    if (n) {
+        out[1]/=n; out[3]/=n; out[4]/=n; out[5]/=n; out[7]/=n; out[9]/=n; out[10]/=n; out[12]/=n;
+        out[13]/=n; out[14]/=n; out[15]/=n; out[16]/=n; out[17]/=n;
+    }
     out[0] = (double)n;
     return n;
 }
