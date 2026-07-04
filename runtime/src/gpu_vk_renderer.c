@@ -1275,10 +1275,12 @@ int vk_renderer_init_context(SDL_Window *win) {
     return 1;
 }
 
+static void cpres_cache_free(void);   /* fwd: CPU-present resource cache */
 void vk_renderer_shutdown(void) {
     if (!s_dev) return;
     p_vkDeviceWaitIdle(s_dev);
     vk_gpu_sync_internal();   /* reclaim deferred staging before tearing down */
+    cpres_cache_free();       /* FMV CPU-present cached image + staging */
     for (int i = 0; i < PIPE_CACHE_N; i++)
         if (s_pipe_cache[i]) p_vkDestroyPipeline(s_dev, s_pipe_cache[i], NULL);
     if (s_pipe_pack)   p_vkDestroyPipeline(s_dev, s_pipe_pack, NULL);
@@ -1457,36 +1459,63 @@ void vk_renderer_present_blank(void) {
 /* Present an ARGB8888 image (24-bit FMV / display-disabled clear) letterboxed.
  * The pixels are 0xAARRGGBB; little-endian byte order [B,G,R,A] matches a
  * B8G8R8A8_UNORM staging image, blitted straight to the swapchain. */
+/* CPU-present resource cache (FMV path): the depth24 compose presents a new
+ * frame 15-24x/s for minutes; creating + destroying a VkImage and a staging
+ * buffer per frame is the same driver-allocation churn class the batched
+ * upload fix killed. Cache both keyed by (w,h) — zero allocations at steady
+ * state; the staging stays persistently mapped. Freed on resize + shutdown.
+ * The per-frame vkQueueWaitIdle below also makes reuse race-free (the copy
+ * from the staging has fully completed before the next frame rewrites it). */
+static VkImage        s_cpres_img  = VK_NULL_HANDLE;
+static VkDeviceMemory s_cpres_imem = VK_NULL_HANDLE;
+static VkImageLayout  s_cpres_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+static VkBuffer       s_cpres_buf  = VK_NULL_HANDLE;
+static VkDeviceMemory s_cpres_mem  = VK_NULL_HANDLE;
+static void          *s_cpres_map  = NULL;
+static int            s_cpres_w = 0, s_cpres_h = 0;
+
+static void cpres_cache_free(void) {
+    if (s_cpres_img)  { p_vkDestroyImage(s_dev, s_cpres_img, NULL);  s_cpres_img = VK_NULL_HANDLE; }
+    if (s_cpres_imem) { p_vkFreeMemory(s_dev, s_cpres_imem, NULL);   s_cpres_imem = VK_NULL_HANDLE; }
+    if (s_cpres_buf)  { p_vkDestroyBuffer(s_dev, s_cpres_buf, NULL); s_cpres_buf = VK_NULL_HANDLE; }
+    if (s_cpres_mem)  { p_vkFreeMemory(s_dev, s_cpres_mem, NULL);    s_cpres_mem = VK_NULL_HANDLE; }
+    s_cpres_map = NULL; s_cpres_w = s_cpres_h = 0;
+    s_cpres_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+}
+
 void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
                              int linear, int force_4_3) {
     (void)force_4_3;
     if (!s_ctx_ok || !pixels || src_w <= 0 || src_h <= 0) { vk_renderer_present_blank(); return; }
     flush_tex_batch(); flush_geometry(); gpu_sync();
 
-    VkBuffer buf; VkDeviceMemory mem; void *map;
-    if (!make_staging((VkDeviceSize)src_w * src_h * 4, &buf, &mem, &map)) { vk_renderer_present_blank(); return; }
-    memcpy(map, pixels, (size_t)src_w * src_h * 4);
-    p_vkUnmapMemory(s_dev, mem);
-
-    VkImage img = VK_NULL_HANDLE; VkDeviceMemory imem = VK_NULL_HANDLE;
-    if (!make_image(VK_FORMAT_B8G8R8A8_UNORM, src_w, src_h,
-                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                    VK_IMAGE_ASPECT_COLOR_BIT, &img, &imem, NULL)) {
-        free_staging(buf, mem); vk_renderer_present_blank(); return;
+    if (s_cpres_w != src_w || s_cpres_h != src_h) {
+        p_vkQueueWaitIdle(s_queue);      /* old resources may be in flight */
+        cpres_cache_free();
+        if (!make_staging((VkDeviceSize)src_w * src_h * 4,
+                          &s_cpres_buf, &s_cpres_mem, &s_cpres_map)) {
+            vk_renderer_present_blank(); return;
+        }
+        if (!make_image(VK_FORMAT_B8G8R8A8_UNORM, src_w, src_h,
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                        VK_IMAGE_ASPECT_COLOR_BIT, &s_cpres_img, &s_cpres_imem, NULL)) {
+            cpres_cache_free(); vk_renderer_present_blank(); return;
+        }
+        s_cpres_w = src_w; s_cpres_h = src_h;
+        s_cpres_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     }
+    memcpy(s_cpres_map, pixels, (size_t)src_w * src_h * 4);
+    VkBuffer buf = s_cpres_buf;
+    VkImage img = s_cpres_img;
 
     VkImage sc; VkCommandBuffer cb; uint32_t idx, fr;
-    if (!acquire_present(&sc, &cb, &idx, &fr)) {
-        p_vkDestroyImage(s_dev, img, NULL); p_vkFreeMemory(s_dev, imem, NULL);
-        free_staging(buf, mem); return;
-    }
-    VkImageLayout il = VK_IMAGE_LAYOUT_UNDEFINED;
-    img_to(cb, img, &il, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    if (!acquire_present(&sc, &cb, &idx, &fr)) return;
+    img_to(cb, img, &s_cpres_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     VkBufferImageCopy bc = {0};
     bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; bc.imageSubresource.layerCount = 1;
     bc.imageExtent.width = src_w; bc.imageExtent.height = src_h; bc.imageExtent.depth = 1;
     p_vkCmdCopyBufferToImage(cb, buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bc);
-    img_to(cb, img, &il, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    img_to(cb, img, &s_cpres_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
 
     img_barrier(cb, sc, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 0, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1509,9 +1538,10 @@ void vk_renderer_present_cpu(const uint32_t *pixels, int src_w, int src_h,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     submit_present(cb, idx, fr);
 
-    p_vkQueueWaitIdle(s_queue);   /* transient resources: keep alive until done */
-    p_vkDestroyImage(s_dev, img, NULL); p_vkFreeMemory(s_dev, imem, NULL);
-    free_staging(buf, mem);
+    /* Cached resources are rewritten next frame: wait for this frame's copy +
+     * blit to complete first (FMV cadence is 15-24 fps; one idle-wait per
+     * movie frame is cheap, and it is what makes the persistent staging safe). */
+    p_vkQueueWaitIdle(s_queue);
     perf_snapshot_present();
 }
 
@@ -1567,6 +1597,29 @@ static void set_scissor_px(VkCommandBuffer cb, int x, int y, int w, int h) {
     p_vkCmdSetScissor(cb, 0, 1, &sc);
 }
 static void begin_geo_pass(VkCommandBuffer cb) {
+    /* Explicit stencil ordering across one-shot submits: this pass both TESTS
+     * and WRITES the stencil (PSX mask bits) that a PRIOR submit's pass wrote.
+     * Cross-submit ordering previously rode on the COLOR image barriers'
+     * execution dependencies alone — no memory dependency covered the DS
+     * attachment, which is spec-fragile (worked on this NVIDIA driver, could
+     * produce mask-bit flicker elsewhere). A self-barrier on the stencil
+     * aspect (late-tests write -> early-tests read|write) makes prior stencil
+     * writes visible before this pass's tests, per submission order. */
+    VkImageMemoryBarrier db = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+    db.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    db.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    db.srcQueueFamilyIndex = db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    db.image = s_ds_img;
+    db.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+    db.subresourceRange.levelCount = 1;
+    db.subresourceRange.layerCount = 1;
+    db.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    db.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    p_vkCmdPipelineBarrier(cb,
+        VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+        0, 0, NULL, 0, NULL, 1, &db);
     VkRenderPassBeginInfo rp = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
     rp.renderPass = s_rpass; rp.framebuffer = s_fbo;
     rp.renderArea.extent.width = VRAM_W * s_scale;

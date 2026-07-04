@@ -80,11 +80,19 @@ only a 26-line build-guard needed salvaging from the retired _wt-vulkan worktree
    churn at 0.7 fps — VK pays per-submit where GL pays per-glTexSubImage2D).
    UP_RECTS_MAX=64 on VK so MDEC row-coalesced FMV frames fit in one flush.
    Verified: attract renders correctly at ~51 fps, vk_perf mostly-idle frames.
-2. Verify the depth24 FMV present path on-screen (vs software reference).
-3. Cache the FMV present staging image (currently created/destroyed per frame).
-4. Add an explicit depth-stencil VkImageMemoryBarrier between one-shot submits
-   (stencil write→test ordering currently rides on color-barrier side effects —
-   works on this RTX 3080 Ti, spec-fragile elsewhere).
+2. ~~Verify FMV on-screen~~ DONE 2026-07-03: Whoopee logo + intro CG movie render
+   correctly on VK (window captures). NOTE Tomba2 movies are 15-bit MDEC->VRAM
+   (upload path), NOT depth24 — the depth24 compose path remains no-regression-
+   verified only; validate on a 24-bit title (MMX6 opening) later.
+3. ~~Cache the FMV present staging image~~ DONE 2026-07-03: persistent image +
+   mapped staging keyed by (w,h), freed on resize/shutdown (cpres cache).
+4. ~~DS barrier~~ DONE 2026-07-03: explicit stencil-aspect self-barrier
+   (late-tests write -> early-tests read|write) at every begin_geo_pass;
+   layouts verified against the init transition chain + render pass
+   (attachment-optimal throughout).
+4b. NEW (minor): flush_cpu_upload allocates 2 stagings per flush — ~16/frame
+   during MDEC FMV streaming only (~0 in gameplay). A sync-aware staging ring
+   would zero it; low priority.
 5. Native-wide (16:9) compositor — entirely missing (wide_* vtable NULL; facade
    reports unsupported and falls back correctly). Mirror GL's per-base wide FBO
    + double-draw + GPU-direct present.
