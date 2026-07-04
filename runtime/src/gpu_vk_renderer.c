@@ -357,11 +357,24 @@ static int       s_gpu_dirty;
 /* CPU-side VRAM writes (GP0 A0 transfers, DMA, fills, single pokes) land in
  * the CPU array immediately and accumulate here; ONE batched upload flushes
  * them before the next GPU op that could observe them (mirrors the GL
- * backend's s_up_pending). Eager per-op uploads are the transition-stall:
+ * backend). Eager per-op uploads are the transition-stall:
  * each PIXEL cost 2 vkAllocateMemory + 2 vkQueueSubmit + a 2-draw blit pass,
  * so a single GP0 A0 texture upload wedged the main thread for minutes inside
- * the driver (freeze dump: 8/8 samples in D3DKMTCreateAllocation churn). */
-static DirtyRect s_up_pending;
+ * the driver (freeze dump: 8/8 samples in D3DKMTCreateAllocation churn).
+ *
+ * EXACT rect list, NOT a single union (ported from the GL fix for the MMX6
+ * black-frame flicker, ISSUES #7): a union of DISJOINT uploads covers the
+ * framebuffers in between, and flushing paints that whole box from the CPU
+ * VRAM array — STALE under VK once the hr image is authoritative (ensure_cpu
+ * syncs on demand only) — stomping freshly rendered frames. Only pixels the
+ * CPU actually wrote may ever be uploaded. See up_add()/up_add_transfer(). */
+/* 64 (vs GL's 16): VK pays TWO queue submits per flush (copies + blit pass),
+ * so overflow-triggered flushes must stay rare. MDEC/FMV macroblock streams
+ * coalesce into one rect per block row via the row-band merge, so a whole
+ * streamed frame fits comfortably. */
+#define UP_RECTS_MAX 64
+static DirtyRect s_up_rects[UP_RECTS_MAX];
+static int       s_up_nrects = 0;
 
 static void rect_clear(DirtyRect *r) { r->set = 0; }
 static void rect_add(DirtyRect *r, int x0, int y0, int x1, int y1) {
@@ -373,6 +386,78 @@ static void rect_add(DirtyRect *r, int x0, int y0, int x1, int y1) {
 static int rect_intersects(const DirtyRect *r, int x0, int y0, int x1, int y1) {
     if (!r->set) return 0;
     return !(x1 < r->x0 || x0 > r->x1 || y1 < r->y0 || y0 > r->y1);
+}
+
+/* Add an uploaded rect (see s_up_rects). Merges ONLY when the merge adds no
+ * uncovered pixels: containment either way, or same row-band / column-band
+ * extension. On overflow: flush the pending set (order-preserving) when the
+ * device is up; pre-ready the CPU array is fully authoritative, so a union is
+ * harmless there. Mirrors the GL backend's up_add (20k-randomized-rect
+ * host-test-proven merge rule). */
+static void up_add(int x0, int y0, int x1, int y1) {
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > VRAM_W - 1) x1 = VRAM_W - 1;
+    if (y1 > VRAM_H - 1) y1 = VRAM_H - 1;
+    if (x0 > x1 || y0 > y1) return;
+    for (int i = 0; i < s_up_nrects; i++) {
+        DirtyRect *r = &s_up_rects[i];
+        if (x0 >= r->x0 && x1 <= r->x1 && y0 >= r->y0 && y1 <= r->y1)
+            return;                                   /* contained */
+        if (x0 <= r->x0 && x1 >= r->x1 && y0 <= r->y0 && y1 >= r->y1) {
+            r->x0 = x0; r->y0 = y0; r->x1 = x1; r->y1 = y1;  /* contains */
+            return;
+        }
+        if (y0 == r->y0 && y1 == r->y1 &&
+            x0 <= r->x1 + 1 && x1 >= r->x0 - 1) {     /* same row-band extension */
+            if (x0 < r->x0) r->x0 = x0;
+            if (x1 > r->x1) r->x1 = x1;
+            return;
+        }
+        if (x0 == r->x0 && x1 == r->x1 &&
+            y0 <= r->y1 + 1 && y1 >= r->y0 - 1) {     /* same column-band extension */
+            if (y0 < r->y0) r->y0 = y0;
+            if (y1 > r->y1) r->y1 = y1;
+            return;
+        }
+    }
+    if (s_up_nrects >= UP_RECTS_MAX) {
+        if (s_ready) {
+            flush_cpu_upload();       /* order-preserving: land the old ones */
+        } else {
+            DirtyRect *r = &s_up_rects[0];
+            for (int i = 1; i < s_up_nrects; i++) {
+                if (s_up_rects[i].x0 < r->x0) r->x0 = s_up_rects[i].x0;
+                if (s_up_rects[i].y0 < r->y0) r->y0 = s_up_rects[i].y0;
+                if (s_up_rects[i].x1 > r->x1) r->x1 = s_up_rects[i].x1;
+                if (s_up_rects[i].y1 > r->y1) r->y1 = s_up_rects[i].y1;
+            }
+            if (x0 < r->x0) r->x0 = x0;
+            if (y0 < r->y0) r->y0 = y0;
+            if (x1 > r->x1) r->x1 = x1;
+            if (y1 > r->y1) r->y1 = y1;
+            s_up_nrects = 1;
+            return;
+        }
+    }
+    DirtyRect *r = &s_up_rects[s_up_nrects++];
+    r->x0 = x0; r->y0 = y0; r->x1 = x1; r->y1 = y1; r->set = 1;
+}
+
+/* GP0(A0) transfer: per-pixel wrap means a wrapping transfer touches up to
+ * FOUR exact rects — never all of VRAM (the "wrapped: take all" union was the
+ * same stale-stomp class). Mirrors the GL backend's up_add_transfer. */
+static void up_add_transfer(int x, int y, int w, int h) {
+    x &= VRAM_W - 1; y &= VRAM_H - 1;
+    if (w > VRAM_W) w = VRAM_W;
+    if (h > VRAM_H) h = VRAM_H;
+    if (w <= 0 || h <= 0) return;
+    int w1 = w, w2 = 0, h1 = h, h2 = 0;
+    if (x + w > VRAM_W) { w1 = VRAM_W - x; w2 = w - w1; }
+    if (y + h > VRAM_H) { h1 = VRAM_H - y; h2 = h - h1; }
+    up_add(x, y, x + w1 - 1, y + h1 - 1);
+    if (w2)       up_add(0, y, w2 - 1, y + h1 - 1);
+    if (h2)       up_add(x, 0, x + w1 - 1, h2 - 1);
+    if (w2 && h2) up_add(0, 0, w2 - 1, h2 - 1);
 }
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -1015,7 +1100,7 @@ static int create_render_targets(void) {
     /* CPU VRAM writes made before the context existed (facade routed to us
      * since gr_init, s_ready was 0) accumulated only in the CPU array — seed
      * a full-frame upload so the GPU images start coherent with it. */
-    rect_add(&s_up_pending, 0, 0, VRAM_W - 1, VRAM_H - 1);
+    up_add(0, 0, VRAM_W - 1, VRAM_H - 1);
     flush_cpu_upload();
     return 1;
 }
@@ -1659,27 +1744,127 @@ static void vram_upload_block(int x, int y, int w, int h, const uint16_t *data) 
 }
 
 /* CPU -> GPU: flush accumulated CPU-side VRAM writes as ONE upload (see
- * s_up_pending). vram_upload_block drains the draw batches first, so PS1
+ * s_up_rects). vram_upload_block drains the draw batches first, so PS1
  * submission order is preserved: every draw appended before these writes has
  * landed by the time the upload writes VRAM, and every GPU-op entry point
  * calls this before touching VRAM so the writes land before later ops. */
 static void flush_cpu_upload(void) {
-    if (!s_up_pending.set || !s_ready || !s_vram) return;
-    int x = s_up_pending.x0, y = s_up_pending.y0;
-    int w = s_up_pending.x1 - s_up_pending.x0 + 1;
-    int h = s_up_pending.y1 - s_up_pending.y0 + 1;
-    rect_clear(&s_up_pending);
-    if (w == VRAM_W) {                    /* full-width rect: rows contiguous */
-        vram_upload_block(x, y, w, h, s_vram + (size_t)y * VRAM_W);
-    } else {
-        uint16_t *tmp = (uint16_t*)malloc((size_t)w * h * 2);
-        if (!tmp) return;
-        for (int row = 0; row < h; row++)
-            memcpy(tmp + (size_t)row * w,
-                   s_vram + (size_t)(y + row) * VRAM_W + x, (size_t)w * 2);
-        vram_upload_block(x, y, w, h, tmp);
-        free(tmp);
+    if (s_up_nrects == 0 || !s_ready || !s_vram) return;
+    /* Snapshot + clear first (re-entrancy safe: up_add overflow calls back). */
+    DirtyRect rects[UP_RECTS_MAX];
+    int nrects = s_up_nrects;
+    memcpy(rects, s_up_rects, (size_t)nrects * sizeof(DirtyRect));
+    s_up_nrects = 0;
+
+    flush_tex_batch(); flush_geometry();   /* PS1 order: queued draws land first */
+    s_perf_cur.upload_blocks++;
+
+    /* COALESCED upload: exactly TWO queue submits per flush regardless of rect
+     * count (one for the buffer->image copies, one render pass for the hr
+     * blits). The naive per-rect vram_upload_block/blit_region loop paid
+     * 2 staging allocs + 3 submits PER RECT — with the exact-rect list feeding
+     * MDEC macroblock streams that re-created the boot-wedge submit churn the
+     * batched-upload fix existed to kill (measured 0.7 fps at the Tomba2
+     * Whoopee logo). Rect data is packed back-to-back in ONE 1555 staging +
+     * ONE RGBA8 staging, addressed via VkBufferImageCopy bufferOffset. */
+    size_t total = 0;
+    for (int i = 0; i < nrects; i++)
+        total += (size_t)(rects[i].x1 - rects[i].x0 + 1) *
+                 (size_t)(rects[i].y1 - rects[i].y0 + 1);
+    if (total == 0) return;
+
+    VkBuffer rbuf; VkDeviceMemory rmem; void *rmap;
+    if (!make_staging((VkDeviceSize)total * 2, &rbuf, &rmem, &rmap)) return;
+    VkBuffer ubuf; VkDeviceMemory umem; void *umap;
+    if (!make_staging((VkDeviceSize)total * 4, &ubuf, &umem, &umap)) {
+        p_vkUnmapMemory(s_dev, rmem);
+        defer_staging(rbuf, rmem);
+        return;
     }
+
+    VkBufferImageCopy rcopies[UP_RECTS_MAX], ucopies[UP_RECTS_MAX];
+    memset(rcopies, 0, sizeof rcopies); memset(ucopies, 0, sizeof ucopies);
+    size_t texoff = 0;
+    uint16_t *rdst = (uint16_t *)rmap;
+    uint8_t  *udst = (uint8_t *)umap;
+    for (int i = 0; i < nrects; i++) {
+        int x = rects[i].x0, y = rects[i].y0;
+        int w = rects[i].x1 - rects[i].x0 + 1;
+        int h = rects[i].y1 - rects[i].y0 + 1;
+        for (int row = 0; row < h; row++) {
+            const uint16_t *src = s_vram + (size_t)(y + row) * VRAM_W + x;
+            memcpy(rdst + texoff + (size_t)row * w, src, (size_t)w * 2);
+            uint8_t *m = udst + (texoff + (size_t)row * w) * 4;
+            for (int col = 0; col < w; col++)
+                rgb555_to_rgba8(src[col], m + (size_t)col * 4);
+        }
+        rcopies[i].bufferOffset = (VkDeviceSize)texoff * 2;
+        rcopies[i].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        rcopies[i].imageSubresource.layerCount = 1;
+        rcopies[i].imageOffset.x = x; rcopies[i].imageOffset.y = y;
+        rcopies[i].imageExtent.width = w; rcopies[i].imageExtent.height = h;
+        rcopies[i].imageExtent.depth = 1;
+        ucopies[i] = rcopies[i];
+        ucopies[i].bufferOffset = (VkDeviceSize)texoff * 4;
+        texoff += (size_t)w * h;
+    }
+    p_vkUnmapMemory(s_dev, rmem);
+    p_vkUnmapMemory(s_dev, umem);
+
+    /* Submit 1: both image copy sets. */
+    VkCommandBuffer cb = begin_oneshot();
+    img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    p_vkCmdCopyBufferToImage(cb, rbuf, s_raw_img,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             (uint32_t)nrects, rcopies);
+    img_to(cb, s_raw_img, &s_raw_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    img_to(cb, s_up_img, &s_up_layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    p_vkCmdCopyBufferToImage(cb, ubuf, s_up_img,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             (uint32_t)nrects, ucopies);
+    end_oneshot(cb);
+    defer_staging(rbuf, rmem);
+    defer_staging(ubuf, umem);
+
+    /* Submit 2: one render pass, N scissored 2-draw blits upload-image -> hr
+     * (plain blit semantics, matching vram_upload_block's blit_region call:
+     * mask writes off, no pack mark — uploaded content IS the CPU data). */
+    if (s_ds_blit_idx >= BLIT_DESC_RING) gpu_sync();
+    VkDescriptorSet ds = s_ds_blit_ring[s_ds_blit_idx++];
+    VkDescriptorImageInfo ii = { s_samp, s_up_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+    VkWriteDescriptorSet wr = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+    wr.dstSet = ds; wr.dstBinding = 0; wr.descriptorCount = 1;
+    wr.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; wr.pImageInfo = &ii;
+    p_vkUpdateDescriptorSets(s_dev, 1, &wr, 0, NULL);
+    cb = begin_oneshot();
+    img_to(cb, s_up_img, &s_up_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    vram_to(cb, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    begin_geo_pass(cb);
+    set_vp_full(cb);
+    p_vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, s_pl_blit, 0, 1, &ds, 0, NULL);
+    for (int i = 0; i < nrects; i++) {
+        int x = rects[i].x0, y = rects[i].y0;
+        int w = rects[i].x1 - rects[i].x0 + 1;
+        int h = rects[i].y1 - rects[i].y0 + 1;
+        set_scissor_px(cb, x, y, w, h);
+        s_perf_cur.blits++;
+        BlitPush bp = {0};
+        bp.shift = px_shift(); bp.maskset = 0; bp.src_div = s_scale;
+        bp.src_off[0] = 0; bp.src_off[1] = 0;
+        bp.rect[0] = x; bp.rect[1] = y; bp.rect[2] = x + w; bp.rect[3] = y + h;
+        bind_masked(cb, 2, 0, 0, 0, 0);
+        bp.stp_pass = 1;
+        p_vkCmdPushConstants(cb, s_pl_blit, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof bp, &bp);
+        p_vkCmdDraw(cb, 6, 1, 0, 0);
+        bind_masked(cb, 2, 0, 0, 0, 1);
+        bp.stp_pass = 2;
+        p_vkCmdPushConstants(cb, s_pl_blit, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof bp, &bp);
+        p_vkCmdDraw(cb, 6, 1, 0, 0);
+    }
+    p_vkCmdEndRenderPass(cb);
+    vram_to(cb, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    end_oneshot(cb);
+    s_gpu_dirty = 1;
 }
 
 /* GPU -> CPU mirror: drain batches, pack, copy the whole raw mirror down. */
@@ -1738,7 +1923,7 @@ static void vkb_set_draw_offset(int x, int y) { s_off_x = x; s_off_y = y; }
 
 /* GP0 02h fill: set a VRAM rect to a solid 1555 colour. The write lands in
  * the CPU array immediately (like every CPU-side VRAM write) and rides the
- * batched s_up_pending upload — the old per-fill staging upload was part of
+ * batched s_up_rects upload — the old per-fill staging upload was part of
  * the per-op alloc/submit churn. */
 static void vkb_fill_rect(int x, int y, int w, int h, uint16_t color) {
     sw_fill_rect(x, y, w, h, color);
@@ -1746,16 +1931,13 @@ static void vkb_fill_rect(int x, int y, int w, int h, uint16_t color) {
     if (x < 0) { w += x; x = 0; } if (y < 0) { h += y; y = 0; }
     if (x + w > VRAM_W) w = VRAM_W - x; if (y + h > VRAM_H) h = VRAM_H - y;
     if (w <= 0 || h <= 0) return;
-    rect_add(&s_up_pending, x, y, x + w - 1, y + h - 1);
+    up_add(x, y, x + w - 1, y + h - 1);
 }
 
 static void vkb_vram_transfer_in(int x, int y, int w, int h, const uint16_t *data) {
     sw_vram_transfer_in(x, y, w, h, data);
     if (!s_ctx_ok) return;
-    if (x + w > VRAM_W || y + h > VRAM_H)
-        rect_add(&s_up_pending, 0, 0, VRAM_W - 1, VRAM_H - 1);  /* wrapped: take all */
-    else
-        rect_add(&s_up_pending, x, y, x + w - 1, y + h - 1);
+    up_add_transfer(x, y, w, h);   /* exact touched rects, incl. per-pixel wrap */
 }
 static void vkb_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
     ensure_cpu();   /* sync GPU-rendered content down to the CPU mirror first */
@@ -1766,8 +1948,8 @@ static void vkb_vram_transfer_out(int x, int y, int w, int h, uint16_t *data) {
 static void vkb_vram_write(int x, int y, uint16_t pixel) {
     sw_vram_write(x, y, pixel);
     if (!s_ctx_ok) return;
-    rect_add(&s_up_pending, x & (VRAM_W - 1), y & (VRAM_H - 1),
-                            x & (VRAM_W - 1), y & (VRAM_H - 1));
+    up_add(x & (VRAM_W - 1), y & (VRAM_H - 1),
+           x & (VRAM_W - 1), y & (VRAM_H - 1));
 }
 static uint16_t vkb_vram_read(int x, int y) {
     ensure_cpu();   /* gated by s_gpu_dirty; cheap when nothing was drawn */

@@ -74,8 +74,12 @@ only a 26-line build-guard needed salvaging from the retired _wt-vulkan worktree
   was provably black) but NOT yet verified on-screen.
 
 **Gap catalog (ranked, low→high effort):**
-1. Port the exact-rect pending-upload fix from GL (R1) — VK currently has the
-   union model and will inherit the same intermittent stomp/flicker class.
+1. ~~Port the exact-rect pending-upload fix from GL~~ DONE 2026-07-03: exact-rect
+   list ported + VK-specific COALESCED flush (one staging pair + two submits per
+   flush regardless of rect count; the naive per-rect port re-created the submit
+   churn at 0.7 fps — VK pays per-submit where GL pays per-glTexSubImage2D).
+   UP_RECTS_MAX=64 on VK so MDEC row-coalesced FMV frames fit in one flush.
+   Verified: attract renders correctly at ~51 fps, vk_perf mostly-idle frames.
 2. Verify the depth24 FMV present path on-screen (vs software reference).
 3. Cache the FMV present staging image (currently created/destroyed per frame).
 4. Add an explicit depth-stencil VkImageMemoryBarrier between one-shot submits
