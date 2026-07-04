@@ -2146,6 +2146,7 @@ typedef struct {
     uint32_t s2_val;       /* CPU $s2 = TRUE source pixel ptr (`move s2,a1` at entry) */
     uint32_t a0_val;       /* CPU $a0 at capture (RECT arg; may be clobbered) */
     uint32_t a1_val;       /* CPU $a1 at capture (source arg; may be clobbered) */
+    uint32_t frame_stamp;  /* s_frame_count at the upload — for load-vs-upload ordering */
     uint32_t stack[10];    /* first 10 words from sp (sp+32=saved $s1, sp+36=saved $ra) */
 } A0HistEntry;
 static A0HistEntry a0_history[A0_HISTORY_CAP];
@@ -2175,12 +2176,13 @@ int gpu_get_a0_extra(int index, uint32_t *func, uint32_t *sp, uint32_t *ra,
     memcpy(stack10, a0_history[index].stack, 10 * sizeof(uint32_t));
     return 1;
 }
-/* True source pointer + arg regs for the LoadImage upload (s2 = pixel source). */
-int gpu_get_a0_src(int index, uint32_t *s2, uint32_t *a0, uint32_t *a1) {
+/* True source pointer + arg regs + frame for the LoadImage upload (s2 = source). */
+int gpu_get_a0_src(int index, uint32_t *s2, uint32_t *a0, uint32_t *a1, uint32_t *frame) {
     if (index < 0 || index >= a0_history_count) return 0;
     *s2 = a0_history[index].s2_val;
     *a0 = a0_history[index].a0_val;
     *a1 = a0_history[index].a1_val;
+    *frame = a0_history[index].frame_stamp;
     return 1;
 }
 
@@ -2217,6 +2219,7 @@ static void gp0_exec_cpu_to_vram(void) {
         a0_history[slot].s2_val = 0;
         a0_history[slot].a0_val = 0;
         a0_history[slot].a1_val = 0;
+        a0_history[slot].frame_stamp = (uint32_t)s_frame_count;
         memset(a0_history[slot].stack, 0, sizeof(a0_history[slot].stack));
         if (debug_cpu_ptr) {
             uint32_t sp = debug_cpu_ptr->gpr[29];
