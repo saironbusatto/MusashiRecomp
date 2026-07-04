@@ -51,6 +51,60 @@ game repos' ISSUES.md until a framework tracker exists.
 2. Flip MMX6's shipping default software→opengl + close ISSUES.md #7.
 3. The same union-upload bug exists in the Vulkan backend (see R2 item 1).
 
+## R1b — Native-wide (16:9) GL: perf collapse ROOT-CAUSED + FIXED, band flicker FIXED
+
+**Status 2026-07-03** (branch `feat/renderer-finish`, commits f5362f4..8b819eb):
+
+- **The 16:9 perf collapse (Tomba2 3D attract 60→12fps, MMX6 2D attract dips)
+  was never a GPU problem.** Stack-sampled (devkitPro gdb) in the wedge: the
+  main thread lived in `ws_backdrop_site_kind` ← `exec_one` — under native-wide
+  the dirty-RAM interpreter classified EVERY executed instruction as a possible
+  backdrop rewrite site; the classifier rescans ±512 bytes on cache miss and its
+  256-slot direct-mapped cache (2 hot PCs 1 KB apart collide) thrashed on
+  overlay working sets. Squash mode gates the whole path off — that is why
+  `ws_nw on=0` restored 60fps while every GPU theory (mirror FBO ping-pong,
+  extra prims, present path) failed. The earlier "60ms scene GPU / 70us per
+  prim" numbers were CPU-starvation-inflated GPU-timestamp gaps (the GPU idles
+  between CPU-paced submissions inside the bracket) — treat GL timer numbers
+  on a CPU-bound frame as suspect.
+- **Fixes** (dbe7812 + 8b819eb): opcode pre-filter (only addu/or/addi/addiu can
+  be rewrite sites) + 8192-slot full-PC-tagged caches + `g_dirty_ram_code_gen`
+  invalidation (memory.c) + a per-entry SITE-WORD tag (revalidates the cached
+  verdict against the live instruction word — plain-CPU-store overlay reloads
+  never hit the page-marking hooks, and a stale verdict fires a GPR rewrite at
+  the wrong instruction = guest corruption).
+- **Numbers**: Tomba2 GL 16:9 attract (heavy scene, ~640-1100 prims) 72-95ms/frame
+  → **17-21ms (p50 17.1ms, ~52-58fps)**; MMX6 GL 16:9 attract locked 16.7ms
+  through demo stages (worst 10s window avg 25ms at stage-load transitions).
+- **Top/bottom band flicker (MMX6 16:9, user-visible) FIXED** (a0b5843): the GL
+  mirror pass scissored the FULL wide surface; the SW reference (`rt_wide`)
+  only widens X and keeps the draw-area Y clip. Under MMX6's vertical double
+  buffer (draw area alternates y=0/y=240, both bands in ONE wide surface)
+  mirror draws bled across the band boundary and presented a frame late as
+  edge flicker. Scissor is now full-width X / draw-area Y. Validated with
+  0.15s-interval capture bursts: top/bottom 16-row inter-frame instability is
+  0.26x/0.21x the scrolling middle band (edges quieter than content).
+- **Wide surfaces now carry a DEPTH24_STENCIL8 attachment** (cfa79bb): the
+  stencil-less wide FBO was a spec-gray target for the stencil-enabled mask
+  fixup passes AND left the PSX mask-bit mirror silently no-op on the wide
+  surface. (Its per-pass GPU "cost" measurements that motivated it were later
+  shown starvation-inflated; the attachment stays for mask correctness.)
+- **New permanent instrumentation**: frame_perf mirror split (GL_TIMESTAMP
+  pairs per wide pass: mirror_gpu_ms / canon_gpu_ms / mirror_pass_us), CPU-side
+  attribution (cpu_flush_ms, cpu_wide_ms, batches, wide target sets, wide FBO
+  creations per frame), and `gl_ws_ablate mode=0..3` (skip mirror / state-only /
+  no-FBO-rebind ablations) — the toolchain that exonerated the GPU and named
+  the CPU producer.
+- **OPEN (out of renderer scope, KNOWN before 16:9 ships on MMX6):** MMX6
+  attract at 16:9 native-wide hit fatal guest wedges twice (~4 min in, wild
+  dispatch 0x21010001 / 0x0C008096 = misaligned jump targets), and once at
+  BOOT in squash mode (unknown dispatch 0x80095098 — the pre-existing MMX6
+  dispatch-miss/flaky-boot class; all ws paths dormant at boot). The stale-
+  cache vector is closed (word tag); remaining suspects are the MMX6-specific
+  GUEST-side widescreen hacks (bg2d guest-widen buffer pressure, cull-widen
+  false positives) or plain MMX6 flakiness — needs its own investigation with
+  the freeze rings. Tomba2 16:9 soaked clean.
+
 ## R2 — Vulkan renderer (3rd backend): RENDERS GAMEPLAY AT SPEED, gaps cataloged
 
 **Status as of 2026-07-03** (same branch/tree; `-DPSX_ENABLE_VULKAN=ON`, SDK
@@ -93,9 +147,26 @@ only a 26-line build-guard needed salvaging from the retired _wt-vulkan worktree
 4b. NEW (minor): flush_cpu_upload allocates 2 stagings per flush — ~16/frame
    during MDEC FMV streaming only (~0 in gameplay). A sync-aware staging ring
    would zero it; low priority.
-5. Native-wide (16:9) compositor — entirely missing (wide_* vtable NULL; facade
-   reports unsupported and falls back correctly). Mirror GL's per-base wide FBO
-   + double-draw + GPU-direct present.
+5. ~~Native-wide (16:9) compositor~~ DONE 2026-07-03 (0b23ea3): per-base_x wide
+   surfaces (RGBA8 color + OWN stencil image + framebuffer on the SHARED render
+   pass — every pipeline works unchanged, and the mask-bit stencil mirror is
+   real on the wide surface from day one). The mirror is a second render pass
+   appended to the SAME one-shot CB as each flushed batch (no extra submits);
+   u_xoff/u_xhalf push constants (pre-plumbed in the shaders) carry the
+   translation/wider clip. Mirror scissor = full-width X / DRAW-AREA Y (the GL
+   band-bleed lesson applied from day one). wide_clear via ClearAttachments
+   (color + stencil=bit15); full-screen overlay rects suppress the batch mirror
+   and draw one full-wide-width rect (margins dim/fade). GPU-direct present
+   blits the displayed band letterboxed at (4*wide_w : 3*native_w);
+   vkb_render_wide_display readback backs the facade + debug dump. vk_perf
+   gains wide/wclr counters. VALIDATED (Tomba2 build-vk, PSX_WS_FORCE_2D=1 —
+   master Tomba2 has no sprite-tag hooks): 16:9 attract presents full-width
+   (mine-cart demo captures), locks 60fps on normal scenes (frame_period p50
+   16.68ms), ~51-57fps on the heavy semi-prim scene (29 wide passes/frame);
+   4:3 unregressed (p50 18.1ms on the 452-flush semi-isolation scene — the
+   pre-existing item-7 profile, wide counters 0). Margins show 4:3-culled
+   geometry only — full margin content needs the cull-widened overlay cache
+   (cg4_0cec55ab.ws-experiment, not installed on master).
 6. SSAA scale >1 unvalidated on VK.
 7. Semi-prim isolation perf (one draw per semi triangle; same cost as GL today).
 
