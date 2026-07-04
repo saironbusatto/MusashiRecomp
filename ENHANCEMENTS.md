@@ -95,15 +95,19 @@ game repos' ISSUES.md until a framework tracker exists.
   creations per frame), and `gl_ws_ablate mode=0..3` (skip mirror / state-only /
   no-FBO-rebind ablations) — the toolchain that exonerated the GPU and named
   the CPU producer.
-- **OPEN (out of renderer scope, KNOWN before 16:9 ships on MMX6):** MMX6
-  attract at 16:9 native-wide hit fatal guest wedges twice (~4 min in, wild
-  dispatch 0x21010001 / 0x0C008096 = misaligned jump targets), and once at
-  BOOT in squash mode (unknown dispatch 0x80095098 — the pre-existing MMX6
-  dispatch-miss/flaky-boot class; all ws paths dormant at boot). The stale-
-  cache vector is closed (word tag); remaining suspects are the MMX6-specific
-  GUEST-side widescreen hacks (bg2d guest-widen buffer pressure, cull-widen
-  false positives) or plain MMX6 flakiness — needs its own investigation with
-  the freeze rings. Tomba2 16:9 soaked clean.
+- **MMX6 wedge incident (RESOLVED to one mechanism, poisoned overlay shards):**
+  during the session MMX6 hit fatal wedges — twice in the 16:9 attract (wild
+  dispatch 0x21010001 / 0x0C008096) and then DETERMINISTICALLY at boot frame
+  2518 (unknown dispatch 0x80095098) at BOTH aspects. Timeline nailed it: the
+  overlay self-heal wrote a fresh 001EA000 shard batch at 20:53, exactly when
+  attract wedge #1 hit (shards hot-loaded mid-run); every boot after loads
+  them and wedges at 2518; quarantining the batch
+  (cache/.../cg4_0cec55ab.quarantine) restored clean boots + attract. Most
+  plausible poison source: the INTERIM stale-verdict build (dbe7812 before the
+  8b819eb word tag) corrupted guest RAM at 16:9, and autocapture snapshotted
+  the corrupted overlay bytes into the captures the shards were compiled from.
+  Self-heal recaptures with the hardened build. NOT a ws-stack or renderer
+  defect. Tomba2 16:9 soaked clean throughout.
 
 ## R2 — Vulkan renderer (3rd backend): RENDERS GAMEPLAY AT SPEED, gaps cataloged
 
