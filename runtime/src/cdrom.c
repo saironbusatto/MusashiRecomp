@@ -892,6 +892,9 @@ static int data_fifo_ready(void) {
            sector_read_pos < sector_size;
 }
 
+static uint64_t s_dataready_fires;  /* INT1 (data-ready) raised per streamed sector — FMV dispatch probe */
+uint64_t cdrom_get_dataready_fires(void) { return s_dataready_fires; }
+
 static int deliver_read_sector(void) {
     int delivered = read_sector_at(read_min, read_sec, read_sect);
     advance_msf(&read_min, &read_sec, &read_sect);
@@ -900,6 +903,7 @@ static int deliver_read_sector(void) {
     response_push(stat_reg);
     set_irq(CDIRQ_DATA_READY);
     fire_cdrom_irq();
+    s_dataready_fires++;
     return 1;
 }
 

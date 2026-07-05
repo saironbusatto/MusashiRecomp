@@ -9172,6 +9172,8 @@ static void handle_fmv_state(int id, const char *json)
     extern uint32_t mdec_get_decode_count(void);
     extern int cdrom_xa_stream_active(void);
     extern uint16_t sio_get_pad_buttons(void);
+    extern uint64_t cdrom_get_dataready_fires(void);
+    extern uint64_t g_cdrom_deliver_count;
     int auto_skip = -1; uint32_t total_table = 0, movie_id = 0; const char *cfg = "(null)";
     debug_get_fmv_config(&auto_skip, &total_table, &movie_id, &cfg);
     MDECDebugState s; mdec_debug_get_state(&s);
@@ -9181,11 +9183,14 @@ static void handle_fmv_state(int id, const char *json)
              "\"fmv_skip_total_table\":\"0x%08X\",\"fmv_skip_movie_id\":\"0x%08X\","
              "\"mdec_decode_count\":%u,\"mdec_decode_macroblocks\":%u,\"mdec_dma_out_words\":%u,"
              "\"xa_stream_active\":%d,"
+             "\"cd_dataready_fires\":%llu,\"cd_irq_delivered\":%llu,"
              "\"pad1\":\"0x%04X\"}",
              id, cfg ? cfg : "(null)", auto_skip,
              total_table, movie_id,
              mdec_get_decode_count(), s.decode_macroblocks, s.dma_out_words,
              cdrom_xa_stream_active(),
+             (unsigned long long)cdrom_get_dataready_fires(),
+             (unsigned long long)g_cdrom_deliver_count,
              (unsigned)(sio_get_pad_buttons() & 0xFFFFu));
 }
 

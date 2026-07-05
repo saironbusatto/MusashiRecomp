@@ -375,6 +375,7 @@ uint64_t g_nestgate_depth, g_nestgate_rfepend, g_nestgate_escreason, g_nestgate_
 uint64_t g_vblank_raise_count   = 0;  /* bit0 set at the cycle-paced raise site */
 uint64_t g_vblank_deliver_count = 0;  /* VBLANK delivered to the guest (exception taken) */
 uint64_t g_irq_deliver_count    = 0;  /* ANY hardware interrupt delivered */
+uint64_t g_cdrom_deliver_count  = 0;  /* CD IRQ (IRQ_CDROM) delivered to the guest — FMV dispatch probe */
 extern uint64_t g_vblank_ack_count;   /* defined in memory.c */
 
 /* Blocks of guaranteed main-code forward progress imposed after a CLAIMED
@@ -766,6 +767,7 @@ void psx_check_interrupts(CPUState* cpu) {
     }
     g_irq_deliver_count++;
     if ((i_stat & i_mask) & (1u << IRQ_VBLANK)) g_vblank_deliver_count++;
+    if ((i_stat & i_mask) & (1u << IRQ_CDROM))  g_cdrom_deliver_count++;
     /* IRQ-delivery context ring (MMX6 VSync-vs-CD-DMA hunt). Capture, at every IRQ
      * delivery, whether the kernel VSync callback-block word at 0x80079D44 is the
      * clobbered game value AND whether a CD DMA (ch3) is mid-transfer / a DMA is
