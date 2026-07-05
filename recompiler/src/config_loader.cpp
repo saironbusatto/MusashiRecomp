@@ -80,8 +80,16 @@ static bool parse_aspect_ratio(const std::string& s, int* num, int* den) {
 // to `root` (project root).
 static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path& root) {
     RuntimeConfig rt;
+    // [localization] language = "en"  (top-level; independent of [runtime]).
+    if (cfg.contains("localization")) {
+        const toml::value& loc = toml::find(cfg, "localization");
+        if (loc.contains("language"))
+            rt.language = toml::find<std::string>(loc, "language");
+    }
     if (!cfg.contains("runtime")) return rt;
     const toml::value& runtime = toml::find(cfg, "runtime");
+    if (runtime.contains("language"))  // [runtime].language convenience alias
+        rt.language = toml::find<std::string>(runtime, "language");
 
     if (runtime.contains("debug_port")) {
         const auto port = toml::find<int64_t>(runtime, "debug_port");
