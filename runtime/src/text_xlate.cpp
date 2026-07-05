@@ -198,6 +198,35 @@ void sj_transcode(const std::string& utf8, std::vector<uint8_t>& out) {
     }
 }
 
+// Transcode a UTF-8 label into fixed-width little-endian fullwidth-Shift-JIS for
+// an in-place RAM source patch. Each ASCII char maps to its fullwidth glyph
+// (2 bytes, stored low/high as the game's per-glyph drawer reads it), truncated
+// to whole cells so at most `width` bytes are produced, then padded with the
+// fullwidth space (0x8140 -> bytes 40 81) to exactly `width` bytes. NEVER emits
+// more than `width` bytes — the hard guarantee against corrupting the next slot.
+void label_transcode_le(const std::string& utf8, uint32_t width, std::vector<uint8_t>& out) {
+    out.clear();
+    const uint32_t maxbytes = width & ~1u;   // whole 2-byte cells only
+    size_t i = 0;
+    while (i < utf8.size() && out.size() + 2 <= maxbytes) {
+        uint8_t c = (uint8_t)utf8[i];
+        uint32_t cp; size_t adv;
+        if (c < 0x80) { cp = c; adv = 1; }
+        else if ((c & 0xE0) == 0xC0 && i + 1 < utf8.size()) {
+            cp = ((c & 0x1F) << 6) | (utf8[i+1] & 0x3F); adv = 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < utf8.size()) {
+            cp = ((c & 0x0F) << 12) | ((utf8[i+1] & 0x3F) << 6) | (utf8[i+2] & 0x3F); adv = 3;
+        } else { cp = ' '; adv = 1; }
+        i += adv;
+        if (cp >= 0xFF01 && cp <= 0xFF5E) cp = cp - 0xFF00 + 0x20;   // fullwidth Latin -> ASCII
+        if (cp == 0x3000) cp = ' ';                                  // ideographic space
+        uint16_t g = fw_sjis_for_ascii(cp <= 0x7E ? cp : ' ');
+        out.push_back((uint8_t)(g & 0xFF));   // trail (low)  — little-endian storage
+        out.push_back((uint8_t)(g >> 8));     // lead  (high)
+    }
+    while (out.size() + 2 <= maxbytes) { out.push_back(0x40); out.push_back(0x81); }  // fw-space pad
+}
+
 // Capture-inventory quality gate (authoring signal only — APPLY is KV-gated and
 // unaffected). Real Tsumu text is hiragana/katakana/fullwidth-alnum heavy, whose
 // SJIS lead bytes concentrate in the 0x82/0x83 rows; vertex/coordinate binary
@@ -257,10 +286,31 @@ struct CapRec {
     bool     translated;
 };
 
+// A per-glyph label source-patch entry. Some UI text (level/stage names) is
+// drawn glyph-by-glyph as sprites from a fixed-stride, space-padded table in the
+// EXE — there is NO string pointer and NO terminator, so the dispatch/arg-scan
+// message hook above can never see it. Instead we patch the label's bytes in
+// guest RAM once the EXE region is resident: overwrite the confirmed slot with
+// the target-language text (fullwidth-Latin Shift-JIS, little-endian) re-padded
+// to the exact slot width, and the game's OWN per-glyph routine then draws
+// English. Verify-before-patch (RAM must equal `src` first) guarantees we never
+// write unless the exact expected JP label is present, and writing exactly
+// `width` bytes (== the table stride) guarantees we never spill into the next
+// slot. See docs/STRING_TRANSLATION.md Appendix Y.
+struct GlyphLabel {
+    uint32_t             addr = 0;      // slot base VA
+    uint32_t             width = 0;     // slot stride in bytes (never exceeded)
+    std::vector<uint8_t> src;           // expected JP source bytes (verify key)
+    std::string          target;        // active-language UTF-8 (empty => skip)
+    bool                 patched = false;
+};
+
 const EncodingProfile* g_prof = &kShiftJisProfile;
 
 std::unordered_map<uint64_t, TableEntry> g_table;      // hash -> translation
 std::unordered_map<uint64_t, CapRec>     g_inv;        // hash -> capture record
+std::vector<GlyphLabel>                  g_glyph_labels;// per-glyph RAM patches
+std::atomic<int>                         g_glyph_pending{0}; // unpatched count (0 => idle)
 std::mutex g_mtx;
 
 std::atomic<bool>     g_apply_armed{false};   // table non-empty AND language enabled
@@ -306,10 +356,12 @@ std::vector<uint8_t> hex_to_bytes(const std::string& hex) {
 
 void load_tables_locked() {
     g_table.clear();
+    g_glyph_labels.clear();
+    g_glyph_pending.store(0, std::memory_order_relaxed);
     for (auto& kv : g_inv) kv.second.translated = false;
     if (g_dir.empty() || !fs::exists(g_dir)) { g_apply_armed.store(false); return; }
     const bool lang_off = g_lang.empty() || g_lang == "jp" || g_lang == "off";
-    size_t files = 0, entries = 0;
+    size_t files = 0, entries = 0, glyphs = 0;
     std::error_code ec;
     for (auto& de : fs::directory_iterator(g_dir, ec)) {
         if (!de.is_regular_file()) continue;
@@ -337,14 +389,39 @@ void load_tables_locked() {
             g_table[key] = TableEntry{ std::move(tgt), term };
             ++entries;
         }
+        // Per-glyph label source-patch entries (RAM-patch layer). Only load when
+        // a target for the active language exists; otherwise the slot stays JP.
+        if (!lang_off && data.contains("glyph_label")) {
+            const auto& garr = toml::find(data, "glyph_label");
+            if (garr.is_array()) for (const auto& g : garr.as_array()) {
+                if (!g.contains("addr") || !g.contains("src_hex")) continue;
+                std::string ghex = toml::find_or<std::string>(g, "src_hex", "");
+                auto gbytes = hex_to_bytes(ghex);
+                if (gbytes.empty()) continue;
+                std::string tgt;
+                if (g.contains(g_lang)) tgt = toml::find_or<std::string>(g, g_lang, "");
+                else if (g.contains("en")) tgt = toml::find_or<std::string>(g, "en", "");
+                if (tgt.empty()) continue;   // no translation for this lang => slot stays JP
+                GlyphLabel gl;
+                gl.addr   = (uint32_t)toml::find_or<int64_t>(g, "addr", 0);
+                gl.width  = (uint32_t)toml::find_or<int64_t>(g, "width", (int64_t)gbytes.size());
+                if (gl.addr == 0 || gl.width == 0 || gbytes.size() > gl.width) continue;
+                gl.src    = std::move(gbytes);
+                gl.target = std::move(tgt);
+                g_glyph_labels.push_back(std::move(gl));
+                ++glyphs;
+            }
+        }
     }
-    g_apply_armed.store(!lang_off && !g_table.empty(), std::memory_order_relaxed);
+    g_glyph_pending.store((int)g_glyph_labels.size(), std::memory_order_relaxed);
+    g_apply_armed.store(!lang_off && (!g_table.empty() || !g_glyph_labels.empty()),
+                        std::memory_order_relaxed);
     // Mark inventory records that now have a translation.
     for (auto& kv : g_inv)
         kv.second.translated = (g_table.find(kv.first) != g_table.end());
     std::fprintf(stderr,
-        "[xlate] loaded %zu entries from %zu file(s) in %s (lang=%s apply=%s)\n",
-        entries, files, g_dir.c_str(), g_lang.c_str(),
+        "[xlate] loaded %zu entries + %zu glyph-labels from %zu file(s) in %s (lang=%s apply=%s)\n",
+        entries, glyphs, files, g_dir.c_str(), g_lang.c_str(),
         g_apply_armed.load() ? "on" : "off");
 }
 
@@ -365,6 +442,33 @@ void inv_upsert_locked(uint64_t key, const uint8_t* bytes, uint32_t len,
     r.first_frame = (uint32_t)s_frame_count; r.count = 1;
     r.translated = (g_table.find(key) != g_table.end());
     g_inv[key] = r;
+}
+
+// ---------------------------------------------------------------------------
+// Glyph-label RAM source-patch: scan the label table and patch any slot whose
+// confirmed JP source bytes are currently resident in guest RAM. Idempotent —
+// a patched slot no longer matches `src`, so it is written exactly once. Runs
+// under g_mtx.
+// ---------------------------------------------------------------------------
+void glyph_labels_patch_locked(uint8_t* ram) {
+    int pending = 0;
+    for (auto& gl : g_glyph_labels) {
+        if (gl.patched || gl.target.empty() || gl.width == 0) continue;
+        // Verify-before-patch: the exact expected JP label must be resident and
+        // the whole slot must fit in RAM. If not, the region isn't loaded yet —
+        // leave it JP and try again on a later scan (never corrupt).
+        if (!va_in_ram(gl.addr) || !va_in_ram(gl.addr + gl.width - 1)) { ++pending; continue; }
+        bool match = gl.src.size() <= gl.width;
+        for (uint32_t i = 0; match && i < gl.src.size(); ++i)
+            if (grb(ram, gl.addr + i) != gl.src[i]) match = false;
+        if (!match) { ++pending; continue; }
+        std::vector<uint8_t> enc;
+        label_transcode_le(gl.target, gl.width, enc);
+        if (enc.empty() || enc.size() > gl.width) { ++pending; continue; }  // paranoia
+        for (uint32_t i = 0; i < enc.size(); ++i) gwb(ram, gl.addr + i, enc[i]);
+        gl.patched = true;
+    }
+    g_glyph_pending.store(pending, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +516,18 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
     if (!cap && !app) return;
     uint8_t* ram = memory_get_ram_ptr();
     if (!ram) return;
-    g_calls.fetch_add(1, std::memory_order_relaxed);
+    uint64_t call_n = g_calls.fetch_add(1, std::memory_order_relaxed);
+
+    // Per-glyph label RAM source-patch (load-time). Runs while any label is still
+    // unpatched — i.e. until the EXE label region becomes resident and every
+    // confirmed slot has been overwritten. Once g_glyph_pending hits 0 this is a
+    // single relaxed load on the hot path. Throttled so the (cheap) verify scan
+    // costs nothing per-dispatch before the region loads.
+    if (app && g_glyph_pending.load(std::memory_order_relaxed) > 0 &&
+        (call_n & 0x1FFu) == 0) {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        glyph_labels_patch_locked(ram);
+    }
 
     const uint32_t sp = cpu->gpr[29];
     // Scan the argument registers a0..a3 for source-text pointers. KV-gated
@@ -482,13 +597,34 @@ extern "C" int text_xlate_debug_json(const char* subcmd, char* out, int cap) {
         return std::snprintf(out, cap, "{\"reloaded\":true,\"entries\":%zu}", g_table.size()); }
 
     if (sc == "stats") {
+        size_t gp = 0; for (auto& gl : g_glyph_labels) if (gl.patched) ++gp;
         return std::snprintf(out, cap,
             "{\"lang\":\"%s\",\"apply\":%s,\"capture\":%s,\"table_entries\":%zu,"
-            "\"distinct_captured\":%zu,\"calls\":%llu,\"hits\":%llu}",
+            "\"distinct_captured\":%zu,\"calls\":%llu,\"hits\":%llu,"
+            "\"glyph_labels\":%zu,\"glyph_patched\":%zu,\"glyph_pending\":%d}",
             g_lang.c_str(), g_apply_armed.load() ? "true" : "false",
             g_capture_on.load() ? "true" : "false",
             g_table.size(), g_inv.size(),
-            (unsigned long long)g_calls.load(), (unsigned long long)g_hits.load());
+            (unsigned long long)g_calls.load(), (unsigned long long)g_hits.load(),
+            g_glyph_labels.size(), gp, g_glyph_pending.load());
+    }
+
+    // glyph: per-label patch status (JP addr -> patched? + target). Observability
+    // for the RAM source-patch layer.
+    if (sc == "glyph") {
+        int w = 0;
+        w += std::snprintf(out + w, cap - w, "[");
+        bool first = true;
+        for (auto& gl : g_glyph_labels) {
+            if (w > cap - 256) break;
+            if (!first) w += std::snprintf(out + w, cap - w, ",");
+            first = false;
+            w += std::snprintf(out + w, cap - w,
+                "{\"addr\":\"%08x\",\"width\":%u,\"patched\":%s,\"en\":\"%s\"}",
+                gl.addr, gl.width, gl.patched ? "true" : "false", gl.target.c_str());
+        }
+        w += std::snprintf(out + w, cap - w, "]");
+        return w;
     }
 
     // dump / todo: JSON array of captured records.

@@ -15,6 +15,14 @@
  *    write it into transient guest-stack scratch (below $sp), and repoint the
  *    arg register — the ORIGINAL draw routine then renders the replacement.
  *    KV-gated, so a stray pointer that isn't in the table is left untouched.
+ *  - GLYPH-LABEL PATCH: UI text drawn glyph-by-glyph from a fixed-stride,
+ *    space-padded EXE table (level/stage names) has no string pointer and no
+ *    terminator, so the arg-scan hook can never see it. Instead each confirmed
+ *    slot is patched in guest RAM once the EXE region is resident: verify the
+ *    expected JP bytes are present, then overwrite exactly the slot width with
+ *    target-language fullwidth Shift-JIS re-padded to that width. The game's own
+ *    per-glyph routine then draws the translation. Fed by [[glyph_label]] TOML
+ *    entries; gated on language; never spills past the confirmed slot bounds.
  *
  * Encoding is abstracted behind an EncodingProfile (validator + terminator rules
  * + UTF-8 -> glyph transcoder) selected per title; Tsumu uses the shift_jis
@@ -49,6 +57,8 @@ void text_xlate_init(const char* project_root, const char* language);
  *   "dump"    -> JSON array of every captured record {hash, addr, pc, len,
  *                count, translated, sjis_hex} — the authoring inventory
  *   "todo"    -> JSON array of captured records with NO table entry yet
+ *   "glyph"   -> JSON array of per-glyph label RAM-patch slots {addr, width,
+ *                patched, en} — status of the glyph-label source-patch layer
  *   "reload"  -> re-read the translation table from disk
  * Returns bytes written into out (<= cap). */
 int text_xlate_debug_json(const char* subcmd, char* out, int cap);
