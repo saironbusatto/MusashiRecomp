@@ -4872,6 +4872,91 @@ static void handle_cdrom_sector_history_clear(int id, const char *json)
     send_ok(id);
 }
 
+static const char *cdrom_command_kind_name(uint8_t kind)
+{
+    switch (kind) {
+    case 'C': return "exec";
+    case 'Q': return "queued";
+    default: return "unknown";
+    }
+}
+
+static void handle_cdrom_command_history(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 128);
+    if (count < 1) count = 1;
+    if (count > CDROM_COMMAND_HISTORY_CAP) count = CDROM_COMMAND_HISTORY_CAP;
+
+    int frame_lo = json_get_int(json, "frame_lo", -1);
+    int frame_hi = json_get_int(json, "frame_hi", -1);
+
+    const CDROMCommandHistoryEntry *entries = NULL;
+    uint64_t total = cdrom_debug_get_command_history(&entries);
+    uint64_t oldest = (total > CDROM_COMMAND_HISTORY_CAP)
+        ? total - CDROM_COMMAND_HISTORY_CAP : 0;
+
+    size_t bufsz = 256u + (size_t)count * 640u;
+    char *buf = (char *)malloc(bufsz);
+    if (!buf) { send_err(id, "oom"); return; }
+
+    size_t pos = 0;
+    int emitted = 0;
+    pos += snprintf(buf + pos, bufsz - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,"
+                    "\"oldest\":%llu,\"entries\":[",
+                    id, (unsigned long long)total,
+                    (unsigned long long)oldest);
+
+    uint64_t seq = total;
+    while (seq > oldest && emitted < count && pos < bufsz - 640) {
+        seq--;
+        const CDROMCommandHistoryEntry *e =
+            &entries[seq % CDROM_COMMAND_HISTORY_CAP];
+        if (e->seq != seq) continue;
+        if (frame_lo >= 0 && (int)e->frame < frame_lo) continue;
+        if (frame_hi >= 0 && (int)e->frame > frame_hi) continue;
+
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s{\"seq\":%llu,\"frame\":%u,\"kind\":\"%s\","
+                        "\"cmd\":\"0x%02X\",\"param_count\":%u,\"params\":[",
+                        emitted ? "," : "",
+                        (unsigned long long)e->seq, e->frame,
+                        cdrom_command_kind_name(e->kind),
+                        e->cmd, e->param_count);
+        for (uint8_t i = 0; i < e->param_count && i < 16 && pos < bufsz - 96; i++) {
+            pos += snprintf(buf + pos, bufsz - pos,
+                            "%s\"0x%02X\"", i ? "," : "", e->params[i]);
+        }
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "],\"stat\":\"0x%02X\",\"request\":\"0x%02X\","
+                        "\"irq_enable\":\"0x%02X\",\"irq_flag\":\"0x%02X\","
+                        "\"mode\":\"0x%02X\",\"seek_msf\":[%u,%u,%u],"
+                        "\"read_msf\":[%u,%u,%u],\"read_cmd\":\"0x%02X\","
+                        "\"reading\":%u,\"pending_cmd\":\"0x%02X\","
+                        "\"pending\":%u,\"queued_cmd\":\"0x%02X\","
+                        "\"queued\":%u,\"func\":\"0x%08X\",\"pc\":\"0x%08X\","
+                        "\"i_stat\":\"0x%08X\"}",
+                        e->stat, e->request, e->irq_enable, e->irq_flag,
+                        e->mode, e->seek_min, e->seek_sec, e->seek_sect,
+                        e->read_min, e->read_sec, e->read_sect, e->read_cmd,
+                        e->reading, e->pending_cmd, e->pending_pending,
+                        e->queued_cmd, e->queued_pending, e->func, e->pc,
+                        e->i_stat);
+        emitted++;
+    }
+
+    pos += snprintf(buf + pos, bufsz - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void handle_cdrom_command_history_clear(int id, const char *json)
+{
+    (void)json;
+    cdrom_debug_clear_command_history();
+    send_ok(id);
+}
+
 static void handle_cdrom_trace_clear(int id, const char *json)
 {
     (void)json;
@@ -4884,6 +4969,9 @@ static void handle_cdrom_trace_dump(int id, const char *json)
     int count = json_get_int(json, "count", 256);
     if (count < 1) count = 1;
     if (count > CDROM_TRACE_CAP) count = CDROM_TRACE_CAP;
+
+    int frame_lo = json_get_int(json, "frame_lo", -1);
+    int frame_hi = json_get_int(json, "frame_hi", -1);
 
     const CDROMTraceEntry *entries = NULL;
     uint64_t total = cdrom_debug_get_trace(&entries);
@@ -4903,6 +4991,8 @@ static void handle_cdrom_trace_dump(int id, const char *json)
     for (uint64_t seq = start; seq < total && pos < bufsz - 400; seq++) {
         const CDROMTraceEntry *e = &entries[seq % CDROM_TRACE_CAP];
         if (e->seq != seq) continue;
+        if (frame_lo >= 0 && (int)e->frame < frame_lo) continue;
+        if (frame_hi >= 0 && (int)e->frame > frame_hi) continue;
         pos += snprintf(buf + pos, bufsz - pos,
                         "%s{\"seq\":%llu,\"kind\":\"%s\",\"addr\":\"0x%08X\","
                         "\"val\":\"0x%08X\",\"w\":%u,\"func\":\"0x%08X\","
@@ -4939,6 +5029,7 @@ static const char *dma_trace_kind_name(uint32_t kind)
     switch (kind) {
     case 'S': return "start";
     case 'C': return "complete";
+    case 'W': return "write";
     default: return "unknown";
     }
 }
@@ -5018,6 +5109,86 @@ static void handle_dma_trace_dump(int id, const char *json)
                         e->func, e->pc);
         emitted++;
     }
+    pos += snprintf(buf + pos, bufsz - pos, "],\"emitted\":%d}", emitted);
+    debug_server_send_line(buf);
+    free(buf);
+}
+
+static void append_word_array(char *buf, size_t bufsz, size_t *pos,
+                              const uint32_t *words, int count)
+{
+    *pos += snprintf(buf + *pos, bufsz - *pos, "[");
+    for (int i = 0; i < count && *pos < bufsz - 16; i++) {
+        *pos += snprintf(buf + *pos, bufsz - *pos,
+                         "%s\"0x%08X\"", i ? "," : "", words[i]);
+    }
+    *pos += snprintf(buf + *pos, bufsz - *pos, "]");
+}
+
+static void handle_dma_cdrom_history(int id, const char *json)
+{
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > DMA_CDROM_HISTORY_CAP) count = DMA_CDROM_HISTORY_CAP;
+
+    int frame_lo = json_get_int(json, "frame_lo", -1);
+    int frame_hi = json_get_int(json, "frame_hi", -1);
+    int newest = json_get_int(json, "newest", 0) != 0;
+
+    const DMACDROMHistoryEntry *entries = NULL;
+    uint64_t total = dma_debug_get_cdrom_history(&entries);
+    uint64_t oldest = (total > DMA_CDROM_HISTORY_CAP) ? total - DMA_CDROM_HISTORY_CAP : 0;
+
+    size_t bufsz = 256u + (size_t)count * 1152u;
+    char *buf = (char *)malloc(bufsz);
+    if (!buf) { send_err(id, "oom"); return; }
+
+    size_t pos = 0;
+    int emitted = 0;
+    pos += snprintf(buf + pos, bufsz - pos,
+                    "{\"id\":%d,\"ok\":true,\"total\":%llu,\"oldest\":%llu,\"entries\":[",
+                    id, (unsigned long long)total, (unsigned long long)oldest);
+
+    uint64_t start = newest && total > (uint64_t)count ? total - (uint64_t)count : oldest;
+    if (start < oldest) start = oldest;
+    for (uint64_t seq = start; seq < total && emitted < count && pos < bufsz - 1152; seq++) {
+        const DMACDROMHistoryEntry *e = &entries[seq % DMA_CDROM_HISTORY_CAP];
+        if (e->seq != seq) continue;
+        if (frame_lo >= 0 && (int)e->frame_start < frame_lo) continue;
+        if (frame_hi >= 0 && (int)e->frame_start > frame_hi) continue;
+
+        pos += snprintf(buf + pos, bufsz - pos,
+                        "%s{\"seq\":%llu,\"frame_start\":%u,\"frame_end\":%u,"
+                        "\"start_addr\":\"0x%08X\",\"final_addr\":\"0x%08X\","
+                        "\"requested_words\":%u,\"moved_words\":%u,"
+                        "\"bcr\":\"0x%08X\",\"chcr\":\"0x%08X\",\"dpcr\":\"0x%08X\","
+                        "\"dicr_start\":\"0x%08X\",\"dicr_end\":\"0x%08X\","
+                        "\"i_stat_start\":\"0x%08X\",\"i_stat_end\":\"0x%08X\","
+                        "\"func\":\"0x%08X\",\"pc\":\"0x%08X\","
+                        "\"lba\":%d,\"sector_size\":%d,"
+                        "\"sector_read_pos_start\":%d,\"sector_read_pos_end\":%d,"
+                        "\"mode\":\"0x%02X\",\"sector_available_start\":%u,"
+                        "\"sector_available_end\":%u,\"completed\":%u,"
+                        "\"first_words\":",
+                        emitted ? "," : "",
+                        (unsigned long long)e->seq, e->frame_start, e->frame_end,
+                        e->start_addr, e->final_addr,
+                        e->requested_words, e->moved_words,
+                        e->bcr, e->chcr, e->dpcr,
+                        e->dicr_start, e->dicr_end,
+                        e->i_stat_start, e->i_stat_end,
+                        e->func, e->pc,
+                        e->lba, e->sector_size,
+                        e->sector_read_pos_start, e->sector_read_pos_end,
+                        e->mode, e->sector_available_start,
+                        e->sector_available_end, e->completed);
+        append_word_array(buf, bufsz, &pos, e->first_words, e->first_count);
+        pos += snprintf(buf + pos, bufsz - pos, ",\"last_words\":");
+        append_word_array(buf, bufsz, &pos, e->last_words, e->last_count);
+        pos += snprintf(buf + pos, bufsz - pos, "}");
+        emitted++;
+    }
+
     pos += snprintf(buf + pos, bufsz - pos, "],\"emitted\":%d}", emitted);
     debug_server_send_line(buf);
     free(buf);
@@ -10861,11 +11032,14 @@ static const CmdEntry s_commands[] = {
     { "cdrom_sector_dump", handle_cdrom_sector_dump },
     { "cdrom_sector_history", handle_cdrom_sector_history },
     { "cdrom_sector_history_clear", handle_cdrom_sector_history_clear },
+    { "cdrom_command_history", handle_cdrom_command_history },
+    { "cdrom_command_history_clear", handle_cdrom_command_history_clear },
     { "cdrom_trace_dump",  handle_cdrom_trace_dump },
     { "cdrom_trace_clear", handle_cdrom_trace_clear },
     { "dma_state",         handle_dma_state },
     { "dma_trace_dump",    handle_dma_trace_dump },
     { "dma_trace_clear",   handle_dma_trace_clear },
+    { "dma_cdrom_history", handle_dma_cdrom_history },
     { "sio_state",         handle_sio_state },
     { "mc_status",         handle_mc_status },
     { "spu_status",        handle_spu_status },

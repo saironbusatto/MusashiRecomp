@@ -139,6 +139,7 @@ static uint64_t command_history_seq;
 /* Seek target */
 static uint8_t seek_min, seek_sec, seek_sect;
 static int     s_setloc_lba = -1;  /* LBA captured at SetLoc time */
+static int     setloc_seek_far;
 
 /* Read state */
 static int reading;
@@ -240,6 +241,7 @@ uint32_t g_cd_overwrite_last_frame = 0;
  * MAX_PER_FRAME knob. */
 #define VBLANK_CYCLES_NTSC          564480   /* 33.8688 MHz / 60 Hz; matches interrupts.c */
 #define CDROM_INSTANT_MAX_PER_FRAME_DEFAULT 32
+#define CDROM_SINGLE_SPEED_SECTOR_CYCLES 451584
 
 /* Runtime-tunable 'instant' budget (step 3). One knob drives three writers:
  * game.toml [runtime] instant_max_per_frame, the cdrom_instant_rate TCP
@@ -324,7 +326,27 @@ uint32_t cdrom_get_burst_total(void) { return s_burst_count; }
 static int sector_delay_cycles(void) {
     /* PS1 CPU is 33.8688 MHz. CD-ROM sectors arrive at 75 Hz in 1x
      * mode, or twice that rate when SetMode bit 7 enables double speed. */
-    int base = (mode_reg & 0x80) ? 225792 : 451584;
+    int base = (mode_reg & 0x80)
+        ? (CDROM_SINGLE_SPEED_SECTOR_CYCLES / 2)
+        : CDROM_SINGLE_SPEED_SECTOR_CYCLES;
+    return apply_speed(base);
+}
+
+static int initial_read_delay_cycles(void) {
+    /* Beetle/PCSX model an additional read-start latency after ReadN/ReadS.
+     * In double-speed mode the first sector still waits one 1x sector period;
+     * subsequent sectors use the steady-state 2x cadence above. */
+    int base = (mode_reg & 0x80)
+        ? CDROM_SINGLE_SPEED_SECTOR_CYCLES
+        : (CDROM_SINGLE_SPEED_SECTOR_CYCLES * 2);
+    return apply_speed(base);
+}
+
+static int seek_complete_delay_cycles(void) {
+    /* PCSX carries a far-SetLoc seek state and explicitly calls out Rockman X5:
+     * far SeekL/SeekP completes after roughly four 1x sector periods, while a
+     * near/already-settled seek returns quickly. */
+    int base = setloc_seek_far ? (CDROM_SINGLE_SPEED_SECTOR_CYCLES * 4) : 0x800;
     return apply_speed(base);
 }
 
@@ -871,7 +893,7 @@ static void start_read_stream(uint8_t cmd) {
     read_sec = seek_sec;
     read_sect = seek_sect;
     read_cmd = cmd;
-    read_delay = sector_delay_cycles();
+    read_delay = initial_read_delay_cycles();
     reading = 1;
     stat_reg |= CDSTAT_READ;
     /* ENQUEUE: sector-read stream scheduled (due in read_delay cycles). A
@@ -975,10 +997,14 @@ static void exec_command(uint8_t cmd) {
 
     case 0x02: /* SetLoc */
         if (param_count >= 3) {
+            int current_lba = (last_sector_lba >= 0)
+                ? last_sector_lba
+                : msf_to_lba(seek_min, seek_sec, seek_sect);
             seek_min = bcd_to_bin(param_fifo[0]);
             seek_sec = bcd_to_bin(param_fifo[1]);
             seek_sect = bcd_to_bin(param_fifo[2]);
             s_setloc_lba = msf_to_lba(seek_min, seek_sec, seek_sect);
+            setloc_seek_far = (abs(current_lba - s_setloc_lba) > 16) ? 1 : 0;
         }
         response_push(stat_reg);
         set_irq(CDIRQ_ACK);
@@ -1083,9 +1109,16 @@ static void exec_command(uint8_t cmd) {
     }
 
     case 0x11: { /* GetlocP */
-        int lba = (last_sector_lba >= 0)
-            ? last_sector_lba
-            : msf_to_lba(read_min, read_sec, read_sect);
+        int lba;
+        if (reading) {
+            /* GetlocP reports the drive/sub-Q position. During a read the
+             * sector stream has already advanced past the data-ready sector. */
+            lba = msf_to_lba(read_min, read_sec, read_sect);
+        } else if (last_sector_lba >= 0) {
+            lba = last_sector_lba;
+        } else {
+            lba = msf_to_lba(seek_min, seek_sec, seek_sect);
+        }
         int rm, rs, rf;
         int am, as, af;
         lba_to_msf(lba, 0, &rm, &rs, &rf);
@@ -1178,7 +1211,7 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         pending.cmd = cmd;   /* 0x15 or 0x16 — completed in process_pending */
         pending.pending = 1;
-        pending.delay = apply_speed(20000);
+        pending.delay = seek_complete_delay_cycles();
         pending.phase = 1;
         break;
 
@@ -1286,6 +1319,7 @@ static void process_pending(uint32_t cycles) {
     case 0x15: /* SeekL complete */
     case 0x16: /* SeekP complete */
         stat_reg &= ~CDSTAT_SEEK;
+        setloc_seek_far = 0;
         response_push(stat_reg);
         set_irq(CDIRQ_COMPLETE);
         fire_cdrom_irq();
@@ -1411,6 +1445,7 @@ void cdrom_init(const char* cue_path) {
     pending.pending = 0;
     memset(&queued_cmd, 0, sizeof(queued_cmd));
     seek_min = seek_sec = seek_sect = 0;
+    setloc_seek_far = 0;
     cdrom_debug_clear_sector_history();
 
     if (cue_path) {
@@ -1751,7 +1786,7 @@ int cdrom_load_in_progress(void) {
     X(last_sector_raw_mode) X(last_sector_xa_file) X(last_sector_xa_channel) \
     X(last_sector_xa_submode) X(last_sector_xa_coding) \
     /* seek target */ \
-    X(seek_min) X(seek_sec) X(seek_sect) X(s_setloc_lba) \
+    X(seek_min) X(seek_sec) X(seek_sect) X(s_setloc_lba) X(setloc_seek_far) \
     /* read stream state */ \
     X(reading) X(read_min) X(read_sec) X(read_sect) X(mode_reg) \
     X(read_cmd) X(read_delay) X(filter_file) X(filter_channel) X(cd_muted) \
