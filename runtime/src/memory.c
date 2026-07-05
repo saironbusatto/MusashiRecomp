@@ -837,6 +837,22 @@ uint32_t psx_read_word(uint32_t addr) {
     if (!psx_get_in_exception()) ls_read_hook(addr, 4, v);
     return v;
 }
+/* Physical address of a CPU/DMA main-RAM access. Fold KUSEG/KSEG0/KSEG1 first
+ * (0x1FFFFFFF), then fold the 2nd-4th main-RAM mirrors: real hardware mirrors the
+ * 2 MB DRAM across the WHOLE 0..0x7FFFFF physical window (Beetle libretro.cpp:874
+ * `A < 0x00800000` routes to main RAM; psx-spx "2048K RAM ... mirrored 4x"). A game
+ * may legitimately place its stack at the top of that window — Tsumu Light computes
+ * sp = (ramtop-8)|0x80000000 with its ramtop constant 0x00800000, giving sp=0x807FFFF8
+ * (top of the 4th mirror). Without this fold those accesses miss DRAM (`< RAM_SIZE`
+ * fails) and hit open bus: stores drop, loads return 0, so the first saved return
+ * address reads back 0 and `jr ra` derails to PC=0. Identity for phys < RAM_SIZE, so
+ * normal-range RAM is byte-identical; MMIO/scratchpad/BIOS (>= 0x800000) untouched. */
+static inline uint32_t psx_ram_phys(uint32_t addr) {
+    uint32_t phys = addr & 0x1FFFFFFFu;
+    if (phys < 0x00800000u) phys &= (RAM_SIZE - 1u);
+    return phys;
+}
+
 static uint32_t psx_read_word_raw(uint32_t addr) {
     /* KSEG2 cache control — before physical translation. */
     if (addr == 0xFFFE0130u) return cache_ctrl;
@@ -850,7 +866,7 @@ static uint32_t psx_read_word_raw(uint32_t addr) {
      * fatal (frame 9705). Ignore writes, read as 0, count for telemetry. */
     if (addr >= 0xC0000000u) { g_kseg2_ignored_reads++; return 0; }
 
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_ram_phys(addr);
 
     if (phys < RAM_SIZE) {
         uint32_t v = (uint32_t)ram[phys]
@@ -940,7 +956,7 @@ static void psx_write_word_raw(uint32_t addr, uint32_t val) {
      * We have no cache model, so silently discard RAM/scratchpad writes. */
     if (sr_ptr && (*sr_ptr & 0x10000u)) return;
 
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_ram_phys(addr);
 
     if (phys < RAM_SIZE) {
         if (phys == D44_PHYS) d44_note(phys, read_ram_word(phys), val);
@@ -998,7 +1014,7 @@ uint16_t psx_read_half(uint32_t addr) {
 static uint16_t psx_read_half_raw(uint32_t addr) {
         /* KSEG2 guard — see psx_read_word_raw. */
     if (addr >= 0xC0000000u) { g_kseg2_ignored_reads++; return 0; }
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_ram_phys(addr);
 
     if (phys < RAM_SIZE) {
         return (uint16_t)ram[phys] | ((uint16_t)ram[phys + 1] << 8);
@@ -1033,7 +1049,7 @@ static void psx_write_half_raw(uint32_t addr, uint16_t val) {
 
         /* KSEG2 guard — see psx_read_word_raw. */
     if (addr >= 0xC0000000u) { g_kseg2_ignored_writes++; return; }
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_ram_phys(addr);
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)read_ram_half(phys), (uint32_t)val, 2);
@@ -1081,7 +1097,7 @@ uint8_t psx_read_byte(uint32_t addr) {
 static uint8_t psx_read_byte_raw(uint32_t addr) {
         /* KSEG2 guard — see psx_read_word_raw. */
     if (addr >= 0xC0000000u) { g_kseg2_ignored_reads++; return 0; }
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_ram_phys(addr);
 
     if (phys < RAM_SIZE) {
         return ram[phys];
@@ -1260,7 +1276,7 @@ static void psx_write_byte_raw(uint32_t addr, uint8_t val) {
 
         /* KSEG2 guard — see psx_read_word_raw. */
     if (addr >= 0xC0000000u) { g_kseg2_ignored_writes++; return; }
-    uint32_t phys = addr & 0x1FFFFFFFu;
+    uint32_t phys = psx_ram_phys(addr);
 
     if (phys < RAM_SIZE) {
         debug_server_trace_write_check(phys, (uint32_t)ram[phys], (uint32_t)val, 1);
