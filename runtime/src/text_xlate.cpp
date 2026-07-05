@@ -175,7 +175,12 @@ void sj_transcode(const std::string& utf8, std::vector<uint8_t>& out) {
             cp = ((c & 0x0F) << 12) | ((utf8[i+1] & 0x3F) << 6) | (utf8[i+2] & 0x3F); adv = 3;
         } else                           { cp = ' ';                                 adv = 1; }
         i += adv;
+        // Framing tokens the author writes into the English (remapped to the
+        // game's control codes in apply_to_reg): \n line break, \f page break,
+        // \r prompt/wait. Preserve them as their raw ASCII control bytes here.
         if (cp == '\n') { out.push_back(0x0A); continue; }
+        if (cp == 0x0C) { out.push_back(0x0C); continue; }   // \f -> page break
+        if (cp == 0x0D) { out.push_back(0x0D); continue; }   // \r -> prompt
         // A codepoint already in the fullwidth SJIS range would be authored as
         // raw JP; here targets are Latin. Map ASCII-range codepoints; fullwidth
         // Unicode letters (U+FF01..) map back to their ASCII then to SJIS.
@@ -208,6 +213,24 @@ bool sj_capture_worthy(const uint8_t* b, uint32_t n) {
         } else i += 1;
     }
     return good >= 2;
+}
+
+// Struct-vs-text safety: a genuine message record contains only text units and
+// the known control framing (0x0A newline; 0x10/0x30 page-break leads; 0xFC/0xFE/
+// 0xFF framing; fullwidth-space pad). A fixed-width struct field packs binary
+// params after the text (e.g. the "Tutorial N" label's trailing 09 08 01 02 F4),
+// which shows up as low-control bytes 0x01..0x09 / 0x0B..0x0F / 0x11..0x1F.
+// Replacing such a record corrupts the struct and derails the game — so apply is
+// refused for records carrying those wild bytes even when a table entry exists.
+bool sj_clean_text(const uint8_t* b, uint32_t n) {
+    for (uint32_t i = 0; i < n; ++i) {
+        uint8_t c = b[i];
+        if (sj_lead(c) && i + 1 < n && sj_trail(b[i + 1])) { ++i; continue; }
+        if (c == 0x0A || c == 0x10 || c == 0x30) continue;          // newline / page-break leads
+        if (c >= 0x20) continue;                                     // text / framing / high bytes
+        return false;                                                // wild low-control => struct
+    }
+    return true;
 }
 
 const EncodingProfile kShiftJisProfile = {
@@ -356,11 +379,13 @@ bool apply_to_reg(uint8_t* ram, CPUState* cpu, uint32_t sp, uint32_t* reg,
     // For framed (0xFFFF) messages the game's line break is the "FE FF" code, not
     // a raw 0x0A — remap so multi-line English reflows in the text box.
     std::vector<uint8_t> body;
-    body.reserve(enc.size() + 8);
+    body.reserve(enc.size() + 16);
     for (uint8_t c : enc) {
-        if (c == 0x0A && t == Term::FFFF) { body.push_back(0xFE); body.push_back(0xFF); }
-        else if (c == 0x0A)               { /* NUL-label: drop stray newline */ }
-        else                               body.push_back(c);
+        if      (c == 0x0A && t == Term::FFFF) { body.push_back(0xFE); body.push_back(0xFF); }  // line break
+        else if (c == 0x0A)                    { /* NUL record: drop stray newline */ }
+        else if (c == 0x0C) { body.push_back(0x30); body.push_back(0xFC); }  // \f page break
+        else if (c == 0x0D) { body.push_back(0x10); body.push_back(0xFC); }  // \r prompt/wait
+        else                 body.push_back(c);
     }
     if (body.empty() || body.size() > kSrcMax) return false;
     // Scratch below the caller's $sp, 8-byte aligned, with headroom.
@@ -423,9 +448,13 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
                 if (it == g_table.end()) continue;
                 te = it->second;
             }
+            // The table entry is author-vetted, but guard against corrupting a
+            // struct that shares the key: apply only when the source record is
+            // framed (0xFFFF, always standalone) OR pure clean text (no wild
+            // binary params). PSX_XLATE_ALLOW_NUL=1 forces through for debugging.
             static const bool allow_nul = [] {
                 const char* e = std::getenv("PSX_XLATE_ALLOW_NUL"); return e && e[0] == '1'; }();
-            if (term != Term::FFFF && !allow_nul) continue;  // framed messages only
+            if (term != Term::FFFF && !allow_nul && !sj_clean_text(buf, len)) continue;
             if (apply_to_reg(ram, cpu, sp, argregs[a], te, term))
                 g_hits.fetch_add(1, std::memory_order_relaxed);
         }
