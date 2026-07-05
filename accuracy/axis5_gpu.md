@@ -216,6 +216,25 @@ vs `beetle-psx/mednafen/psx/<file>:line` (oracle).
   and can scribble across VRAM where hardware would have dropped it).
 - **Effect**: rare; mainly a robustness/timing divergence. Low priority.
 
+### D12 — Textured-polygon texpage attribute did not update GPU draw-mode state — FIXED 2026-07-05
+- **Oracle**: every textured polygon's texpage word is copied into the GPU
+  draw-mode state before drawing — `SetTPage(CB[4 + ((cc>>4)&1)] >> 16)` runs
+  for all GP0 0x20-0x3F with the texture bit (gpu.cpp:1070-1072). The poly's
+  own word (not the last E1) selects its semi-transparency mode, and later
+  rect/sprite prims (no texpage word) consume the state the poly left behind.
+  Poly words cannot alter dither/draw-to-display (E1-only bits 9-10) nor
+  texture-disable (bit 11 latches only under GP1(09h) TexDisableAllowChange).
+- **Ours (pre-fix)**: textured polys fetched texels from their own tpage but
+  blended with the stale E1-set global `semi_transparency`, and never updated
+  `texpage_x/y/colors` for subsequent rects.
+- **Effect**: additive glows (mode 1 in the prim word) blended with whatever
+  mode the last E1 set — Ape Escape's headlamp halos / siren flares / firework
+  bursts rendered as dark blobs or black starbursts, intermittently (depends
+  on OT bucket order, hence camera/distance). Proven on Ape attract frame
+  60052: nine op-0x2E quads at the artifact coords carried prim mode 1 vs E1
+  mode 0. Fixed in `gpu.c set_tpage_from_poly()`, called by all four textured
+  poly handlers; all backends inherit via `gr_set_semi_transparency`.
+
 ### Items that are FAITHFUL (no action)
 - Semi-transparency 4-mode selection + STP-bit gating (SW and GL).
 - Mask set/check including in copies (SW and GL).
