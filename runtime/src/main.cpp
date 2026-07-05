@@ -39,6 +39,7 @@
 #include "game_options.h"
 #include "crc32.h"
 #include "disc_identity.h"
+#include "psx_keybinds.h"    /* configurable keyboard->DualShock keybinds (keybinds.ini) */
 #if defined(PSX_LAUNCHER)
 #include "launcher.h"
 #endif
@@ -1016,6 +1017,12 @@ static void load_input_config(const char* argv0) {
     if (!controller_enabled) {
         for (auto& entry : controller_map) entry.sources.clear();
     }
+
+    /* Configurable KEYBOARD keybinds (keybinds.ini, next to the exe) — separate
+     * from input.ini's gamepad map. Loads the user's map (or writes defaults on
+     * first run). The launcher may have just edited+saved this file; we re-read
+     * it here so the runtime always reflects the current bindings. */
+    psx_keybinds_init(argv0);
 }
 
 static void close_player(PlayerInput& p) {
@@ -1134,26 +1141,13 @@ static bool controller_source_pressed_h(SDL_GameController* h, const ControllerS
     }
 }
 
-static uint16_t pad_from_keyboard(void) {
+/* Keyboard -> PSX button word for `player` (1 or 2), via the configurable
+ * keybinds.ini map (psx_keybinds). Defaults reproduce the old hardcoded layout
+ * (arrows=d-pad, X/S/Z/A=Cross/Circle/Square/Triangle, Q/W/E/R=L1/R1/L2/R2,
+ * Return=Start, RShift=Select), so out-of-the-box behaviour is unchanged. */
+static uint16_t pad_from_keyboard(int player) {
     const Uint8* keys = SDL_GetKeyboardState(NULL);
-    uint16_t buttons = 0xFFFF; /* all released */
-
-    if (keys[SDL_SCANCODE_UP])      buttons &= ~PAD_UP;
-    if (keys[SDL_SCANCODE_DOWN])    buttons &= ~PAD_DOWN;
-    if (keys[SDL_SCANCODE_LEFT])    buttons &= ~PAD_LEFT;
-    if (keys[SDL_SCANCODE_RIGHT])   buttons &= ~PAD_RIGHT;
-    if (keys[SDL_SCANCODE_RETURN])  buttons &= ~PAD_START;
-    if (keys[SDL_SCANCODE_RSHIFT])  buttons &= ~PAD_SELECT;
-    if (keys[SDL_SCANCODE_X])       buttons &= ~PAD_CROSS;
-    if (keys[SDL_SCANCODE_Z])       buttons &= ~PAD_SQUARE;
-    if (keys[SDL_SCANCODE_S])       buttons &= ~PAD_CIRCLE;
-    if (keys[SDL_SCANCODE_A])       buttons &= ~PAD_TRIANGLE;
-    if (keys[SDL_SCANCODE_Q])       buttons &= ~PAD_L1;
-    if (keys[SDL_SCANCODE_W])       buttons &= ~PAD_R1;
-    if (keys[SDL_SCANCODE_E])       buttons &= ~PAD_L2;
-    if (keys[SDL_SCANCODE_R])       buttons &= ~PAD_R2;
-
-    return buttons;
+    return psx_keybinds_pad_word(keys, player);
 }
 
 static uint16_t controller_pad_buttons(SDL_GameController* h) {
@@ -1189,9 +1183,10 @@ static uint8_t axis_to_pad_byte(int16_t v) {
     return (uint8_t)b;
 }
 
-/* Buttons for a player's selected device (0xFFFF = none pressed). */
-static uint16_t pad_buttons_for(const PlayerInput& p) {
-    if (p.kind == 1) return pad_from_keyboard();
+/* Buttons for a player's selected device (0xFFFF = none pressed). `player` is
+ * 1 or 2 — selects which keybinds.ini section drives a keyboard port. */
+static uint16_t pad_buttons_for(const PlayerInput& p, int player) {
+    if (p.kind == 1) return pad_from_keyboard(player);
     if (p.kind == 2) return controller_pad_buttons(p.handle);
     return 0xFFFF;
 }
@@ -1209,14 +1204,14 @@ static uint16_t pad_buttons_for(const PlayerInput& p) {
  * D-pad instead flips the pad to digital, so the game runs its own d-pad path)
  * and true in pinned-ANALOG mode. The keyboard branch always folds the arrows
  * — they are that player's only stick source. */
-static void pad_sticks_for(const PlayerInput& p, uint8_t out[4], bool fold_dpad) {
+static void pad_sticks_for(const PlayerInput& p, int player, uint8_t out[4], bool fold_dpad) {
     out[0] = out[1] = out[2] = out[3] = 0x80;
     if (p.kind == 1) {
+        /* Keyboard analog: the configurable left/right stick-direction binds
+         * (default = arrow keys on the LEFT stick; RIGHT stick unbound), so the
+         * old keyboard analog behaviour is preserved unless the user rebinds. */
         const Uint8* keys = SDL_GetKeyboardState(NULL);
-        if (keys[SDL_SCANCODE_LEFT])  out[0] = 0x00;
-        if (keys[SDL_SCANCODE_RIGHT]) out[0] = 0xFF;
-        if (keys[SDL_SCANCODE_UP])    out[1] = 0x00;
-        if (keys[SDL_SCANCODE_DOWN])  out[1] = 0xFF;
+        psx_keybinds_sticks(keys, player, out);
         return;
     }
     if (p.kind == 2 && p.handle) {
@@ -1245,7 +1240,7 @@ static bool hybrid_stick_active(const PlayerInput& p) {
     int ly = SDL_GameControllerGetAxis(p.handle, SDL_CONTROLLER_AXIS_LEFTY);
     return lx > dz || lx < -dz || ly > dz || ly < -dz;
 }
-static bool hybrid_dpad_active(const PlayerInput& p, bool kb_always) {
+static bool hybrid_dpad_active(const PlayerInput& p, int player, bool kb_always) {
     if (p.kind == 2 && p.handle) {
         if (SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_LEFT)  ||
             SDL_GameControllerGetButton(p.handle, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) ||
@@ -1255,9 +1250,7 @@ static bool hybrid_dpad_active(const PlayerInput& p, bool kb_always) {
     }
     if (p.kind == 1 || kb_always) {
         const Uint8* keys = SDL_GetKeyboardState(NULL);
-        if (keys[SDL_SCANCODE_LEFT] || keys[SDL_SCANCODE_RIGHT] ||
-            keys[SDL_SCANCODE_UP]   || keys[SDL_SCANCODE_DOWN])
-            return true;
+        if (psx_keybinds_dpad_active(keys, player)) return true;
     }
     return false;
 }
@@ -1291,13 +1284,14 @@ static void sample_pad_into_sio(int override) {
     }
     for (int s = 0; s < 2; s++) {
         PlayerInput& p = g_players[s];
+        const int  player  = s + 1;             /* keybinds.ini section (1|2) */
         const bool kb_here = (g_dev_kb_p1 && s == 0);
         if (p.kind == 0 && !kb_here) continue;  /* no device in this port */
 
         /* Buttons: merge the assigned device with the keyboard (PSX pad word is
          * active-low, so AND combines "pressed on either source"). */
-        uint16_t btn = (p.kind != 0) ? pad_buttons_for(p) : (uint16_t)0xFFFF;
-        if (kb_here) btn &= pad_from_keyboard();
+        uint16_t btn = (p.kind != 0) ? pad_buttons_for(p, player) : (uint16_t)0xFFFF;
+        if (kb_here) btn &= pad_from_keyboard(1);  /* dev keyboard drives P1 binds */
         sio_set_pad_state_slot(s, btn);
 
         /* Resolve the pad type this frame from the player's mode (a port driven
@@ -1309,21 +1303,18 @@ static void sample_pad_into_sio(int override) {
             eff_analog = 0;
         } else if (mode == PSXRecompV4::PAD_MODE_ANALOG) {
             eff_analog = 1;
-            pad_sticks_for(p, st, /*fold_dpad=*/true);
+            pad_sticks_for(p, player, st, /*fold_dpad=*/true);
         } else { /* HYBRID */
-            if (hybrid_stick_active(p))               p.hybrid_analog = true;
-            else if (hybrid_dpad_active(p, kb_here))  p.hybrid_analog = false;
+            if (hybrid_stick_active(p))                       p.hybrid_analog = true;
+            else if (hybrid_dpad_active(p, player, kb_here))  p.hybrid_analog = false;
             eff_analog = p.hybrid_analog ? 1 : 0;
-            if (eff_analog) pad_sticks_for(p, st, /*fold_dpad=*/false);
+            if (eff_analog) pad_sticks_for(p, player, st, /*fold_dpad=*/false);
         }
-        /* In dev builds also fold the keyboard arrows onto the analog stick, so an
-         * analog-mode P1 still steers from the keyboard. */
+        /* In dev builds also fold the keyboard's stick binds onto the analog
+         * stick, so an analog-mode P1 still steers from the keyboard (P1 binds). */
         if (kb_here && eff_analog) {
             const Uint8* keys = SDL_GetKeyboardState(NULL);
-            if (keys[SDL_SCANCODE_LEFT])  st[0] = 0x00;
-            if (keys[SDL_SCANCODE_RIGHT]) st[0] = 0xFF;
-            if (keys[SDL_SCANCODE_UP])    st[1] = 0x00;
-            if (keys[SDL_SCANCODE_DOWN])  st[1] = 0xFF;
+            psx_keybinds_sticks(keys, 1, st);
         }
         /* Push sticks every frame; request the pad type (digital/analog) through
          * the coherent channel so a hybrid stick<->d-pad flip is applied only at
