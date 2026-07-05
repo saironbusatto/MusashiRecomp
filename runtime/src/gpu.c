@@ -1680,6 +1680,21 @@ static uint16_t current_texpage(void) {
                       (semi_transparency << 5) | (texpage_colors << 7));
 }
 
+/* Hardware: the texpage attribute word carried inside every textured polygon
+ * (GP0 0x24-0x3F with the texture bit) is copied into the GPU draw-mode state
+ * (GPUSTAT bits 0-8) exactly like GP0(E1) bits 0-8 — the poly's own word, not
+ * the last E1, decides its semi-transparency mode, and later rectangle/sprite
+ * prims (which carry no texpage word) consume the state the poly left behind.
+ * Beetle: SetTPage(CB[4 + ((cc>>4)&1)] >> 16) on every textured poly.
+ * Bits 9-10 (dither / draw-to-display) exist only in E1; bit 11 (texture
+ * disable) only latches when GP1(09h) allowed it, which polys can't grant. */
+static void set_tpage_from_poly(uint16_t tpage_word) {
+    texpage_x         = tpage_word & 0xF;
+    texpage_y         = (tpage_word >> 4) & 1;
+    semi_transparency = (tpage_word >> 5) & 3;
+    texpage_colors    = (tpage_word >> 7) & 3;
+}
+
 /* Helper: set up SW renderer state before a textured draw.
  * semi_trans: whether the primitive has semi-transparency enabled (from opcode bit)
  * raw_texture: 1 if this is a raw-texture opcode (bit 0 of GP0 opcode set) */
@@ -1708,9 +1723,10 @@ static void gp0_exec_textured_tri(void) {
     uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
     uint16_t clut_x = (clut & 0x3F) * 16;
     uint16_t clut_y = (clut >> 6) & 0x1FF;
-    /* Texpage from word 4 bits 16-31, or use current state */
+    /* Texpage from word 4 bits 16-31 */
     uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[4] >> 16);
     uint16_t tpage = tpage_word & 0x1FF;
+    set_tpage_from_poly(tpage_word);
 
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
@@ -1743,7 +1759,9 @@ static void gp0_exec_textured_quad(void) {
     uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
     uint16_t clut_x = (clut & 0x3F) * 16;
     uint16_t clut_y = (clut >> 6) & 0x1FF;
-    uint16_t tpage = (uint16_t)(gp0_cmd_buf[4] >> 16) & 0x1FF;
+    uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[4] >> 16);
+    uint16_t tpage = tpage_word & 0x1FF;
+    set_tpage_from_poly(tpage_word);
 
     /* Widescreen: tagged billboard quads carry CPU-computed pixel offsets the
      * GTE squash never saw — re-squash every X around the prim's anchor. */
@@ -1815,7 +1833,9 @@ static void gp0_exec_shaded_textured_tri(void) {
     uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
     uint16_t clut_x = (clut & 0x3F) * 16;
     uint16_t clut_y = (clut >> 6) & 0x1FF;
-    uint16_t tpage = (uint16_t)(gp0_cmd_buf[5] >> 16) & 0x1FF;
+    uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[5] >> 16);
+    uint16_t tpage = tpage_word & 0x1FF;
+    set_tpage_from_poly(tpage_word);
 
     for (int i = 0; i < 3; i++) {
         vx[i] += draw_offset_x;
@@ -1852,7 +1872,9 @@ static void gp0_exec_shaded_textured_quad(void) {
     uint16_t clut = (uint16_t)(gp0_cmd_buf[2] >> 16);
     uint16_t clut_x = (clut & 0x3F) * 16;
     uint16_t clut_y = (clut >> 6) & 0x1FF;
-    uint16_t tpage = (uint16_t)(gp0_cmd_buf[5] >> 16) & 0x1FF;
+    uint16_t tpage_word = (uint16_t)(gp0_cmd_buf[5] >> 16);
+    uint16_t tpage = tpage_word & 0x1FF;
+    set_tpage_from_poly(tpage_word);
 
     for (int i = 0; i < 4; i++) {
         vx[i] += draw_offset_x;
