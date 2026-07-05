@@ -1021,6 +1021,31 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         break;
 
+    case 0x07: /* MotorOn — spin the drive motor up. Two-phase like Stop:
+                * INT3 (ACK) now with the current status, then a pending INT2
+                * (COMPLETE) after spin-up reporting status with the motor bit
+                * SET (psx-spx "07h MotorOn"). If the motor is ALREADY spinning
+                * the hardware rejects the command with INT5 (ERROR) and error
+                * code 0x20 ("wrong condition") — replicate that.
+                *
+                * Previously 0x07 had no case and fell through to default ->
+                * CDIRQ_ERROR (INT5) with no error code, so a game that spins the
+                * motor up (e.g. after a Stop) and waits for the MotorOn
+                * completion IRQ would never see it. */
+        if (stat_reg & CDSTAT_MOTOR) {
+            response_push(stat_reg | CDSTAT_ERROR);
+            response_push(0x20); /* error code: motor already on */
+            set_irq(CDIRQ_ERROR);
+            break;
+        }
+        response_push(stat_reg);
+        set_irq(CDIRQ_ACK);
+        pending.cmd = 0x07;
+        pending.pending = 1;
+        pending.delay = apply_speed(30000); /* motor spin-up */
+        pending.phase = 1;
+        break;
+
     case 0x08: /* Stop — stop the motor. Two-phase like Pause: INT3 (ACK) now
                 * with the pre-stop status (motor still spinning), then a pending
                 * INT2 (COMPLETE) after the motor spins down, reporting the new
@@ -1323,6 +1348,13 @@ static void process_pending(uint32_t cycles) {
                 fire_cdrom_irq();
             }
         }
+        break;
+
+    case 0x07: /* MotorOn complete — motor now spinning */
+        stat_reg |= CDSTAT_MOTOR;
+        response_push(stat_reg);
+        set_irq(CDIRQ_COMPLETE);
+        fire_cdrom_irq();
         break;
 
     case 0x08: /* Stop complete — motor has spun down */
