@@ -12,6 +12,7 @@
 #include "psx_interpreter.h"
 #include "cdrom.h"
 #include "fntrace.h"
+#include "text_xlate.h"
 #include "boot_state.h"
 #include "bios_hle.h"
 #include "savestate.h"
@@ -2035,6 +2036,12 @@ int main(int argc, char** argv) {
             if (gc.runtime.has_memcard_dir)  memcard_dir   = gc.runtime.memcard_dir;
             if (gc.runtime.has_window_title) window_title  = gc.runtime.window_title;
             if (gc.runtime.has_debug_port)   debug_port    = gc.runtime.debug_port;
+            /* On-the-fly string translation / localization (framework feature —
+             * text_xlate.cpp): load translations/ *.toml under the project root
+             * and select the language. Capture inventory is always-on; APPLY is
+             * gated by language + table presence. See docs/STRING_TRANSLATION.md. */
+            text_xlate_init(gc.project_root.string().c_str(),
+                            gc.runtime.language.c_str());
             if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
             if (gc.runtime.has_instant_max_per_frame)
                 instant_rate = gc.runtime.instant_max_per_frame;

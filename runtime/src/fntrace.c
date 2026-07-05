@@ -1,6 +1,7 @@
 /* fntrace.c — runtime side of psx_dispatch call ring. See fntrace.h. */
 
 #include "fntrace.h"
+#include "text_xlate.h"     /* on-the-fly string translation hook (framework) */
 #include "parity_trace.h"   /* general control-flow parity ring (native producer) */
 #include <string.h>
 #include <stdlib.h>
@@ -56,6 +57,15 @@ static inline int armed_match(uint32_t target) {
 }
 
 void fntrace_record(CPUState* cpu, uint32_t target) {
+    /* On-the-fly string translation (framework feature — text_xlate.cpp). The
+     * generated psx_dispatch_impl calls us at the top of each dispatch iteration
+     * with cpu->gpr[4..7] holding THIS call's args, BEFORE the target function
+     * runs — the exact chokepoint to (a) capture every source string drawn and
+     * (b) repoint a string-arg at a translated replacement so the game's own
+     * renderer draws it. Cheap no-op when uninitialised/disarmed. No BIOS regen
+     * (runtime-side), works in Release. See docs/STRING_TRANSLATION.md. */
+    text_xlate_on_dispatch(cpu, target);
+
     /* General parity ring: one DISPATCH row per leader while current_tcb matches
      * the watched thread. Gated by the cheap armed flag so disarmed runs pay only
      * a single branch on this hot path. pc==target (the leader being entered). */

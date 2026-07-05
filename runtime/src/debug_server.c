@@ -10864,6 +10864,21 @@ static void handle_game_options(int id, const char *json)
     send_fmt("{\"id\":%d,\"ok\":true,\"go\":%s}", id, buf);
 }
 
+/* On-the-fly string translation (text_xlate.cpp). Always-on capture inventory +
+ * apply stats/dump, queried over TCP (no log files — Rule 3). sub: stats (def) |
+ * dump | todo | reload. */
+static void handle_xlate(int id, const char *json)
+{
+    extern int text_xlate_debug_json(const char *subcmd, char *out, int cap);
+    char sub[32] = {0};
+    if (!json_get_str(json, "sub", sub, sizeof(sub))) strcpy(sub, "stats");
+    static char buf[1 << 20];   /* 1 MB — the inventory dump can be large */
+    int n = text_xlate_debug_json(sub, buf, (int)sizeof(buf));
+    if (n < 0) n = 0;
+    if (n < (int)sizeof(buf)) buf[n] = 0; else buf[sizeof(buf) - 1] = 0;
+    send_fmt("{\"id\":%d,\"ok\":true,\"xlate\":%s}", id, buf);
+}
+
 /* Live host-stack-usage profile (RECURSION_BUG.md §17): read the always-on ring
  * while the game is still responsive to distinguish a gradual cross-frame leak
  * (used_kb climbs linearly with frame) from a within-one-frame runaway. */
@@ -10984,6 +10999,7 @@ static const CmdEntry s_commands[] = {
     { "lockstep",          handle_lockstep },
     { "lockstep_func",     handle_lockstep_func },
     { "ping",              handle_ping },
+    { "xlate",             handle_xlate },
     { "parity_dump",       handle_parity_dump },
     { "parity_ctl",        handle_parity_ctl },
     { "devtrace_dump",     handle_devtrace_dump },

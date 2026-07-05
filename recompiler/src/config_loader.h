@@ -48,6 +48,12 @@ struct RuntimeConfig {
     bool                  has_debug_port = false;
     uint16_t              debug_port     = 0;
 
+    // Localization / on-the-fly string translation (docs/STRING_TRANSLATION.md).
+    // language selects the translations/*.toml column; "jp"/"off"/"" disables
+    // APPLY (capture still runs). From [localization].language or [runtime].
+    // language; env PSX_LANG overrides at runtime.
+    std::string           language = "en";
+
     bool                  has_window_title = false;
     std::string           window_title;
 
