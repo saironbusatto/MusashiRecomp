@@ -1021,6 +1021,28 @@ static void exec_command(uint8_t cmd) {
         set_irq(CDIRQ_ACK);
         break;
 
+    case 0x08: /* Stop — stop the motor. Two-phase like Pause: INT3 (ACK) now
+                * with the pre-stop status (motor still spinning), then a pending
+                * INT2 (COMPLETE) after the motor spins down, reporting the new
+                * status with the motor bit cleared (psx-spx "08h Stop").
+                *
+                * Previously 0x08 had no case and fell through to default ->
+                * CDIRQ_ERROR (INT5). A game that stops the drive on a scene
+                * change then waits for the Stop completion IRQ never sees it and
+                * hangs: Tsumu Light's CD library retries Stop forever (~90-frame
+                * timeout) and never advances past its first content load. */
+        stop_read_stream();
+        xa_reset_decode();
+        spu_cd_audio_reset();
+        stat_reg &= ~(CDSTAT_READ | CDSTAT_PLAY | CDSTAT_SEEK);
+        response_push(stat_reg);
+        set_irq(CDIRQ_ACK);
+        pending.cmd = 0x08;
+        pending.pending = 1;
+        pending.delay = apply_speed(30000); /* motor spin-down */
+        pending.phase = 1;
+        break;
+
     case 0x09: /* Pause */
         stop_read_stream();
         xa_reset_decode();
@@ -1301,6 +1323,13 @@ static void process_pending(uint32_t cycles) {
                 fire_cdrom_irq();
             }
         }
+        break;
+
+    case 0x08: /* Stop complete — motor has spun down */
+        stat_reg &= ~(CDSTAT_MOTOR | CDSTAT_READ | CDSTAT_PLAY | CDSTAT_SEEK);
+        response_push(stat_reg);
+        set_irq(CDIRQ_COMPLETE);
+        fire_cdrom_irq();
         break;
 
     case 0x09: /* Pause complete */
