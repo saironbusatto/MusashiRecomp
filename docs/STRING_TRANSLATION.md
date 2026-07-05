@@ -621,6 +621,58 @@ string-pointer text, the always-on capture will surface it during play);
 (3) fold endianness + the LE-first-byte fix into `EncodingProfile`;
 (4) `screenshot` writes fail to some temp paths — use a project-dir path.
 
+## Appendix Y — Per-glyph text: investigation & why it resists (2026-07-05)
+
+The HUD / title / menu labels are drawn **per-glyph as sprites** (glyph index →
+font tile → sprite), NOT via the string-pointer formatter, so the message-path
+hook cannot reach them. Investigation results (concrete, for the eventual hook):
+
+**Font glyph-index map** (table at EXE `0x80074ACA`, one LE-SJIS code per index):
+- **Latin `Ａ–Ｚ` = indices 73–98**, **digits `０–９` = 105–114** (primary bank);
+  a second Latin/digit bank at **213–252**. Hiragana fills 0–64 and 121–207.
+  So for any English char the glyph index is known. **The font already contains
+  fullwidth Latin/digit glyphs** (confirmed) — no glyph injection needed.
+- Note: this table has **no katakana** (it is the name-entry character set);
+  the katakana glyphs the HUD uses live at other indices in the VRAM font
+  (`MOJI.BIN`) — dumping `MOJI.BIN` / the VRAM font page is still needed to map
+  katakana → index if a katakana label is to be recognized.
+
+**Label storage** — per-glyph labels are static **little-endian Shift-JIS** in
+the EXE, in **fixed-width, space-padded slots** (patchable):
+- Level names ~`0x80070755–0x800708E4`: `はこにわ`(0x8007075E) `たわー`(0x800707AC)
+  `くらげ`(0x800707C6) `せんしゃ`(0x800707E0) `せぱれーと`(0x800707FA)
+  `おてほん`(0x80070814) `ろじうら`(0x800708E4) … each padded with fullwidth
+  spaces (`81 40`) to a fixed slot.
+- Tutorial labels ~`0x80070300+` (`ちゅーとりある` ×6); mode name `のーまるげーむ`;
+  `はい`/`いいえ` at several sites.
+
+**Cleanest hook (designed, not shipped):** since fullwidth Latin glyphs exist,
+a **load-time source patch** — after game-start, overwrite a label's katakana/
+hiragana SJIS in RAM with fullwidth-Latin English SJIS (`ステージ`→`ＳＴＡＧＥ`),
+padded to the slot with `81 40` — makes the **existing** per-glyph routine draw
+English, with no new draw routine and no glyph injection. English must fit the
+slot (the space padding gives the budget; e.g. `たわー`→`ＴＯＷＥＲ`,
+`くらげ`→`ＪＥＬＬＹＦＩＳＨ`). For labels drawn instead via the string-pointer
+path, they simply go in `tsumu.toml` like any message entry.
+
+**Why it is not shipped/verified here:** the bar is a screenshot of English on
+these screens, and **the screens are unreachable in the headless build**: the
+attract never auto-plays the gameplay demo (150 s observed: title/Sony-logo
+only), and reaching the mode/level-select or in-game HUD requires completing the
+**name-entry glyph grid** (enter a char, navigate to the "End" cell, confirm) —
+which is intractable via blind debug-input injection (input reaches the pad,
+verified, but precise grid navigation to "End" did not land). Committing a
+RAM-patch feature that overwrites game memory without a rendered-English
+screenshot would be unverified coverage, so it is documented here instead.
+
+**Remaining resisters within per-glyph:** the HUD counter `ステージ：X–Y` (label
+storage not found statically — composed at runtime / in an overlay; needs
+gameplay capture to pin); the title prompt and `CLEAR!!` (likely baked sprite
+graphics, not glyph-drawn → would need image replacement, out of the glyph
+model). Next step for whoever has a reachable build: dump `MOJI.BIN`, confirm the
+katakana index range, ship the load-time source patch for the padded label
+slots, and screenshot the level-select / HUD.
+
 ## Appendix A — Key source references
 
 **n64recomp prior art** (`F:\Projects\n64recomp\PocketMonstersStadiumRecomp\`):
