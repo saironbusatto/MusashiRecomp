@@ -249,7 +249,7 @@ static void rtrace_callback(uint32_t addr, uint32_t value,
 #define BEETLE_FNTRACE_MAX_ARMS   64
 struct BeetleFnTraceEntry {
     uint64_t seq;
-    uint32_t caller_pc, target_pc, parent_ra, a0, a1, frame, sp;
+    uint32_t caller_pc, target_pc, parent_ra, a0, a1, a2, a3, frame, sp;
     uint8_t  kind, pad[3];
 };
 static BeetleFnTraceEntry s_fntrace[BEETLE_FNTRACE_CAP];
@@ -296,6 +296,14 @@ static void fntrace_callback(uint32_t caller_pc, uint32_t target_pc,
     e->parent_ra = parent_ra;
     e->a0        = a0;
     e->a1        = a1;
+    if (PSX_CPU) {
+        char dummy[8] = {0};
+        e->a2 = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR + 6, dummy, sizeof(dummy));
+        e->a3 = PSX_CPU->GetRegister(PS_CPU::GSREG_GPR + 7, dummy, sizeof(dummy));
+    } else {
+        e->a2 = 0;
+        e->a3 = 0;
+    }
     e->frame     = s_frame_count;
     e->kind      = kind;
     /* SP at retire — needed for the func_8001A954 SP/RA-lifecycle oracle
@@ -1010,7 +1018,8 @@ extern "C" int beetle_spu_get_global_state(
 extern "C" uint32_t beetle_fntrace_get(uint64_t *out_seq,
                                        uint32_t *out_caller, uint32_t *out_target,
                                        uint32_t *out_ra, uint32_t *out_a0,
-                                       uint32_t *out_a1, uint32_t *out_frame,
+                                       uint32_t *out_a1, uint32_t *out_a2,
+                                       uint32_t *out_a3, uint32_t *out_frame,
                                        uint8_t *out_kind, uint32_t *out_sp,
                                        int max_count)
 {
@@ -1027,6 +1036,8 @@ extern "C" uint32_t beetle_fntrace_get(uint64_t *out_seq,
         out_ra[i]     = e->parent_ra;
         out_a0[i]     = e->a0;
         out_a1[i]     = e->a1;
+        out_a2[i]     = e->a2;
+        out_a3[i]     = e->a3;
         out_frame[i]  = e->frame;
         out_kind[i]   = e->kind;
         out_sp[i]     = e->sp;

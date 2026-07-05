@@ -222,10 +222,22 @@ int main(int argc, char** argv) {
                     pixels[y * w + x] = fb[y * w + x] | 0xFF000000u;
                 }
             }
-            SDL_UpdateTexture(tex, NULL, pixels, (int)(w * sizeof(uint32_t)));
+            /* Upload and present ONLY the valid w×h region. The texture is
+             * allocated at the max PSX size (640×512), but the live frame
+             * dimensions vary per-frame (256/320/368/512/640 wide, 240/480
+             * tall). Passing NULL rects made SDL treat the source as the full
+             * 640×512 texture while `pixels` is tightly packed at stride w:
+             * each 640-texel texture row was filled from a w-stride buffer
+             * (→ horizontal doubling / shear) and rows past the h*w packed
+             * data drew uninitialized memory (→ garbage streaks below). A
+             * per-frame src rect fixes both — the upload's pitch (w*4) now
+             * matches the packed stride, and only the valid pixels are scaled
+             * to the window. */
+            SDL_Rect src = { 0, 0, (int)w, (int)h };
+            SDL_UpdateTexture(tex, &src, pixels, (int)(w * sizeof(uint32_t)));
             SDL_Rect dst = { 0, 0, 640, 480 };
             SDL_RenderClear(ren);
-            SDL_RenderCopy(ren, tex, NULL, &dst);
+            SDL_RenderCopy(ren, tex, &src, &dst);
             SDL_RenderPresent(ren);
         }
 
