@@ -72,6 +72,9 @@ struct EncodingProfile {
     bool (*read_record)(uint8_t* ram, uint32_t va, uint8_t* out, uint32_t* len, Term* term);
     // Transcode a UTF-8 target string into game glyph bytes appended to `out`.
     void (*transcode)(const std::string& utf8, std::vector<uint8_t>& out);
+    // Authoring quality gate: is this decoded record worth recording in the
+    // always-on capture inventory (vs. binary that passed the reader by chance)?
+    bool (*capture_worthy)(const uint8_t* bytes, uint32_t len);
 };
 
 // ---- Shift-JIS profile (Tsumu) --------------------------------------------
@@ -84,14 +87,17 @@ bool sj_first_byte_textish(uint8_t c) {
     return sj_ascii(c) || sj_kana(c) || sj_lead(c);
 }
 
-// A record ends at NUL or the game's 0xFFFF message terminator. Content may
-// interleave control bytes (framing/line-break); we keep them verbatim so the
-// hash is byte-exact and the original renderer sees the same framing.
+// A record ends at NUL (menu/UI labels) or the game's 0xFFFF message terminator
+// (framed multi-line messages). Content bytes are kept VERBATIM — including the
+// game's control framing: a lone SJIS-lead byte with no valid trail, 0x8x/0xFE,
+// and the "FE FF" line-break code — so the hash is byte-exact and the original
+// renderer sees identical framing. Binary structs are filtered by requiring a
+// minimum count of decodable 2-byte SJIS units.
 bool sj_read_record(uint8_t* ram, uint32_t va, uint8_t* out, uint32_t* len, Term* term) {
     if (!va_in_ram(va)) return false;
     uint8_t b0 = grb(ram, va);
     if (!sj_first_byte_textish(b0)) return false;
-    uint32_t n = 0, real = 0;  // real = count of genuine text units (not control)
+    uint32_t n = 0, real = 0, two = 0;  // real=text units; two=decodable 2-byte SJIS
     Term t = Term::None;
     for (uint32_t i = 0; i < kSrcMax; ++i) {
         uint8_t c = grb(ram, va + i);
@@ -99,23 +105,22 @@ bool sj_read_record(uint8_t* ram, uint32_t va, uint8_t* out, uint32_t* len, Term
         if (c == 0xFF && grb(ram, va + i + 1) == 0xFF) { t = Term::FFFF; break; }
         if (sj_lead(c) && sj_trail(grb(ram, va + i + 1))) {
             if (n + 2 > kSrcMax) break;
-            out[n++] = c; out[n++] = grb(ram, va + i + 1); ++i; ++real; continue;
+            out[n++] = c; out[n++] = grb(ram, va + i + 1); ++i; ++real; ++two; continue;
         }
         if (sj_kana(c) || sj_ascii(c) || c == 0x0A) {
             if (n + 1 > kSrcMax) break;
             out[n++] = c; if (c != 0x0A) ++real; continue;
         }
-        // Byte in the game's control-code space (0x01..0x1F, 0x80, 0x8x-framing,
-        // 0xFD/0xFE lone) — keep verbatim, but a run of them with no text means
-        // this isn't a string. Cap stray control so structs are rejected.
-        if (c < 0x20 || c == 0x80 || c == 0xFD || c == 0xFE) {
-            if (n + 1 > kSrcMax) break;
-            out[n++] = c; continue;
-        }
-        // Anything else (invalid SJIS trail, high byte not kana/lead) => not text.
-        return false;
+        // Control / framing byte: lone SJIS lead (0x81..0x9F/0xE0..0xFC with no
+        // valid trail — e.g. the "81 FF" / "FE FF" framing), 0x01..0x1F, 0x80,
+        // 0xFD/0xFE, or a lone 0xFF (second half of a FE-FF line break). Keep it.
+        if (n + 1 > kSrcMax) break;
+        out[n++] = c;
     }
-    if (t == Term::None || real < 1) return false;
+    // Reject binary: a genuine string carries at least two decodable 2-byte SJIS
+    // chars (or, for a short pure label, at least three text units).
+    if (t == Term::None) return false;
+    if (two < 2 && real < 3) return false;
     *len = n; *term = t;
     return true;
 }
@@ -177,13 +182,36 @@ void sj_transcode(const std::string& utf8, std::vector<uint8_t>& out) {
         if (cp >= 0xFF01 && cp <= 0xFF5E) cp = cp - 0xFF00 + 0x20;
         if (cp == 0x3000) cp = ' ';
         uint16_t g = fw_sjis_for_ascii(cp <= 0x7E ? cp : ' ');
-        out.push_back((uint8_t)(g >> 8));
-        out.push_back((uint8_t)(g & 0xFF));
+        // Endianness of the 16-bit glyph code as the game's drawer reads it.
+        // EXE menu labels are big-endian SJIS; the message-table text is stored
+        // little-endian. Selectable per run (PSX_XLATE_LE=1) until confirmed;
+        // once known this becomes an EncodingProfile flag.
+        static const bool le = [] { const char* e = std::getenv("PSX_XLATE_LE");
+                                    return e && e[0] == '1'; }();
+        if (le) { out.push_back((uint8_t)(g & 0xFF)); out.push_back((uint8_t)(g >> 8)); }
+        else    { out.push_back((uint8_t)(g >> 8));   out.push_back((uint8_t)(g & 0xFF)); }
     }
 }
 
+// Capture-inventory quality gate (authoring signal only — APPLY is KV-gated and
+// unaffected). Real Tsumu text is hiragana/katakana/fullwidth-alnum heavy, whose
+// SJIS lead bytes concentrate in the 0x82/0x83 rows; vertex/coordinate binary
+// that passes the record reader by chance has diverse leads. Require >= 2 such
+// chars so the always-on inventory stays a clean enumeration of drawn strings.
+bool sj_capture_worthy(const uint8_t* b, uint32_t n) {
+    uint32_t good = 0;
+    for (uint32_t i = 0; i + 1 < n; ) {
+        uint8_t c = b[i];
+        if (sj_lead(c) && sj_trail(b[i + 1])) {
+            if (c == 0x83 || (c == 0x82 && b[i + 1] >= 0x4F)) ++good;  // kana/fullwidth
+            i += 2;
+        } else i += 1;
+    }
+    return good >= 2;
+}
+
 const EncodingProfile kShiftJisProfile = {
-    "shift_jis", sj_first_byte_textish, sj_read_record, sj_transcode
+    "shift_jis", sj_first_byte_textish, sj_read_record, sj_transcode, sj_capture_worthy
 };
 
 // ===========================================================================
@@ -202,6 +230,7 @@ struct CapRec {
     uint32_t ra;
     uint32_t first_frame;
     uint64_t count;
+    Term     term;         // terminator that delimited the record (nul|ffff)
     bool     translated;
 };
 
@@ -300,15 +329,15 @@ void load_tables_locked() {
 // Capture inventory upsert.
 // ---------------------------------------------------------------------------
 void inv_upsert_locked(uint64_t key, const uint8_t* bytes, uint32_t len,
-                       uint32_t addr, uint32_t pc, uint32_t ra) {
+                       uint32_t addr, uint32_t pc, uint32_t ra, Term term) {
     auto it = g_inv.find(key);
     if (it != g_inv.end()) { it->second.count++; it->second.addr = addr;
                              it->second.pc = pc; it->second.ra = ra; return; }
-    if (g_inv.size() >= 20000) return;  // sane bound
+    if (g_inv.size() >= 60000) return;  // sane bound
     CapRec r{};
     uint32_t n = len < 96 ? len : 96;
     std::memcpy(r.bytes, bytes, n);
-    r.sample_len = (uint8_t)n; r.full_len = (uint16_t)len;
+    r.sample_len = (uint8_t)n; r.full_len = (uint16_t)len; r.term = term;
     r.addr = addr; r.pc = pc; r.ra = ra;
     r.first_frame = (uint32_t)s_frame_count; r.count = 1;
     r.translated = (g_table.find(key) != g_table.end());
@@ -322,16 +351,26 @@ bool apply_to_reg(uint8_t* ram, CPUState* cpu, uint32_t sp, uint32_t* reg,
                   const TableEntry& te, Term src_term) {
     std::vector<uint8_t> enc;
     g_prof->transcode(te.target, enc);
-    if (enc.empty() || enc.size() > kSrcMax) return false;
+    if (enc.empty()) return false;
+    Term t = (te.term != Term::Nul) ? te.term : src_term;  // preserve source terminator
+    // For framed (0xFFFF) messages the game's line break is the "FE FF" code, not
+    // a raw 0x0A — remap so multi-line English reflows in the text box.
+    std::vector<uint8_t> body;
+    body.reserve(enc.size() + 8);
+    for (uint8_t c : enc) {
+        if (c == 0x0A && t == Term::FFFF) { body.push_back(0xFE); body.push_back(0xFF); }
+        else if (c == 0x0A)               { /* NUL-label: drop stray newline */ }
+        else                               body.push_back(c);
+    }
+    if (body.empty() || body.size() > kSrcMax) return false;
     // Scratch below the caller's $sp, 8-byte aligned, with headroom.
     if (sp < 0x80001000u) return false;
     uint32_t scratch = (sp - 0x900u) & ~7u;
-    if (!va_in_ram(scratch) || !va_in_ram(scratch + (uint32_t)enc.size() + 2)) return false;
-    for (size_t i = 0; i < enc.size(); ++i) gwb(ram, scratch + (uint32_t)i, enc[i]);
-    Term t = (te.term != Term::Nul) ? te.term : src_term;  // preserve source terminator
-    if (t == Term::FFFF) { gwb(ram, scratch + (uint32_t)enc.size(),     0xFF);
-                           gwb(ram, scratch + (uint32_t)enc.size() + 1, 0xFF); }
-    else                 { gwb(ram, scratch + (uint32_t)enc.size(),     0x00); }
+    if (!va_in_ram(scratch) || !va_in_ram(scratch + (uint32_t)body.size() + 2)) return false;
+    for (size_t i = 0; i < body.size(); ++i) gwb(ram, scratch + (uint32_t)i, body[i]);
+    if (t == Term::FFFF) { gwb(ram, scratch + (uint32_t)body.size(),     0xFF);
+                           gwb(ram, scratch + (uint32_t)body.size() + 1, 0xFF); }
+    else                 { gwb(ram, scratch + (uint32_t)body.size(),     0x00); }
     scratch_note(scratch);
     *reg = scratch;
     return true;
@@ -364,11 +403,19 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
         if (!g_prof->read_record(ram, va, buf, &len, &term)) continue;
         uint64_t key = fnv1a(buf, len);
 
-        if (cap) {
+        if (cap && (!g_prof->capture_worthy || g_prof->capture_worthy(buf, len))) {
             std::lock_guard<std::mutex> lk(g_mtx);
-            inv_upsert_locked(key, buf, len, va, target, cpu->gpr[31]);
+            inv_upsert_locked(key, buf, len, va, target, cpu->gpr[31], term);
         }
         if (app) {
+            // Safety: by default only substitute standalone framed (0xFFFF)
+            // messages. NUL-terminated records are frequently fixed-width struct
+            // fields with binary params packed after the text (e.g. the "Tutorial
+            // N" label carries trailing coordinate bytes); replacing those
+            // corrupts the struct and derails the game. A NUL record is only
+            // safe when its table entry opts in with term="nul" AND matches
+            // byte-for-byte (the author vetted it). PSX_XLATE_ALLOW_NUL=1 lifts
+            // the gate for experimentation.
             TableEntry te;
             {
                 std::lock_guard<std::mutex> lk(g_mtx);
@@ -376,6 +423,9 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
                 if (it == g_table.end()) continue;
                 te = it->second;
             }
+            static const bool allow_nul = [] {
+                const char* e = std::getenv("PSX_XLATE_ALLOW_NUL"); return e && e[0] == '1'; }();
+            if (term != Term::FFFF && !allow_nul) continue;  // framed messages only
             if (apply_to_reg(ram, cpu, sp, argregs[a], te, term))
                 g_hits.fetch_add(1, std::memory_order_relaxed);
         }
@@ -425,9 +475,10 @@ extern "C" int text_xlate_debug_json(const char* subcmd, char* out, int cap) {
         first = false;
         w += std::snprintf(out + w, cap - w,
             "{\"hash\":\"%016llx\",\"addr\":\"%08x\",\"pc\":\"%08x\",\"ra\":\"%08x\","
-            "\"len\":%u,\"count\":%llu,\"xl\":%s,\"hex\":\"",
+            "\"len\":%u,\"count\":%llu,\"term\":\"%s\",\"xl\":%s,\"hex\":\"",
             (unsigned long long)kv.first, r.addr, r.pc, r.ra,
             (unsigned)r.full_len, (unsigned long long)r.count,
+            r.term == Term::FFFF ? "ffff" : "nul",
             r.translated ? "true" : "false");
         for (uint32_t i = 0; i < r.sample_len && w < cap - 4; ++i)
             w += std::snprintf(out + w, cap - w, "%02x", r.bytes[i]);
