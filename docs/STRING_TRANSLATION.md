@@ -553,6 +553,54 @@ core.
 
 ---
 
+## Appendix Z — Implementation status & Phase-0 empirical findings (2026-07-05)
+
+The mechanism is IMPLEMENTED and verified working headless on Tsumu; the
+translation table is an ongoing coverage effort. Hard-won findings from driving
+the real game (these correct/extend §2, which was written pre-implementation):
+
+- **Hook point (as specced):** `text_xlate_on_dispatch()` is called from
+  `fntrace_record()` at the `psx_dispatch` chokepoint. No generated-code edits,
+  no BIOS regen, works in the Release build. Capture + apply confirmed live.
+- **Two encodings, two endiannesses.** The EXE menu labels (e.g. `0x80010C5C`
+  `ＴＳＵＭＵ ｌｉｇｈｔ`) are **big-endian** Shift-JIS, NUL-terminated. The
+  message-table text (tutorial/hint/dialogue, drawn via a string pointer) is
+  **little-endian 16-bit** Shift-JIS (bytes `bf 82` = ち), framed with control
+  codes and **0xFFFF**-terminated. The transcoder must emit the matching
+  endianness (`PSX_XLATE_LE`); this should become an `EncodingProfile` flag.
+- **Control framing (confirmed):** `FE FF` = line break; `FF FF` = end of
+  message; `30 FC` / `10 FC` = page/prompt breaks; `＄`/`％` (`8x` codes) =
+  on-screen button icons; fullwidth space `81 40` pads fixed-width fields.
+- **Two draw paths — only one is interceptable.** Message/dialogue text is drawn
+  by passing a **string pointer** to a formatter → captured & translatable.
+  The **title prompt, HUD ("ステージ"/"バッテリー"), and menu labels are drawn
+  per-glyph as sprites** (glyph index, no string pointer) → **NOT reachable by
+  arg-scanning**. Full HUD/menu localization needs a second hook that intercepts
+  the per-glyph sprite draw and remaps the glyph index — a larger, separate
+  effort (open item).
+- **Struct-embedded strings crash if naively replaced.** Some NUL records are
+  fixed-width struct fields with binary params packed after the text (e.g. the
+  `ちゅーとりあるの5` "Tutorial N" label carries trailing coordinate bytes).
+  Replacing the whole record corrupts the struct and derails the game (observed
+  `PC=0`). **Apply is therefore gated to standalone 0xFFFF-framed messages by
+  default** (`PSX_XLATE_ALLOW_NUL=1` to override for vetted labels). This is the
+  concrete form of the §5.4 "dynamically-composed / struct" risk.
+- **Capture quality gate.** The relaxed reader admits vertex/coordinate binary
+  that passes by chance (~20k records). A gate requiring ≥2 hiragana/katakana/
+  fullwidth chars (SJIS lead `0x82`/`0x83`) keeps the always-on inventory a clean
+  enumeration (~52 real records). Authoring reads it via TCP `xlate dump/todo`.
+- **Verification.** Framed tutorial hints apply on real draws (hits climb, game
+  stays alive, English written little-endian). These particular hints are
+  composed during a load transition and displayed only in **interactive tutorial
+  mode**; a full on-screen visual pass needs menu navigation to that mode (and,
+  for the HUD/menu, the per-glyph hook above). Debug-server `screenshot` is
+  flaky after extended headless runs — a tooling bug to fix (CLAUDE.md rule 15).
+
+**Open items for full "all text" coverage:** (1) per-glyph sprite-draw hook for
+HUD/title/menu; (2) `MONDAI.BIN` disc puzzle text (extract + decode LE-SJIS);
+(3) drive interactive tutorial/menus to enumerate & visually verify every
+message; (4) fold endianness into `EncodingProfile`; (5) fix `screenshot`.
+
 ## Appendix A — Key source references
 
 **n64recomp prior art** (`F:\Projects\n64recomp\PocketMonstersStadiumRecomp\`):
