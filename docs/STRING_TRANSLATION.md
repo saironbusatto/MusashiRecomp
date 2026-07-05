@@ -596,10 +596,30 @@ the real game (these correct/extend §2, which was written pre-implementation):
   for the HUD/menu, the per-glyph hook above). Debug-server `screenshot` is
   flaky after extended headless runs — a tooling bug to fix (CLAUDE.md rule 15).
 
-**Open items for full "all text" coverage:** (1) per-glyph sprite-draw hook for
-HUD/title/menu; (2) `MONDAI.BIN` disc puzzle text (extract + decode LE-SJIS);
-(3) drive interactive tutorial/menus to enumerate & visually verify every
-message; (4) fold endianness into `EncodingProfile`; (5) fix `screenshot`.
+**Coverage status (138 entries shipped):** the full in-EXE message table was
+statically enumerated — pointer table at **0x80071474** plus the block
+**0x80070900–0x80073700** — decoded (little-endian Shift-JIS, control framing
+honored) and translated to English: mode-select descriptions, the entire
+interactive tutorial, ~90 per-stage hints, all memory-card save/load/format
+messages, the Yes/No confirmation dialogs, and the contributor credits. Every
+entry's `src_hex` is byte-exact to what the game draws — cross-checked by
+hashing against the always-on runtime capture ring (confirmed matches), so the
+apply hook fires on the real draws (verified: hits climb, no crash, English
+written little-endian).
+
+**Reader limitation (small gap):** the byte-based reader rejects a record whose
+first byte isn't "textish" — which for LE storage means a first glyph whose low
+byte is 0xA0 (i.e. records starting with **あ**, e.g. the name-entry prompt
+"あなたの名前を教えてね"). Those few stay Japanese until the reader is made
+LE-word-aware (would rehash the table).
+
+**Still out of scope / open:** (1) per-glyph sprite-draw text — HUD
+(ステージ/バッテリー), title prompt, menu labels, the "CLEAR!!" banner, the
+name-entry glyph grid — needs a separate glyph-index-remap hook (deferred
+feature, by design); (2) `MONDAI.BIN` disc puzzle data (if it carries
+string-pointer text, the always-on capture will surface it during play);
+(3) fold endianness + the LE-first-byte fix into `EncodingProfile`;
+(4) `screenshot` writes fail to some temp paths — use a project-dir path.
 
 ## Appendix A — Key source references
 
