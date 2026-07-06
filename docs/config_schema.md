@@ -8,7 +8,7 @@ Consumed by:
 
 Examples:
 - `bios/SCPH1001.toml` — BIOS-only config (no game; psx-runtime targets this)
-- `F:/Projects/TombaRecomp/game.toml` — game config (tomba-runtime targets this)
+- `../TombaRecomp/game.toml` — game config (tomba-runtime targets this)
 
 ## How configs combine
 

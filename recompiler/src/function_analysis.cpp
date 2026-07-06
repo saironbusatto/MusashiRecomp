@@ -1133,22 +1133,240 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
     std::vector<uint32_t> starts_vec(function_starts.begin(), function_starts.end());
     std::sort(starts_vec.begin(), starts_vec.end());
 
+    // ── Control-flow-aware function extent + code/data classification ──
+    //
+    // The legacy estimate set end_addr to the NEXT discovered function start
+    // and then ran is_likely_data_section over that whole span. In Psy-Q /
+    // Capcom titles (e.g. Mega Man X4) a real function is immediately followed
+    // by an INLINE data / jump table (build-signature strings, dispatch
+    // tables). That trailing data inflated the function's measured extent, and
+    // is_likely_data_section's undefined-opcode density then misclassified the
+    // real function as a data section — emitting a psx_unknown_dispatch stub
+    // for real, directly-called code (the entire 0x800EE3A4.. text tail,
+    // ~261 KB / 7,373 entries, became stubs, and the boot jal into it hit the
+    // stub → fail-fast).
+    //
+    // Fix (mirrors the proven analyze_exact_entries overlay walk): walk each
+    // function's control flow from its entry to its real terminus (the jr $ra /
+    // tail-jump reachable from the entry). If the reachable body is provably
+    // clean code — reaches a return/tail exit, decodes with zero invalid
+    // primary opcodes, and every indirect jump was resolved to in-function
+    // targets — bound end_addr to that terminus (so trailing inline data is
+    // excluded and never linearly disassembled as code) and mark it code. Only
+    // functions that are NOT provably clean code fall back to the legacy
+    // boundary + density heuristic, which still correctly rejects genuine data
+    // tables minted as function starts (those never walk as clean code:
+    // ~44% of random data words carry an invalid primary opcode).
+    auto in_exe_p3 = [&](uint32_t a) {
+        return a >= exe_.header.load_address && a < exe_.end_address() && (a & 3u) == 0;
+    };
+    // Same primary-opcode validity table as is_likely_data_section so the two
+    // agree on what "clean code" means (COP2/GTE, LWC2/SWC2 are valid PS1 ops).
+    auto valid_primary_p3 = [](uint32_t instr) -> bool {
+        static const bool valid[64] = {
+            true,  true,  true,  true,  true,  true,  true,  true,   // 0x00-0x07
+            true,  true,  true,  true,  true,  true,  true,  true,   // 0x08-0x0F
+            true,  false, true,  false, false, false, false, false,  // 0x10-0x17
+            false, false, false, false, false, false, false, false,  // 0x18-0x1F
+            true,  true,  true,  true,  true,  true,  true,  false,  // 0x20-0x27
+            true,  true,  true,  true,  false, false, true,  false,  // 0x28-0x2F
+            true,  false, true,  false, false, false, false, false,  // 0x30-0x37
+            true,  false, true,  false, false, false, false, false,  // 0x38-0x3F
+        };
+        return valid[(instr >> 26) & 0x3Fu];
+    };
+    // Resolve a `jr $rN` jump table by the standard Psy-Q pattern
+    // (sltiu bound; sll idx,2; lui/addiu base; addu; lw target; jr). Returns
+    // true and fills `targets` (in-function entries) when a table is
+    // recognized; false when the indirect jump is unresolved.
+    auto resolve_jt_p3 = [&](uint32_t entry, uint32_t hard_cap, uint32_t jr_pc,
+                             uint32_t jr_rs, std::vector<uint32_t>& targets) -> bool {
+        uint32_t lw_base = 0xFFu; int32_t lw_offset = 0;
+        uint32_t addu_cand[2] = {0xFFu, 0xFFu};
+        uint32_t lui_val = 0; int16_t addiu_val[2] = {0, 0};
+        bool found_addiu[2] = {false, false};
+        bool found_lui = false; uint32_t table_count = 0;
+        for (int back = 1; back <= 40; back++) {
+            uint32_t scan_addr = jr_pc - static_cast<uint32_t>(back * 4);
+            if (scan_addr < entry) break;
+            auto scan_opt = exe_.read_word(scan_addr);
+            if (!scan_opt.has_value()) break;
+            uint32_t instr = *scan_opt;
+            uint32_t op = (instr >> 26) & 0x3Fu;
+            uint32_t rs = (instr >> 21) & 0x1Fu;
+            uint32_t rt = (instr >> 16) & 0x1Fu;
+            uint32_t rd = (instr >> 11) & 0x1Fu;
+            uint32_t fn = instr & 0x3Fu;
+            if (op == 0x23u && rt == jr_rs && lw_base == 0xFFu) {
+                lw_base = rs;
+                lw_offset = static_cast<int32_t>(static_cast<int16_t>(instr & 0xFFFFu));
+                continue;
+            }
+            if (op == 0x00u && fn == 0x21u && rd == lw_base && lw_base != 0xFFu &&
+                addu_cand[0] == 0xFFu) {
+                addu_cand[0] = rs; addu_cand[1] = rt; continue;
+            }
+            if (op == 0x09u && addu_cand[0] != 0xFFu) {
+                for (int c = 0; c < 2; c++) {
+                    if (!found_addiu[c] && addu_cand[c] != 0xFFu &&
+                        rs == addu_cand[c] && rt == addu_cand[c]) {
+                        addiu_val[c] = static_cast<int16_t>(instr & 0xFFFFu);
+                        found_addiu[c] = true; break;
+                    }
+                }
+                continue;
+            }
+            if (op == 0x0Fu && addu_cand[0] != 0xFFu && !found_lui) {
+                for (int c = 0; c < 2; c++) {
+                    if (addu_cand[c] != 0xFFu && rt == addu_cand[c]) {
+                        lui_val = (instr & 0xFFFFu) << 16;
+                        if (!found_addiu[c]) addiu_val[c] = 0;
+                        addiu_val[0] = addiu_val[c];
+                        found_addiu[0] = found_addiu[c];
+                        found_lui = true; break;
+                    }
+                }
+                continue;
+            }
+            if (op == 0x0Bu && table_count == 0) { table_count = instr & 0xFFFFu; continue; }
+            if (found_lui && table_count != 0) break;
+        }
+        if (!found_lui || table_count == 0 || table_count >= 512) return false;
+        uint32_t table_base = lui_val +
+            (found_addiu[0] ? static_cast<uint32_t>(static_cast<int32_t>(addiu_val[0])) : 0u) +
+            static_cast<uint32_t>(lw_offset);
+        for (uint32_t k = 0; k < table_count; k++) {
+            auto entry_opt = exe_.read_word(table_base + k * 4u);
+            if (!entry_opt.has_value()) continue;
+            uint32_t target = *entry_opt;
+            if (target >= entry && target < hard_cap && in_exe_p3(target)) targets.push_back(target);
+        }
+        return true;
+    };
+    struct ExtentP3 { uint32_t terminus; bool clean_code; bool hit_invalid; bool resolved_jt; bool unresolved_indirect; };
+    auto compute_extent_p3 = [&](uint32_t entry, uint32_t hard_cap) -> ExtentP3 {
+        std::set<uint32_t> visited;
+        std::queue<uint32_t> work;
+        work.push(entry);
+        bool hit_invalid = false, reached_exit = false, unresolved_indirect = false;
+        bool resolved_jt = false;
+        auto in_fn = [&](uint32_t a) { return in_exe_p3(a) && a >= entry && a < hard_cap; };
+        while (!work.empty()) {
+            uint32_t pc = work.front(); work.pop();
+            if (visited.count(pc) || !in_fn(pc)) continue;
+            auto word_opt = exe_.read_word(pc);
+            if (!word_opt.has_value()) continue;
+            uint32_t instr = *word_opt;
+            visited.insert(pc);
+            if (!valid_primary_p3(instr)) { hit_invalid = true; continue; }
+            ExactCf cf = exact_classify_cf(pc, instr);
+            uint32_t delay = pc + 4u;
+            switch (cf.kind) {
+            case ExactCfKind::Normal:
+                if (in_fn(pc + 4u)) work.push(pc + 4u);
+                break;
+            case ExactCfKind::Branch:
+                if (in_fn(delay)) visited.insert(delay);
+                if (in_fn(pc + 8u)) work.push(pc + 8u);
+                if (in_fn(cf.target)) work.push(cf.target);
+                break;
+            case ExactCfKind::Jump:
+                if (in_fn(delay)) visited.insert(delay);
+                if (in_fn(cf.target)) work.push(cf.target);
+                else reached_exit = true;  // tail call / jump out of function
+                break;
+            case ExactCfKind::Jal:
+            case ExactCfKind::Jalr:
+                if (in_fn(delay)) visited.insert(delay);
+                if (in_fn(pc + 8u)) work.push(pc + 8u);
+                break;
+            case ExactCfKind::JrRa:
+                if (in_fn(delay)) visited.insert(delay);
+                reached_exit = true;
+                break;
+            case ExactCfKind::JrOther: {
+                if (in_fn(delay)) visited.insert(delay);
+                std::vector<uint32_t> jt;
+                uint32_t jr_rs = (instr >> 21) & 0x1Fu;
+                if (resolve_jt_p3(entry, hard_cap, pc, jr_rs, jt)) {
+                    resolved_jt = true;
+                    for (uint32_t t : jt) if (in_fn(t)) work.push(t);
+                } else {
+                    unresolved_indirect = true;  // computed jump we can't bound
+                }
+                break;
+            }
+            }
+        }
+        ExtentP3 info;
+        info.terminus = visited.empty() ? entry : (*visited.rbegin() + 4u);
+        // Density guard: a real function's basic blocks densely cover
+        // [entry, terminus]. A walk that follows a data-decoded branch/jump into
+        // an inline data region can coincidentally reach a far jr $ra (the word
+        // 0x03E00008 appears in data) and look "clean" while spanning tens of KB
+        // it barely visited — that over-extended range then hosts many aliases
+        // and emits the whole data region as code (huge bloat). Require the
+        // visited instructions to cover a meaningful fraction (~25%) of the span
+        // so sparse data-following walks are rejected and fall back to the
+        // density heuristic. Real functions (incl. those with small inline jump
+        // tables) stay well above this floor.
+        uint32_t span = info.terminus - entry;
+        bool dense = (span == 0) || (static_cast<uint64_t>(visited.size()) * 16u >= span);
+        info.clean_code = reached_exit && !hit_invalid && !unresolved_indirect &&
+                          !visited.empty() && dense;
+        info.hit_invalid = hit_invalid;
+        info.resolved_jt = resolved_jt;
+        info.unresolved_indirect = unresolved_indirect;
+        return info;
+    };
+
     for (size_t i = 0; i < starts_vec.size(); i++) {
         Function func;
         func.start_addr = starts_vec[i];
+        uint32_t next_start = (i + 1 < starts_vec.size()) ? starts_vec[i + 1] : end_addr;
 
-        // Estimate end address (next function start or end of executable)
-        if (i + 1 < starts_vec.size()) {
-            func.end_addr = starts_vec[i + 1];
+        ExtentP3 ext = compute_extent_p3(func.start_addr, next_start);
+        if (ext.clean_code) {
+            // Real function: bound to its control-flow terminus so trailing
+            // inline data / jump tables are excluded from the emitted extent.
+            func.end_addr = ext.terminus;
+            if (func.end_addr <= func.start_addr) func.end_addr = func.start_addr + 4u;
+            if (func.end_addr > next_start) func.end_addr = next_start;
+            func.is_data_section = false;
+        } else if (ext.hit_invalid && !ext.resolved_jt) {
+            // The reachable body (reached via straight/branch flow, no resolved
+            // jump table) decodes with an invalid primary opcode — real PS1 code
+            // never executes an invalid opcode, so this "function start" is
+            // genuinely data (e.g. a filename/string or pointer-table slot minted
+            // as a start by pointer-table promotion). Classify as data even when
+            // the dense-minted-start span is below is_likely_data_section's size
+            // floor. Guarded by !resolved_jt so a mis-resolved jump table can
+            // never force a real function to a stub.
+            func.end_addr = next_start;
+            func.is_data_section = true;
         } else {
-            func.end_addr = end_addr;
-        }
-        auto ret_it = function_last_return.find(func.start_addr);
-        if (ret_it != function_last_return.end()) {
-            uint32_t return_end = ret_it->second + 8u;  /* include jr delay slot */
-            if (return_end > func.start_addr && return_end < func.end_addr) {
-                func.end_addr = return_end;
+            // Legacy boundary estimate + density heuristic, but bound end_addr to
+            // the control-flow walk terminus (a valid upper bound on code
+            // reachable from the entry). Without this, a function-start on a
+            // data-heavy tail with no intervening discovered entry gets
+            // end_addr = next_start spanning tens of KB of inline data; that
+            // over-extended range then hosts many pointer-table aliases and emits
+            // the whole data region as code (massive bloat). The terminus bound
+            // is skipped only when an unresolved indirect jump means real code may
+            // exist beyond the walk that we cannot safely bound.
+            func.end_addr = next_start;
+            auto ret_it = function_last_return.find(func.start_addr);
+            if (ret_it != function_last_return.end()) {
+                uint32_t return_end = ret_it->second + 8u;  /* include jr delay slot */
+                if (return_end > func.start_addr && return_end < func.end_addr) {
+                    func.end_addr = return_end;
+                }
             }
+            if (!ext.unresolved_indirect && ext.terminus > func.start_addr &&
+                ext.terminus < func.end_addr) {
+                func.end_addr = ext.terminus;
+            }
+            func.is_data_section = is_likely_data_section(func.start_addr, func.end_addr);
         }
 
         func.size = func.end_addr - func.start_addr;
@@ -1175,9 +1393,6 @@ FunctionAnalysisResult FunctionAnalyzer::analyze() {
                 break;
             }
         }
-
-        // Check if this "function" is actually a data section
-        func.is_data_section = is_likely_data_section(func.start_addr, func.end_addr);
 
         result.functions.push_back(func);
     }

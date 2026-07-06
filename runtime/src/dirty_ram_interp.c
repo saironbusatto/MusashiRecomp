@@ -1010,12 +1010,10 @@ int dirty_ram_xprobe_json(char *out, int cap) {
 #ifdef PSX_HAS_GAME_DISPATCH
 static int interp_enter_compiled(CPUState *cpu, uint32_t target) {
     if (target == 0x8001A954u) site_note(&g_site_interp);
-    /* Decline if the target page is dirty: an overlay overwrote it after the
-     * game-start baseline, so the compiled function is STALE. Returning 0 lets the
-     * JAL/JALR handler fall through to is_local_dirty_target -> local-flow interp of
-     * the live overlay, instead of running stale compiled code (the same staleness
-     * the dirty_ram_dispatch_inner gate guards). Clean targets run compiled. */
-    if (dirty_ram_is_dirty(target & 0x1FFFFFFFu)) return 0;
+    /* Decline when the target page no longer matches the static game image.
+     * Returning 0 lets the JAL/JALR handler fall through to local-flow interp
+     * of the live RAM bytes instead of running stale compiled code. */
+    if (!dirty_ram_text_native_ok(target & 0x1FFFFFFFu)) return 0;
     if (psx_mixed_owner_enabled()
         && interp_host_stack_used() > psx_mixed_stack_watermark()) {
         cpu->pc = target;
@@ -2062,15 +2060,10 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 
 #ifdef PSX_HAS_GAME_DISPATCH
     xprobe_event(cpu->gpr[31], XOP_DD, XSITE_DD, addr, 0u, cpu->gpr[29], cpu->gpr[31], 0);
-    /* Run the statically-compiled game function ONLY for a CLEAN page (RAM matches
-     * the compiled image). A dirty page in the game-text region means an overlay
-     * overwrote it after the game-start baseline (dirty_ram_clear_image_baseline),
-     * so the compiled function is STALE and we must fall through to interpret the
-     * live overlay. Without this gate the loader thread's psx_dispatch(0x8001DB38)
-     * ran the stale compiled func_8001DB38 instead of the START.BIN-loader overlay
-     * (Tomba 2 Whoopee-Camp splash). Clean text still runs compiled (the fast path,
-     * unchanged for non-overlaying games once their text is baselined). */
-    if (!dirty_ram_is_dirty(phys)) {
+    /* Run the statically-compiled game function only while the target is still
+     * native-safe. Dirty overlay pages and pages whose text bytes diverged from
+     * the original EXE image fall through to interpret the live RAM bytes. */
+    if (dirty_ram_text_native_ok(phys)) {
         g_mixed_depth++;
         {
             ls_func_enter(addr, cpu);
@@ -2185,6 +2178,23 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
 #ifndef PSX_NO_DEBUG_TOOLS
     extern void debug_server_cyc_observe(uint32_t block_leader_phys);
 #endif
+    /* Async-interrupt latency fix. A guest wait loop that lives ENTIRELY in
+     * dirty RAM (e.g. libcd's CdSync spin, as in Kula World) re-enters this
+     * interpreter once per short (~7-insn) block and exits before the
+     * per-invocation `(insns_executed & 0xFFF)` gate below can fire — so a
+     * pending, IEc+IM2-enabled interrupt is never taken and the loop spins for
+     * seconds while the CD IRQ that would set its wait-flag is never serviced.
+     * Poll on a GLOBAL invocation counter so short-block loops still yield to
+     * interrupts (this is the interpreter analogue of a block-leader poll in
+     * static code). psx_check_interrupts runs the handler and returns with
+     * registers restored, so continuing the loop afterward is safe. */
+    {
+        static uint32_t s_interp_entry_poll = 0;
+        if ((++s_interp_entry_poll & 0x3Fu) == 0) {
+            cpu->pc = pc;
+            psx_check_interrupts(cpu);
+        }
+    }
     for (int i = 0; i < MAX_INSNS_PER_DISPATCH; i++) {
         uint32_t next_pc = 0;
 #ifndef PSX_NO_DEBUG_TOOLS

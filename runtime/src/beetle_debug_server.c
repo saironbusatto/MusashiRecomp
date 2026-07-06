@@ -67,6 +67,15 @@ extern uint32_t beetle_get_sio_trace(uint32_t *out_seq, uint8_t *out_tx,
 extern uint32_t beetle_get_sio_trace_total(void);
 extern void     beetle_reset_sio_trace(void);
 
+/* CD command trace */
+extern uint32_t beetle_get_cdcmd_trace(uint32_t *out_seq, uint8_t *out_cmd,
+                                       uint8_t *out_nargs, uint8_t *out_a0,
+                                       uint8_t *out_a1, uint8_t *out_a2,
+                                       uint32_t *out_pc,
+                                       int max_count);
+extern uint32_t beetle_get_cdcmd_trace_total(void);
+extern void     beetle_reset_cdcmd_trace(void);
+
 /* wtrace */
 extern int      beetle_wtrace_arm(uint32_t lo, uint32_t hi);
 extern int      beetle_wtrace_disarm(int slot);
@@ -160,7 +169,8 @@ extern uint64_t beetle_fntrace_total(void);
 extern uint32_t beetle_fntrace_get(uint64_t *out_seq,
                                     uint32_t *out_caller, uint32_t *out_target,
                                     uint32_t *out_ra, uint32_t *out_a0,
-                                    uint32_t *out_a1, uint32_t *out_frame,
+                                    uint32_t *out_a1, uint32_t *out_a2,
+                                    uint32_t *out_a3, uint32_t *out_frame,
                                     uint8_t *out_kind, uint32_t *out_sp,
                                     int max_count);
 
@@ -468,6 +478,41 @@ static void h_sio_trace(int id, const char *json) {
     send_fmt("]}\n");
 
     free(seqs); free(txs); free(rxs); free(ctrl);
+}
+
+static void h_cdrom_cmd_dump(int id, const char *json) {
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 8192) count = 8192;
+
+    uint32_t *seqs = (uint32_t*)malloc(count * sizeof(uint32_t));
+    uint32_t *pcs  = (uint32_t*)malloc(count * sizeof(uint32_t));
+    uint8_t *cmds = (uint8_t*)malloc(count), *nargs = (uint8_t*)malloc(count);
+    uint8_t *a0 = (uint8_t*)malloc(count), *a1 = (uint8_t*)malloc(count), *a2 = (uint8_t*)malloc(count);
+    if (!seqs || !pcs || !cmds || !nargs || !a0 || !a1 || !a2) {
+        free(seqs); free(pcs); free(cmds); free(nargs); free(a0); free(a1); free(a2);
+        send_err(id, "alloc"); return;
+    }
+    uint32_t got = beetle_get_cdcmd_trace(seqs, cmds, nargs, a0, a1, a2, pcs, count);
+    uint32_t total = beetle_get_cdcmd_trace_total();
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"count\":%u,\"entries\":[",
+             id, total, got);
+    for (uint32_t i = 0; i < got; i++) {
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"seq\":%u,\"cmd\":\"0x%02X\",\"nargs\":%u,"
+                 "\"a0\":\"0x%02X\",\"a1\":\"0x%02X\",\"a2\":\"0x%02X\","
+                 "\"pc\":\"0x%08X\"}",
+                 seqs[i], cmds[i], nargs[i], a0[i], a1[i], a2[i], pcs[i]);
+    }
+    send_fmt("]}\n");
+    free(seqs); free(pcs); free(cmds); free(nargs); free(a0); free(a1); free(a2);
+}
+
+static void h_cdrom_cmd_reset(int id, const char *json) {
+    (void)json;
+    beetle_reset_cdcmd_trace();
+    send_ok(id);
 }
 
 static void h_sio_write_window(int id, const char *json) {
@@ -872,16 +917,19 @@ static void h_fntrace_dump(int id, const char *json) {
     uint32_t *ras     = (uint32_t*)malloc(count * sizeof(uint32_t));
     uint32_t *a0s     = (uint32_t*)malloc(count * sizeof(uint32_t));
     uint32_t *a1s     = (uint32_t*)malloc(count * sizeof(uint32_t));
+    uint32_t *a2s     = (uint32_t*)malloc(count * sizeof(uint32_t));
+    uint32_t *a3s     = (uint32_t*)malloc(count * sizeof(uint32_t));
     uint32_t *frames  = (uint32_t*)malloc(count * sizeof(uint32_t));
     uint8_t  *kinds   = (uint8_t*) malloc(count);
     uint32_t *sps     = (uint32_t*)malloc(count * sizeof(uint32_t));
-    if (!seqs || !callers || !targets || !ras || !a0s || !a1s || !frames || !kinds || !sps) {
+    if (!seqs || !callers || !targets || !ras || !a0s || !a1s || !a2s || !a3s ||
+        !frames || !kinds || !sps) {
         free(seqs); free(callers); free(targets); free(ras);
-        free(a0s); free(a1s); free(frames); free(kinds); free(sps);
+        free(a0s); free(a1s); free(a2s); free(a3s); free(frames); free(kinds); free(sps);
         send_err(id, "alloc"); return;
     }
     uint32_t got = beetle_fntrace_get(seqs, callers, targets, ras,
-                                       a0s, a1s, frames, kinds, sps, count);
+                                       a0s, a1s, a2s, a3s, frames, kinds, sps, count);
     uint64_t total = beetle_fntrace_total();
 
     send_fmt("{\"id\":%d,\"ok\":true,\"total\":%llu,\"count\":%u,\"entries\":[",
@@ -890,14 +938,16 @@ static void h_fntrace_dump(int id, const char *json) {
         if (i > 0) send_fmt(",");
         send_fmt("{\"seq\":%llu,\"caller\":\"0x%08X\",\"target\":\"0x%08X\","
                  "\"ra\":\"0x%08X\",\"a0\":\"0x%08X\",\"a1\":\"0x%08X\","
+                 "\"a2\":\"0x%08X\",\"a3\":\"0x%08X\","
                  "\"frame\":%u,\"kind\":\"%s\",\"sp\":\"0x%08X\"}",
                  (unsigned long long)seqs[i], callers[i], targets[i],
-                 ras[i], a0s[i], a1s[i], frames[i], fn_kind_str(kinds[i]), sps[i]);
+                 ras[i], a0s[i], a1s[i], a2s[i], a3s[i],
+                 frames[i], fn_kind_str(kinds[i]), sps[i]);
     }
     send_fmt("]}\n");
 
     free(seqs); free(callers); free(targets); free(ras);
-    free(a0s); free(a1s); free(frames); free(kinds); free(sps);
+    free(a0s); free(a1s); free(a2s); free(a3s); free(frames); free(kinds); free(sps);
 }
 
 /* ---- spu_voices: Beetle oracle ground truth via PS_SPU::GetRegister ----
@@ -1484,6 +1534,8 @@ static const CmdEntry CMDS[] = {
     { "vram_peek",             h_vram_peek },
     { "sio_trace_reset",       h_sio_trace_reset },
     { "sio_trace",             h_sio_trace },
+    { "cdrom_cmd_dump",        h_cdrom_cmd_dump },
+    { "cdrom_cmd_reset",       h_cdrom_cmd_reset },
     { "sio_write_window",      h_sio_write_window },
     /* wtrace — normalized verb set (parity contract with psx-runtime). */
     { "wtrace_arm",            h_wtrace_arm },

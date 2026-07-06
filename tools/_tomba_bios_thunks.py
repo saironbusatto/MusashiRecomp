@@ -11,7 +11,7 @@ with a trailing pad/nop, but we accept either stride.
 import struct, sys, os
 
 BIOS_BASE = 0x80010000
-PATH = sys.argv[1] if len(sys.argv) > 1 else 'F:/Projects/TombaRecomp/tomba/SCUS_942.36_no_header'
+PATH = sys.argv[1] if len(sys.argv) > 1 else '../TombaRecomp/tomba/SCUS_942.36_no_header'
 
 # Standard PSX BIOS function names. Source: docs/psx_bios_disasm.txt + nocash.
 A0 = {
@@ -150,12 +150,12 @@ for a0, kind in seen_sc:
     print(f"  syscall a0=0x{a0:X}  {kind:30s}  ({cnt} sites)")
 
 # Persist to seeds dir for later use by the audit
-out_dir = 'F:/Projects/TombaRecomp/seeds'
+out_dir = '../TombaRecomp/seeds'
 os.makedirs(out_dir, exist_ok=True)
 out = os.path.join(out_dir, 'tomba_bios_thunks.txt')
 with open(out, 'w') as f:
     f.write(f"# Tomba PSX BIOS thunk inventory\n")
-    f.write(f"# Source: F:/Projects/TombaRecomp/tomba/SCUS_942.36_no_header\n")
+    f.write(f"# Source: ../TombaRecomp/tomba/SCUS_942.36_no_header\n")
     f.write(f"# Pattern: li t2, 0x{{A0|B0|C0}}; jr t2; li t1, FN  (PSY-Q libapi/libetc style)\n")
     f.write(f"# Total thunks: {len(results)}\n\n")
     for vec in ('A', 'B', 'C'):

@@ -498,7 +498,13 @@ static void persist_sljit_shard(uint32_t entry_phys, uint32_t lo, uint32_t len,
  * sets s_async_cache_dirty; the DISPATCH thread rescans-and-registers on its
  * next miss (candidate table stays single-threaded). PSX_SLJIT_SYNC=1 forces
  * the legacy synchronous JIT-on-miss path. */
+#ifdef _WIN32
 static volatile LONG s_async_cache_dirty = 0;
+#  define async_cache_dirty_exchange(v) InterlockedExchange(&s_async_cache_dirty, (v))
+#else
+static volatile int  s_async_cache_dirty = 0;
+#  define async_cache_dirty_exchange(v) __atomic_exchange_n(&s_async_cache_dirty, (v), __ATOMIC_SEQ_CST)
+#endif
 static int           g_sljit_async = 1;
 
 /* MASTER SAFETY GATE (2026-06-25): the sljit EMITTER mistranslates some overlay
@@ -935,7 +941,7 @@ void overlay_loader_async_publish(uint32_t entry_phys, uint32_t lo, uint32_t len
     if (!wok) { remove(tmp); return; }
     if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) { remove(tmp); return; }
     s_sljit_persist_writes++;   /* telemetry-only; benign cross-thread incr */
-    InterlockedExchange(&s_async_cache_dirty, 1);
+    async_cache_dirty_exchange(1);
 #else
     (void)entry_phys; (void)lo; (void)len; (void)crc; (void)blob; (void)blob_size;
 #endif
@@ -1608,7 +1614,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
     if (head < 0 && s_active && overlay_cache_window_contains(phys)) {
         /* Pick up shards the background compile worker just published (idempotent
          * rescan; runs only when a publish has flipped the dirty flag). */
-        if (g_sljit_tier_enabled && g_sljit_async && InterlockedExchange(&s_async_cache_dirty, 0)) {
+        if (g_sljit_tier_enabled && g_sljit_async && async_cache_dirty_exchange(0)) {
             scan_sljit_cache_dir();
             head = idx_head(phys);
         }
@@ -2282,10 +2288,9 @@ static int psx_sljit_call_inner(CPUState *cpu, uint32_t target, uint32_t return_
                                 int check_contract) {
     uint32_t site_sp = cpu->gpr[29];   /* sp at the call (after the delay slot) */
 #ifdef PSX_HAS_GAME_DISPATCH
-    /* Skip the compiled game function if its page is dirty (an overlay overwrote it
-     * after the game-start baseline -> compiled code is stale); fall through to the
-     * native/interp paths which run the live overlay. Clean pages run compiled. */
-    if (!dirty_ram_is_dirty(target & 0x1FFFFFFFu)) {
+    /* Skip the compiled game function when its target is no longer native-safe;
+     * fall through to the native/interp paths that run the live RAM bytes. */
+    if (dirty_ram_text_native_ok(target & 0x1FFFFFFFu)) {
         extern int psx_dispatch_game_compiled(CPUState *cpu, uint32_t addr);
         cpu->pc = 0;
         if (psx_dispatch_game_compiled(cpu, target)) {

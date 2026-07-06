@@ -7,6 +7,8 @@
  * overlay_backend_resolve (env PSX_OVERLAY_BACKEND > [runtime] overlay_backend >
  * auto; auto => gcc if a compile cmd is wired, else sljit). gcc is the default. */
 
+#include <stddef.h>
+
 #include "code_provider.h"
 #include "autocompile.h"
 #include "overlay_sljit.h"

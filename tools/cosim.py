@@ -25,9 +25,9 @@ import socket, subprocess, os, sys, time, argparse
 # build (e.g. a Tomba regression) without editing this file. Defaults = MMX6.
 #   COSIM_EXE  = path to that game's build-cosim/psx-cosim.exe
 #   COSIM_GAME = path to that game's game.toml
-EXE = os.environ.get("COSIM_EXE", r"F:\Projects\psxrecomp\MegaManX6Recomp\build-cosim\psx-cosim.exe")
+EXE = os.environ.get("COSIM_EXE", r"../MegaManX6Recomp\build-cosim\psx-cosim.exe")
 CWD = os.environ.get("COSIM_CWD", os.path.dirname(EXE))
-GAME = os.environ.get("COSIM_GAME", r"F:\Projects\psxrecomp\MegaManX6Recomp\game.toml")
+GAME = os.environ.get("COSIM_GAME", r"../MegaManX6Recomp\game.toml")
 LOGDIR = os.path.join(CWD, "cosim-logs")
 
 def tail_file(path, max_bytes=8192):
