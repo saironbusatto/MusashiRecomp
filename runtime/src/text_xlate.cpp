@@ -389,6 +389,18 @@ std::vector<VramPatch>                   g_vram_patches; // pre-rendered strip p
 std::atomic<int>                         g_vram_patch_n{0};  // count (0 => upload hook idle)
 std::vector<MsgInplace>                  g_msg_inplace; // table-driven message RAM patches
 std::atomic<int>                         g_msg_inplace_pending{0}; // unpatched count (0 => idle)
+// Card-manager messages are packed into NUL-terminated *chunks*; within a chunk,
+// distinct messages (each with its own pointer-table entry) are separated ONLY by
+// runs of the fullwidth space (0x8140), with no terminator between them. The
+// game's renderer reads a message from its pointer until the next NUL, so any
+// non-last message in a chunk bleeds through its neighbours into the chunk tail
+// (e.g. the "Reading Card" / "Saving" status messages rendered the format prompt
+// and its Yes/No wait). A separator drops a NUL at the start of the trailing
+// space-run so each message reads to its own terminator. Verify-then-patch: only
+// a resident fullwidth space is ever overwritten, so drift can never corrupt text.
+struct NulSep { uint32_t addr = 0; bool patched = false; };
+std::vector<NulSep>                      g_msg_seps;    // inter-message NUL separators
+std::atomic<int>                         g_msg_sep_pending{0}; // unpatched count (0 => idle)
 std::mutex g_mtx;
 
 std::atomic<bool>     g_apply_armed{false};   // table non-empty AND language enabled
@@ -451,6 +463,8 @@ void load_tables_locked() {
     g_vram_patch_n.store(0, std::memory_order_relaxed);
     g_msg_inplace.clear();
     g_msg_inplace_pending.store(0, std::memory_order_relaxed);
+    g_msg_seps.clear();
+    g_msg_sep_pending.store(0, std::memory_order_relaxed);
     for (auto& kv : g_inv) kv.second.translated = false;
     if (g_dir.empty() || !fs::exists(g_dir)) { g_apply_armed.store(false); return; }
     const bool lang_off = g_lang.empty() || g_lang == "jp" || g_lang == "off";
@@ -539,12 +553,26 @@ void load_tables_locked() {
                 ++vpatches;
             }
         }
+        // Inter-message NUL separators (structure fix for packed message chunks).
+        // Each entry names a VA that currently holds a fullwidth space at the start
+        // of an inter-message gap; a NUL is dropped there so the preceding message
+        // reads to its own terminator instead of bleeding into its neighbour.
+        if (!lang_off && data.contains("msg_sep")) {
+            const auto& sarr = toml::find(data, "msg_sep");
+            if (sarr.is_array()) for (const auto& s : sarr.as_array()) {
+                if (!s.contains("addr")) continue;
+                uint32_t a = (uint32_t)toml::find_or<int64_t>(s, "addr", 0);
+                if (a) g_msg_seps.push_back(NulSep{ a, false });
+            }
+        }
     }
     g_glyph_pending.store((int)g_glyph_labels.size(), std::memory_order_relaxed);
     g_vram_patch_n.store((int)g_vram_patches.size(), std::memory_order_relaxed);
     g_msg_inplace_pending.store((int)g_msg_inplace.size(), std::memory_order_relaxed);
+    g_msg_sep_pending.store((int)g_msg_seps.size(), std::memory_order_relaxed);
     g_apply_armed.store(!lang_off && (!g_table.empty() || !g_glyph_labels.empty() ||
-                                      !g_vram_patches.empty() || !g_msg_inplace.empty()),
+                                      !g_vram_patches.empty() || !g_msg_inplace.empty() ||
+                                      !g_msg_seps.empty()),
                         std::memory_order_relaxed);
     // Mark inventory records that now have a translation.
     for (auto& kv : g_inv)
@@ -675,6 +703,28 @@ void msg_inplace_patch_locked(uint8_t* ram) {
     g_msg_inplace_pending.store(pending, std::memory_order_relaxed);
 }
 
+// Drop an end-of-message terminator (0xFFFF) at each inter-message separator VA
+// once the region is resident. The text renderer (FUN at 0x80058xxx, message
+// pointer at gp+0x26c) stops a message at the \r prompt-wait (0xFC10) or the
+// 0xFFFF end marker — NOT at 0x0000 (that byte is drawn as a glyph). 0xFFFF ends
+// the message with no input-wait (as the game's own term=ffff status messages
+// do), so the preceding packed message reads to its own terminator instead of
+// bleeding through its neighbours to the next \r. Verify-then-patch: the two
+// bytes must currently be a fullwidth space (LE 0x40 0x81) — never overwrite
+// text — so an already-patched or drifted slot is simply skipped.
+void msg_seps_patch_locked(uint8_t* ram) {
+    int pending = 0;
+    for (auto& s : g_msg_seps) {
+        if (s.patched) continue;
+        if (!va_in_ram(s.addr) || !va_in_ram(s.addr + 1)) { ++pending; continue; }
+        if (grb(ram, s.addr) != 0x40 || grb(ram, s.addr + 1) != 0x81) { ++pending; continue; }
+        gwb(ram, s.addr,     0xFF);
+        gwb(ram, s.addr + 1, 0xFF);
+        s.patched = true;
+    }
+    g_msg_sep_pending.store(pending, std::memory_order_relaxed);
+}
+
 // ---------------------------------------------------------------------------
 // VRAM-strip patch: verify the rect holds the exact expected JP pixels, then
 // rewrite it with the target-language pixels through the renderer facade.
@@ -768,6 +818,12 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
         (call_n & 0x1FFu) == 0) {
         std::lock_guard<std::mutex> lk(g_mtx);
         msg_inplace_patch_locked(ram);
+    }
+    // Inter-message NUL separators: same cheap throttle; idle once all placed.
+    if (app && g_msg_sep_pending.load(std::memory_order_relaxed) > 0 &&
+        (call_n & 0x1FFu) == 0) {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        msg_seps_patch_locked(ram);
     }
 
     const uint32_t sp = cpu->gpr[29];
