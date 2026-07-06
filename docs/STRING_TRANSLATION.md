@@ -894,5 +894,16 @@ proven HUD-visible because the y=320 row, same palette, is blitted onto the
 HUD). Authoring loop (scratchpad `composestrips2.py`): peek the strip rect →
 `src_hex`; overwrite the measured text-texel span with Latin glyph texels →
 `en_hex`; preview-render both; append to toml; `xlate reload` + `vpatch` to
-test live. The remaining strips inventoried above are the mechanical follow-up
-backlog for full menu translation.
+test live. Same-day follow-up shipped the rest of the inventory — 37 entries
+total: title menu (TUTORIAL/NEW GAME/CONTINUE ×2 variants), pause menu
+(CONTINUE/RESTART/GIVE UP/CHANGE CONTROLS + TARGET BATT), results
+(STAGES/BATTERY/RANK/REFILL/NORMAL/SPECIAL), mode menu (TUTORIAL/NORMAL
+GAME/FREE PLAY/STROKE GAME/DATA SAVE), DATA 1-4, STAGE SELECT, SELECT MOVIE
+PIECE, BAD T BLOCK COUNT/LAYOUT, HIGH SCORE + FREE pills, TO CONTINUE / TO
+SAVE prompts, high-score headers NAME/BATTERY. Per-strip palette families
+matter: pause/mode boxes bg=1 with {c,d,e,f} text (Latin glyphs must be
+remapped, e.g. {1→d,2→c}, or the stroke nibble collides with the box bg and
+vanishes); gray prompt strips bg=5 keep the Latin {1,2} palette; the
+high-score pill is light-on-dark (map {1→f,2→d}). Remaining: グループ box +
+１/２/３位 badges, and the level-select レベル１/２/３ labels which are NOT in
+this sheet (likely the 8bpp character sheets GRAPH2/3) — separate hunt.
