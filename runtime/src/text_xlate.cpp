@@ -156,7 +156,8 @@ uint16_t fw_sjis_for_ascii(uint32_t cp) {
         case '-':  return 0x817C;  // fullwidth minus
         case '/':  return 0x815E;
         case '&':  return 0x8195;
-        case '%':  return 0x8193;
+        case '$':  return 0x8190;  // fullwidth $ (Tsumu font: ○ button glyph)
+        case '%':  return 0x8193;  // fullwidth % (Tsumu font: ✕ button glyph)
         case '+':  return 0x817B;
         case '=':  return 0x8181;
         case '*':  return 0x8196;
@@ -358,6 +359,26 @@ struct VramPatch {
     uint64_t              applied = 0;   // times applied (per-upload re-apply)
 };
 
+// Table-driven message record. Some UI text is addressed through a POINTER
+// TABLE the renderer indexes internally — e.g. Tsumu's memory-card dialogs:
+// show_card_dialog(id) loads table[id] and draws it, so the string pointer is
+// never a dispatch argument and the a0..a3 message hook can never see it (nor
+// can it be captured). The fix is the glyph-label pattern applied to an SJIS
+// message record: verify the exact JP bytes are resident at a known address,
+// then overwrite them IN PLACE with the transcoded target text (little-endian
+// fullwidth-Shift-JIS body + the game's FE-FF line-break / 30-FC page-break /
+// 10-FC prompt framing), terminated, never exceeding the source byte length —
+// so the game's own message renderer reads the translation. Verify-before-
+// patch + the length cap guarantee no corruption; idempotent (a patched slot
+// no longer matches `src`). Authored via a [[entry]] carrying a `ram_addr`.
+struct MsgInplace {
+    uint32_t             addr = 0;      // message record VA (game data region)
+    std::vector<uint8_t> src;           // expected JP record bytes (verify key)
+    std::string          target;        // active-language UTF-8
+    Term                 term = Term::Nul; // record terminator (nul / ffff)
+    bool                 patched = false;
+};
+
 const EncodingProfile* g_prof = &kShiftJisProfile;
 
 std::unordered_map<uint64_t, TableEntry> g_table;      // hash -> translation
@@ -366,6 +387,8 @@ std::vector<GlyphLabel>                  g_glyph_labels;// per-glyph RAM patches
 std::atomic<int>                         g_glyph_pending{0}; // unpatched count (0 => idle)
 std::vector<VramPatch>                   g_vram_patches; // pre-rendered strip patches
 std::atomic<int>                         g_vram_patch_n{0};  // count (0 => upload hook idle)
+std::vector<MsgInplace>                  g_msg_inplace; // table-driven message RAM patches
+std::atomic<int>                         g_msg_inplace_pending{0}; // unpatched count (0 => idle)
 std::mutex g_mtx;
 
 std::atomic<bool>     g_apply_armed{false};   // table non-empty AND language enabled
@@ -426,6 +449,8 @@ void load_tables_locked() {
     g_glyph_pending.store(0, std::memory_order_relaxed);
     g_vram_patches.clear();
     g_vram_patch_n.store(0, std::memory_order_relaxed);
+    g_msg_inplace.clear();
+    g_msg_inplace_pending.store(0, std::memory_order_relaxed);
     for (auto& kv : g_inv) kv.second.translated = false;
     if (g_dir.empty() || !fs::exists(g_dir)) { g_apply_armed.store(false); return; }
     const bool lang_off = g_lang.empty() || g_lang == "jp" || g_lang == "off";
@@ -453,6 +478,16 @@ void load_tables_locked() {
             Term term = Term::Nul;
             std::string ts = toml::find_or<std::string>(e, "term", "nul");
             if (ts == "ffff" || ts == "FFFF") term = Term::FFFF;
+            else if (ts == "none") term = Term::None;  // mid-blob sub-record: no
+                                                       // terminator write (content follows)
+            // Optional in-place RAM patch: a record the game addresses through a
+            // pointer table (never a dispatch arg) can't be reached by the a0..a3
+            // hook, so overwrite the JP bytes in place at `ram_addr`. The entry
+            // still joins g_table (harmless if the record is also ever passed).
+            if (e.contains("ram_addr")) {
+                uint32_t ra = (uint32_t)toml::find_or<int64_t>(e, "ram_addr", 0);
+                if (ra) g_msg_inplace.push_back(MsgInplace{ ra, bytes, tgt, term, false });
+            }
             uint64_t key = fnv1a(bytes.data(), (uint32_t)bytes.size());
             g_table[key] = TableEntry{ std::move(tgt), term };
             ++entries;
@@ -507,15 +542,16 @@ void load_tables_locked() {
     }
     g_glyph_pending.store((int)g_glyph_labels.size(), std::memory_order_relaxed);
     g_vram_patch_n.store((int)g_vram_patches.size(), std::memory_order_relaxed);
+    g_msg_inplace_pending.store((int)g_msg_inplace.size(), std::memory_order_relaxed);
     g_apply_armed.store(!lang_off && (!g_table.empty() || !g_glyph_labels.empty() ||
-                                      !g_vram_patches.empty()),
+                                      !g_vram_patches.empty() || !g_msg_inplace.empty()),
                         std::memory_order_relaxed);
     // Mark inventory records that now have a translation.
     for (auto& kv : g_inv)
         kv.second.translated = (g_table.find(kv.first) != g_table.end());
     std::fprintf(stderr,
-        "[xlate] loaded %zu entries + %zu glyph-labels + %zu vram-patches from %zu file(s) in %s (lang=%s apply=%s)\n",
-        entries, glyphs, vpatches, files, g_dir.c_str(), g_lang.c_str(),
+        "[xlate] loaded %zu entries + %zu glyph-labels + %zu vram-patches + %zu msg-inplace from %zu file(s) in %s (lang=%s apply=%s)\n",
+        entries, glyphs, vpatches, g_msg_inplace.size(), files, g_dir.c_str(), g_lang.c_str(),
         g_apply_armed.load() ? "on" : "off");
 }
 
@@ -563,6 +599,80 @@ void glyph_labels_patch_locked(uint8_t* ram) {
         gl.patched = true;
     }
     g_glyph_pending.store(pending, std::memory_order_relaxed);
+}
+
+// Build a message body: little-endian fullwidth-Shift-JIS (as the message-table
+// drawer reads it) with the author's \n/\f/\r framing tokens mapped to the
+// game's control codes (FE-FF line break, 30-FC page break, 10-FC prompt).
+// Mirrors sj_transcode's glyph mapping + apply_to_reg's framing, fused for the
+// in-place path (which writes the framed bytes directly rather than repointing).
+void msg_inplace_build(const std::string& utf8, std::vector<uint8_t>& out) {
+    out.clear();
+    size_t i = 0;
+    while (i < utf8.size()) {
+        uint8_t c = (uint8_t)utf8[i];
+        uint32_t cp; size_t adv;
+        if (c < 0x80)                    { cp = c; adv = 1; }
+        else if ((c & 0xE0) == 0xC0 && i + 1 < utf8.size()) {
+            cp = ((c & 0x1F) << 6) | (utf8[i+1] & 0x3F); adv = 2;
+        } else if ((c & 0xF0) == 0xE0 && i + 2 < utf8.size()) {
+            cp = ((c & 0x0F) << 12) | ((utf8[i+1] & 0x3F) << 6) | (utf8[i+2] & 0x3F); adv = 3;
+        } else                           { cp = ' '; adv = 1; }
+        i += adv;
+        if (cp == '\n') { out.push_back(0xFE); out.push_back(0xFF); continue; }  // line break
+        if (cp == 0x0C) { out.push_back(0x30); out.push_back(0xFC); continue; }  // \f page break
+        if (cp == 0x0D) { out.push_back(0x10); out.push_back(0xFC); continue; }  // \r prompt/wait
+        if (cp >= 0xFF01 && cp <= 0xFF5E) cp = cp - 0xFF00 + 0x20;   // fullwidth Latin -> ASCII
+        if (cp == 0x3000) cp = ' ';
+        uint16_t g = fw_sjis_for_ascii(cp <= 0x7E ? cp : ' ');
+        out.push_back((uint8_t)(g & 0xFF));   // little-endian storage
+        out.push_back((uint8_t)(g >> 8));
+    }
+}
+
+// Table-driven message in-place RAM patch. Mirrors glyph_labels_patch_locked
+// but for SJIS message records. Runs under g_mtx.
+void msg_inplace_patch_locked(uint8_t* ram) {
+    int pending = 0;
+    for (auto& m : g_msg_inplace) {
+        if (m.patched || m.target.empty() || m.src.empty()) continue;
+        uint32_t len = (uint32_t)m.src.size();
+        if (!va_in_ram(m.addr) || !va_in_ram(m.addr + len - 1)) { ++pending; continue; }
+        // Verify-before-patch: the exact JP record must be resident (else the
+        // region isn't loaded yet, or it's already patched — never corrupt).
+        bool match = true;
+        for (uint32_t i = 0; match && i < len; ++i)
+            if (grb(ram, m.addr + i) != m.src[i]) match = false;
+        if (!match) { ++pending; continue; }
+        std::vector<uint8_t> body;
+        msg_inplace_build(m.target, body);
+        // Structure-preserving in-place patch. The author writes the SAME control
+        // framing as the source (\n \f \r), so an English body sized to the exact
+        // source length reproduces the record's control layout — critically the
+        // trailing \r (0x10-FC prompt/wait) an interactive dialog needs to accept
+        // input and advance. Truncate to whole 2-byte cells if over-long, then pad
+        // with the fullwidth space to the source length so no stale JP tail
+        // remains, and reuse the record's own terminator slot (offset len) so the
+        // NUL/0xFFFF lands exactly where the game expects it.
+        while (!body.empty() && body.size() > len) body.resize(body.size() - 2);
+        if (body.empty()) { m.patched = true; continue; }  // nothing fit; don't spin
+        // term=none marks a mid-blob sub-record (e.g. a Yes/No prompt whose \r is
+        // followed by another message in the same NUL/FFFF span): write the body
+        // exactly, WITHOUT padding or a terminator, so the following content is
+        // left intact. Otherwise pad to the record length and stamp the terminator
+        // in the record's own terminator slot.
+        if (m.term != Term::None)
+            while (body.size() + 2 <= len) { body.push_back(0x40); body.push_back(0x81); }
+        for (uint32_t i = 0; i < body.size(); ++i) gwb(ram, m.addr + i, body[i]);
+        uint32_t ti = (uint32_t)body.size();
+        if (m.term == Term::FFFF) {
+            if (va_in_ram(m.addr + ti + 1)) { gwb(ram, m.addr + ti, 0xFF); gwb(ram, m.addr + ti + 1, 0xFF); }
+        } else if (m.term == Term::Nul && va_in_ram(m.addr + ti)) {
+            gwb(ram, m.addr + ti, 0x00);
+        }
+        m.patched = true;
+    }
+    g_msg_inplace_pending.store(pending, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -652,6 +762,13 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
         std::lock_guard<std::mutex> lk(g_mtx);
         glyph_labels_patch_locked(ram);
     }
+    // Table-driven message records (never a dispatch arg): patch in place while
+    // any is still unpatched. Same cheap throttle as glyph labels.
+    if (app && g_msg_inplace_pending.load(std::memory_order_relaxed) > 0 &&
+        (call_n & 0x1FFu) == 0) {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        msg_inplace_patch_locked(ram);
+    }
 
     const uint32_t sp = cpu->gpr[29];
     // Scan the argument registers a0..a3 for source-text pointers. KV-gated
@@ -738,17 +855,20 @@ extern "C" int text_xlate_debug_json(const char* subcmd, char* out, int cap) {
     if (sc == "stats") {
         size_t gp = 0; for (auto& gl : g_glyph_labels) if (gl.patched) ++gp;
         uint64_t va = 0; for (auto& vp : g_vram_patches) va += vp.applied;
+        size_t mp = 0; for (auto& m : g_msg_inplace) if (m.patched) ++mp;
         return std::snprintf(out, cap,
             "{\"lang\":\"%s\",\"apply\":%s,\"capture\":%s,\"table_entries\":%zu,"
             "\"distinct_captured\":%zu,\"calls\":%llu,\"hits\":%llu,"
             "\"glyph_labels\":%zu,\"glyph_patched\":%zu,\"glyph_pending\":%d,"
-            "\"vram_patches\":%zu,\"vram_applied\":%llu}",
+            "\"vram_patches\":%zu,\"vram_applied\":%llu,"
+            "\"msg_inplace\":%zu,\"msg_inplace_patched\":%zu,\"msg_inplace_pending\":%d}",
             g_lang.c_str(), g_apply_armed.load() ? "true" : "false",
             g_capture_on.load() ? "true" : "false",
             g_table.size(), g_inv.size(),
             (unsigned long long)g_calls.load(), (unsigned long long)g_hits.load(),
             g_glyph_labels.size(), gp, g_glyph_pending.load(),
-            g_vram_patches.size(), (unsigned long long)va);
+            g_vram_patches.size(), (unsigned long long)va,
+            g_msg_inplace.size(), mp, g_msg_inplace_pending.load());
     }
 
     // vpatch: force-apply every VRAM-strip patch against current VRAM content
