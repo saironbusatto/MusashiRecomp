@@ -13,6 +13,7 @@
 #include "gpu.h"
 #include "gpu_sw_renderer.h"
 #include "gpu_render.h"
+#include "text_xlate.h"
 #include "crash_trace.h"
 #include "debug_server.h"
 #include "cpu_state.h"
@@ -2411,6 +2412,44 @@ uint32_t gpu_get_opcode_count(uint8_t op) { return gp0_opcode_count[op]; }
 
 extern uint64_t s_frame_count;  /* defined in debug_server.c */
 extern uint32_t g_debug_last_store_pc;  /* defined in debug_server.c */
+extern uint32_t g_debug_current_func_addr;  /* defined in debug_server.c */
+uint32_t debug_guest_ra(void);  /* accessor in debug_server.c (guest $ra) */
+uint32_t debug_guest_sp(void);  /* accessor in debug_server.c (guest $sp) */
+extern uint8_t *memory_get_ram_ptr(void); /* raw 2MB main-RAM base (no lockstep) */
+
+/* Bounded guest-stack unwind for VRAM-copy builder attribution. Scans the live
+ * stack for words that are valid return addresses (main-RAM code range, and the
+ * instruction at ret-8 is a jal/jalr), innermost first. A consumer skips the
+ * libgpu funnel band to name the game-level routine that issued the copy. Pure
+ * reads against the raw RAM array — no lockstep/observer pollution. */
+uint32_t g_gp0_last_copy_sp = 0;   /* diag: raw guest $sp at last op-0x80 copy */
+static void gp0_capture_builder_chain(uint32_t out[6]) {
+    for (int i = 0; i < 6; i++) out[i] = 0;
+    uint8_t *ram = memory_get_ram_ptr();
+    if (!ram) return;
+    const uint32_t RMASK = 0x001FFFFFu;             /* 2 MB, mirror-folded */
+    uint32_t rawsp = debug_guest_sp();
+    g_gp0_last_copy_sp = rawsp;
+    if ((rawsp & 0x1FFFFFFFu) >= 0x00800000u) return; /* not in RAM/mirror */
+    uint32_t sp = rawsp & RMASK & ~3u;              /* fold to 2MB, word-align */
+    /* Two-pass: prefer words that are genuine return addresses (call at ret-8),
+     * but if guest code validation yields none, fall back to any code-range
+     * stack word so the chain is never silently empty. */
+    int found = 0;
+    for (int pass = 0; pass < 2 && found == 0; pass++) {
+        for (uint32_t off = 0; off + 4 <= 0x400u && found < 6; off += 4) {
+            uint32_t w; memcpy(&w, ram + ((sp + off) & RMASK), 4);
+            if ((w & 3u) || w < 0x80010000u || w >= 0x80120000u) continue;
+            if (pass == 0) {
+                uint32_t ins; memcpy(&ins, ram + ((w - 8u) & RMASK), 4);
+                uint32_t op = ins >> 26;
+                int is_call = (op == 3u) || (op == 0u && (ins & 0x3Fu) == 9u);
+                if (!is_call) continue;
+            }
+            out[found++] = w;
+        }
+    }
+}
 
 #define GP0_RING_CAP        (1u << 20)  /* 1 048 576 entries */
 /* GpuGp0RingEntry + GPU_GP0_RING_MAX_WORDS are public types in gpu.h. */
@@ -2429,12 +2468,16 @@ static void gp0_ring_record(const uint32_t *words, int n) {
     e->seq     = (uint32_t)gp0_ring_seq;
     e->src_addr = gp0_cmd_source_addr;
     e->pc      = g_debug_last_store_pc;
+    e->func    = g_debug_current_func_addr;
+    e->ra      = debug_guest_ra();
     e->opcode  = (uint8_t)((words[0] >> 24) & 0xFF);
     e->n_words = (uint8_t)(n > 255 ? 255 : (n < 0 ? 1 : n));
     e->pad     = 0;
     int copy_n = e->n_words > GPU_GP0_RING_MAX_WORDS ? GPU_GP0_RING_MAX_WORDS : e->n_words;
     for (int i = 0; i < copy_n; i++) e->cmd[i] = words[i];
     for (int i = copy_n; i < GPU_GP0_RING_MAX_WORDS; i++) e->cmd[i] = 0;
+    if (e->opcode == 0x80) { gp0_capture_builder_chain(e->bld); e->csp = g_gp0_last_copy_sp; }
+    else { for (int i = 0; i < 6; i++) e->bld[i] = 0; e->csp = 0; }
     gp0_ring_head = (gp0_ring_head + 1) % GP0_RING_CAP;
     gp0_ring_seq++;
 }
@@ -2844,13 +2887,18 @@ void gpu_write_gp0(uint32_t val) {
                     /* Transfer complete */
                     gp0_state = GP0_IDLE;
                     vram_write_remaining = 0;
+                    text_xlate_vram_upload(vram_write_x, vram_write_y,
+                                           vram_write_w, vram_write_h);
                     return;
                 }
             }
         }
 
-        if (--vram_write_remaining == 0)
+        if (--vram_write_remaining == 0) {
             gp0_state = GP0_IDLE;
+            text_xlate_vram_upload(vram_write_x, vram_write_y,
+                                   vram_write_w, vram_write_h);
+        }
 
         return;
     }

@@ -739,6 +739,16 @@ the disc's only pre-rendered text graphic is the `TSUMU light` logo. The clear
 banner is drawn from Latin glyphs the game already owns. **No translation
 required** (the earlier "resister" assumption was wrong — corrected here).
 
+### In-game HUD — RESOLVED 2026-07-06, see Appendix Z (the analysis below was superseded)
+The characterization below assumed the HUD labels were composed per-glyph at
+stage load. They are not: the labels exist as **pre-rendered pixel strips
+inside the glyph-sheet asset itself** (the 64hw-wide block uploaded to VRAM
+832,256 — MOJI.BIN carries the font AND the baked label strips). The stage-load
+compose just MoveImages the whole strip (`src=(834,352) 18×16` ステージすう：,
+`src=(852,352) 18×16` のこりバッテリー：) into the HUD cache row at y=32. The
+shipped fix is the `[[vram_patch]]` upload-time pixel patch (Appendix Z) — no
+glyph remap hook was needed. Historical analysis kept for the record:
+
 ### In-game HUD `ステージ：X–Y` / `バッテリー：N` — RESISTER (characterized, NOT shipped)
 The HUD label is the one genuinely-unshipped item. Rendering model, pinned via
 the always-on GP0 ring (`gpu_frame_dump`, records every primitive with its
@@ -823,3 +833,66 @@ risk rewriting non-HUD quads (blocks/menus) — a fragile hack (Rule 5, forbidde
 Precise remaining step for the USER's reachable build: enter a stage so the HUD
 draws, dump the GP0 ring at drawer `0x8005443C`, read the HUD glyph quads' U,Vs +
 screen row, then rewrite those to the font's Latin tiles for STAGE / BATTERY.
+
+## Appendix Z — VRAM-strip patch layer (`[[vram_patch]]`) — HUD labels SHIPPED (2026-07-06)
+
+### The missing model: pre-rendered strips, not composed glyphs
+The HUD labels (and, it turns out, the entire menu system) are **pre-rendered
+pixel strips baked into the glyph-sheet asset** — not glyph-code strings, not
+per-glyph composes. Evidence chain:
+- The 144-entry font order table at `0x80074a9c` contains **no katakana** (only
+  hiragana + fullwidth Latin/digits + a little punctuation), yet the HUD shows
+  katakana `ステージすう：`/`のこりバッテリー：` — so that text cannot come from
+  the glyph-code path at all.
+- No SJIS code string for either label exists anywhere in the EXE or in a full
+  2 MB RAM scan (searched as both hiragana and katakana, both byte orders).
+- Rendering VRAM `(832,256) 64×256` as 4bpp shows the sheet rows 0–4 are the
+  font, and rows past the font are **baked strips**: the HUD labels at y=352,
+  `○ボタンで すすむ !!` at y=368, results-screen labels (`ステージすう`/
+  `のこりバッテリー`/`ランク`/`ほじゅうバッテリー`/`ノーマル`/`スペシャル`) at
+  y≈448–511; block `(896,256)` holds the main-menu strips (`ちゅーとりある`,
+  `のーまる げーむ`, `ふりー ぷれい`, `すとろーく げーむ`, `でーた せーぶ`,
+  `にゅーげーむ`, `こんてぃにゅー`, `ハイスコア`) and `(896,384)` the high-score
+  table (`１位/２位/３位`, `なまえ`, `のこりバッテリー`, `グループ`); block
+  `(768,256)` the pause menu (`このままつづける`, `さいしょからはじめる`,
+  `あきらめる`, `そうさタイプのへんこう`, `目標残バッテリー：`) and misc
+  (`〜を選択`, `Tブロック…不正です`, `○ボタンでせーぶへ!!`); `(960,~440)`
+  `データ１〜４`. (`CRASH`/`CLEAR!!`/`EMPTY` strips are already English.)
+- The sheet arrives as four `GP0 0xA0` LoadImage uploads of 64×256 at
+  `(768,256) (832,256) (896,256) (960,256)` (~boot frame 1500; ring-attributed
+  to the libgpu LoadImage path, guest buffer transient — a CD-read bounce
+  buffer, which is why the RAM scan finds nothing).
+- At stage load the game MoveImages whole label strips into a HUD cache row:
+  `src=(834,352) 18×16` + `src=(852,352) 18×16` → `dst=(642..,32)`, digits
+  blitted separately from the big-digit row y=336 (ring `bld[]` chains:
+  `0x80041E78`/`0x80041EA4` return sites). Patching the SHEET therefore fixes
+  every downstream consumer.
+
+### Mechanism (general, runtime): patch rides the game's own upload
+`text_xlate.cpp` gains a third layer, `[[vram_patch]]`: on completion of every
+CPU→VRAM transfer (`gpu.c` GP0 0xA0 state machine, both completion paths call
+`text_xlate_vram_upload(x,y,w,h)`), any configured rect fully contained in the
+upload is verified **halfword-for-halfword** against `src_hex` (expected JP
+pixels) and only on an exact match rewritten with `<lang>_hex` through
+`gr_vram_read`/`gr_vram_write` — the renderer facade the upload itself uses, so
+software / GL / supersampling mirrors all stay coherent. Re-applies on every
+matching re-upload (source-path patch, NOT a one-shot VRAM poke — survives
+scene reloads; a different asset at the same coords fails verify and is left
+alone). Config lives with the other translation surfaces in
+`translations/tsumu.toml`; language-gated like `[[glyph_label]]`. Debug:
+`xlate stats` → `vram_patches`/`vram_applied`; `xlate vpatch` force-applies
+against current VRAM (verify still gates) for config iteration without waiting
+for a re-upload.
+
+### Shipped entries + authoring recipe
+Shipped: `hud_stage` `(834,352,18,16)` → `STAGE`, `hud_battery`
+`(852,352,18,16)` → `BATTERY` — rects exactly the game's own compose-blit strip
+units; the replacement preserves the bullet-dot and colon pixels verbatim and
+swaps only the JP text texels for text composed from the sheet's own fullwidth
+Latin glyphs (row y=304, 8 texels/glyph, palette nibbles {1=stroke, 2=shadow} —
+proven HUD-visible because the y=320 row, same palette, is blitted onto the
+HUD). Authoring loop (scratchpad `composestrips2.py`): peek the strip rect →
+`src_hex`; overwrite the measured text-texel span with Latin glyph texels →
+`en_hex`; preview-render both; append to toml; `xlate reload` + `vpatch` to
+test live. The remaining strips inventoried above are the mechanical follow-up
+backlog for full menu translation.

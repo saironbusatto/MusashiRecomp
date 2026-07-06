@@ -64,10 +64,18 @@ typedef struct {
     uint32_t seq;
     uint32_t src_addr;      /* RAM/MMIO source address of command header, if known */
     uint32_t pc;            /* g_debug_last_store_pc when command completes */
+    uint32_t func;          /* g_debug_current_func_addr at issue (executing guest fn) */
+    uint32_t ra;            /* guest $ra at issue: direct caller of the leaf GP0 helper */
     uint8_t  opcode;
     uint8_t  n_words;       /* total command length; >MAX means truncated */
     uint16_t pad;
     uint32_t cmd[GPU_GP0_RING_MAX_WORDS];
+    /* Builder attribution (populated only for VRAM->VRAM copies, op 0x80):
+     * bounded guest-stack unwind of validated return addresses, innermost
+     * first. Lets a caller skip the libgpu funnel band and name the game-level
+     * routine that assembled the copy. Zero for non-copy commands. */
+    uint32_t bld[6];
+    uint32_t csp;           /* raw guest $sp at copy time (diagnostic) */
 } GpuGp0RingEntry;
 
 uint64_t gpu_gp0_ring_total(void);

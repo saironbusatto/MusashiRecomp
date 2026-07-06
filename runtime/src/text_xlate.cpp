@@ -20,6 +20,11 @@
 
 extern "C" uint8_t* memory_get_ram_ptr(void);
 extern "C" { extern uint64_t s_frame_count; }
+/* Renderer VRAM facade (gpu_render.h) — the same read/write path the GP0 0xA0
+ * upload uses, so vram-strip patches stay coherent across software/GL backends
+ * and the supersampling mirror. */
+extern "C" uint16_t gr_vram_read(int x, int y);
+extern "C" void     gr_vram_write(int x, int y, uint16_t pixel);
 
 namespace {
 
@@ -334,12 +339,33 @@ struct GlyphLabel {
     bool                 patched = false;
 };
 
+// A VRAM-strip patch entry. Some UI text is pre-rendered pixels inside a
+// texture asset the game uploads to VRAM and samples with quads (Tsumu's HUD
+// labels live in the glyph-sheet image) — no glyph codes exist anywhere, so
+// neither the message hook nor the glyph-label patch can reach it. The patch
+// rides the game's own upload path instead: whenever a GP0 0xA0 CPU→VRAM
+// transfer completes and fully contains the patch rect, the rect is verified
+// halfword-for-halfword against the expected JP pixels and, only on an exact
+// match, rewritten with the target-language pixels through the renderer's own
+// VRAM write facade. Because it re-applies on every matching upload it is a
+// source-path patch (survives scene reloads / re-uploads), not a one-shot
+// VRAM poke.
+struct VramPatch {
+    int                   x = 0, y = 0;  // rect origin, VRAM halfword coords
+    int                   w = 0, h = 0;  // rect size (halfwords × rows)
+    std::vector<uint16_t> src;           // expected JP pixels (verify key), w*h
+    std::vector<uint16_t> rep;           // replacement pixels, w*h
+    uint64_t              applied = 0;   // times applied (per-upload re-apply)
+};
+
 const EncodingProfile* g_prof = &kShiftJisProfile;
 
 std::unordered_map<uint64_t, TableEntry> g_table;      // hash -> translation
 std::unordered_map<uint64_t, CapRec>     g_inv;        // hash -> capture record
 std::vector<GlyphLabel>                  g_glyph_labels;// per-glyph RAM patches
 std::atomic<int>                         g_glyph_pending{0}; // unpatched count (0 => idle)
+std::vector<VramPatch>                   g_vram_patches; // pre-rendered strip patches
+std::atomic<int>                         g_vram_patch_n{0};  // count (0 => upload hook idle)
 std::mutex g_mtx;
 
 std::atomic<bool>     g_apply_armed{false};   // table non-empty AND language enabled
@@ -383,14 +409,27 @@ std::vector<uint8_t> hex_to_bytes(const std::string& hex) {
     return b;
 }
 
+// hex string -> little-endian halfwords (VRAM pixel stream order).
+std::vector<uint16_t> hex_to_halfwords(const std::string& hex) {
+    auto b = hex_to_bytes(hex);
+    std::vector<uint16_t> hw;
+    if (b.empty() || (b.size() & 1)) return hw;
+    hw.reserve(b.size() / 2);
+    for (size_t i = 0; i + 1 < b.size(); i += 2)
+        hw.push_back((uint16_t)(b[i] | (b[i + 1] << 8)));
+    return hw;
+}
+
 void load_tables_locked() {
     g_table.clear();
     g_glyph_labels.clear();
     g_glyph_pending.store(0, std::memory_order_relaxed);
+    g_vram_patches.clear();
+    g_vram_patch_n.store(0, std::memory_order_relaxed);
     for (auto& kv : g_inv) kv.second.translated = false;
     if (g_dir.empty() || !fs::exists(g_dir)) { g_apply_armed.store(false); return; }
     const bool lang_off = g_lang.empty() || g_lang == "jp" || g_lang == "off";
-    size_t files = 0, entries = 0, glyphs = 0;
+    size_t files = 0, entries = 0, glyphs = 0, vpatches = 0;
     std::error_code ec;
     for (auto& de : fs::directory_iterator(g_dir, ec)) {
         if (!de.is_regular_file()) continue;
@@ -441,16 +480,42 @@ void load_tables_locked() {
                 ++glyphs;
             }
         }
+        // VRAM-strip patch entries (pre-rendered-pixel layer). The replacement
+        // pixels come from a per-language "<lang>_hex" key ("en_hex" fallback);
+        // no key for the active language => the strip stays JP.
+        if (!lang_off && data.contains("vram_patch")) {
+            const auto& varr = toml::find(data, "vram_patch");
+            if (varr.is_array()) for (const auto& v : varr.as_array()) {
+                if (!v.contains("src_hex")) continue;
+                VramPatch vp;
+                vp.x = (int)toml::find_or<int64_t>(v, "x", -1);
+                vp.y = (int)toml::find_or<int64_t>(v, "y", -1);
+                vp.w = (int)toml::find_or<int64_t>(v, "w", 0);
+                vp.h = (int)toml::find_or<int64_t>(v, "h", 0);
+                if (vp.x < 0 || vp.y < 0 || vp.w <= 0 || vp.h <= 0) continue;
+                if (vp.x + vp.w > 1024 || vp.y + vp.h > 512) continue;
+                vp.src = hex_to_halfwords(toml::find_or<std::string>(v, "src_hex", ""));
+                std::string rk = g_lang + "_hex";
+                if (v.contains(rk)) vp.rep = hex_to_halfwords(toml::find_or<std::string>(v, rk, ""));
+                else if (v.contains("en_hex")) vp.rep = hex_to_halfwords(toml::find_or<std::string>(v, "en_hex", ""));
+                size_t need = (size_t)vp.w * (size_t)vp.h;
+                if (vp.src.size() != need || vp.rep.size() != need) continue;
+                g_vram_patches.push_back(std::move(vp));
+                ++vpatches;
+            }
+        }
     }
     g_glyph_pending.store((int)g_glyph_labels.size(), std::memory_order_relaxed);
-    g_apply_armed.store(!lang_off && (!g_table.empty() || !g_glyph_labels.empty()),
+    g_vram_patch_n.store((int)g_vram_patches.size(), std::memory_order_relaxed);
+    g_apply_armed.store(!lang_off && (!g_table.empty() || !g_glyph_labels.empty() ||
+                                      !g_vram_patches.empty()),
                         std::memory_order_relaxed);
     // Mark inventory records that now have a translation.
     for (auto& kv : g_inv)
         kv.second.translated = (g_table.find(kv.first) != g_table.end());
     std::fprintf(stderr,
-        "[xlate] loaded %zu entries + %zu glyph-labels from %zu file(s) in %s (lang=%s apply=%s)\n",
-        entries, glyphs, files, g_dir.c_str(), g_lang.c_str(),
+        "[xlate] loaded %zu entries + %zu glyph-labels + %zu vram-patches from %zu file(s) in %s (lang=%s apply=%s)\n",
+        entries, glyphs, vpatches, files, g_dir.c_str(), g_lang.c_str(),
         g_apply_armed.load() ? "on" : "off");
 }
 
@@ -498,6 +563,36 @@ void glyph_labels_patch_locked(uint8_t* ram) {
         gl.patched = true;
     }
     g_glyph_pending.store(pending, std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// VRAM-strip patch: verify the rect holds the exact expected JP pixels, then
+// rewrite it with the target-language pixels through the renderer facade.
+// `force` skips the upload-containment gate (debug "vpatch" re-apply). Runs
+// under g_mtx. Returns patches applied this call.
+// ---------------------------------------------------------------------------
+int vram_patches_apply_locked(int ux, int uy, int uw, int uh, bool force) {
+    int applied = 0;
+    for (auto& vp : g_vram_patches) {
+        if (!force &&
+            (vp.x < ux || vp.y < uy || vp.x + vp.w > ux + uw || vp.y + vp.h > uy + uh))
+            continue;
+        // Verify-before-patch: every halfword must match the expected JP
+        // pixels. A different asset at the same coords (or an already-patched
+        // strip) fails the compare and is left untouched.
+        bool match = true;
+        for (int r = 0; match && r < vp.h; ++r)
+            for (int c = 0; match && c < vp.w; ++c)
+                if (gr_vram_read(vp.x + c, vp.y + r) != vp.src[(size_t)r * vp.w + c])
+                    match = false;
+        if (!match) continue;
+        for (int r = 0; r < vp.h; ++r)
+            for (int c = 0; c < vp.w; ++c)
+                gr_vram_write(vp.x + c, vp.y + r, vp.rep[(size_t)r * vp.w + c]);
+        vp.applied++;
+        ++applied;
+    }
+    return applied;
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +707,14 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
     }
 }
 
+extern "C" void text_xlate_vram_upload(int x, int y, int w, int h) {
+    // Hot path: one relaxed load when no patches are configured / lang off.
+    if (g_vram_patch_n.load(std::memory_order_relaxed) <= 0) return;
+    if (!g_apply_armed.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lk(g_mtx);
+    vram_patches_apply_locked(x, y, w, h, false);
+}
+
 extern "C" void text_xlate_init(const char* project_root, const char* language) {
     const char* env = std::getenv("PSX_LANG");
     if (env && *env) g_lang = env;
@@ -634,15 +737,38 @@ extern "C" int text_xlate_debug_json(const char* subcmd, char* out, int cap) {
 
     if (sc == "stats") {
         size_t gp = 0; for (auto& gl : g_glyph_labels) if (gl.patched) ++gp;
+        uint64_t va = 0; for (auto& vp : g_vram_patches) va += vp.applied;
         return std::snprintf(out, cap,
             "{\"lang\":\"%s\",\"apply\":%s,\"capture\":%s,\"table_entries\":%zu,"
             "\"distinct_captured\":%zu,\"calls\":%llu,\"hits\":%llu,"
-            "\"glyph_labels\":%zu,\"glyph_patched\":%zu,\"glyph_pending\":%d}",
+            "\"glyph_labels\":%zu,\"glyph_patched\":%zu,\"glyph_pending\":%d,"
+            "\"vram_patches\":%zu,\"vram_applied\":%llu}",
             g_lang.c_str(), g_apply_armed.load() ? "true" : "false",
             g_capture_on.load() ? "true" : "false",
             g_table.size(), g_inv.size(),
             (unsigned long long)g_calls.load(), (unsigned long long)g_hits.load(),
-            g_glyph_labels.size(), gp, g_glyph_pending.load());
+            g_glyph_labels.size(), gp, g_glyph_pending.load(),
+            g_vram_patches.size(), (unsigned long long)va);
+    }
+
+    // vpatch: force-apply every VRAM-strip patch against current VRAM content
+    // (verify still gates each one) and report per-patch status. Lets a freshly
+    // reloaded patch be exercised without waiting for the game to re-upload.
+    if (sc == "vpatch") {
+        int n = g_apply_armed.load() ? vram_patches_apply_locked(0, 0, 0, 0, true) : 0;
+        int w = 0;
+        w += std::snprintf(out + w, cap - w, "{\"applied_now\":%d,\"patches\":[", n);
+        bool first = true;
+        for (auto& vp : g_vram_patches) {
+            if (w > cap - 160) break;
+            if (!first) w += std::snprintf(out + w, cap - w, ",");
+            first = false;
+            w += std::snprintf(out + w, cap - w,
+                "{\"x\":%d,\"y\":%d,\"w\":%d,\"h\":%d,\"applied\":%llu}",
+                vp.x, vp.y, vp.w, vp.h, (unsigned long long)vp.applied);
+        }
+        w += std::snprintf(out + w, cap - w, "]}");
+        return w;
     }
 
     // glyph: per-label patch status (JP addr -> patched? + target). Observability

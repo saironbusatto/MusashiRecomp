@@ -5309,8 +5309,8 @@ static void handle_gpu_frame_dump(int id, const char *json)
 
     int n = gpu_gp0_ring_dump_frame((uint32_t)target, entries, max_entries);
 
-    /* ~190 bytes per entry in JSON; budget conservatively. */
-    size_t buf_sz = 256 + (size_t)n * 280u;
+    /* ~190 bytes base + up to ~90 for the copy builder chain; budget conservatively. */
+    size_t buf_sz = 256 + (size_t)n * 400u;
     char *buf = (char *)malloc(buf_sz);
     if (!buf) { free(entries); send_err(id, "alloc failed"); return; }
 
@@ -5322,16 +5322,26 @@ static void handle_gpu_frame_dump(int id, const char *json)
         const GpuGp0RingEntry *e = &entries[i];
         pos += (size_t)snprintf(buf + pos, buf_sz - pos,
             "%s{\"seq\":%u,\"op\":\"0x%02X\",\"n\":%u,"
-            "\"src\":\"0x%08X\",\"pc\":\"0x%08X\",\"w\":[",
+            "\"src\":\"0x%08X\",\"pc\":\"0x%08X\","
+            "\"func\":\"0x%08X\",\"ra\":\"0x%08X\",\"w\":[",
             i ? "," : "", e->seq, e->opcode, e->n_words,
-            e->src_addr, e->pc);
+            e->src_addr, e->pc, e->func, e->ra);
         int show = e->n_words < GPU_GP0_RING_MAX_WORDS
                  ? e->n_words : GPU_GP0_RING_MAX_WORDS;
         for (int k = 0; k < show && pos < buf_sz - 32; k++) {
             pos += (size_t)snprintf(buf + pos, buf_sz - pos,
                 "%s\"0x%08X\"", k ? "," : "", e->cmd[k]);
         }
-        pos += (size_t)snprintf(buf + pos, buf_sz - pos, "]}");
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos, "]");
+        if (e->opcode == 0x80) {
+            pos += (size_t)snprintf(buf + pos, buf_sz - pos,
+                ",\"csp\":\"0x%08X\",\"bld\":[", e->csp);
+            for (int k = 0; k < 6 && e->bld[k] && pos < buf_sz - 32; k++)
+                pos += (size_t)snprintf(buf + pos, buf_sz - pos,
+                    "%s\"0x%08X\"", k ? "," : "", e->bld[k]);
+            pos += (size_t)snprintf(buf + pos, buf_sz - pos, "]");
+        }
+        pos += (size_t)snprintf(buf + pos, buf_sz - pos, "}");
     }
     snprintf(buf + pos, buf_sz - pos, "]}");
     debug_server_send_line(buf);
@@ -11295,6 +11305,11 @@ static void process_command(const char *line)
 /* Extended init that accepts a CPU state pointer for register queries. */
 static CPUState *s_init_cpu = NULL;
 CPUState *debug_cpu_ptr = NULL; /* Global, used by memory.c watchpoints */
+
+/* Guest $ra accessor for other TUs (e.g. gpu.c GP0 ring caller capture) that
+ * must not depend on the CPUState layout. Returns 0 before the CPU is bound. */
+uint32_t debug_guest_ra(void) { return debug_cpu_ptr ? debug_cpu_ptr->gpr[31] : 0; }
+uint32_t debug_guest_sp(void) { return debug_cpu_ptr ? debug_cpu_ptr->gpr[29] : 0; }
 
 void debug_server_set_cpu(CPUState *cpu)
 {
