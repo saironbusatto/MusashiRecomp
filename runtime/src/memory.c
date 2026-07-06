@@ -137,7 +137,11 @@ void dirty_ram_clear_image_baseline(void) {
  * a modified page is still allowed to use the static native entry if the code
  * bytes at the target match the original image; otherwise it is sticky-diverged
  * and must execute from live RAM through the dirty interpreter. */
-static const uint8_t *text_ref_image = NULL;
+/* Mutable: the runtime owns this heap buffer (main.cpp mallocs the EXE image and
+ * never frees it). Intentional data patches by the translation layer are blessed
+ * into it via dirty_ram_text_bless so they are not mistaken for self-modifying
+ * code — see dirty_ram_text_native_ok / dirty_ram_text_bless. */
+static uint8_t *text_ref_image = NULL;
 static uint32_t text_ref_lo = 0, text_ref_hi = 0;
 static uint32_t text_modified_bitmap[DIRTY_RAM_BITMAP_WORDS];
 static uint32_t text_diverged_bitmap[DIRTY_RAM_BITMAP_WORDS];
@@ -148,7 +152,7 @@ void dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                    uint32_t len) {
     if (!bytes || len == 0 || phys_lo >= RAM_SIZE) return;
     if (len > RAM_SIZE - phys_lo) len = RAM_SIZE - phys_lo;
-    text_ref_image = bytes;
+    text_ref_image = (uint8_t *)bytes;  /* runtime-owned mutable heap buffer */
     text_ref_lo = phys_lo;
     text_ref_hi = phys_lo + len;
     memset(text_modified_bitmap, 0, sizeof(text_modified_bitmap));
@@ -179,9 +183,18 @@ int dirty_ram_text_native_ok(uint32_t phys) {
         g_text_native_blocked++;
         return 0;
     }
-    if (!(text_modified_bitmap[page >> 5] & bit))
-        return !dirty_ram_is_dirty(phys);
+    /* Fast path: a page never touched by a guarded write AND not runtime-dirty
+     * still holds the pristine compiled image — native is safe with no compare. */
+    if (!(text_modified_bitmap[page >> 5] & bit) && !dirty_ram_is_dirty(phys))
+        return 1;
 
+    /* Flagged (a guarded write that differed, an overlay-dirty page, or an
+     * intentional runtime data patch): the compiled native code is valid IFF the
+     * bytes at the entry still match the reference image. Decide by the ACTUAL
+     * bytes, not the page-dirty heuristic — so a data-only change in a page that
+     * also holds code (e.g. a translation string table blessed into the ref via
+     * dirty_ram_text_bless) does not needlessly block a still-valid function and
+     * route it to psx_unknown_dispatch. A genuine code overwrite still diverges. */
     uint32_t n = 256;
     if (n > text_ref_hi - phys) n = text_ref_hi - phys;
     if (memcmp(ram + phys, text_ref_image + (phys - text_ref_lo), n) == 0)
@@ -191,6 +204,35 @@ int dirty_ram_text_native_ok(uint32_t phys) {
     g_text_diverged_pages++;
     g_text_native_blocked++;
     return 0;
+}
+
+/* Bless an INTENTIONAL data patch into the reference image so the text-divergence
+ * guard does not mistake it for self-modifying code. The runtime's own
+ * translation layer (text_xlate) patches string/glyph tables that share 4 KB
+ * pages — and the guard's 256-byte compare window — with real compiled functions.
+ * Without this, patching a data table diverges the page and blocks native
+ * dispatch of every function in it (a real function fatally routes to
+ * psx_unknown_dispatch). By updating text_ref_image to match the patched bytes,
+ * the compare passes for the intentional change while a genuine game write of
+ * DIFFERENT bytes still diverges and is still caught. Clears the sticky diverged
+ * bit for affected pages so the guard re-evaluates against the updated reference.
+ * Byte-for-byte identical writes are a no-op. */
+void dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len) {
+    if (!text_ref_image || !bytes || len == 0) return;
+    if (phys >= text_ref_hi || phys + len <= text_ref_lo) return;   /* out of range */
+    uint32_t lo = phys < text_ref_lo ? text_ref_lo : phys;
+    uint32_t hi = phys + len > text_ref_hi ? text_ref_hi : phys + len;
+    if (hi <= lo) return;
+    uint8_t *ref = text_ref_image + (lo - text_ref_lo);
+    const uint8_t *src = bytes + (lo - phys);
+    if (memcmp(ref, src, hi - lo) == 0) return;                     /* already in sync */
+    memcpy(ref, src, hi - lo);
+    /* Re-open the affected pages: clear the sticky diverged bit so the next
+     * dispatch re-runs the compare against the now-updated reference. */
+    uint32_t first_page = lo >> DIRTY_RAM_PAGE_SHIFT;
+    uint32_t last_page  = (hi - 1u) >> DIRTY_RAM_PAGE_SHIFT;
+    for (uint32_t page = first_page; page <= last_page; page++)
+        text_diverged_bitmap[page >> 5] &= ~(1u << (page & 31u));
 }
 
 uint64_t dirty_ram_text_native_blocked(void) { return g_text_native_blocked; }

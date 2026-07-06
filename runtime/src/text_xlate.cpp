@@ -25,6 +25,11 @@ extern "C" { extern uint64_t s_frame_count; }
  * and the supersampling mirror. */
 extern "C" uint16_t gr_vram_read(int x, int y);
 extern "C" void     gr_vram_write(int x, int y, uint16_t pixel);
+// Bless an in-place RAM patch into the text-image guard so it isn't mistaken for
+// self-modifying code (memory.c). Our patches (string/glyph tables) share pages
+// with real compiled functions; without this the guard blocks their native
+// dispatch and the game fatally routes to psx_unknown_dispatch.
+extern "C" void     dirty_ram_text_bless(uint32_t phys, const uint8_t* bytes, uint32_t len);
 
 namespace {
 
@@ -48,6 +53,14 @@ inline void gwb(uint8_t* ram, uint32_t va, uint8_t v) {
     uint32_t pa; if (ram_fold(va, &pa)) ram[pa] = v;
 }
 inline bool va_in_ram(uint32_t va) { uint32_t pa; return ram_fold(va, &pa); }
+// Bless a just-written patch region into the text-image guard (see the extern
+// above). gwb writes RAM directly; this syncs the guard's reference so the patch
+// reads as intentional data, not self-modifying code. Reads the now-current bytes
+// straight from guest RAM, so it always blesses exactly what was written.
+inline void bless_patch(uint8_t* ram, uint32_t va, uint32_t len) {
+    uint32_t pa;
+    if (len && ram_fold(va, &pa)) dirty_ram_text_bless(va & 0x1FFFFFFFu, ram + pa, len);
+}
 
 // ---------------------------------------------------------------------------
 // FNV-1a 64 over raw source bytes — the translation KV key.
@@ -624,6 +637,7 @@ void glyph_labels_patch_locked(uint8_t* ram) {
         label_transcode_le(gl.target, gl.width, enc);
         if (enc.empty() || enc.size() > gl.width) { ++pending; continue; }  // paranoia
         for (uint32_t i = 0; i < enc.size(); ++i) gwb(ram, gl.addr + i, enc[i]);
+        bless_patch(ram, gl.addr, (uint32_t)enc.size());
         gl.patched = true;
     }
     g_glyph_pending.store(pending, std::memory_order_relaxed);
@@ -698,6 +712,9 @@ void msg_inplace_patch_locked(uint8_t* ram) {
         } else if (m.term == Term::Nul && va_in_ram(m.addr + ti)) {
             gwb(ram, m.addr + ti, 0x00);
         }
+        // Bless the whole written span (body + up to a 2-byte terminator) so the
+        // guard sees the patched record as intentional data, not modified code.
+        bless_patch(ram, m.addr, ti + 2);
         m.patched = true;
     }
     g_msg_inplace_pending.store(pending, std::memory_order_relaxed);
@@ -720,6 +737,7 @@ void msg_seps_patch_locked(uint8_t* ram) {
         if (grb(ram, s.addr) != 0x40 || grb(ram, s.addr + 1) != 0x81) { ++pending; continue; }
         gwb(ram, s.addr,     0xFF);
         gwb(ram, s.addr + 1, 0xFF);
+        bless_patch(ram, s.addr, 2);
         s.patched = true;
     }
     g_msg_sep_pending.store(pending, std::memory_order_relaxed);
