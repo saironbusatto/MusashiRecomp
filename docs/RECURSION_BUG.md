@@ -196,7 +196,7 @@ No stubs, no HLE, never edit generated C; the fix is in the recompiler/runtime.
 ## 6. Build & run (this project)
 
 ```
-cd /f/Projects/psxrecomp/TombaRecomp
+cd ../TombaRecomp
 export PATH=/c/msys64/mingw64/bin:$PATH TMP=/c/msys64/tmp TEMP=/c/msys64/tmp
 # regen tools + BIOS + game (generated/ is gitignored; off master tip):
 cmake --build ../psxrecomp/recompiler/build --target psxrecomp-game psxrecomp-bios -j8
@@ -580,7 +580,7 @@ idles indefinitely, **USER-CONFIRMED** — and tips the per-frame loop
 SYMPTOM; the time-based divergence is the ROOT. Every soak so far was **us-vs-us**; we
 have never diffed against real hardware over the idle window.
 
-**NEXT = the oracle.** psxref (`F:\Projects\psxref`, Beetle PSX, TCP **4380**, shares
+**NEXT = the oracle.** psxref (`<psxref>`, Beetle PSX, TCP **4380**, shares
 `card1.mcd`; see [[psxref_oracle]] / `memory/psxref_oracle.md`). Run BOTH our recomp
 and psxref idle (**turbo** if possible, to reach ~frame 50k in well under 14 min wall
 clock) and find the **FIRST** state / control-flow divergence around frame ~50k — that

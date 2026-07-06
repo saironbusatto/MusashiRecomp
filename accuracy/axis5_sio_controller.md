@@ -2,7 +2,7 @@
 
 Cross-reference of `runtime/src/sio.c` (+ `main.cpp` pad driver, `memcard.c`)
 against the in-tree Beetle/Mednafen oracle
-(`F:\Projects\psxrecomp\psxrecomp\beetle-psx\mednafen\psx\`:
+(`beetle-psx/mednafen/psx/`:
 `frontio.cpp`, `input/dualshock.cpp`, `input/gamepad.cpp`, `input/memcard.cpp`)
 and nocash psx-spx "Controllers and Memory Cards".
 

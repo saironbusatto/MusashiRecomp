@@ -165,7 +165,7 @@ Known follow-up work:
 For the current game milestone, build and run the sibling TombaRecomp project:
 
 ```sh
-cd F:/Projects/TombaRecomp
+cd ../TombaRecomp
 cmake --build build -j16
 ./build/psx-runtime.exe --game game.toml
 ```

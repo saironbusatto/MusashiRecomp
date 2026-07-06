@@ -219,12 +219,12 @@ Runtime-only changes (everything except `sprite_tag_funcs` / cull-widen) just
 need a rebuild:
 ```
 PATH=/c/msys64/mingw64/bin:$PATH
-cmake --build F:/Projects/psxrecomp/TombaRecomp/build-stable --target psx-runtime -j16
+cmake --build ../TombaRecomp/build-stable --target psx-runtime -j16
 ```
 Changes that emit into generated C (`sprite_tag_funcs`, future cull-widen) need
 a regen first (see `memory/regen_build_recipe.md`):
 ```
-F:/Projects/psxrecomp/psxrecomp/recompiler/build/psxrecomp-game.exe --config game.toml
+recompiler/build/psxrecomp-game.exe --config game.toml
 ```
 `build-stable` is RelWithDebInfo + debug tools (TCP port 4470) + launcher ON.
 Always `taskkill /F /IM psx-runtime.exe` before relaunching.

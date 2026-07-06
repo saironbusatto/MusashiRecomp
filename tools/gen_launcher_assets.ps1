@@ -3,7 +3,7 @@
 # logo, verification icons). Swap with real renders later — the <img>/decorator
 # pipeline (stb_image PNG loader) is the same either way.
 Add-Type -AssemblyName System.Drawing
-$out = "F:\Projects\psxrecomp\psxrecomp\runtime\launcher\assets\img"
+$out = "runtime\launcher\assets\img"
 if (-not (Test-Path $out)) { New-Item -ItemType Directory -Force $out | Out-Null }
 
 function New-Canvas($w, $h) {
