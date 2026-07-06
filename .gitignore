@@ -92,3 +92,9 @@ games/*/*
 
 # macOS .app bundle (contains recompiled BIOS-derived binary — not distributable)
 /dist/
+
+# Session-scratch debug scripts (hardcoded local paths; kept on disk, not tracked)
+tools/_options_session/
+
+# Compiled test binaries (build artifacts; the runtime/tests/*.c sources are tracked)
+runtime/tests/*.exe
