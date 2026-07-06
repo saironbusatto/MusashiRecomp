@@ -85,6 +85,20 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         const toml::value& loc = toml::find(cfg, "localization");
         if (loc.contains("language"))
             rt.language = toml::find<std::string>(loc, "language");
+        // `default` is the launcher-facing alias for the pre-selected language.
+        if (loc.contains("default"))
+            rt.language = toml::find<std::string>(loc, "default");
+        // Optional launcher dropdown options: languages = [ {code, label}, ... ].
+        if (loc.contains("languages") && toml::find(loc, "languages").is_array()) {
+            for (const auto& e : toml::find(loc, "languages").as_array()) {
+                if (!e.contains("code")) continue;
+                RuntimeConfig::LanguageOption lo;
+                lo.code  = toml::find<std::string>(e, "code");
+                lo.label = e.contains("label") ? toml::find<std::string>(e, "label")
+                                                : lo.code;
+                if (!lo.code.empty()) rt.languages.push_back(std::move(lo));
+            }
+        }
     }
     if (!cfg.contains("runtime")) return rt;
     const toml::value& runtime = toml::find(cfg, "runtime");
@@ -924,6 +938,13 @@ UserSettings load_user_settings(const fs::path& path) {
             s.memcard2_enabled = toml::find<bool>(m, "enable2"); s.has_memcard2_enabled = true;
         });
     }
+    if (doc.contains("localization")) {
+        const toml::value& lc = toml::find(doc, "localization");
+        if (lc.contains("language")) try_get([&]{
+            const auto v = toml::find<std::string>(lc, "language");
+            if (!v.empty()) { s.language = v; s.has_language = true; }
+        });
+    }
     if (doc.contains("controller")) {
         const toml::value& ct = toml::find(doc, "controller");
         if (ct.contains("p1_device")) try_get([&]{
@@ -1053,6 +1074,11 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
             f << "p2_mode   = \"" << pad_mode_to_string(s.p2_mode) << "\"\n";
         if (s.has_deadzone)
             f << "deadzone  = " << s.deadzone << "\n";
+    }
+
+    if (s.has_language) {
+        f << "\n[localization]\n";
+        f << "language = \"" << s.language << "\"\n";
     }
 
     return f.good();

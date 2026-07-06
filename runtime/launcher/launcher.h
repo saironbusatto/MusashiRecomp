@@ -14,6 +14,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 struct SDL_Window;
 
@@ -37,6 +39,13 @@ struct GameInfo {
     bool        allow_hybrid     = true;     // offer the "Hybrid" pad mode (false => Analog | D-Pad only)
     bool        lock_mode        = false;    // hide the whole pad-mode selector and force locked_mode (single-pad-type games)
     int         locked_mode      = 2;        // PAD_MODE_DIGITAL; the mode forced when lock_mode is true
+
+    // Optional "Localization" dropdown. Populated from game.toml
+    // [localization].languages. When non-empty the launcher shows a language
+    // menu; empty => no menu (the general case — only Tsumu declares languages).
+    // code feeds the runtime's translation layer ("off"/"jp"/"" = untranslated).
+    struct Language { std::string code; std::string label; };
+    std::vector<Language> languages;
 };
 
 // Run the launcher loop to completion. `gl_context` is an SDL_GLContext (void*

@@ -8,7 +8,7 @@ body {
 	background-color: #0b0e14;
 	font-size: 15dp;
 }
-#root { width: 100%; height: 100%; display: block; }
+#root { width: 100%; height: 100%; display: block; overflow-y: auto; }
 #frame { display: block; padding: 22dp 26dp; }
 
 /* ---- top bar ---- */
@@ -34,6 +34,12 @@ h1 { display: block; font-size: 27dp; font-weight: bold; color: #ffffff; }
 	padding: 18dp 22dp;
 	margin-bottom: 13dp;
 }
+/* Settings view: two side-by-side columns so the panels use the horizontal
+   space and the view fits without scrolling. SYSTEM stays full-width below
+   (its BIOS/disc paths need the room). */
+.settings-cols { display: flex; flex-direction: row; align-items: flex-start; }
+.settings-col { display: block; flex: 1 1 0; min-width: 0; }
+.settings-col:first-child { margin-right: 13dp; }
 .cards-row { display: flex; flex-direction: row; align-items: stretch; margin-bottom: 13dp; }
 .card {
 	display: block;
@@ -338,6 +344,8 @@ button:hover { background-color: #232d3c; }
 
 	<!-- ================= SETTINGS VIEW ================= -->
 	<div data-if="view == 'settings'">
+		<div class="settings-cols">
+		<div class="settings-col">
 		<div class="panel">
 			<div class="eyebrow">VIDEO</div>
 			<div class="set-row"><span class="set-lbl">Window size</span><span class="set-ctl">
@@ -363,6 +371,13 @@ button:hover { background-color: #232d3c; }
 				<button class="toggle" data-event-click="toggle_widescreen"><span class="value" data-if="widescreen">On</span><span class="value" data-if="widescreen == false">Off</span></button>
 				<span class="ws-hint" data-if="widescreen">16:9 native field-of-view</span></span></div>
 		</div>
+		</div>
+		<div class="settings-col">
+		<div class="panel" data-if="lang_menu">
+			<div class="eyebrow">LOCALIZATION</div>
+			<div class="set-row"><span class="set-lbl">Language</span><span class="set-ctl">
+				<button class="toggle wide" data-event-click="cycle_language"><span class="value">{{lang_label}}</span></button></span></div>
+		</div>
 		<div class="panel">
 			<div class="eyebrow">AUDIO</div>
 			<div class="set-row"><span class="set-lbl">SPU high-quality (float shadow)</span><span class="set-ctl">
@@ -372,6 +387,8 @@ button:hover { background-color: #232d3c; }
 			<div class="eyebrow">CONTROLLER</div>
 			<div class="set-row"><span class="set-lbl">Analog stick deadzone</span><span class="set-ctl">
 				<button class="toggle" data-event-click="cycle_deadzone"><span class="value">{{deadzone_pct}}%</span></button></span></div>
+		</div>
+		</div>
 		</div>
 		<div class="panel">
 			<div class="eyebrow">SYSTEM</div>
