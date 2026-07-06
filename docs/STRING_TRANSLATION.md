@@ -776,3 +776,23 @@ textures @VRAM 768,0), `GRAPH1/4.BIN` (16bpp `TSUMU light` title @320,0),
 (4bpp Hect logo), `TSU_KOK.TIM` (16bpp), **`MOJI.BIN`** (22528 B raw font, lba
 7119 — the HUD/per-glyph font sheet), `MONDAI.BIN` (puzzle data), `SOUND.BIN`,
 `TSUMU.XA`. Rendered PNGs confirm no CLEAR!! banner among the baked graphics.
+
+### HUD remap — the drawer is now pinned (mechanism cracked, for the next pass)
+Live GP0-ring capture on the name-entry screen (which draws per-glyph text at the
+screen top, same class as the HUD) pinned the per-glyph text drawer concretely:
+- **Drawer PC `0x8005443C`** — issues one textured quad per glyph via **direct
+  GP0** (not DMA), building the primitives in game RAM at **`~0x80092xxx`**. Each
+  glyph is a `0x2C` textured quad: screen rect (X,Y, 16–32 px cell) + **U,V into
+  texpage `0x1E`** selecting the font tile, CLUT `0x7C10`.
+- **The font page (texpage 0x1E) holds hiragana AND Latin** — proven because the
+  name-entry grid draws `Ａ–Ｚ`/`０–９` through this exact drawer. So the Latin
+  tile U,Vs the HUD remap needs are directly readable off the grid's letter quads
+  (correlate each grid cell's on-screen glyph ↔ its quad U,V).
+- **Remaining blocker for a clean HUD remap:** catch the HUD label's own compose
+  (it draws its katakana quads via this drawer at stage-load) to get its source
+  prims + katakana U,Vs, then either rewrite those prims' U,V to the Latin tiles
+  or hook `0x8005443C` to remap the HUD-position glyph quads. Reaching a fresh
+  stage-load is gated on confirming a name in the grid (blind debug-input grid
+  navigation to the "decide" cell did not land) or a memcard LOAD path — a
+  reachable interactive build (the USER's) clears this immediately. With the
+  drawer + font-tile scheme now known, the remap itself is a scoped U,V rewrite.
