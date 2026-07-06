@@ -1,4 +1,4 @@
-param([string]$Out = "F:\Projects\psxrecomp\TombaRecomp\build-clean\launcher_shot.png")
+param([string]$Out = "../TombaRecomp\build-clean\launcher_shot.png")
 $p = Get-Process psx-runtime -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
 if (-not $p) { Write-Output "no window"; exit 1 }
 Write-Output ("hwnd=" + $p.MainWindowHandle + " title=" + $p.MainWindowTitle)

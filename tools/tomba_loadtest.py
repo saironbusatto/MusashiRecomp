@@ -12,11 +12,11 @@ Usage: python tomba_loadtest.py <exe> <game.toml> [port]
 """
 import sys, time, subprocess, socket, json
 
-EXE  = sys.argv[1] if len(sys.argv)>1 else r"F:/Projects/psxrecomp/TombaRecomp/build-codex-ape-fw/psx-runtime.exe"
+EXE  = sys.argv[1] if len(sys.argv)>1 else r"../TombaRecomp/build-codex-ape-fw/psx-runtime.exe"
 TOML = sys.argv[2] if len(sys.argv)>2 else "game-loadtest.toml"
 PORT = int(sys.argv[3]) if len(sys.argv)>3 else 4470
-BIOS = r"F:/Projects/psxrecomp/psxrecomp/bios/SCPH1001.BIN"
-CWD  = r"F:/Projects/psxrecomp/TombaRecomp"
+BIOS = r"bios/SCPH1001.BIN"
+CWD  = r"../TombaRecomp"
 NONE,RIGHT,CROSS,START = 0xFFFF,0xFFDF,0xBFFF,0xFFF7
 
 def q(cmd, **kw):
@@ -70,7 +70,7 @@ def nonblack():
     return nz/tot if tot else 0
 
 def shot(name):
-    b=f"F:/Projects/psxrecomp/_scratch/{name}.bmp"; q("screenshot_file",path=b)
+    b=f"../_scratch/{name}.bmp"; q("screenshot_file",path=b)
     try:
         from PIL import Image; Image.open(b).save(b.replace(".bmp",".png"))
     except Exception: pass

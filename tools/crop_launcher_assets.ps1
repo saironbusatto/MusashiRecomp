@@ -6,8 +6,8 @@
 # interior dark details (disc PlayStation logo, controller buttons, the centre
 # hole) are preserved. Logo: simple global luminance key (thin bright glyphs).
 Add-Type -AssemblyName System.Drawing
-$src = "C:\Users\Matthew\Desktop\ef772e04-a7db-4ecd-98bb-eb75a01de0a6.png"
-$out = "F:\Projects\psxrecomp\psxrecomp\runtime\launcher\assets\img"
+$src = "<desktop>/ef772e04-a7db-4ecd-98bb-eb75a01de0a6.png"
+$out = "runtime\launcher\assets\img"
 $mock = [System.Drawing.Bitmap]::FromFile($src)
 
 function Get-Crop($x,$y,$w,$h) {

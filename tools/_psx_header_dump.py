@@ -1,5 +1,5 @@
 import struct, os, sys
-p = sys.argv[1] if len(sys.argv) > 1 else 'F:/Projects/TombaRecomp/tomba/SCUS_942.36'
+p = sys.argv[1] if len(sys.argv) > 1 else '../TombaRecomp/tomba/SCUS_942.36'
 with open(p, 'rb') as f:
     h = f.read(0x800)
 magic = h[:8]

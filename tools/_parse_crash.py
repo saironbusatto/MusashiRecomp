@@ -2,8 +2,8 @@
 dispatch_ring entries, last 5 unknown_dispatch entries, last 30
 dirty_block_log entries. Highlight the relevant ones for the
 0xBFC09790 caller investigation."""
-import json
-with open(r'F:\Projects\psxrecomp\psx_last_run_report.json') as f:
+import sys, json
+with open(sys.argv[1] if len(sys.argv) > 1 else 'psx_last_run_report.json') as f:
     r = json.load(f)
 
 print(f"reason: {r.get('reason')}")

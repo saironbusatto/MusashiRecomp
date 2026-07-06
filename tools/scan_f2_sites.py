@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import sys
-rom = open('F:/Projects/psxrecomp/bios/SCPH1001.BIN','rb').read()
+rom = open('../bios/SCPH1001.BIN','rb').read()
 
 matches = []
 for rt in range(32):
@@ -46,7 +46,7 @@ for addr, rt, op, rs, rt_out, imm, nw, offset in matches:
 # Read dispatch.c:
 print("\n--- Functions containing 0xF2000003 sites ---")
 import re
-dispatch = open('F:/Projects/psxrecomp/generated/SCPH1001_dispatch.c').read()
+dispatch = open('../generated/SCPH1001_dispatch.c').read()
 entries = re.findall(r'\{\s*0x([0-9A-F]+)u,\s*func_([0-9A-F]+)\s*\}', dispatch)
 # Only keep those in code range (phys 0x1FC00000+)
 fn_list = sorted([(int(a,16), name) for a,name in entries])

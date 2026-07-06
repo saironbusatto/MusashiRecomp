@@ -64,5 +64,5 @@ def validate(path, expect_remaps):
     return cfg
 
 bios = validate(ROOT / "bios" / "SCPH1001.toml", expect_remaps=2)
-tomba = validate(Path("F:/Projects/TombaRecomp/game.toml"), expect_remaps=0)
+tomba = validate(Path("../TombaRecomp/game.toml"), expect_remaps=0)
 print("\nOK: both configs parse and validate.")

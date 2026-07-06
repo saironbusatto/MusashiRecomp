@@ -557,8 +557,8 @@ fringe on them.
 Tooling: `tools/crop_launcher_assets.ps1` (crop + knockout),
 `tools/gen_launcher_assets.ps1` (procedural check/verdict icons),
 `tools/shot_launcher.ps1` (screenshot the GL launcher window). Mockup
-source: `C:\Users\Matthew\Desktop\ef772e04-a7db-4ecd-98bb-eb75a01de0a6.png`
-(1448×1086). Pure-cosmetic; does not block Phase 4/5 wiring.
+source: a local mockup PNG (1448×1086). Pure-cosmetic; does not block
+Phase 4/5 wiring.
 
 ---
 

@@ -5,7 +5,7 @@ oracle and nocash psx-spx.
 
 - **Our impl:** `runtime/src/spu.c` (799 LOC) + `runtime/src/spu_shadow.c` (float
   resample shadow, opt-in, verify-only — irrelevant to hardware accuracy).
-- **Oracle:** `F:/Projects/psxrecomp/psxrecomp/beetle-psx/mednafen/psx/spu.cpp`
+- **Oracle:** `beetle-psx/mednafen/psx/spu.cpp`
   (1664 LOC, `PS_SPU`).
 - **Spec:** nocash psx-spx "Sound Processing Unit (SPU)".
 

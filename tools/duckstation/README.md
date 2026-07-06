@@ -13,7 +13,7 @@ PSXRecomp v4 uses a patched build of [stenzek/duckstation](https://github.com/st
 ## First-time setup
 
 ```bash
-cd /f/Projects/psxrecomp-v4
+cd <psxrecomp-v4>
 bash tools/duckstation/setup.sh     # ~5 min: clone submodule + fetch/extract deps + apply patch
 bash tools/duckstation/build.sh     # ~15-30 min: compile duckstation-qt Release x64
 ```
@@ -41,7 +41,7 @@ The pinned base SHA lives in one place only: `UPSTREAM_BASE` at the top of `tool
 
 - Keeps the upstream source untracked in v4's git history — no 2.1GB of upstream code in our blame.
 - Keeps *our* 1200-line patch reviewable as a single text diff in `tools/duckstation/` — in-tree, versioned, diffable across sessions.
-- Matches the nestopia setup in sibling project `F:\Projects\nesrecomp\runner\nestopia_cmake.cmake` + `runner/nestopia_oracle.patch`. Same mental model: submodule upstream, patch on top, auto-apply at setup time.
+- Matches the nestopia setup in sibling project `<nesrecomp>/runner\nestopia_cmake.cmake` + `runner/nestopia_oracle.patch`. Same mental model: submodule upstream, patch on top, auto-apply at setup time.
 - No private/public GitHub fork to maintain or keep in sync.
 
 ## Protocol parity with native runtime

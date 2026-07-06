@@ -2,15 +2,15 @@
 
 Backport of the gbarecomp "verified-enhancement" QoL layer to psxrecomp.
 All work lives on the `feat/shadow-enhancements` branch / `_shadow_psxrecomp`
-worktree (sibling of the core repo `F:\Projects\psxrecomp\psxrecomp`, branched
+worktree (sibling of the core repo `psxrecomp`, branched
 off `master`). It does not touch the in-flight `feat/gl-renderer`,
 `feat/mmx6-input`, `dev/ape-escape`, or any other branch/worktree.
 
 ## Which PSX core / language / build
 
-- **Core chosen:** `F:\Projects\psxrecomp\psxrecomp` — the real git repo
+- **Core chosen:** `psxrecomp` — the real git repo
   (`origin git@github.com:mstan/psxrecomp.git`, default branch `master`, current
-  to 2026-06-10). `F:\Projects\psxrecomp-v4` is a stale stub (symlink to
+  to 2026-06-10). `<psxrecomp-v4>` is a stale stub (symlink to
   `psxrecomp/duckstation` + an empty `recompiler/build`), NOT a maintained core.
 - **Language:** runtime is **C99** (`spu.c`, `gpu.c`, …) with a little C++17
   (`main.cpp`, `gte.cpp`). All shadow code is written in **C** to match the
