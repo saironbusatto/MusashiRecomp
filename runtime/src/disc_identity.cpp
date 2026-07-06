@@ -130,6 +130,8 @@ std::string scan_boot_serial(const std::vector<uint8_t>& buf) {
             j++;
             if (token.size() > 32) break;
         }
+        const size_t slash = token.find_last_of("\\/");
+        if (slash != std::string::npos) token = token.substr(slash + 1);
         const std::string norm = normalize_serial(token);
         if (!norm.empty()) return norm;
     }
