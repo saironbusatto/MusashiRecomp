@@ -24,6 +24,19 @@ import argparse, json, socket, sys
 SRC = {0:"vblank",1:"gpu",2:"cdrom",3:"dma",4:"timer0",5:"timer1",6:"timer2",
        7:"sio0",8:"sio1",9:"spu",10:"pio"}
 
+# KNOWN INTENTIONAL divergences from the Beetle oracle — where OUR runtime is
+# MORE faithful to real hardware than Beetle, so a native/beetle delta on this
+# source is EXPECTED, not a bug. Labeled (not red-flagged) unless --strict.
+# See ACCURACY_BURNDOWN.md (Axis 5 — CDROM). Add entries here (never silence a
+# real divergence): source-name -> one-line reason.
+KNOWN_DIVERGENCES = {
+    "cdrom": "SCPH-1001 CD controller version 94/09/19/C0 (psx-spx) vs Beetle's "
+             "hardcoded 97/01/10/C2 — version <0x95 keeps the shell CD-init flag "
+             "[0xA000DFFC] clear, so Beetle issues a spurious boot ReadTOC we do "
+             "not: expect a CDROM event count/timing delta around CD-init. "
+             "Also GetID region (SCEA/E/I) + status bit2 ADPBUSY idle=0.",
+}
+
 def query(port, cmd, **kw):
     obj = {"cmd": cmd}; obj.update(kw)
     s = socket.create_connection(("127.0.0.1", port), timeout=15)
@@ -61,6 +74,8 @@ def main():
     ap.add_argument("--cyc-hi", type=int, default=None)
     ap.add_argument("--drift", type=int, default=2_000_000)
     ap.add_argument("--show", type=int, default=0)
+    ap.add_argument("--strict", action="store_true",
+                    help="do NOT suppress KNOWN_DIVERGENCES (show them as raw drift)")
     args = ap.parse_args()
 
     nat = pull(args.native, args.cyc_lo, args.cyc_hi)
@@ -73,6 +88,7 @@ def main():
     sources = sorted(set(ns) | set(bs))
     print(f"\n{'source':<8} {'native#':>8} {'beetle#':>8}  {'first divergent ordinal (cycle delta)':<40}")
     print("-" * 78)
+    suppressed = []
     for s in sources:
         n, b = ns.get(s, []), bs.get(s, [])
         name = SRC.get(s, f"src{s}")
@@ -86,9 +102,20 @@ def main():
                 break
         if not flag and len(n) != len(b):
             flag = f"count differs ({len(n)} vs {len(b)}) — no big per-ordinal drift in first {m}"
+        diverged = bool(flag)
         if not flag:
             flag = "tracks (no drift > threshold)"
+        known = KNOWN_DIVERGENCES.get(name)
+        if diverged and known and not args.strict:
+            flag = f"KNOWN✓ intentional (more faithful) — {flag}"
+            suppressed.append(name)
         print(f"{name:<8} {len(n):>8} {len(b):>8}  {flag}")
+
+    if suppressed and not args.strict:
+        print("\nKNOWN intentional divergences suppressed (re-run with --strict to"
+              " see raw): " + ", ".join(suppressed))
+        for nm in suppressed:
+            print(f"  {nm}: {KNOWN_DIVERGENCES[nm]}")
 
     if args.show:
         for s in sources:
