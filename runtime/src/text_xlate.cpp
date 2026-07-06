@@ -228,20 +228,49 @@ void label_transcode_le(const std::string& utf8, uint32_t width, std::vector<uin
 }
 
 // Capture-inventory quality gate (authoring signal only — APPLY is KV-gated and
-// unaffected). Real Tsumu text is hiragana/katakana/fullwidth-alnum heavy, whose
-// SJIS lead bytes concentrate in the 0x82/0x83 rows; vertex/coordinate binary
-// that passes the record reader by chance has diverse leads. Require >= 2 such
-// chars so the always-on inventory stays a clean enumeration of drawn strings.
+// unaffected). Real Tsumu text is hiragana/katakana/fullwidth-alnum/kanji heavy,
+// whose SJIS lead bytes concentrate in the 0x81/0x82/0x83 and 0x88-0x9F/0xE0-0xEA
+// rows; vertex/coordinate binary that passes the record reader by chance has
+// diverse, out-of-row leads. Gate: (a) a minimum real length, (b) >= 2 real
+// kana/fullwidth-alnum chars, and (c) the decoded 2-byte units are >= 80% in
+// valid Shift-JIS text rows — so the always-on inventory stays a clean
+// enumeration of drawn strings and binary noise is dropped.
 bool sj_capture_worthy(const uint8_t* b, uint32_t n) {
-    uint32_t good = 0;
+    if (n < 4) return false;
+    uint32_t units = 0, good = 0, kanafw = 0, unit_bytes = 0;
     for (uint32_t i = 0; i + 1 < n; ) {
-        uint8_t c = b[i];
-        if (sj_lead(c) && sj_trail(b[i + 1])) {
-            if (c == 0x83 || (c == 0x82 && b[i + 1] >= 0x4F)) ++good;  // kana/fullwidth
+        uint8_t c = b[i], d = b[i + 1];
+        if (sj_lead(c) && sj_trail(d)) {
+            ++units;
+            // Valid Shift-JIS text rows: 0x81 symbols/punct, 0x82 hiragana +
+            // fullwidth alnum, 0x83 katakana, 0x88-0x9F + 0xE0-0xEA kanji.
+            if (c == 0x81 || c == 0x82 || c == 0x83 ||
+                (c >= 0x88 && c <= 0x9F) || (c >= 0xE0 && c <= 0xEA)) { ++good; unit_bytes += 2; }
+            if (c == 0x83 || (c == 0x82 && d >= 0x4F)) ++kanafw;  // kana / fullwidth alnum
             i += 2;
         } else i += 1;
     }
-    return good >= 2;
+    if (kanafw < 2) return false;                       // needs real JP / fullwidth content
+    if (units == 0 || good * 5 < units * 4) return false;  // >= 80% of units in valid rows
+    if (unit_bytes * 2 < n) return false;               // >= 50% of record is 2-byte SJIS text
+                                                        // (drops long single-byte fill buffers)
+    return true;
+}
+
+// Canonical record-START gate (capture only). A capture is ingested only when
+// `va` is a genuine record boundary — the unit immediately preceding it is a
+// terminator (NUL / 0xFFFF) or a region edge. This collapses the partial-offset
+// explosion: a register that lands mid-string (or mid-binary-struct) is preceded
+// by content bytes, not a terminator, so the SAME record is no longer re-ingested
+// at every byte offset a register happens to point. APPLY is unaffected — it must
+// still match the exact bytes the game draws at whatever offset the register
+// carries, so this gate is never consulted on the apply path.
+inline bool sj_at_record_start(uint8_t* ram, uint32_t va) {
+    if (!va_in_ram(va - 1)) return true;                         // region edge
+    uint8_t p1 = grb(ram, va - 1);
+    if (p1 == 0x00) return true;                                 // after NUL terminator
+    if (p1 == 0xFF && grb(ram, va - 2) == 0xFF) return true;     // after 0xFFFF terminator
+    return false;                                                // mid-record offset — skip
 }
 
 // Struct-vs-text safety: a genuine message record contains only text units and
@@ -543,7 +572,14 @@ extern "C" void text_xlate_on_dispatch(CPUState* cpu, uint32_t target) {
         if (!g_prof->read_record(ram, va, buf, &len, &term)) continue;
         uint64_t key = fnv1a(buf, len);
 
-        if (cap && (!g_prof->capture_worthy || g_prof->capture_worthy(buf, len))) {
+        // CAPTURE (always-on inventory): ingest each real string ONCE at its
+        // genuine record start, and only if it clears the noise gate. The
+        // canonical-start test collapses the partial-offset explosion (the same
+        // record was previously re-ingested at every offset a register landed on).
+        // APPLY below is deliberately NOT gated by record-start — it matches the
+        // exact bytes the game draws wherever the pointer lands.
+        if (cap && sj_at_record_start(ram, va) &&
+            (!g_prof->capture_worthy || g_prof->capture_worthy(buf, len))) {
             std::lock_guard<std::mutex> lk(g_mtx);
             inv_upsert_locked(key, buf, len, va, target, cpu->gpr[31], term);
         }
