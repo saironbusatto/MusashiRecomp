@@ -699,3 +699,70 @@ slots, and screenshot the level-select / HUD.
   `0x0000FC10` @ `0x80071470`).
 - `DISC.md` — `MOJI.BIN` (font), `MONDAI.BIN` (puzzle text), disc file list.
 - `game.toml` — `load_address`, `entry_pc`, `debug_port = 4510`.
+
+## Appendix X — Per-glyph coverage pass: shipped, and the composed-HUD resisters (2026-07-05)
+
+Follow-up to Appendix Y. Concrete outcomes of the per-glyph work, with the
+static evidence that decides what is source-patchable vs. what genuinely resists.
+
+### Shipped (RAM source-patch layer — `[[glyph_label]]`)
+- **Stage/level/tutorial names** — the full uniform 26-byte-stride table at
+  **`0x80070300`–`0x800708FE`** (59 slots, one per puzzle). Confirmed clean:
+  every slot start is +26 from the last (`text` + fullwidth-space pad), so slot
+  bounds are certain. Patched in RAM once resident, verified byte-for-byte
+  against the source before writing exactly 26 bytes. (commit `f00631e` runtime,
+  `31ab3c2` table.)
+- **Name-entry prompt** `あなたの名前を教えてね。` @ **`0x80071360`** — a static
+  0xFFFF-framed record whose renderer reads the source address *directly* (a
+  pointer-repoint `[[entry]]` captures it with `xl=true` and `hits` increments,
+  but the pixels don't change). Source-patched instead: `[[glyph_label]]` width
+  24 (12 cells) → fullwidth "YOUR NAME?", trailing `FF FF` @ `0x80071378` left
+  intact. Renders English on-screen. (commit `31ba92d`.)
+- **Name-entry Latin input is NATIVE.** The kana grid already draws the font's
+  fullwidth Latin `Ａ–Ｚ` and digits `０–９` (char table `0x80074ACA`, indices
+  73–98 / 213–252). A non-JP player can type an English name today — no change
+  needed; the only JP on that screen was the prompt above.
+
+### Key discriminator: static source address ⇒ source-patchable
+The RAM source-patch works for **any** label the game draws from a fixed EXE
+address, *regardless of draw path* (per-glyph sprite loop OR string formatter) —
+both read the same bytes. It CANNOT touch text that is **composed at runtime**
+(no static source to overwrite).
+
+### Resisters — composed per-glyph, no static source (NOT shipped)
+- **In-game HUD `ステージ：X–Y` / `バッテリー：N`.** Drawn per-glyph as sprites.
+  **Proof it is composed, not stored:** a full 2 MB guest-RAM scan (live, in a
+  gameplay stage with the HUD on-screen) finds the katakana `ステージ`
+  (`58 83 65 83 5b 81 57 83`) and `バッテリー` (`6f 83 62 83 65 83 8a 83 5b 81`)
+  **only** at the static message-text addresses (`0x800709xx`…), every one
+  followed by a grammatical particle (を/が/の/は) — i.e. inside sentences, never
+  as a standalone HUD label. There is no `ステージ：` template
+  (no occurrence is followed by `：` = `46 81`), and no HUD string buffer in RAM.
+  So the label is emitted from **hardcoded font-tile indices** (MOJI.BIN glyphs),
+  not from any SJIS/string the source-patch could rewrite.
+- **Stage-clear `CLEAR!!` banner.** No static source of ANY form: `クリア`
+  (`4e 83 8a 83 41 83`) appears only message-embedded ("…をクリアしていく"…);
+  there is **no** standalone `クリア`, **no** fullwidth `ＣＬＥＡＲ`
+  (`63 82 6b 82 65 82 61 82 72 82`), and **no** ASCII `CLEAR`/`CLEAR!!` anywhere
+  in the EXE. It is also **not a baked sprite**: every graphic TIM on the disc
+  was extracted and rendered (see asset map) — the only pre-rendered text is the
+  **`TSUMU light` title logo** (`GRAPH1/4.BIN`, already English). So `CLEAR!!`
+  is composed per-glyph at runtime, same class as the HUD.
+
+Both resisters need the **per-glyph sprite-draw interception + glyph-index
+remap** hook flagged in Appendix Y — a separate, larger effort: (1) crack the
+MOJI.BIN font layout to map katakana → tile index, (2) pin the composition/draw
+routine (Ghidra auto-analysis yields 0 functions on the raw dump; use the
+generated C or a live gameplay draw-trace), (3) intercept the sprite draw and
+remap indices to Latin **only for the HUD/banner draws** (a blanket VRAM font
+swap would corrupt katakana in menus/messages, and `ステージ`→`STAGE` is a
+4-vs-5 glyph mismatch). No fragile partial was shipped for these — doing so
+without the scoped intercept would corrupt other katakana.
+
+### Disc asset map (all files extracted from `Tsumu Light (Japan).bin`)
+ISO9660 root: `DOUGA.BIN` (FMV), `END.STR` (ending FMV), `FB_TEX.BIN` (4bpp block
+textures @VRAM 768,0), `GRAPH1/4.BIN` (16bpp `TSUMU light` title @320,0),
+`GRAPH2/3.BIN` (8bpp character sprite sheets @320,256 / 576,256), `HECTLOGO.TIM`
+(4bpp Hect logo), `TSU_KOK.TIM` (16bpp), **`MOJI.BIN`** (22528 B raw font, lba
+7119 — the HUD/per-glyph font sheet), `MONDAI.BIN` (puzzle data), `SOUND.BIN`,
+`TSUMU.XA`. Rendered PNGs confirm no CLEAR!! banner among the baked graphics.
