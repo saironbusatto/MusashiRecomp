@@ -263,8 +263,8 @@ generated C as native code, and simulates hardware through MMIO handlers for
 GPU, DMA, timers, CD-ROM, MDEC, SIO0, memory cards, SPU, GTE, and interrupt
 delivery. BIOS A0/B0/C0 vectors go through the recompiled BIOS, not HLE shims.
 
-See `CLAUDE.md`, `PLAN.md`, and `CURRENT_STATE.md` for the development rules
-and current project context.
+See `CLAUDE.md`, `PLAN.md`, and `FAITHFUL_TIMING_PLAN.md` for the development
+rules and current project context.
 
 ## Disc Speed
 
