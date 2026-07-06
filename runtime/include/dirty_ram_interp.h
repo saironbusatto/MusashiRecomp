@@ -90,6 +90,9 @@ void     dirty_ram_mark_executable_range(uint32_t phys, uint32_t len);
 void     dirty_ram_register_text_image(uint32_t phys_lo, const uint8_t *bytes,
                                        uint32_t len);
 int      dirty_ram_text_native_ok(uint32_t phys);
+/* Bless an intentional runtime data patch (e.g. text_xlate string/glyph tables)
+ * into the text reference image so it is not mistaken for self-modifying code. */
+void     dirty_ram_text_bless(uint32_t phys, const uint8_t *bytes, uint32_t len);
 uint64_t dirty_ram_text_native_blocked(void);
 uint32_t dirty_ram_text_diverged_pages(void);
 
