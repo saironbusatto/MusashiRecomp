@@ -796,3 +796,30 @@ screen top, same class as the HUD) pinned the per-glyph text drawer concretely:
   navigation to the "decide" cell did not land) or a memcard LOAD path — a
   reachable interactive build (the USER's) clears this immediately. With the
   drawer + font-tile scheme now known, the remap itself is a scoped U,V rewrite.
+
+### HUD remap — reachability blockers (why it's not finishable headless)
+Attempted the LOAD-GAME unblock (skip the name grid) to reach a dynamic HUD:
+- **Both memcards are empty.** `saves/card1.mcd` + `card2.mcd` are formatted
+  (magic `MC`) but have **0 used blocks** and no `SLPS`/`TSM` save markers — so
+  **LOAD GAME has nothing to load** and cannot reach a stage.
+- **NEW GAME** still routes through the name-entry glyph grid; blind debug-input
+  navigation to its "decide" cell did not land (confirmed again this pass).
+- **The attract demo's HUD is not per-frame-drawn.** With the GP0 ring recording
+  from the game's first GP0 write (frame 554), a full 554→3754 capture shows the
+  HUD (screen y≈8) is **never** drawn as glyph quads or any top-region primitive;
+  steady gameplay frames contain only the animated 3D scene (~8 textured `0x2C`
+  quads at screen y≥31, via BIOS DMA `0xBFC38B1C`). The HUD is composed once at
+  stage-load and thereafter only displayed. In the demo its values are static
+  (`0-5` / `∞`), so there is **no dynamic HUD draw to intercept** and no
+  discriminator to capture.
+
+**Net:** the drawer + font-tile scheme are cracked (see above), but capturing the
+HUD label's own glyph quads (kana U,Vs + a call-context/screen-region
+discriminator) requires **real gameplay where the HUD is dynamically drawn**
+(battery counting down / stage advancing) — reachable only via a real save
+(create one first) or driving NEW GAME past the name grid on an interactive
+build. No hook was shipped: without the captured discriminator, any remap would
+risk rewriting non-HUD quads (blocks/menus) — a fragile hack (Rule 5, forbidden).
+Precise remaining step for the USER's reachable build: enter a stage so the HUD
+draws, dump the GP0 ring at drawer `0x8005443C`, read the HUD glyph quads' U,Vs +
+screen row, then rewrite those to the font's Latin tiles for STAGE / BATTERY.
