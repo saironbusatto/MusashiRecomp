@@ -113,23 +113,3 @@ if(NOT MSVC AND EXISTS "${BEETLE_LIB}")
 elseif(NOT MSVC)
     message(STATUS "psx-beetle: libmednafen_psx.a not found - skipping psx-beetle")
 endif()
-
-# ---- Kula World target (SCES-01000) ----
-#
-# Only defined when the locally-recompiled game output exists (the disc dump,
-# EXE, and generated C are untracked — see games/*/* in .gitignore), so a
-# fresh clone without the game still configures cleanly.
-
-set(KULA_GENERATED "${PSXRECOMP_ROOT}/games/kula/generated")
-if(EXISTS "${KULA_GENERATED}/SCES_010.00_full.c")
-    psxrecomp_add_runtime_target(kula-runtime
-        GAME_GENERATED_FULL_C     "${KULA_GENERATED}/SCES_010.00_full.c"
-        GAME_GENERATED_DISPATCH_C "${KULA_GENERATED}/SCES_010.00_dispatch.c"
-        DEBUG_PORT 4370
-        WINDOW_TITLE "Kula World (PSXRecomp)"
-        DEFAULT_BIOS_PATH "${PSXRECOMP_ROOT}/bios/SCPH1001.BIN"
-        DEFAULT_GAME_CONFIG_PATH "${PSXRECOMP_ROOT}/games/kula/game.toml"
-    )
-else()
-    message(STATUS "kula-runtime: games/kula/generated/SCES_010.00_full.c not found - skipping")
-endif()
