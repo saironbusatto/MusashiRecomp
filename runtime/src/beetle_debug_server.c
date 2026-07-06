@@ -67,6 +67,15 @@ extern uint32_t beetle_get_sio_trace(uint32_t *out_seq, uint8_t *out_tx,
 extern uint32_t beetle_get_sio_trace_total(void);
 extern void     beetle_reset_sio_trace(void);
 
+/* CD command trace */
+extern uint32_t beetle_get_cdcmd_trace(uint32_t *out_seq, uint8_t *out_cmd,
+                                       uint8_t *out_nargs, uint8_t *out_a0,
+                                       uint8_t *out_a1, uint8_t *out_a2,
+                                       uint32_t *out_pc,
+                                       int max_count);
+extern uint32_t beetle_get_cdcmd_trace_total(void);
+extern void     beetle_reset_cdcmd_trace(void);
+
 /* wtrace */
 extern int      beetle_wtrace_arm(uint32_t lo, uint32_t hi);
 extern int      beetle_wtrace_disarm(int slot);
@@ -469,6 +478,41 @@ static void h_sio_trace(int id, const char *json) {
     send_fmt("]}\n");
 
     free(seqs); free(txs); free(rxs); free(ctrl);
+}
+
+static void h_cdrom_cmd_dump(int id, const char *json) {
+    int count = json_get_int(json, "count", 256);
+    if (count < 1) count = 1;
+    if (count > 8192) count = 8192;
+
+    uint32_t *seqs = (uint32_t*)malloc(count * sizeof(uint32_t));
+    uint32_t *pcs  = (uint32_t*)malloc(count * sizeof(uint32_t));
+    uint8_t *cmds = (uint8_t*)malloc(count), *nargs = (uint8_t*)malloc(count);
+    uint8_t *a0 = (uint8_t*)malloc(count), *a1 = (uint8_t*)malloc(count), *a2 = (uint8_t*)malloc(count);
+    if (!seqs || !pcs || !cmds || !nargs || !a0 || !a1 || !a2) {
+        free(seqs); free(pcs); free(cmds); free(nargs); free(a0); free(a1); free(a2);
+        send_err(id, "alloc"); return;
+    }
+    uint32_t got = beetle_get_cdcmd_trace(seqs, cmds, nargs, a0, a1, a2, pcs, count);
+    uint32_t total = beetle_get_cdcmd_trace_total();
+
+    send_fmt("{\"id\":%d,\"ok\":true,\"total\":%u,\"count\":%u,\"entries\":[",
+             id, total, got);
+    for (uint32_t i = 0; i < got; i++) {
+        if (i > 0) send_fmt(",");
+        send_fmt("{\"seq\":%u,\"cmd\":\"0x%02X\",\"nargs\":%u,"
+                 "\"a0\":\"0x%02X\",\"a1\":\"0x%02X\",\"a2\":\"0x%02X\","
+                 "\"pc\":\"0x%08X\"}",
+                 seqs[i], cmds[i], nargs[i], a0[i], a1[i], a2[i], pcs[i]);
+    }
+    send_fmt("]}\n");
+    free(seqs); free(pcs); free(cmds); free(nargs); free(a0); free(a1); free(a2);
+}
+
+static void h_cdrom_cmd_reset(int id, const char *json) {
+    (void)json;
+    beetle_reset_cdcmd_trace();
+    send_ok(id);
 }
 
 static void h_sio_write_window(int id, const char *json) {
@@ -1490,6 +1534,8 @@ static const CmdEntry CMDS[] = {
     { "vram_peek",             h_vram_peek },
     { "sio_trace_reset",       h_sio_trace_reset },
     { "sio_trace",             h_sio_trace },
+    { "cdrom_cmd_dump",        h_cdrom_cmd_dump },
+    { "cdrom_cmd_reset",       h_cdrom_cmd_reset },
     { "sio_write_window",      h_sio_write_window },
     /* wtrace — normalized verb set (parity contract with psx-runtime). */
     { "wtrace_arm",            h_wtrace_arm },

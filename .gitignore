@@ -79,3 +79,16 @@ __pycache__/
 # DuckStation oracle (local-only; private fork at git@github.com:mstan/duckstation.git)
 /duckstation/
 _wip/
+
+# Game discs/EXEs and recompiler output (copyrighted, not distributable).
+# Only the per-game config (game.toml) is tracked.
+games/*/*
+!games/*/game.toml
+!games/*/seeds.txt
+
+# Per-game memcards created at runtime
+*.mcr
+!dummy.*.mcr
+
+# macOS .app bundle (contains recompiled BIOS-derived binary — not distributable)
+/dist/

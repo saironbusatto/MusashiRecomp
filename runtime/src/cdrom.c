@@ -16,6 +16,9 @@
 #include "event_ring.h"
 #include <string.h>
 #include <stdlib.h>
+#ifndef _WIN32
+#  include <signal.h>
+#endif
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
@@ -48,6 +51,21 @@ static uint8_t stat_reg;
 static uint8_t request_reg;
 static uint8_t irq_enable;
 static uint8_t irq_flag;
+
+/* Disc license region string returned in GetID's last four response bytes
+ * ("SCEE" PAL / "SCEA" NTSC-U / "SCEI" NTSC-J). Real hardware reports the
+ * region of the INSERTED DISC (mechacon reads it from the license area);
+ * the BIOS CD driver revalidates it when the kernel CD subsystem
+ * reinitializes mid-game, and a mismatch throws it into an endless
+ * GetStat/Init retry loop (Kula World wedged at its first level load this
+ * way). Set from the mounted disc's SYSTEM.CNF serial at launch
+ * (main.cpp); the default matches the console region of the one supported
+ * BIOS (SCPH1001, NTSC-U). */
+static uint8_t disc_scex[4] = { 'S', 'C', 'E', 'A' };
+
+void cdrom_set_disc_scex(const char scex[4]) {
+    memcpy(disc_scex, scex, 4);
+}
 
 /* CPS-native CD interrupt single-outstanding latch.
  *
@@ -972,6 +990,24 @@ static void queue_or_exec_command(uint8_t cmd) {
 }
 
 static void exec_command(uint8_t cmd) {
+#if !defined(PSX_NO_DEBUG_TOOLS) && !defined(_WIN32)
+    /* Self-stop trap: PSX_CD_TRAP_CMD=<byte> makes the process SIGSTOP
+     * itself the moment that CD command dispatches, so a debugger can
+     * attach and read the full native+guest call chain at the exact
+     * instant with ZERO run-speed cost. (A gdb conditional breakpoint on
+     * this function slows the emu two orders of magnitude via ptrace —
+     * unusable for wedges that need minutes of healthy boot first.) */
+    {
+        static long trap_cmd = -2, trap_nth = 1, trap_hits = 0;
+        if (trap_cmd == -2) {
+            const char *e = getenv("PSX_CD_TRAP_CMD");
+            trap_cmd = (e && *e) ? strtol(e, NULL, 0) : -1;
+            e = getenv("PSX_CD_TRAP_NTH");   /* stop on the Nth match (default 1st) */
+            if (e && *e) trap_nth = strtol(e, NULL, 0);
+        }
+        if ((long)cmd == trap_cmd && ++trap_hits == trap_nth) raise(SIGSTOP);
+    }
+#endif
     trace_cdrom('C', 0, cmd, 0);
     /* ENQUEUE: a CD command was issued (aux = command byte). */
     event_ring_record_aux(EV_ENQ, (uint8_t)SRC_CD_CMD, (uint32_t)cmd);
@@ -1249,10 +1285,19 @@ static void exec_command(uint8_t cmd) {
 
     case 0x19: /* Test */
         if (param_count >= 1 && param_fifo[0] == 0x20) {
-            response_push(0x97);
-            response_push(0x01);
-            response_push(0x10);
-            response_push(0xC2);
+            /* CD controller firmware version (BCD date + region). This BIOS is
+             * SCPH-1001, whose sub-CPU reports the 1994 controller: 94/09/19 C0.
+             * The value must be < 0x95 in the high byte — the shell's CD-init
+             * (func at ROM 0x1DF50) sets kernel flag [0xA000DFFC]=1 when the
+             * version byte >= 0x95, which later makes the boot CD-open
+             * (0xBFC0D570) issue a spurious ReadTOC that wedges the game's
+             * streaming reads. Beetle hardcodes the PSone-era 0x97 regardless of
+             * BIOS, which is wrong for SCPH-1001; matching the real 1994
+             * controller keeps the flag clear (Kula World demo-load wedge). */
+            response_push(0x94);
+            response_push(0x09);
+            response_push(0x19);
+            response_push(0xC0);
             set_irq(CDIRQ_ACK);
         } else {
             response_push(stat_reg);
@@ -1335,10 +1380,10 @@ static void process_pending(uint32_t cycles) {
             response_push(0x00);
             response_push(0x20);
             response_push(0x00);
-            response_push('S');
-            response_push('C');
-            response_push('E');
-            response_push('I');
+            response_push(disc_scex[0]);
+            response_push(disc_scex[1]);
+            response_push(disc_scex[2]);
+            response_push(disc_scex[3]);
             set_irq(CDIRQ_COMPLETE);
         }
         fire_cdrom_irq();
@@ -1463,11 +1508,19 @@ uint32_t cdrom_read(uint32_t addr) {
     switch (addr) {
     case 0x1F801800: {
         uint8_t s = index_reg & 0x03;
-        s |= (1 << 2); /* ADPCM empty */
+        /* Bit 2 is ADPBUSY (XA-ADPCM playback in progress), NOT "ADPCM
+         * empty" — it must idle at 0. The oracle (beetle cdc.cpp, Read
+         * A==0) never raises it. Raising it permanently made every BIOS
+         * status poll see "XA busy" and steered the kernel CD driver
+         * init down a different branch from real hardware. */
         if (param_count == 0) s |= (1 << 3);
         if (param_count < PARAM_FIFO_SIZE) s |= (1 << 4);
         if (response_read < response_count) s |= (1 << 5);
         if (data_fifo_ready()) s |= (1 << 6);
+        /* Bit 7 BUSYSTS: command written but not yet executed (our queued
+         * path; the synchronous path leaves no guest-observable window).
+         * Mirrors beetle's PendingCommandCounter/phase<=1 busy window. */
+        if (queued_cmd.pending) s |= (1 << 7);
         ret = s;
         break;
     }

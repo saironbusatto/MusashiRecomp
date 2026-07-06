@@ -2580,6 +2580,20 @@ int main(int argc, char** argv) {
         std::fprintf(stdout, "psxrecomp: SPU float-shadow enabled (verified-enhancement)\n");
     spu_init();
     cdrom_init(disc_path_str.empty() ? NULL : disc_path_str.c_str());
+    if (!disc_path_str.empty()) {
+        /* GetID must report the inserted disc's license region (the BIOS CD
+         * driver revalidates it mid-game). Derive it from the disc's boot
+         * serial via the same disc_identity module the launch check uses. */
+        const auto ident = PSXRecompV4::identify_disc(
+            disc_path_str, /*expected_serial*/"", /*expected_crc*/0,
+            /*has_expected_crc*/false, /*compute_crc*/false);
+        if (ident.region == "PAL")         cdrom_set_disc_scex("SCEE");
+        else if (ident.region == "NTSC-J") cdrom_set_disc_scex("SCEI");
+        else if (ident.region == "NTSC-U") cdrom_set_disc_scex("SCEA");
+        if (!ident.region.empty())
+            std::fprintf(stdout, "psxrecomp: disc region %s (serial %s)\n",
+                         ident.region.c_str(), ident.detected_serial.c_str());
+    }
     {
         int divisor = 1; /* default: authentic 1x timing */
         if (disc_speed == "instant") divisor = 0;
