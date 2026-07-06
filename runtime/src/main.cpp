@@ -2011,6 +2011,12 @@ int main(int argc, char** argv) {
     bool ctrl_allow_hybrid = true;  /* game.toml [controller] allow_hybrid; false hides Hybrid in the launcher */
     bool ctrl_lock_mode    = false; /* game.toml [controller] lock_mode; true hides the whole pad-mode selector */
     int  resolved_deadzone = -1;  /* <0 => keep input.ini/runtime default (12000) */
+    /* Localization: the effective language (game.toml default -> settings.toml ->
+     * launcher choice), applied to the translation layer AFTER the launcher runs.
+     * lang_menu_options drives the launcher's "Localization" dropdown (empty =>
+     * no dropdown; only games that declare [localization].languages get one). */
+    std::string resolved_language = "en";
+    std::vector<PSXRecompV4::RuntimeConfig::LanguageOption> lang_menu_options;
     std::filesystem::path resolved_disc;
     std::string window_title = PSX_WINDOW_TITLE;
     uint16_t   debug_port    = (uint16_t)DEFAULT_DEBUG_PORT;
@@ -2042,6 +2048,8 @@ int main(int argc, char** argv) {
              * gated by language + table presence. See docs/STRING_TRANSLATION.md. */
             text_xlate_init(gc.project_root.string().c_str(),
                             gc.runtime.language.c_str());
+            resolved_language = gc.runtime.language;   /* launcher/settings may override */
+            lang_menu_options = gc.runtime.languages;  /* launcher localization dropdown */
             if (gc.runtime.has_disc_speed)   disc_speed    = gc.runtime.disc_speed;
             if (gc.runtime.has_instant_max_per_frame)
                 instant_rate = gc.runtime.instant_max_per_frame;
@@ -2272,6 +2280,7 @@ int main(int argc, char** argv) {
         if (us.has_memcard2_path)    memcard2_path    = us.memcard2_path;
         if (us.has_memcard1_enabled) memcard1_enabled = us.memcard1_enabled;
         if (us.has_memcard2_enabled) memcard2_enabled = us.memcard2_enabled;
+        if (us.has_language) resolved_language = us.language;
         if (us.has_p1_device) p1_device = us.p1_device;
         if (us.has_p2_device) p2_device = us.p2_device;
         if (us.has_p1_mode) p1_mode = us.p1_mode;
@@ -2368,6 +2377,7 @@ int main(int argc, char** argv) {
             seed.memcard2_enabled = memcard2_enabled; seed.has_memcard2_enabled = true;
             if (!memcard1_path.empty()) { seed.memcard1_path = memcard1_path; seed.has_memcard1_path = true; }
             if (!memcard2_path.empty()) { seed.memcard2_path = memcard2_path; seed.has_memcard2_path = true; }
+            seed.language = resolved_language; seed.has_language = true;
             seed.p1_device = p1_device; seed.has_p1_device = true;
             seed.p2_device = p2_device; seed.has_p2_device = true;
             seed.p1_mode = p1_mode; seed.has_p1_mode = true;
@@ -2408,6 +2418,8 @@ int main(int argc, char** argv) {
                     ginfo.allow_hybrid     = ctrl_allow_hybrid;
                     ginfo.lock_mode        = ctrl_lock_mode;
                     ginfo.locked_mode      = p1_mode;  /* force the game's declared mode (default_mode) */
+                    for (const auto& lo : lang_menu_options)
+                        ginfo.languages.push_back({ lo.code, lo.label });
                     lr = psx_launcher::run(lwin, lctx, seed, ginfo, assets.c_str());
                     SDL_GL_DeleteContext(lctx);
                 }
@@ -2444,6 +2456,7 @@ int main(int argc, char** argv) {
                 memcard2_enabled = seed.memcard2_enabled;
                 if (seed.has_memcard1_path) memcard1_path = seed.memcard1_path;
                 if (seed.has_memcard2_path) memcard2_path = seed.memcard2_path;
+                if (seed.has_language) resolved_language = seed.language;
                 p1_device = seed.p1_device; p2_device = seed.p2_device;
                 p1_mode = seed.p1_mode; p2_mode = seed.p2_mode;
                 if (seed.has_deadzone) resolved_deadzone = seed.deadzone;
@@ -2455,6 +2468,11 @@ int main(int argc, char** argv) {
         }
     }
 #endif
+
+    /* Re-apply the resolved language to the translation layer. text_xlate_init
+     * (at config load) only saw the game.toml default; this folds in the
+     * settings.toml override and the launcher's choice. No-op when unchanged. */
+    text_xlate_set_language(resolved_language.c_str());
 
     /* CLI overrides win over config — applied last, before backend/port init.
      * Enables a soak fleet: several instances on distinct ports + renderers,

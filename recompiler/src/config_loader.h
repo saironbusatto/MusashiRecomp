@@ -51,8 +51,15 @@ struct RuntimeConfig {
     // Localization / on-the-fly string translation (docs/STRING_TRANSLATION.md).
     // language selects the translations/*.toml column; "jp"/"off"/"" disables
     // APPLY (capture still runs). From [localization].language or [runtime].
-    // language; env PSX_LANG overrides at runtime.
+    // language; env PSX_LANG overrides at runtime. Also the launcher default.
     std::string           language = "en";
+
+    // Optional launcher-facing language menu. When a game declares
+    // [localization].languages, the launcher shows a "Localization" dropdown of
+    // these {code,label} options (code feeds `language`; "off"/"jp"/"" = the
+    // untranslated native game). Empty => no dropdown (the general default).
+    struct LanguageOption { std::string code; std::string label; };
+    std::vector<LanguageOption> languages;
 
     bool                  has_window_title = false;
     std::string           window_title;
@@ -556,6 +563,10 @@ struct UserSettings {
     // Analog-stick deadzone, raw SDL axis units (0..32767). The launcher edits
     // this as 0-100% (raw = pct*32767/100), mirroring snesrecomp's GamepadDeadzone.
     bool has_deadzone  = false; int  deadzone  = 12000;
+    // Localization: the launcher's chosen language code (feeds RuntimeConfig
+    // .language / g_lang). "off"/"jp"/"" = untranslated native game. Persisted to
+    // settings.toml [localization].language.
+    bool has_language = false; std::string language = "en";
 };
 
 // GameOptions — the game's OWN native OPTION-screen settings, declared in a

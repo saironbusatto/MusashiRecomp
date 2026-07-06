@@ -900,6 +900,17 @@ extern "C" void text_xlate_init(const char* project_root, const char* language) 
     load_tables_locked();
 }
 
+extern "C" void text_xlate_set_language(const char* language) {
+    // PSX_LANG env is an authoring/testing override — if set it pins the language
+    // and the launcher's choice is ignored (matches text_xlate_init precedence).
+    const char* env = std::getenv("PSX_LANG");
+    std::string want = (env && *env) ? env : (language ? language : "");
+    std::lock_guard<std::mutex> lk(g_mtx);
+    if (want == g_lang) return;      // no change => skip the reload
+    g_lang = want;
+    load_tables_locked();            // re-selects the target column + re-arms APPLY
+}
+
 extern "C" int text_xlate_debug_json(const char* subcmd, char* out, int cap) {
     if (!out || cap <= 0) return 0;
     std::string sc = subcmd ? subcmd : "stats";

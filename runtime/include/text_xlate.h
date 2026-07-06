@@ -63,6 +63,13 @@ void text_xlate_on_dispatch(struct CPUState* cpu, uint32_t target);
  * it needs. */
 void text_xlate_init(const char* project_root, const char* language);
 
+/* Switch the active language and reload the translation tables. For the launcher:
+ * text_xlate_init runs at config-load (before the launcher), so the launcher's
+ * chosen language is re-applied through this after it returns. "jp"/"off"/""
+ * disables APPLY (untranslated native game). PSX_LANG env still wins if set.
+ * No-op if `language` matches the already-active one. Thread-safe. */
+void text_xlate_set_language(const char* language);
+
 /* Called by the GPU on completion of every CPU→VRAM image upload (GP0 0xA0)
  * with the upload rect in VRAM halfword coords. Applies any [[vram_patch]]
  * whose rect is contained in the upload (verify-then-patch). Cheap no-op when

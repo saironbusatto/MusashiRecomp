@@ -154,7 +154,13 @@ struct LauncherModel {
     Rml::String p1_status, p2_status;        // resolved status line
     Rml::String p1_dot, p2_dot;              // "" (on) | "off"
     Rml::String p1_options, p2_options;      // data-rml option-list markup
-    Rml::String dd_open;                     // "" | "p1" | "p2" (which list is open)
+    Rml::String dd_open;                     // "" | "p1" | "p2" (which device list is open)
+
+    // Localization (only shown when the game declares languages). Settings-view
+    // cycle button, like Renderer / Screen model.
+    bool        lang_menu    = false;        // game.languages non-empty => show it
+    int         lang_index   = 0;            // index into the game's language list
+    Rml::String lang_label;                  // current option label ("English")
 
     // Memory cards — real introspection of the on-disk .mcd images. Each slot
     // has a resolved file path, an enable toggle, and parsed directory stats.
@@ -342,6 +348,22 @@ void refresh_player(LauncherModel& m, int player, const std::vector<DeviceOption
     if (o.kind == 0)      { status = "No device — port empty"; dot = "off"; }
     else if (o.kind == 1) { status = Rml::String("Keyboard \xE2\x80\x94 ") + type; dot = ""; }
     else                  { status = o.label + Rml::String(" \xE2\x80\x94 ") + type; dot = ""; }
+}
+
+// Recompute the language button's label from lang_index (Settings cycle toggle).
+void refresh_language(LauncherModel& m,
+                      const std::vector<psx_launcher::GameInfo::Language>& langs) {
+    if (langs.empty()) return;
+    if (m.lang_index < 0 || m.lang_index >= (int)langs.size()) m.lang_index = 0;
+    m.lang_label = langs[m.lang_index].label;
+}
+
+// Resolve a saved language code to an index in the game's language list.
+int lang_index_for(const std::vector<psx_launcher::GameInfo::Language>& langs,
+                   const std::string& code) {
+    for (size_t i = 0; i < langs.size(); i++)
+        if (langs[i].code == code) return (int)i;
+    return 0;   // unknown/first — the game's declared default sits at [0] by convention
 }
 
 const char* renderer_name(int v)  { return v == 1 ? "OpenGL" : "Software"; }
@@ -708,6 +730,13 @@ Result run(SDL_Window* window, void* gl_context,
     refresh_player(m, 0, dev_opts);
     refresh_player(m, 1, dev_opts);
 
+    // ---- Seed the localization dropdown (only when the game declares one) ----
+    m.lang_menu = !game.languages.empty();
+    if (m.lang_menu) {
+        m.lang_index = lang_index_for(game.languages, io.language);
+        refresh_language(m, game.languages);
+    }
+
     // ---- Data model: bind fields + action callbacks ----
     Rml::DataModelConstructor c = context->CreateDataModel("settings");
     if (!c) {
@@ -758,6 +787,8 @@ Result run(SDL_Window* window, void* gl_context,
     c.Bind("p1_options",     &m.p1_options);
     c.Bind("p2_options",     &m.p2_options);
     c.Bind("dd_open",        &m.dd_open);
+    c.Bind("lang_menu",      &m.lang_menu);
+    c.Bind("lang_label",     &m.lang_label);
     c.Bind("mc1_enabled",    &m.mc1_enabled);
     c.Bind("mc2_enabled",    &m.mc2_enabled);
     c.Bind("mc1_name",       &m.mc1_name);
@@ -929,6 +960,16 @@ Result run(SDL_Window* window, void* gl_context,
             dirty_player(player);
             handle.DirtyVariable("dd_open");
         });
+    // ---- localization: Language cycle button (Settings > LOCALIZATION) ----
+    // Matches the Settings-view idiom (Renderer / Screen model cycle toggles):
+    // each click advances to the next declared language, wrapping around.
+    c.BindEventCallback("cycle_language",
+        [&m, handle, langs = game.languages](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) mutable {
+            if (langs.empty()) return;
+            m.lang_index = (m.lang_index + 1) % (int)langs.size();
+            refresh_language(m, langs);
+            handle.DirtyVariable("lang_label");
+        });
     // Pad-mode segmented selector: each segment passes its mode (0=hybrid,
     // 1=analog, 2=digital) so any mode is one click away.
     c.BindEventCallback("set_mode_p1",
@@ -1074,6 +1115,14 @@ Result run(SDL_Window* window, void* gl_context,
         io.p1_mode = m.p1_mode; io.has_p1_mode = true;
         io.p2_mode = m.p2_mode; io.has_p2_mode = true;
         io.deadzone = m.deadzone_pct * 32767 / 100; io.has_deadzone = true;
+
+        // Localization: persist the chosen language code (only meaningful when the
+        // game declared a menu; otherwise leave io.language untouched).
+        if (m.lang_menu && m.lang_index >= 0 &&
+            m.lang_index < (int)game.languages.size()) {
+            io.language = game.languages[m.lang_index].code;
+            io.has_language = true;
+        }
     }
 
     Rml::Shutdown();
