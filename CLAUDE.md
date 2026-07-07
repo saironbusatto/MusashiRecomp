@@ -114,11 +114,19 @@ first-class High-Level Emulation tier alongside LLE, modeled on
 `F:/Projects/gbarecomp/gbarecomp` (`src/runtime/bios_hle.{h,cpp}`, commits
 23a57ce + 168e313):
 
-1. **Two selectable backends, LLE default.** A null-by-default hook intercepts
-   BIOS service dispatch before the recompiled BIOS runs; selection is
-   per-game config (`[runtime] bios_hle = true`) + env override (PSX_BIOS_HLE), with a startup
-   banner naming the active backend. With HLE off the build is byte-identical
-   to a build without the tier.
+1. **Two selectable backends. AMENDMENT 2026-07-06 — HLE is now the DEFAULT, but
+   this changes NOTHING institutional.** We still BUILD LLE: the recompiled BIOS
+   is the foundation we architect against, the reference implementation, and the
+   oracle — fully linked, load-bearing, selectable, and the thing every accuracy
+   check runs against. HLE is a QoL layer we lay ON TOP (instant boot-skip for
+   players); the faithful LLE core is proven, so defaulting the convenience on is
+   an enhancement-phase load-time win, not an architecture change. Mechanically
+   this only flips the framework runtime default `bios_hle` false→true
+   (`config_loader.h`); opt OUT per-game with `[runtime] bios_hle = false` or env
+   `PSX_BIOS_HLE=0`. A null-by-default hook intercepts BIOS service dispatch
+   before the recompiled BIOS runs; a startup banner names the active backend.
+   With HLE off the build is byte-identical to a build without the tier. Keep new
+   bring-up and all verification on LLE; HLE-default is the shipping convenience.
 2. **LLE remains the reference implementation and the oracle.** It stays fully
    linked, load-bearing, and selectable; every BIOS call the HLE layer does
    not implement transparently falls through to the recompiled BIOS, so HLE is

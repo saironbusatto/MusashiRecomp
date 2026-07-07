@@ -92,15 +92,18 @@ struct RuntimeConfig {
     // at host speed. Kept so existing game.toml/settings.toml keep working.
     bool                  fast_boot = false;
 
-    // bios_hle: opt-in High-Level Emulation tier for BIOS kernel services
-    // (CLAUDE.md §0 amendment 2026-07-02, the gbarecomp model). Default off =
-    // LLE (the recompiled BIOS), which remains the reference implementation
-    // and the oracle. When on, implemented kernel services are computed
-    // in-runtime against the real guest kernel structures and every other
-    // call falls through to LLE. Implies the HLE boot shell-skip unless
-    // bios_hle_keep_intro. PSX_BIOS_HLE / PSX_BIOS_HLE_KEEP_INTRO env
-    // override at launch. Runtime: runtime/src/bios_hle.c.
-    bool                  bios_hle = false;
+    // bios_hle: High-Level Emulation tier for BIOS kernel services
+    // (CLAUDE.md §0 amendment 2026-07-02, the gbarecomp model). DEFAULT ON as of
+    // 2026-07-06 (user-directed player default: instant boot-skip for every
+    // game). Opt OUT with [runtime] bios_hle = false or env PSX_BIOS_HLE=0 to run
+    // pure LLE (the recompiled BIOS), which REMAINS the reference implementation
+    // and the oracle — this only flips the default, LLE is still fully linked and
+    // selectable. When on, implemented kernel services are computed in-runtime
+    // against the real guest kernel structures and every other call falls through
+    // to LLE. Implies the HLE boot shell-skip unless bios_hle_keep_intro.
+    // PSX_BIOS_HLE / PSX_BIOS_HLE_KEEP_INTRO env override at launch.
+    // Runtime: runtime/src/bios_hle.c.
+    bool                  bios_hle = true;
     bool                  bios_hle_keep_intro = false;
 
     // hle_scheduler: the HLE tier's standing SUBSYSTEM REPLACEMENT for guest
