@@ -8,6 +8,19 @@ if(NOT DEFINED PSXRECOMP_ROOT)
     get_filename_component(PSXRECOMP_ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 endif()
 
+# Default to an optimized build. The recompiled game is a huge (~270 MB) block of
+# generated C; with no CMAKE_BUILD_TYPE the compiler emits it at -O0 and the game
+# runs at a small fraction of full speed (terrible framerate). A naive
+# `cmake -B build` (as in the README) must NOT produce that, so default to
+# Release when the user hasn't chosen a type. Single-config generators only;
+# multi-config (VS/Xcode) pick per-build. Overridable with -DCMAKE_BUILD_TYPE=...
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type (Release/RelWithDebInfo/Debug)" FORCE)
+    message(STATUS "psxrecomp: no CMAKE_BUILD_TYPE set — defaulting to Release "
+                   "(optimized). Use -DCMAKE_BUILD_TYPE=RelWithDebInfo/Debug to override.")
+endif()
+
 # Content-addressed compiler cache (ccache). git branch operations (checkout /
 # merge / new branch) rewrite working-tree file mtimes, which makes ninja treat
 # the ~279 MB generated-C objects as stale and recompile them (~15 min) even when
