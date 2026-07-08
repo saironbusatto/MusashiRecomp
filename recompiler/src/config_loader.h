@@ -172,6 +172,13 @@ struct RuntimeConfig {
     // Defaults to true.
     bool                  video_antialiasing = true;
 
+    // fxaa: when true, the GL present path applies FXAA (NVIDIA's original
+    // 3.11-quality implementation) as a full-screen post-process after the
+    // blit to the window, smoothing aliased edges. Only meaningful for the
+    // OpenGL renderer (the software path always bypasses it). Default off
+    // because it's a subtle visual enhancement, not a correctness fix.
+    bool                  video_fxaa = false;
+
     // texture_filtering: "nearest" (default, native PSX look) | "bilinear"
     // (smooths textures and 2D backgrounds). Stored as 0/1.
     int                   video_texture_filter = 0;
@@ -508,6 +515,7 @@ struct UserSettings {
     // both the launcher and the emulator window so they boot at the same size.
     bool has_window_width   = false; int  window_width   = 1280; // -> 1280x960
     bool has_antialiasing   = false; bool antialiasing   = true;
+    bool has_fxaa           = false; bool fxaa           = false;
     bool has_texture_filter = false; int  texture_filter = 0; // 0=nearest,1=bilinear
     bool has_screen_kind    = false; int  screen_kind    = 0; // 0..3 (ScreenKind)
     bool has_auto_skip_fmv  = false; bool auto_skip_fmv  = false; // skip FMVs

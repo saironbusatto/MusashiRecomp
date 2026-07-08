@@ -200,6 +200,9 @@ static RuntimeConfig parse_runtime_block(const toml::value& cfg, const fs::path&
         if (video.contains("antialiasing")) {
             rt.video_antialiasing = toml::find<bool>(video, "antialiasing");
         }
+        if (video.contains("fxaa")) {
+            rt.video_fxaa = toml::find<bool>(video, "fxaa");
+        }
         if (video.contains("texture_filtering")) {
             const auto mode = toml::find<std::string>(video, "texture_filtering");
             if (mode == "nearest")       rt.video_texture_filter = 0;
@@ -846,6 +849,9 @@ UserSettings load_user_settings(const fs::path& path) {
         if (v.contains("antialiasing")) try_get([&]{
             s.antialiasing = toml::find<bool>(v, "antialiasing"); s.has_antialiasing = true;
         });
+        if (v.contains("fxaa")) try_get([&]{
+            s.fxaa = toml::find<bool>(v, "fxaa"); s.has_fxaa = true;
+        });
         if (v.contains("texture_filtering")) try_get([&]{
             const auto m = toml::find<std::string>(v, "texture_filtering");
             if (m == "nearest") { s.texture_filter = 0; s.has_texture_filter = true; }
@@ -1013,6 +1019,8 @@ bool save_user_settings(const fs::path& path, const UserSettings& s) {
         f << "window_width      = " << s.window_width << "\n";
     if (s.has_antialiasing)
         f << "antialiasing      = " << (s.antialiasing ? "true" : "false") << "\n";
+    if (s.has_fxaa)
+        f << "fxaa              = " << (s.fxaa ? "true" : "false") << "\n";
     if (s.has_texture_filter)
         f << "texture_filtering = \"" << (s.texture_filter ? "bilinear" : "nearest") << "\"\n";
     if (s.has_screen_kind) {
