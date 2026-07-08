@@ -131,6 +131,7 @@ typedef void   (APIENTRY *PFN_glUseProgram)(GLuint);
 typedef GLint  (APIENTRY *PFN_glGetUniformLocation)(GLuint, const char *);
 typedef void   (APIENTRY *PFN_glUniform1i)(GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform1f)(GLint, GLfloat);
+typedef void   (APIENTRY *PFN_glUniform2f)(GLint, GLfloat, GLfloat);
 typedef void   (APIENTRY *PFN_glUniform2i)(GLint, GLint, GLint);
 typedef void   (APIENTRY *PFN_glUniform4i)(GLint, GLint, GLint, GLint, GLint);
 typedef void   (APIENTRY *PFN_glBlendColor)(GLfloat, GLfloat, GLfloat, GLfloat);
@@ -191,6 +192,7 @@ static PFN_glUseProgram        p_glUseProgram;
 static PFN_glGetUniformLocation p_glGetUniformLocation;
 static PFN_glUniform1i         p_glUniform1i;
 static PFN_glUniform1f         p_glUniform1f;
+static PFN_glUniform2f         p_glUniform2f;
 static PFN_glUniform2i         p_glUniform2i;
 static PFN_glUniform4i         p_glUniform4i;
 static PFN_glBlendColor        p_glBlendColor;
@@ -243,6 +245,7 @@ static int load_modern_gl(void) {
     LOAD(p_glGetProgramInfoLog, "glGetProgramInfoLog"); LOAD(p_glUseProgram, "glUseProgram");
     LOAD(p_glGetUniformLocation, "glGetUniformLocation"); LOAD(p_glUniform1i, "glUniform1i");
     LOAD(p_glUniform1f, "glUniform1f");
+    LOAD(p_glUniform2f, "glUniform2f");
     LOAD(p_glUniform2i, "glUniform2i"); LOAD(p_glUniform4i, "glUniform4i");
     LOAD(p_glBlendColor, "glBlendColor");
     LOAD(p_glBlendFuncSeparate, "glBlendFuncSeparate");
@@ -288,6 +291,13 @@ static GLuint        s_present_tex = 0;    /* CPU-readout present path (24bpp) *
 static int           s_present_w = 0, s_present_h = 0;
 static GLuint        s_present_prog = 0, s_present_vao = 0;
 static GLint         s_present_uTex = -1;
+
+/* post-processing (FXAA) infrastructure */
+static GLuint        s_pp_fbo = 0, s_pp_tex = 0;
+static int           s_pp_w = 0, s_pp_h = 0;
+static int           s_fxaa_on = 0;
+static GLuint        s_fxaa_prog = 0;
+static GLint         s_fxaa_uTex = -1, s_fxaa_uTexel = -1;
 
 static int           s_raster_ok = 0;      /* full GPU pipeline available */
 
@@ -618,6 +628,37 @@ static const char *PRESENT_FS =
     "#version 330\n"
     "in vec2 v_uv; uniform sampler2D u_tex; out vec4 frag;\n"
     "void main(){ frag = texture(u_tex, v_uv); }\n";
+
+/* Post-processing vertex shader: fullscreen triangle WITHOUT Y flip (the PP
+ * FBO content is already display-oriented from the blit). */
+static const char *FXAA_VS =
+    "#version 330\n"
+    "out vec2 v_uv;\n"
+    "void main(){\n"
+    "  vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2);\n"
+    "  v_uv = p; gl_Position = vec4(p*2.0-1.0,0.0,1.0); }\n";
+/* FXAA 3.11 (quality presub) — single-pass, standard implementation. */
+static const char *FXAA_FS =
+    "#version 330\n"
+    "in vec2 v_uv; uniform sampler2D u_tex; uniform vec2 u_texel; out vec4 frag;\n"
+    "void main(){\n"
+    "  vec3 rgbNW = texture(u_tex, v_uv + vec2(-1.0,-1.0)*u_texel).rgb;\n"
+    "  vec3 rgbNE = texture(u_tex, v_uv + vec2( 1.0,-1.0)*u_texel).rgb;\n"
+    "  vec3 rgbSW = texture(u_tex, v_uv + vec2(-1.0, 1.0)*u_texel).rgb;\n"
+    "  vec3 rgbSE = texture(u_tex, v_uv + vec2( 1.0, 1.0)*u_texel).rgb;\n"
+    "  vec3 rgbM  = texture(u_tex, v_uv).rgb;\n"
+    "  vec3 luma = vec3(0.299,0.587,0.114);\n"
+    "  float lNW = dot(rgbNW,luma), lNE = dot(rgbNE,luma);\n"
+    "  float lSW = dot(rgbSW,luma), lSE = dot(rgbSE,luma), lM = dot(rgbM,luma);\n"
+    "  float lMin = min(lM,min(min(lNW,lNE),min(lSW,lSE)));\n"
+    "  float lMax = max(lM,max(max(lNW,lNE),max(lSW,lSE)));\n"
+    "  vec2 dir; dir.x = -((lNW+lNE)-(lSW+lSE)); dir.y = ((lNW+lSW)-(lNE+lSE));\n"
+    "  float dirR = max((lNW+lNE+lSW+lSE)*0.03125,1.0/128.0);\n"
+    "  float rD = 1.0/(min(abs(dir.x),abs(dir.y))+dirR);\n"
+    "  dir = clamp(dir*rD,vec2(-8.0),vec2(8.0))*u_texel;\n"
+    "  vec3 rgbA = 0.5*(texture(u_tex,v_uv+dir*(1.0/3.0-0.5)).rgb+texture(u_tex,v_uv+dir*(2.0/3.0-0.5)).rgb);\n"
+    "  vec3 rgbB = rgbA*0.5+0.25*(texture(u_tex,v_uv+dir*-0.5).rgb+texture(u_tex,v_uv+dir*0.5).rgb);\n"
+    "  frag = vec4(dot(rgbB,luma)<lMin||dot(rgbB,luma)>lMax?rgbA:rgbB,1.0); }\n";
 
 /* Geometry: position in VRAM pixels (draw offset already applied by gpu.c),
  * color rgb in 0..1, color a = mask bit (0/1). The clip transform is in
@@ -1966,6 +2007,11 @@ int gl_renderer_init_context(SDL_Window *win) {
             p_glGenVertexArrays(1, &s_present_vao);
             s_present_uTex = p_glGetUniformLocation(s_present_prog, "u_tex");
         } else ok = 0;
+        s_fxaa_prog = build_program(FXAA_VS, FXAA_FS);
+        if (s_fxaa_prog) {
+            s_fxaa_uTex   = p_glGetUniformLocation(s_fxaa_prog, "u_tex");
+            s_fxaa_uTexel = p_glGetUniformLocation(s_fxaa_prog, "u_texel");
+        }
     }
     if (ok) ok = init_gpu_raster();
     if (!ok) {
@@ -1990,12 +2036,39 @@ void gl_renderer_set_swap_interval(int interval) {
     }
 }
 
+/* ---- post-processing helpers --------------------------------------------- */
+
+static void pp_ensure(int w, int h) {
+    if (w == s_pp_w && h == s_pp_h && s_pp_fbo) return;
+    if (s_pp_fbo) {
+        p_glDeleteFramebuffers(1, &s_pp_fbo); s_pp_fbo = 0;
+        glDeleteTextures(1, &s_pp_tex); s_pp_tex = 0;
+    }
+    s_pp_tex = make_tex(GL_RGBA8, w, h, GL_RGBA, GL_UNSIGNED_BYTE);
+    if (!make_fbo(&s_pp_fbo, s_pp_tex, 0)) {
+        glDeleteTextures(1, &s_pp_tex); s_pp_tex = 0;
+        s_pp_fbo = 0;
+    }
+    s_pp_w = s_pp_fbo ? w : 0;
+    s_pp_h = s_pp_fbo ? h : 0;
+}
+
+static void pp_cleanup(void) {
+    if (s_pp_fbo) { p_glDeleteFramebuffers(1, &s_pp_fbo); s_pp_fbo = 0; }
+    if (s_pp_tex) { glDeleteTextures(1, &s_pp_tex); s_pp_tex = 0; }
+    s_pp_w = s_pp_h = 0;
+}
+
+void gl_renderer_set_fxaa(int on) { s_fxaa_on = !!on; }
+int  gl_renderer_fxaa(void)       { return s_fxaa_on; }
+
 void gl_renderer_shutdown(void) {
     if (s_ctx) {
         ensure_cpu();
         SDL_GL_DeleteContext(s_ctx); s_ctx = NULL;
     }
     free(s_conv); s_conv = NULL;
+    pp_cleanup();
     s_raster_ok = 0;
 }
 
@@ -2552,12 +2625,53 @@ void gl_renderer_present_vram(int disp_x, int disp_y, int w, int h, int linear,
     else
         letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
 
+    int S = s_scale;
+    if (s_fxaa_on) {
+        pp_ensure(ww, wh);
+        if (s_pp_fbo) {
+            /* Blit into the PP FBO (display-oriented content + black borders). */
+            p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_pp_fbo);
+            glDisable(GL_SCISSOR_TEST);
+            glViewport(0, 0, ww, wh);
+            glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
+            p_glBlitFramebuffer(disp_x * S, disp_y * S, (disp_x + w) * S, (disp_y + h) * S,
+                                lx, ly + lh, lx + lw, ly,
+                                GL_COLOR_BUFFER_BIT, linear ? GL_LINEAR : GL_NEAREST);
+            /* Run FXAA → backbuffer. */
+            p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+            glDisable(GL_SCISSOR_TEST);
+            glViewport(0, 0, ww, wh);
+            glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
+            p_glActiveTexture(PSXGL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, s_pp_tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            p_glUseProgram(s_fxaa_prog);
+            p_glUniform1i(s_fxaa_uTex, 0);
+            p_glUniform2f(s_fxaa_uTexel, 1.0f/(float)ww, 1.0f/(float)wh);
+            p_glBindVertexArray(s_present_vao);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            p_glBindVertexArray(0);
+            p_glUseProgram(0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            pres_record(GL_PRES_VRAM, disp_x, disp_y, w, h, lx, ly, lw, lh);
+            latency_ring_mark(LAT_SWAP_BEGIN);
+            SDL_GL_SwapWindow(s_win);
+            latency_ring_mark(LAT_SWAP_END);
+            gl_perf_present_exit(0);
+            coh_record(GL_COH_PRESENT, disp_x, disp_y, disp_x + w - 1, disp_y + h - 1);
+            return;
+        }
+    }
+    pp_cleanup();
+    /* Fast path (no post-processing): blit straight to the backbuffer. */
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
     glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, s_hr_fbo);
-    int S = s_scale;
     /* FBO y matches VRAM y; the window's y=0 is at the bottom, so flip
      * vertically: display top row lands at the letterbox rect's top. */
     p_glBlitFramebuffer(disp_x * S, disp_y * S, (disp_x + w) * S, (disp_y + h) * S,
@@ -2591,12 +2705,50 @@ int gl_renderer_present_wide_fbo(int disp_x, int disp_y, int disp_h, int linear)
     int lx, ly, lw, lh;
     letterbox_rect(ww, wh, &lx, &ly, &lw, &lh);
 
+    int S = s_scale;
+    if (s_fxaa_on) {
+        pp_ensure(ww, wh);
+        if (s_pp_fbo) {
+            p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, s_pp_fbo);
+            glDisable(GL_SCISSOR_TEST);
+            glViewport(0, 0, ww, wh);
+            glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
+            p_glBlitFramebuffer(0, disp_y * S, g_wide_w * S, (disp_y + disp_h) * S,
+                                lx, ly + lh, lx + lw, ly,
+                                GL_COLOR_BUFFER_BIT, linear ? GL_LINEAR : GL_NEAREST);
+            p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
+            p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, 0);
+            glDisable(GL_SCISSOR_TEST);
+            glViewport(0, 0, ww, wh);
+            glClearColor(0.f,0.f,0.f,1.f); glClear(GL_COLOR_BUFFER_BIT);
+            p_glActiveTexture(PSXGL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, s_pp_tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            p_glUseProgram(s_fxaa_prog);
+            p_glUniform1i(s_fxaa_uTex, 0);
+            p_glUniform2f(s_fxaa_uTexel, 1.0f/(float)ww, 1.0f/(float)wh);
+            p_glBindVertexArray(s_present_vao);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            p_glBindVertexArray(0);
+            p_glUseProgram(0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            pres_record(GL_PRES_WIDE, disp_x, disp_y, g_wide_w, disp_h, lx, ly, lw, lh);
+            latency_ring_mark(LAT_SWAP_BEGIN);
+            SDL_GL_SwapWindow(s_win);
+            latency_ring_mark(LAT_SWAP_END);
+            gl_perf_present_exit(1);
+            coh_record(GL_COH_PRESENT, 0, disp_y, g_wide_w - 1, disp_y + disp_h - 1);
+            return 1;
+        }
+    }
+    pp_cleanup();
     p_glBindFramebuffer(PSXGL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, ww, wh);
     glClearColor(0.f, 0.f, 0.f, 1.f); glClear(GL_COLOR_BUFFER_BIT);
     p_glBindFramebuffer(PSXGL_READ_FRAMEBUFFER, fbo);
-    int S = s_scale;
     /* Source: full wide width [0, g_wide_w], displayed Y band [disp_y, +disp_h].
      * V-flip the dst (ly+lh .. ly) so the top scanline lands at the rect top. */
     p_glBlitFramebuffer(0, disp_y * S, g_wide_w * S, (disp_y + disp_h) * S,

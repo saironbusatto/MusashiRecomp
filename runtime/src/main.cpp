@@ -145,6 +145,7 @@ static uint32_t*     sdl_pixel_buf = nullptr;
 /* [video] options, resolved from the game config (defaults: native + AA). */
 static int           g_video_scale = 1;     /* internal-resolution SSAA factor */
 static bool          g_video_aa    = true;  /* linear present filtering */
+static bool          g_video_fxaa  = false; /* FXAA post-process on the GL path */
 static int           g_video_texfilter = 0; /* 0=nearest, 1=bilinear */
 static int           g_video_renderer = 0;  /* 0=software, 1=opengl (requested) */
 static int           g_fullscreen     = 0;  /* launch the game window in desktop fullscreen */
@@ -2053,6 +2054,7 @@ int main(int argc, char** argv) {
             }
             g_video_scale      = gc.runtime.video_supersampling;
             g_video_aa         = gc.runtime.video_antialiasing;
+            g_video_fxaa       = gc.runtime.video_fxaa;
             g_video_texfilter  = gc.runtime.video_texture_filter;
             g_video_renderer   = gc.runtime.video_renderer;
             g_video_screen     = gc.runtime.video_screen_kind;
@@ -2280,6 +2282,7 @@ int main(int argc, char** argv) {
         if (us.has_supersampling)  g_video_scale     = us.supersampling;
         if (us.has_window_width)   g_video_win_w     = us.window_width;
         if (us.has_antialiasing)   g_video_aa        = us.antialiasing;
+        if (us.has_fxaa)           g_video_fxaa      = us.fxaa;
         if (us.has_texture_filter) g_video_texfilter = us.texture_filter;
         if (us.has_screen_kind)    g_video_screen    = us.screen_kind;
         if (us.has_auto_skip_fmv)  g_auto_skip_fmv   = us.auto_skip_fmv ? 1 : 0;
@@ -2381,6 +2384,7 @@ int main(int argc, char** argv) {
             seed.renderer = g_video_renderer;             seed.has_renderer = true;
             seed.supersampling = g_video_scale;           seed.has_supersampling = true;
             seed.antialiasing = g_video_aa;               seed.has_antialiasing = true;
+            seed.fxaa = g_video_fxaa;                     seed.has_fxaa = true;
             seed.texture_filter = g_video_texfilter;      seed.has_texture_filter = true;
             seed.screen_kind = g_video_screen;            seed.has_screen_kind = true;
             seed.auto_skip_fmv = (g_auto_skip_fmv != 0);  seed.has_auto_skip_fmv = true;
@@ -2458,6 +2462,7 @@ int main(int argc, char** argv) {
                 g_video_renderer  = seed.renderer;
                 g_video_scale     = seed.supersampling;
                 g_video_aa        = seed.antialiasing;
+                g_video_fxaa      = seed.fxaa;
                 g_video_texfilter = seed.texture_filter;
                 g_video_screen    = seed.screen_kind;
                 g_auto_skip_fmv   = seed.auto_skip_fmv ? 1 : 0;
@@ -2568,6 +2573,8 @@ int main(int argc, char** argv) {
                      g_ws_anchor_addr ? " + sprite tags" : "",
                      g_ws_hud_sprt ? " + HUD squash" : "");
     }
+    /* Post-processing enhancement: FXAA on the GL present path. */
+    if (g_gl_active || g_vk_active) gl_renderer_set_fxaa(g_video_fxaa);
     /* Present-time screen-colour model (verified-enhancement LUT). Default raw
      * is byte-identical; PSX_SCREEN env overrides this at scanout. */
     gpu_set_screen_kind(g_video_screen);
@@ -2576,6 +2583,9 @@ int main(int argc, char** argv) {
                      "psxrecomp: supersampling %dx (antialiasing %s, texture filter %s)\n",
                      g_video_scale, g_video_aa ? "on" : "off",
                      g_video_texfilter ? "bilinear" : "nearest");
+    if (g_video_fxaa)
+        std::fprintf(stdout,
+                     "psxrecomp: FXAA post-process enabled\n");
     if (g_video_screen != 0)
         std::fprintf(stdout, "psxrecomp: screen-colour model %s\n",
                      g_video_screen == 1 ? "crt" : g_video_screen == 2 ? "composite"
