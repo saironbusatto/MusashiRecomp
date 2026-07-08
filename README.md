@@ -26,6 +26,7 @@ targets are:
 
 - [TombaRecomp](https://github.com/mstan/TombaRecomp) — *Tomba!*
 - [MegaManX6Recomp](https://github.com/mstan/MegaManX6Recomp) — *Mega Man X6*
+- [Brave Fencer Musashi Recompiled](https://github.com/saironbusatto/MusashiRecomp) — *Brave Fencer Musashi*
 
 ## Philosophy — toward 100% static recompilation
 
@@ -83,19 +84,20 @@ a game is played; this branch is where that machinery is being built.
 
 ## Status
 
-Current milestone as of 2026-05-18:
+Current milestone as of 2026-07-08:
 
 | Subsystem | State |
 |---|---|
-| BIOS recompilation (`SCPH1001.BIN`) | Boots and hands off to Tomba |
-| Game EXE recompilation | Tomba title, OPTIONS, NEW GAME, save/load, and gameplay reached |
-| CD-ROM / MDEC / XA | Tomba FMVs stream and play at the game's 15 fps cadence |
+| BIOS recompilation (`SCPH1001.BIN`) | Boots and hands off to game |
+| Game EXE recompilation | Tomba title, OPTIONS, NEW GAME, save/load, and gameplay reached. BFM boots past title to gameplay |
+| CD-ROM / MDEC / XA | Tomba FMVs stream and play at 15 fps; BFM loads from disc |
 | Memory cards | Tomba save and load verified |
-| SIO0 controllers | Digital pad polling plus DualShock config replies used by Tomba |
-| GPU | Functional for BIOS boot, FMVs, menus, and first gameplay area |
-| Interrupts, COP0, timers | Working for current Tomba path |
-| Dirty-RAM support | BIOS/game RAM-installed dispatch paths handled |
+| SIO0 controllers | Digital pad polling plus DualShock config replies |
+| GPU | Functional for BIOS boot, FMVs, menus, and gameplay |
+| Interrupts, COP0, timers | Working for current game paths |
+| Dirty-RAM support | BIOS/game RAM-installed dispatch paths handled; kernel-window guard prevents stale overlay dispatch on boot |
 | Controller input | Keyboard plus SDL/XInput-style controller mapping via `input.ini` |
+| Overlay cache (Linux) | POSIX dlopen + dirent.h directory scan for caching compiled game overlays. Captures overlays loaded via CD DMA and dispatches them as native DLLs |
 
 Known follow-up work:
 
@@ -108,7 +110,9 @@ Known follow-up work:
   the watch list until longer in-game soak tests are clean.
 - Neither game is fully validated end to end yet. Tomba has considerably more
   coverage; Mega Man X6 is playable (stages, controller, and memory-card
-  save/load all work). Full playthroughs of both are still unverified.
+  save/load all work). Brave Fencer Musashi boots past the title screen
+  and reaches gameplay but still needs overlay-cache stability work.
+  Full playthroughs of all targets are still unverified.
 
 For the current game milestone, build and run the sibling TombaRecomp project:
 
