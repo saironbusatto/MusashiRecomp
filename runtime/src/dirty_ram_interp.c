@@ -2073,6 +2073,15 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
             if (_gc) return 1;
         }
         clean_game_text_miss = psx_game_address_in_text(addr) ? 1 : 0;
+    } else if (psx_game_address_in_text(addr)) {
+        /* DMA-overwritten game text: the compiled code is static C that
+         * operates on CPUState, not on RAM bytes at its own address. Try
+         * dispatching the compiled function even when the page is dirty,
+         * since the compiled code doesn't depend on the current RAM contents.
+         * This handles games like Brave Fencer Musashi where DMA streaming
+         * overwrites game text pages with data at runtime. */
+        int _gc = psx_dispatch_game_compiled(cpu, addr);
+        if (_gc) return 1;
     }
 #endif
 

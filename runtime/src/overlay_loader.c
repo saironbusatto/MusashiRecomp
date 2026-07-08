@@ -19,6 +19,7 @@
 #  include <windows.h>
 #else
 #  include <dlfcn.h>
+#  include <dirent.h>
 #endif
 
 /* ============================================================================
@@ -667,7 +668,36 @@ static void scan_one_cache_dir(const char *dir) {
     } while (FindNextFileA(h, &fd));
     FindClose(h);
 #else
-    (void)dir;
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *entry;
+    while ((entry = readdir(d)) != NULL && s_cache_idx_count < CACHE_IDX_CAP) {
+        size_t namelen = strlen(entry->d_name);
+        if (namelen != 21) continue;
+        if (entry->d_name[8] != '_') continue;
+        if (entry->d_name[17] != '.' || entry->d_name[18] != 'd' ||
+            entry->d_name[19] != 'l' || entry->d_name[20] != 'l') continue;
+        int valid = 1;
+        for (int ci = 0; valid && ci < 8; ci++) {
+            char c = entry->d_name[ci];
+            valid = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') ||
+                    (c >= 'a' && c <= 'f');
+        }
+        for (int ci = 9; valid && ci < 17; ci++) {
+            char c = entry->d_name[ci];
+            valid = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') ||
+                    (c >= 'a' && c <= 'f');
+        }
+        if (!valid) continue;
+        uint32_t addr = (uint32_t)strtoul(entry->d_name, NULL, 16);
+        if (cache_idx_has_basename(entry->d_name)) continue;
+        char full[768];
+        snprintf(full, sizeof(full), "%s/%s", dir, entry->d_name);
+        CacheEntry *e = &s_cache_idx[s_cache_idx_count++];
+        e->region_start = addr;
+        snprintf(e->path, sizeof(e->path), "%s", full);
+    }
+    closedir(d);
 #endif
 }
 
@@ -1320,8 +1350,19 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
     InitFn init_fn = (InitFn)dlsym(h, "overlay_init");
     if (!init_fn) { loader_log("no overlay_init in %s", dll_path); dlclose(h); return 0; }
     init_fn(&s_callbacks);
-    loader_log("%s loaded (posix export scan TODO)", dll_path);
-    return 0;
+
+    int registered = 0;
+    char symname[32];
+    for (int i = 0; i < man_n; i++) {
+        uint32_t entry = man[i].entry;
+        snprintf(symname, sizeof(symname), "func_%08X", entry);
+        OverlayFn fn = (OverlayFn)(uintptr_t)dlsym(h, symname);
+        if (!fn) continue;
+        cand_register(entry & 0x1FFFFFFFu, fn, &man[i], dll);
+        registered++;
+    }
+    loader_log("loaded %s -> %d candidates", dll_path, registered);
+    return registered;
 }
 #endif
 
@@ -1610,6 +1651,20 @@ static int overlay_find_by_range(uint32_t phys) {
 
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
+
+    /* Rule 18: kernel window code (phys < g_overlay_region_floor) is
+     * install-at-runtime RAM written by the BIOS and MUST be interpreted,
+     * never dispatched through cached overlay DLLs. The BIOS writes
+     * dispatch stubs into kernel RAM at boot; those addresses may happen
+     * to coincide with overlay-cache entries captured from a prior run,
+     * but running the stale cached version instead of the live RAM bytes
+     * breaks boot. Immediate return 0 here means the caller falls through
+     * to the dirty-RAM interpreter. */
+    {
+        extern uint32_t g_overlay_region_floor;
+        if (phys < g_overlay_region_floor) return 0;
+    }
+
     int head = idx_head(phys);
     if (head < 0 && s_active && overlay_cache_window_contains(phys)) {
         /* Pick up shards the background compile worker just published (idempotent

@@ -1172,6 +1172,44 @@ void psx_unknown_dispatch(CPUState* cpu, uint32_t addr, uint32_t phys) {
         psx_unknown_dispatch_record(addr, phys, cpu->gpr[31],
                                     cpu->gpr[4], cpu->gpr[5]);
 
+        /* Overlay loader: try to dispatch runtime-loaded overlay code
+         * before falling through to FAIL-FAST. The overlay loader
+         * captures code loaded from CD via DMA3 and can compile or
+         * interpret it. Without this, compiled game code that
+         * tail-calls to overlay addresses (e.g., 0x80129220 for Brave
+         * Fencer Musashi) hits FAIL-FAST even though the overlay
+         * loader has the code available. */
+        {
+            extern int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
+            if (overlay_loader_dispatch(cpu, addr)) {
+                return;
+            }
+        }
+
+        /* Rule 18 fallback: self-modifying / install-at-runtime RAM is
+         * interpreted, not HLE'd. When overlay_loader_dispatch fails (no
+         * compiled overlay cached), fall back to the dirty-RAM interpreter
+         * for addresses in the overlay region. DMA3 loads overlay code into
+         * RAM at runtime — the page IS dirty, and the interpreter can
+         * execute the live RAM bytes. Without this, games that load overlays
+         * from CD hit FAIL-FAST even though the code is right there in RAM. */
+        {
+            extern uint32_t g_overlay_region_floor;
+            extern int dirty_ram_dispatch(CPUState *cpu, uint32_t addr,
+                                          uint32_t stop_addr);
+            extern void dirty_ram_mark_executable_range(uint32_t phys,
+                                                        uint32_t len);
+            if (phys >= g_overlay_region_floor) {
+                /* Mark this page dirty so dirty_ram_dispatch's
+                 * dirty_ram_is_dirty check passes. The DMA3 transfer may
+                 * have completed already or may still be in progress —
+                 * either way the RAM bytes are there. */
+                dirty_ram_mark_executable_range(phys & ~0xFFFu, 0x1000);
+                int rc = dirty_ram_dispatch(cpu, addr, 0);
+                if (rc) return;
+            }
+        }
+
         /* LOUD BY DEFAULT. A miss that reaches this point is a real,
          * unresolvable dispatch target — a recompiler discovery bug (ROM
          * code the static pass never found) or corrupt guest state. The
