@@ -1,0 +1,25 @@
+# Brave Fencer Musashi (USA) — SLUS-00726
+# Values read directly from the PS-X EXE header of SLUS_007.26
+# (extracted from the disc root, LBA 24) and SYSTEM.CNF (LBA 23).
+
+[game]
+name         = "Brave Fencer Musashi"
+id           = "SLUS-00726"
+exe          = "games/musashi/SLUS_007.26"
+load_address = "0x80010000"
+entry_pc     = "0x80010000"
+text_size    = "0x00064800"
+stack_base   = "0x801FFFF0"
+disc         = "games/musashi/Brave Fencer Musashi (USA).cue"
+
+[recompiler]
+# No Ghidra seeds yet — discovery walks the call graph from entry_pc alone.
+seeds   = "games/musashi/seeds.txt"
+out_dir = "games/musashi/generated"
+strict  = true
+
+[runtime]
+debug_port   = 4370
+window_title = "Brave Fencer Musashi (PSXRecomp)"
+controller   = "digital"
+memcard_dir  = "."
