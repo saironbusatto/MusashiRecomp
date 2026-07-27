@@ -40,6 +40,26 @@ if(NOT MSVC)
     )
 endif()
 
+# ---- musashi-runtime (game-specific target) ----
+#
+# Only registered when games/musashi/generated/ has been produced locally
+# (the disc, EXE, and generated C are untracked — see games/*/* in
+# .gitignore), so a fresh clone without the game still configures cleanly.
+
+set(MUSASHI_GENERATED "${PSXRECOMP_ROOT}/games/musashi/generated")
+if(EXISTS "${MUSASHI_GENERATED}/SLUS_007.26_full.c")
+    psxrecomp_add_runtime_target(musashi-runtime
+        GAME_GENERATED_FULL_C     "${MUSASHI_GENERATED}/SLUS_007.26_full.c"
+        GAME_GENERATED_DISPATCH_C "${MUSASHI_GENERATED}/SLUS_007.26_dispatch.c"
+        DEBUG_PORT 4370
+        WINDOW_TITLE "Brave Fencer Musashi (PSXRecomp)"
+        DEFAULT_BIOS_PATH "${PSXRECOMP_ROOT}/bios/SCPH1001.BIN"
+        DEFAULT_GAME_CONFIG_PATH "${PSXRECOMP_ROOT}/games/musashi/game.toml"
+    )
+else()
+    message(STATUS "musashi-runtime: games/musashi/generated/SLUS_007.26_full.c not found - skipping")
+endif()
+
 # ---- psx-beetle target (Beetle PSX libretro standalone, MinGW) ----
 #
 # Standalone binary that runs Beetle PSX (mednafen-psx libretro core) with
