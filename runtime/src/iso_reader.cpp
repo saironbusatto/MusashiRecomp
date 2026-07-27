@@ -56,6 +56,28 @@ bool ISOReader::Open(const std::string& filename) {
         std::string line;
         int  cur_track_num   = -1;
         bool cur_track_audio = false;
+        // Multi-FILE cues (one .bin per track — the common "Track 1/2/3.bin"
+        // rip layout) name a new FILE before each track, and every INDEX time
+        // is relative to ITS OWN file, not to the disc. Two consequences:
+        //
+        //  1. The DATA image is the FIRST file (track 1). Letting later FILE
+        //     lines overwrite it mounts an audio track as the data disc, and
+        //     the BIOS then fails to Load() the boot EXE (SystemHalt(906)).
+        //  2. Absolute track LBAs must accumulate the sector counts of the
+        //     preceding files, or every track after the first reports a
+        //     bogus (near-zero) start to GetTN/GetTD.
+        //
+        // Single-FILE cues keep exactly the previous behaviour: one file, and
+        // its INDEX times are already absolute, so file_base_lba stays 0.
+        bool     have_data_file = false;
+        uint32_t file_base_lba  = 0;   // absolute LBA where the current FILE starts
+        std::filesystem::path cur_file_path;
+        auto file_sectors = [](const std::filesystem::path& p) -> uint32_t {
+            std::error_code ec;
+            auto sz = std::filesystem::file_size(p, ec);
+            if (ec) return 0;
+            return (uint32_t)(sz / RAW_SECTOR_SIZE);   // cue BINARY tracks are raw 2352
+        };
         while (std::getline(cue_file, line)) {
             // FILE "filename.bin" BINARY
             size_t file_pos = line.find("FILE");
@@ -67,10 +89,19 @@ bool ISOReader::Open(const std::string& filename) {
                     std::string bin_name = line.substr(quote1 + 1, quote2 - quote1 - 1);
                     std::filesystem::path cue_path(filename);
                     std::filesystem::path bin_path(bin_name);
-                    if (bin_path.is_relative()) {
-                        bin_filename = (cue_path.parent_path() / bin_name).string();
-                    } else {
-                        bin_filename = bin_name;
+                    std::string resolved = bin_path.is_relative()
+                                         ? (cue_path.parent_path() / bin_name).string()
+                                         : bin_name;
+
+                    // Advance the absolute base past the file we just finished.
+                    if (have_data_file)
+                        file_base_lba += file_sectors(cur_file_path);
+                    cur_file_path = resolved;
+
+                    // First FILE holds the data track — that is the image we mount.
+                    if (!have_data_file) {
+                        bin_filename   = resolved;
+                        have_data_file = true;
                     }
                 }
                 continue;
@@ -92,7 +123,7 @@ bool ISOReader::Open(const std::string& filename) {
                 CDTrack t;
                 t.number    = cur_track_num;
                 t.is_audio  = cur_track_audio;
-                t.start_lba = (uint32_t)(((mm * 60 + ss) * 75) + ff);  // .bin-relative LBA
+                t.start_lba = file_base_lba + (uint32_t)(((mm * 60 + ss) * 75) + ff);
                 tracks_.push_back(t);
                 cur_track_num = -1;
             }

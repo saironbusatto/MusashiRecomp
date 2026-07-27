@@ -9930,7 +9930,7 @@ static void handle_sljit_status(int id, const char *json)
     (void)json;
     int selftest = overlay_sljit_selftest();
     int available = 0, st_ok = 0;
-    unsigned long long compiles = 0, declines = 0, bytes = 0;
+    uint64_t compiles = 0, declines = 0, bytes = 0;
     overlay_sljit_get_status(&available, &st_ok, &compiles, &declines, &bytes);
     send_fmt("{\"id\":%d,\"ok\":true,\"backend\":\"%s\",\"available\":%d,"
              "\"selftest_ok\":%d,\"live\":%d,\"compiles\":%llu,\"declines\":%llu,"
@@ -9939,7 +9939,8 @@ static void handle_sljit_status(int id, const char *json)
              "\"persist_on\":%d,\"persist_calls\":%u,\"persist_writes\":%u,"
              "\"persist_dbg\":%d}\n",
              id, overlay_backend_name(overlay_backend_active()), available,
-             selftest, overlay_loader_get_sljit_live(), compiles, declines, bytes,
+             selftest, overlay_loader_get_sljit_live(),
+             (unsigned long long)compiles, (unsigned long long)declines, (unsigned long long)bytes,
              overlay_loader_sljit_registered(),
              overlay_loader_sljit_obsoleted(),
              overlay_loader_sljit_reloaded(),
