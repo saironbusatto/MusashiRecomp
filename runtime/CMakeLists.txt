@@ -53,8 +53,13 @@ if(EXISTS "${MUSASHI_GENERATED}/SLUS_007.26_full.c")
         GAME_GENERATED_DISPATCH_C "${MUSASHI_GENERATED}/SLUS_007.26_dispatch.c"
         DEBUG_PORT 4370
         WINDOW_TITLE "Brave Fencer Musashi (PSXRecomp)"
-        DEFAULT_BIOS_PATH "${PSXRECOMP_ROOT}/bios/SCPH1001.BIN"
-        DEFAULT_GAME_CONFIG_PATH "${PSXRECOMP_ROOT}/games/musashi/game.toml"
+        # Relative on purpose: resolve_existing_runtime_path() anchors these on
+        # the EXE's directory and then walks upward, so one binary works both
+        # from runtime/build (walks up to the repo root) and from a packaged
+        # folder that ships bios/ and games/musashi/ beside the executable.
+        # An absolute path here would bake this machine's layout into the build.
+        DEFAULT_BIOS_PATH "bios/SCPH1001.BIN"
+        DEFAULT_GAME_CONFIG_PATH "games/musashi/game.toml"
     )
 else()
     message(STATUS "musashi-runtime: games/musashi/generated/SLUS_007.26_full.c not found - skipping")
