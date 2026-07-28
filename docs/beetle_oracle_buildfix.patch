@@ -1,0 +1,139 @@
+Oracle build fixes on top of the three committed beetle-psx patches.
+
+Apply LAST, after beetle_wtrace_hook / beetle_sio_trace_hook /
+beetle_cdcmd_trace_hook, against beetle-psx at 5759277b.
+
+Two problems this closes:
+
+1. beetle_wtrace_hook and beetle_cdcmd_trace_hook COLLIDE. The cdcmd patch
+   was generated against a tree without the wtrace patch applied, so it
+   re-adds g_psxrecomp_wtrace_cb / g_psxrecomp_fntrace_cb alongside its own
+   cdcmd callback. Applying all three per docs/beetle-linux.md therefore
+   duplicates both definitions and libretro.cpp fails to compile
+   ("redefinition of g_psxrecomp_wtrace_cb"). Here the earlier duplicate
+   block is dropped, keeping the cdcmd block that already declares all three.
+
+2. runtime/src/beetle_libretro.cpp requires g_psxrecomp_rtrace_cb and
+   g_psxrecomp_irq_cb, which NO committed patch provides -- the integration
+   grew past the patches and the matching beetle-psx side was never captured.
+   Added: typedefs + externs in psx.h, definitions in libretro.cpp, fire
+   sites after each LB/LBU/LH/LHU/LW in the live interpreter (mirroring how
+   the wtrace patch instruments the stores), and a rising-edge-only fire in
+   IRQ_Assert (it is called on every device poll; without the edge filter the
+   consumer ring fills with duplicates).
+
+NOT sufficient to link psx-beetle on its own. That target still wants eight
+more symbols no patch supplies -- beetle_core_get_guest_cycles, the five
+beetle_cyc_watch_* functions, psxrecomp_cdc_irq_type, psxrecomp_dma_int_status
+and retro_psxref_exc_ring_dump. Their semantics are not recoverable from this
+repo, so they are deliberately NOT guessed at here (CLAUDE.md rule 14).
+
+--- a/libretro.cpp
++++ b/libretro.cpp
+@@ -511,11 +511,9 @@
+ /* PSXRecomp oracle hooks: NULL when no listener attached. */
+ psxrecomp_wtrace_cb_t  g_psxrecomp_wtrace_cb  = NULL;
+ psxrecomp_fntrace_cb_t g_psxrecomp_fntrace_cb = NULL;
+-
+-/* PSXRecomp oracle hooks: NULL when no listener attached. */
+-psxrecomp_wtrace_cb_t  g_psxrecomp_wtrace_cb  = NULL;
+-psxrecomp_fntrace_cb_t g_psxrecomp_fntrace_cb = NULL;
+ psxrecomp_cdcmd_cb_t   g_psxrecomp_cdcmd_cb   = NULL;
++psxrecomp_rtrace_cb_t  g_psxrecomp_rtrace_cb  = NULL;
++psxrecomp_irq_cb_t     g_psxrecomp_irq_cb     = NULL;
+ 
+ MultiAccessSizeMem<512 * 1024, uint32, false> *BIOSROM = NULL;
+ MultiAccessSizeMem<65536, uint32, false> *PIOMem = NULL;
+--- a/mednafen/psx/psx.h
++++ b/mednafen/psx/psx.h
+@@ -208,4 +208,27 @@
+                                       uint32_t pc);
+ extern psxrecomp_cdcmd_cb_t g_psxrecomp_cdcmd_cb;
+ 
++/* PSXRecomp oracle: CPU-load (read) trace callback — the read-side mirror of
++ * g_psxrecomp_wtrace_cb. Fired from the live interpreter after each LB/LBU/
++ * LH/LHU/LW retires its ReadMemory, with the same argument shape as the write
++ * side so both can share one consumer.
++ *   addr  = effective address
++ *   value = the loaded value, zero-extended to 32 bits
++ *   pc    = PC of the load instruction
++ *   ra    = GPR[31] at the load
++ *   size  = 1, 2 or 4 bytes
++ *
++ * NOTE: these last two hooks were NOT part of the three in-repo patches
++ * (docs/beetle_*.patch); runtime/src/beetle_libretro.cpp had grown to require
++ * them and no matching beetle-psx patch was ever committed, so the documented
++ * build recipe could not link. Added here to close that gap. */
++typedef void (*psxrecomp_rtrace_cb_t)(uint32_t addr, uint32_t value,
++                                      uint32_t pc, uint32_t ra, uint8_t size);
++extern psxrecomp_rtrace_cb_t g_psxrecomp_rtrace_cb;
++
++/* PSXRecomp oracle: IRQ assert/deassert edge callback.
++ *   which = IRQ line index (see IRQ_Assert in irq.cpp) */
++typedef void (*psxrecomp_irq_cb_t)(int which);
++extern psxrecomp_irq_cb_t g_psxrecomp_irq_cb;
++
+ #endif
+--- a/mednafen/psx/cpu.cpp
++++ b/mednafen/psx/cpu.cpp
+@@ -2244,6 +2244,8 @@
+ 
+ 	LDWhich = rt;
+ 	LDValue = (int32)ReadMemory<int8>(timestamp, address);
++	 if(MDFN_UNLIKELY(g_psxrecomp_rtrace_cb))
++	  g_psxrecomp_rtrace_cb(address, (uint32_t)LDValue, PC, GPR[31], 1);
+ 
+ 	if (PGXP_GetModes() & PGXP_MODE_MEMORY)
+ 		PGXP_CPU_LB(instr, LDValue, address);
+@@ -2268,6 +2270,8 @@
+ 
+         LDWhich = rt;
+ 	LDValue = ReadMemory<uint8>(timestamp, address);
++	 if(MDFN_UNLIKELY(g_psxrecomp_rtrace_cb))
++	  g_psxrecomp_rtrace_cb(address, (uint32_t)LDValue, PC, GPR[31], 1);
+ 
+ 	if (PGXP_GetModes() & PGXP_MODE_MEMORY)
+ 		PGXP_CPU_LBU(instr, LDValue, address);
+@@ -2301,6 +2305,8 @@
+ 
+ 	 LDWhich = rt;
+          LDValue = (int32)ReadMemory<int16>(timestamp, address);
++	 if(MDFN_UNLIKELY(g_psxrecomp_rtrace_cb))
++	  g_psxrecomp_rtrace_cb(address, (uint32_t)LDValue, PC, GPR[31], 2);
+ 	}
+ 	if (PGXP_GetModes() & PGXP_MODE_MEMORY)
+ 		PGXP_CPU_LH(instr, LDValue, address);
+@@ -2334,6 +2340,8 @@
+ 
+ 	 LDWhich = rt;
+          LDValue = ReadMemory<uint16>(timestamp, address);
++	 if(MDFN_UNLIKELY(g_psxrecomp_rtrace_cb))
++	  g_psxrecomp_rtrace_cb(address, (uint32_t)LDValue, PC, GPR[31], 2);
+ 	}
+ 
+ 	if (PGXP_GetModes() & PGXP_MODE_MEMORY)
+@@ -2369,6 +2377,8 @@
+ 
+ 	 LDWhich = rt;
+          LDValue = ReadMemory<uint32>(timestamp, address);
++	 if(MDFN_UNLIKELY(g_psxrecomp_rtrace_cb))
++	  g_psxrecomp_rtrace_cb(address, (uint32_t)LDValue, PC, GPR[31], 4);
+ 	}
+ 
+ 	if (PGXP_GetModes() & PGXP_MODE_MEMORY)
+--- a/mednafen/psx/irq.cpp
++++ b/mednafen/psx/irq.cpp
+@@ -75,6 +75,13 @@
+       Status |= (old_Asserted ^ Asserted) & Asserted;
+    }
+ 
++   /* PSXRecomp oracle: report only the RISING edge. IRQ_Assert is called on
++    * every poll by several devices, so firing unconditionally would bury the
++    * consumer's ring in duplicates; old_Asserted vs Asserted isolates the
++    * transition that actually matters for cross-checking IRQ delivery. */
++   if(MDFN_UNLIKELY(g_psxrecomp_irq_cb) && ((old_Asserted ^ Asserted) & (1 << which)) && status)
++      g_psxrecomp_irq_cb(which);
++
+    Recalc();
+ }
+ 
