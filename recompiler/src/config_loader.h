@@ -394,6 +394,17 @@ struct GameConfig {
     uint32_t              ws_sprite_anchor_addr = 0;
     bool                  ws_hud_sprt_squash = false;
 
+    // native_wide: true (default) renders a genuinely wider frame and presents
+    //   it 1:1; false uses the squash path (GTE squashes screen-X, the present
+    //   stretches back out to the display aspect).
+    // The native-wide rewrite is the shelved spike described in WIDESCREEN.md;
+    // where it does not engage it reports nw_extra=0 and the picture stays 4:3,
+    // i.e. aspect_ratio silently has no effect. Squash is the committed,
+    // user-validated path. Until native-wide is finished, a game that wants
+    // widescreen to actually apply sets this false. Previously reachable only
+    // through the `ws_nw` debug command, which is A/B tooling, not config.
+    bool                  ws_native_wide = true;
+
     // Cull-margin widening. The game's per-object draw classifier compares
     // (objX - camX + BIAS) against a RANGE derived from the 4:3 screen width;
     // the GTE squash shows ~33% more world, so the fixed margin collapses and

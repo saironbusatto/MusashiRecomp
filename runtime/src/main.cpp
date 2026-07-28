@@ -2067,6 +2067,12 @@ int main(int argc, char** argv) {
             g_fmv_skip_no_xa       = gc.runtime.video_fmv_skip_no_xa ? 1 : 0;
             g_ws_anchor_addr   = gc.ws_sprite_anchor_addr;
             g_ws_hud_sprt      = gc.ws_hud_sprt_squash;
+            /* [widescreen] native_wide — pick the wide strategy from config
+             * instead of only the ws_nw A/B command. Native-wide is still the
+             * default; a game whose frames it fails to widen (nw_extra stays 0,
+             * so aspect_ratio silently does nothing) selects the committed
+             * squash path with native_wide = false. */
+            g_ws_native_wide   = gc.ws_native_wide ? 1 : 0;
             /* [widescreen] full_2d — opt a pure-2D sprite game (MMX6) into the
              * widescreen present path. Applied to the GPU layer up front so the
              * ws engage at game entry classifies every frame as gameplay. */

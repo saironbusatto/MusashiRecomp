@@ -18,11 +18,41 @@ seeds   = "games/musashi/seeds.txt"
 out_dir = "games/musashi/generated"
 strict  = true
 
+[video]
+# OpenGL is the backend this game is actually developed and tested against
+# (the software rasterizer is slow enough here that the compositor treats the
+# window as unresponsive during boot). Baked in so no CLI flag is needed.
+renderer          = "opengl"
+
+# Widescreen hack: the GTE squashes screen-X and the present path stretches
+# back out, so GTE-projected world geometry gains field of view. Screen-space
+# 2D (HUD, FMV, sprites) stretches — if that turns out to matter in BFM the
+# fix is the optional [widescreen] block, not reverting this.
+aspect_ratio      = "16:9"
+
+# 2x ordered-grid supersampling. Fill-rate cost is ~N^2, which is nothing for
+# PS1-era geometry on any modern GPU; 3 or 4 also work if the edges still read
+# too jagged.
+supersampling     = 2
+
 [runtime]
 debug_port   = 4370
 window_title = "Brave Fencer Musashi (PSXRecomp)"
 controller   = "digital"
 memcard_dir  = "."
+
+# 4x CD-ROM timing. Deliberately NOT "instant": the README documents that as
+# hanging some games during early init, with 4x as the recommended value until
+# that is root-caused. FMV playback reverts to 1x automatically whenever XA
+# audio is streaming, so movies keep their intended pacing either way.
+disc_speed   = "4x"
+
+[widescreen]
+# Use the squash path, not native-wide. Native-wide is the shelved spike in
+# WIDESCREEN.md: with it selected the runtime reports nw_extra=0 and the frame
+# never actually widens, so aspect_ratio above would silently do nothing.
+# Squash is the committed, user-validated path.
+native_wide = false
 
 # LLE (the real recompiled BIOS intro) is the only boot path that reaches the
 # title screen today. Under HLE the guest wedges in an event poll loop and no
