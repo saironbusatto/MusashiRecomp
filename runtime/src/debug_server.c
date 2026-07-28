@@ -9467,6 +9467,51 @@ static void handle_dispatch_check(int id, const char *json) {
 }
 
 /* dispatch_tail: dump the last N dispatched function addresses */
+/* critsec_ring — Enter/ExitCriticalSection history plus the running balance.
+ * `enters - exits` is the diagnostic: IEc (COP0 SR bit 0) is cleared only by
+ * Enter and restored only by Exit, so a hang with IEc=0 and IRQs pending means
+ * that difference is stuck above zero. The per-entry EPC identifies the caller
+ * whose Exit never came. */
+static void handle_critsec_ring(int id, const char *json)
+{
+    int count = 32;
+    { char buf[32];
+      if (json_get_str(json, "count", buf, sizeof(buf))) {
+          int c = atoi(buf);
+          if (c > 0 && c <= 256) count = c;
+      } }
+
+    CritSecEntry_pub ents[256];
+    uint64_t total = 0, enters = 0, exits = 0;
+    int n = critsec_ring_dump(ents, count, &total, &enters, &exits);
+
+    /* Heap-format: 256 entries overflow send_fmt's fixed buffer. */
+    size_t cap = 256 + (size_t)n * 220;
+    char *out = (char *)malloc(cap);
+    if (!out) { send_err(id, "alloc failed"); return; }
+
+    int off = snprintf(out, cap,
+        "{\"id\":%d,\"ok\":true,\"total\":%llu,\"enters\":%llu,\"exits\":%llu,"
+        "\"balance\":%lld,\"entries\":[",
+        id, (unsigned long long)total, (unsigned long long)enters,
+        (unsigned long long)exits, (long long)(enters - exits));
+
+    for (int i = 0; i < n && off > 0 && (size_t)off < cap; i++) {
+        off += snprintf(out + off, cap - (size_t)off,
+            "%s{\"seq\":%llu,\"cycle\":%llu,\"which\":\"%s\",\"epc\":\"0x%08X\","
+            "\"ra\":\"0x%08X\",\"sr_before\":\"0x%08X\",\"sr_after\":\"0x%08X\"}",
+            i ? "," : "",
+            (unsigned long long)ents[i].seq, (unsigned long long)ents[i].cycle,
+            ents[i].which == 1 ? "enter" : "exit",
+            ents[i].epc, ents[i].ra, ents[i].sr_before, ents[i].sr_after);
+    }
+    if (off > 0 && (size_t)off < cap)
+        snprintf(out + off, cap - (size_t)off, "]}\n");
+
+    debug_server_send_line(out);
+    free(out);
+}
+
 static void handle_dispatch_tail(int id, const char *json) {
     int count = 64;
     { /* try to parse count */
@@ -11215,6 +11260,7 @@ static const CmdEntry s_commands[] = {
     { "dispatch_stats",    handle_dispatch_stats },
     { "dispatch_check",    handle_dispatch_check },
     { "dispatch_tail",     handle_dispatch_tail },
+    { "critsec_ring",      handle_critsec_ring },
     { "card_mgr_trace",    handle_card_mgr_trace },
     { "card_mgr_clear",    handle_card_mgr_clear },
     { "fn_filter",         handle_fn_filter },
