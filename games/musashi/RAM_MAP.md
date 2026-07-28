@@ -14,19 +14,38 @@ All addresses are offsets into main RAM as `read_ram` reports them (add
 Found 2026-07-27. Confirmed against the on-screen HUD at two different HP
 values (37 → 27) and against BP reported independently by the player.
 
-| Address    | Size | Meaning    | Observed | Source |
-|------------|------|------------|----------|--------|
-| `0x078EB2` | u16  | unidentified | 150    | — |
-| `0x078EB4` | u16  | **HP current** | 37 → 27 | decompiled overlay code |
-| `0x078EB6` | u16  | **HP maximum**, growable, capped at `0x662` (1634) | 150 | decompiled overlay code |
-| `0x078EB8` | u16  | **BP current** | 147 | decompiled overlay code |
+| Address    | Size | Meaning     | Observed | 
+|------------|------|-------------|----------|
+| `0x078EB2` | u16  | **HP maximum** | 150   |
+| `0x078EB4` | u16  | **HP current** | 37 → 27 |
+| `0x078EB6` | u16  | **BP maximum** | 150   |
+| `0x078EB8` | u16  | **BP current** | 147   |
 
-**Corrected 2026-07-27.** These were first labelled as `[max, current]` pairs by
-inference from the HUD. The decompiled overlay code disagrees and wins: the
-damage routine subtracts from `0x78EB4`, the routine at `0x8014BCEC` adds to
-`0x78EB6` and clamps it to 1634 (a growable maximum, not a per-stat mirror of
-150), and `0x8014BD24` adds to `0x78EB8`. `0x078EB2` holding 150 at observation
-time was coincidence, not a max-HP field. BP maximum has not been located.
+Four consecutive `u16`s, `[max, current]` for each stat.
+
+**Settled by decompiled code, after I got it wrong once in between.** The first
+labelling above was inferred from the HUD. I then "corrected" it to make
+`0x78EB6` the HP maximum, on the strength of `FUN_8014BCEC` adding to `0x78EB6`
+with a cap — without checking what actually clamps against it. That was wrong,
+and the original was right. The code is unambiguous:
+
+```c
+/* 0x78EB2 is the HP ceiling */
+if (DAT_80078eb4 == DAT_80078eb2)          /* HP full? */
+if (DAT_80078eb4 <= DAT_80078eb2 >> 1)     /* below half? */
+DAT_80078eb4 = DAT_80078eb2;               /* full heal */
+if (DAT_80078eb2 < DAT_80078eb4) DAT_80078eb4 = DAT_80078eb2;   /* clamp */
+DAT_80078eb2 = DAT_80078eb2 + n;           /* grow max HP */
+
+/* 0x78EB6 is the BP ceiling */
+FUN_8014BD24: DAT_80078eb8 += n; if (DAT_80078eb6 < DAT_80078eb8) DAT_80078eb8 = DAT_80078eb6;
+FUN_8014BDC8: DAT_80078eb8 = DAT_80078eb6;      /* refill BP */
+FUN_8014BCEC: DAT_80078eb6 += n, capped 0x662;  /* grow max BP */
+```
+
+Both maxima read 150 at observation time, so the HUD alone could never separate
+them — only the code could. Lesson: partial code reading is not better than
+inference, it just looks more authoritative.
 
 ### Two identical copies
 
@@ -143,8 +162,10 @@ visiting new areas and repeating the dump extends coverage.
 |---|---|
 | `0x8014BC80` | `HP -= dmg`; if `dmg > HP` then `HP = 0` and clears `0x800B9A17` (death) |
 | `0x8014BCC0` | `HP -= dmg` but floors at **1** — damage that cannot kill |
-| `0x8014BCEC` | adds to HP maximum `0x78EB6`, clamped to `0x662` (1634) |
-| `0x8014BD24` | adds to BP `0x78EB8` |
+| `0x8014BCEC` | adds to **BP** maximum `0x78EB6`, clamped to `0x662` (1634) |
+| `0x8014BD24` | adds to BP `0x78EB8`, clamped to BP max `0x78EB6` |
+| `0x8014BD60` | subtracts from BP `0x78EB8`, floors at 0 |
+| `0x8014BDC8` | refills BP to maximum |
 
 `0x8014BCB4`, the store found by `wtrace`, is inside `0x8014BC80`. The two
 distinct damage routines (killing vs non-killing) are a useful distinction for a
