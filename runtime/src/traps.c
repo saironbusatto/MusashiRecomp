@@ -25,6 +25,74 @@ static uint32_t traps_parity_rw(void* ctx, uint32_t addr) {
 int psx_get_in_exception(void);
 void psx_exception_longjmp(void);
 
+/* ── critical-section ring (diagnostic-only) ─────────────────────────────────
+ * IEc (COP0 SR bit 0) is cleared by EnterCriticalSection (syscall 1) and
+ * restored by ExitCriticalSection (syscall 2), and by nothing else. A hang
+ * with IEc=0 and IRQs pending therefore means an Enter without its matching
+ * Exit — the CPU can never take the interrupt the guest is waiting on.
+ *
+ * `balance` is the number that matters: it should hover around 0/1 and come
+ * back down. A monotonically rising value pins the leak, and the ring gives
+ * the EPC of the calls so the offender is identifiable. Queried over TCP as
+ * `critsec_ring` (rule 3: no printf, ever). */
+#define CRITSEC_RING_N 256
+typedef struct {
+    uint64_t seq;
+    uint64_t cycle;
+    uint32_t which;      /* 1 = Enter, 2 = Exit */
+    uint32_t epc;
+    uint32_t ra;
+    uint32_t sr_before;
+    uint32_t sr_after;
+} CritSecEntry;
+
+static CritSecEntry s_critsec[CRITSEC_RING_N];
+static uint64_t     s_critsec_seq   = 0;
+static uint64_t     s_critsec_enter = 0;
+static uint64_t     s_critsec_exit  = 0;
+
+extern uint64_t psx_cycle_count;
+
+static void critsec_record(uint32_t which, uint32_t epc, uint32_t ra,
+                           uint32_t sr_before, uint32_t sr_after)
+{
+    CritSecEntry *e = &s_critsec[s_critsec_seq % CRITSEC_RING_N];
+    e->seq       = s_critsec_seq++;
+    e->cycle     = psx_cycle_count;
+    e->which     = which;
+    e->epc       = epc;
+    e->ra        = ra;
+    e->sr_before = sr_before;
+    e->sr_after  = sr_after;
+    if (which == 1) s_critsec_enter++; else s_critsec_exit++;
+}
+
+/* Snapshot for the debug server. Returns entries written into `out`
+ * (oldest-first), capped at `max`. */
+int critsec_ring_dump(CritSecEntry_pub *out, int max,
+                      uint64_t *total, uint64_t *enters, uint64_t *exits)
+{
+    if (total)  *total  = s_critsec_seq;
+    if (enters) *enters = s_critsec_enter;
+    if (exits)  *exits  = s_critsec_exit;
+    if (!out || max <= 0) return 0;
+
+    int have = (int)(s_critsec_seq < CRITSEC_RING_N ? s_critsec_seq : CRITSEC_RING_N);
+    if (have > max) have = max;
+    uint64_t first = s_critsec_seq - (uint64_t)have;
+    for (int i = 0; i < have; i++) {
+        const CritSecEntry *e = &s_critsec[(first + (uint64_t)i) % CRITSEC_RING_N];
+        out[i].seq       = e->seq;
+        out[i].cycle     = e->cycle;
+        out[i].which     = e->which;
+        out[i].epc       = e->epc;
+        out[i].ra        = e->ra;
+        out[i].sr_before = e->sr_before;
+        out[i].sr_after  = e->sr_after;
+    }
+    return have;
+}
+
 /* ── Deterministic TCB scheduler — SCAFFOLDING (plan steps 1-2, INERT) ───────
  * These definitions back psx_scheduler.h. They are NOT yet wired into the live
  * thread-switch path: psx_change_thread_fiber (the host-fiber bridge) below is
@@ -785,6 +853,7 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
 
     switch (func) {
         case 1: /* EnterCriticalSection: disable interrupts */
+            critsec_record(1, cpu->cop0[14] /*EPC*/, cpu->gpr[31], sr, sr & ~1u);
             cpu->cop0[12] = sr & ~1u; /* clear IEc (bit 0) */
             cpu->gpr[2] = sr & 1u; /* return old IEc */
             g_pc0_reason = PSX_PC0_CRIT_SECTION;
@@ -797,6 +866,7 @@ int psx_syscall(CPUState* cpu, uint32_t code) {
             return 0;
 
         case 2: /* ExitCriticalSection: enable interrupts */
+            critsec_record(2, cpu->cop0[14] /*EPC*/, cpu->gpr[31], sr, sr | 0x0401u);
             cpu->cop0[12] = sr | 0x0401u; /* set IEc (bit 0) + IM[2] (bit 10) */
             cpu->gpr[2] = 0;
             g_pc0_reason = PSX_PC0_CRIT_SECTION;

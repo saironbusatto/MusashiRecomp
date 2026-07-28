@@ -244,6 +244,23 @@ void debug_server_freeze_dump_dirty_block_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_dirty_insn_json(FILE *f, uint32_t max_count);
 void debug_server_freeze_dump_evcb_json(FILE *f, uint32_t max_count);
 
+/* Critical-section ring (traps.c). IEc is cleared only by
+ * EnterCriticalSection and restored only by ExitCriticalSection, so an
+ * enters-vs-exits imbalance is the direct explanation for a hang with
+ * interrupts disabled and IRQs pending. */
+typedef struct {
+    uint64_t seq;
+    uint64_t cycle;
+    uint32_t which;      /* 1 = Enter, 2 = Exit */
+    uint32_t epc;
+    uint32_t ra;
+    uint32_t sr_before;
+    uint32_t sr_after;
+} CritSecEntry_pub;
+
+int critsec_ring_dump(CritSecEntry_pub *out, int max,
+                      uint64_t *total, uint64_t *enters, uint64_t *exits);
+
 #ifdef __cplusplus
 }
 #endif
