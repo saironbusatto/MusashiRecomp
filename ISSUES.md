@@ -710,3 +710,62 @@ LLE reaches the title screen and the attract demo, so HLE is a convenience
 engineering work it was meant to accelerate turns out not to need it: the RAM
 hunt boots once and then works against a live instance over the debug server,
 so the 40s is a per-session cost, not a per-iteration one.
+
+---
+
+## Issue #9 — Widescreen needs per-game sprite-tag RE, and fails silently without it
+
+**Status:** open, root-caused, not implemented
+**Date opened:** 2026-07-27
+**Phase:** enhancement tier
+**Affects:** any 3D game with no `[widescreen]` block. Found on BFM (SLUS-00726).
+
+### Symptom
+
+Setting `[video] aspect_ratio = "16:9"` appears to work — the boot banner prints
+`widescreen 16:9 (GTE X-squash + stretched present; engages at game entry)` and
+`gpu_state` reports `configured=1 mode=1 squash=[3,4]` — but the picture on
+screen stays 4:3, pillarboxed inside the wide window. **User-confirmed by eye.**
+
+### Root cause
+
+`gpu.c`:
+
+```c
+static int ws_game_mode(void) {
+    if (ws_full_2d_mode()) return 1;
+    return (uint32_t)s_frame_count - ws_last_tag_stamp <= 2;
+}
+```
+
+`gpu_ws_present_native_43()` returns 1 whenever `!ws_game_mode()`, and squash is
+gated behind `ws_active() = ws_configured() && !present_native_43`. So a frame
+only goes wide if the **sprite-tag path** stamped `ws_last_tag_stamp` within the
+last two frames — and that path only runs for a game that has configured
+`[widescreen] sprite_tag_funcs` + `sprite_anchor_addr`, i.e. whose
+character-billboard drawing functions have been identified by hand.
+
+With no `[widescreen]` block, `last_tag_frame` stays at its sentinel
+(`0xFFFFFC18` observed), every frame classifies as full-2D, and every frame
+pillarboxes. The `full_2d = true` escape hatch is not a substitute: it is for
+genuine 2D tile games (MMX6) and forces the BG tile-budget reveal cap.
+
+### Why this matters beyond BFM
+
+The failure is silent and actively misleading: banner, `configured`, `mode` and
+`squash` all report success while nothing happens. Anyone enabling widescreen on
+a new game will believe it worked. Either the banner should state that no
+sprite-tag config is present and the setting is therefore inert, or
+`aspect_ratio` without a `[widescreen]` block on a non-`full_2d` game should be
+rejected at config load.
+
+### What BFM would need
+
+Identify the functions that draw Musashi/NPC billboards and the scratchpad
+address holding their projected anchor SXY, then set `sprite_tag_funcs` and
+`sprite_anchor_addr`. That is reverse-engineering work of the same class as the
+player-struct hunt, not configuration — the Ghidra corpus in
+`games/musashi/ghidra/` is the starting point.
+
+Until then `games/musashi/game.toml` deliberately omits `aspect_ratio`, so the
+build does not claim a feature it is not delivering.
