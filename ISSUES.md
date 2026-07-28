@@ -626,3 +626,87 @@ save-load, FMV, menus, and combat with **0 divergences, 0 wedges**, shards
 validated-then-promoted, device functions correctly pinned to the interpreter.
 "Diff is clean" or "shard validated" is NOT success until the full save-load loop
 closes live.
+
+---
+
+## Issue #8 — HLE boot: game wedges in an event poll loop (BFM)
+
+**Status:** open, two hypotheses eliminated, not root-caused
+**Date opened:** 2026-07-27
+**Phase:** enhancement tier (HLE is a QoL layer; LLE is unaffected)
+**Affects:** Brave Fencer Musashi (SLUS-00726). Not checked on other titles.
+
+### Symptom
+
+With `bios_hle = true` (the framework default) BFM never renders a frame of
+content — the window stays blank. With `bios_hle = false` the same build boots
+through the Sony and Squaresoft logos to the title screen and attract demo.
+`games/musashi/game.toml` pins LLE because of this.
+
+**It is not a boot failure.** The runtime reaches frame 10000+ and ~4.7e9
+guest cycles; video keeps advancing. The *guest* is wedged, not the emulator.
+
+### Hard data
+
+Captured live over the debug server, HLE run, ~frame 10000:
+
+| Probe | Value |
+|---|---|
+| `dispatch_tail` | 1,543,865 dispatches cycling `0x5E0 -> Events -> 0xF40` |
+| `event_ring_tail` | 662,892 entries, ENQ/DEQ churn at guest `pc=0x8005DF24` |
+| `hle_dump` | backend HLE, boot_skip=1, 2749 calls serviced |
+| `evcb_snapshot` | 9 live events, all `status=ENABLED`, entries 0-7 `mode=CALLBACK` with handlers |
+
+`0x5E0` is TableB0Handler and `0xF40` is ReturnFromException
+(`docs/psx_bios_disasm.txt`). The loop is therefore: guest issues a B0 event
+service, the event system runs, an exception returns, repeat — a poll for an
+event that never satisfies. `pc=0x8005DF24` is inside the game's own text
+(`0x80010000..0x80074800`) and runs in INTERP mode.
+
+The EvCB table is **healthy**: events opened, ENABLED, callback mode, handlers
+populated. It is not a synthesis error in the event table.
+
+### Eliminated (by measurement, not argument)
+
+1. **IRQ mask divergence.** `i_mask` is `0x0000000D` in both LLE and HLE.
+   Identical. Not the cause.
+
+2. **Critical-section leak.** IEc (COP0 SR bit 0) is cleared only by
+   EnterCriticalSection (syscall 1, `traps.c`) and restored only by
+   ExitCriticalSection (syscall 2), and the BIOS boot *does* enter a critical
+   section immediately before `Exec()` hands off to the game
+   (`docs/psx_bios_disasm.txt:608`), which made an unbalanced pair a plausible
+   story. Instrumented it — `critsec_ring`, added in 2fdfbba — and the answer
+   is a clean no: balance **-1** (13 enters, 14 exits), every pair in the ring
+   correctly matched `0x401 -> 0x400 -> 0x401`, last operation re-enabling IEc.
+
+### Correction to an earlier reading
+
+A single `irq_state` sample showed `IEc=0` with IRQs `0x9` pending and
+unmasked, against `IEc=1` on LLE, and that was initially reported as the root
+cause. It is not sound evidence: the LLE sample was taken at an idle title
+screen and the HLE sample inside a guest that loops through
+ReturnFromException, so a one-shot sample will regularly catch the CPU
+legitimately inside exception context where `IEc=0` is correct. The
+critical-section ring then ruled out the mechanism outright. **Any future pass
+must sample IEc/i_stat over time, not once.**
+
+### Next steps
+
+1. Sample `irq_state` repeatedly (~20 samples over 5s) in HLE. If IEc
+   oscillates, interrupts *are* being serviced and the question becomes "which
+   event never arrives", not "why do no interrupts arrive".
+2. If interrupts are being serviced: identify the event the guest polls at
+   `0x8005DF24`, then compare LLE vs HLE for who calls `DeliverEvent` for that
+   class/spec. Entries 0-7 are class `0xF4000001` (memory card) and
+   `0xF0000011`, which points at the card/SIO path.
+3. `hle_dump` reports only a total call count. Per-function counters there
+   would say immediately which B0 service the 2749 calls went to.
+
+### Why it is parked
+
+LLE reaches the title screen and the attract demo, so HLE is a convenience
+(instant boot vs ~40s of real BIOS intro), not a blocker. The reverse
+engineering work it was meant to accelerate turns out not to need it: the RAM
+hunt boots once and then works against a live instance over the debug server,
+so the 40s is a per-session cost, not a per-iteration one.

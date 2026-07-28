@@ -24,9 +24,9 @@ window_title = "Brave Fencer Musashi (PSXRecomp)"
 controller   = "digital"
 memcard_dir  = "."
 
-# LLE (real recompiled BIOS intro) is the only boot path that reaches the
-# title screen today. The HLE boot-skip hangs before the first frame — a
-# separate, still-undiagnosed bug (it is NOT the multi-FILE cue bug fixed in
-# f8546a9; that one is gone and LLE boots clean through both logos). Flip
-# this back to true once HLE boot is fixed.
+# LLE (the real recompiled BIOS intro) is the only boot path that reaches the
+# title screen today. Under HLE the guest wedges in an event poll loop and no
+# content frame is ever drawn. Investigated and written up as ISSUES.md
+# Issue #8 — including two hypotheses eliminated by measurement, so a future
+# pass does not repeat them. Flip back to true once that issue closes.
 bios_hle = false
