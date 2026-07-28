@@ -85,6 +85,11 @@ _wip/
 games/*/*
 !games/*/game.toml
 !games/*/seeds.txt
+# RAM_MAP.md is research output — addresses and observed values, i.e. facts
+# about how the game lays out its own state, not game data. It is expensive
+# to rediscover (live differential scanning against a real playthrough) and
+# useless if it dies with a working copy, so it is tracked.
+!games/*/RAM_MAP.md
 
 # Per-game memcards created at runtime
 *.mcr
@@ -98,3 +103,8 @@ tools/_options_session/
 
 # Compiled test binaries (build artifacts; the runtime/tests/*.c sources are tracked)
 runtime/tests/*.exe
+
+# Savestates — a full RAM/VRAM snapshot of a running game, i.e. copyrighted
+# game data. Useful locally (they restore overlay code for analysis without
+# replaying), never distributable.
+*.pst

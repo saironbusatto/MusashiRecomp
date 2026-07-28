@@ -49,6 +49,14 @@ memcard_dir  = "."
 # audio is streaming, so movies keep their intended pacing either way.
 disc_speed   = "4x"
 
+# Capture overlays to overlay_captures.json so they can be compiled to native
+# code offline and dispatched natively on later runs. Off by default in the
+# framework, which meant BFM captured nothing all through the first play
+# session — and BFM keeps real game logic in overlays (the damage store lives
+# at 0x8014BCB4, well past the 0x74800 text end), so with this off the parts
+# that matter are never accelerated and never available for offline analysis.
+overlay_cache = true
+
 
 # LLE (the real recompiled BIOS intro) is the only boot path that reaches the
 # title screen today. Under HLE the guest wedges in an event poll loop and no
