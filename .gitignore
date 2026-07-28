@@ -90,6 +90,8 @@ games/*/*
 # to rediscover (live differential scanning against a real playthrough) and
 # useless if it dies with a working copy, so it is tracked.
 !games/*/RAM_MAP.md
+!games/*/ACTOR_SYSTEM.md
+!games/*/LUMINA_SYSTEM.md
 
 # Per-game memcards created at runtime
 *.mcr
