@@ -92,6 +92,7 @@ games/*/*
 !games/*/RAM_MAP.md
 !games/*/ACTOR_SYSTEM.md
 !games/*/LUMINA_SYSTEM.md
+!games/*/GO_NO_GO.md
 
 # Per-game memcards created at runtime
 *.mcr
