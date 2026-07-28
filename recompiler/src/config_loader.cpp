@@ -641,6 +641,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
     std::vector<uint32_t> ws_sprite_tag_funcs;
     uint32_t ws_sprite_anchor_addr = 0;
     bool ws_hud_sprt_squash = false;
+    bool ws_native_wide = true;   /* [widescreen] native_wide */
     bool ws_full_2d = false;
     if (cfg.contains("widescreen")) {
         const toml::value& ws = toml::find(cfg, "widescreen");
@@ -654,6 +655,9 @@ GameConfig load_game_config(const fs::path& config_path_in) {
             ws_sprite_anchor_addr = parse_hex(
                 toml::find<std::string>(ws, "sprite_anchor_addr"),
                 "widescreen.sprite_anchor_addr");
+        }
+        if (ws.contains("native_wide")) {
+            ws_native_wide = toml::find<bool>(ws, "native_wide");
         }
         if (!ws_sprite_tag_funcs.empty() && ws_sprite_anchor_addr == 0)
             throw std::runtime_error(fmt::format(
@@ -754,6 +758,7 @@ GameConfig load_game_config(const fs::path& config_path_in) {
         /*ws_sprite_tag_funcs*/   ws_sprite_tag_funcs,
         /*ws_sprite_anchor_addr*/ ws_sprite_anchor_addr,
         /*ws_hud_sprt_squash*/    ws_hud_sprt_squash,
+        /*ws_native_wide*/        ws_native_wide,
         /*ws_cull_bias_sites*/    ws_cull_bias_sites,
         /*ws_cull_range_sites*/   ws_cull_range_sites,
         /*ws_cull_a1_sites*/      ws_cull_a1_sites,
