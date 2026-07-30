@@ -195,7 +195,13 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
         if (len != sizeof(CpuRegs)) return 0;
         const CpuRegs* c = (const CpuRegs*)p;
         memcpy(cpu->gpr,      c->gpr,      sizeof cpu->gpr);
-        cpu->pc = entry_pc;   /* always enter at the game entry, never a mid-PC */
+        /* Resume at the PC the file carries. Both producers record a valid
+         * block-leader resume PC (savestate_poll passes resume_pc;
+         * boot_state_trigger_capture passes entry_pc), so a boot snapshot
+         * still enters at the game entry while a user save state resumes
+         * where it was taken. A zero pc means a pre-fix file that stored the
+         * mid-block sentinel — fall back rather than dispatch through 0. */
+        cpu->pc = c->pc ? c->pc : entry_pc;
         cpu->hi = c->hi; cpu->lo = c->lo;
         memcpy(cpu->cop0,     c->cop0,     sizeof cpu->cop0);
         memcpy(cpu->gte_data, c->gte_data, sizeof cpu->gte_data);
@@ -327,6 +333,12 @@ void boot_state_set_capture(const char* path, uint32_t bios_checksum,
 
 void boot_state_trigger_capture(const CPUState* cpu) {
     if (!s_capture_path[0]) return;
-    boot_state_save(cpu, s_capture_checksum, s_capture_entry_pc, s_capture_path);
+    /* This fires from fntrace the instant the game entry PC first dispatches,
+     * where cpu->pc is mid-block (0) rather than the resume PC. The resume PC
+     * here is by construction the entry we just observed, so record it
+     * explicitly — the load restores whatever pc the file carries. */
+    CPUState snap = *cpu;
+    snap.pc = s_capture_entry_pc;
+    boot_state_save(&snap, s_capture_checksum, s_capture_entry_pc, s_capture_path);
     s_capture_path[0] = '\0';
 }
