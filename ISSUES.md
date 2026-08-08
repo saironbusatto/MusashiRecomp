@@ -769,3 +769,13 @@ player-struct hunt, not configuration — the Ghidra corpus in
 
 Until then `games/musashi/game.toml` deliberately omits `aspect_ratio`, so the
 build does not claim a feature it is not delivering.
+
+### Design (2026-08-08) — `BFM_WIDESCREEN_PLAN.md`
+
+Designed, not implemented. One correction to the framing above: the sprite-tag
+RE is a requirement of the **squash** strategy, not of widescreen as such. The
+gate (`ws_game_mode`, gpu.c:124) blocks native-wide too, but native-wide does no
+per-primitive work at all — it needs the tags only as a 3D-frame-vs-2D-screen
+detector, which a general GTE-activity test could supply with zero per-game RE.
+The squash path was chosen deliberately as the one proven in production on
+Tomba; the general route is recorded there as plan B.
