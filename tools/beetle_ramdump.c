@@ -1,14 +1,14 @@
 /* beetle_ramdump — minimal libretro host: boot the Beetle PSX core and dump
  * main RAM.
  *
- * WHY THIS EXISTS: the full psx-beetle oracle target does not link — it needs
- * eight symbols (beetle_core_get_guest_cycles, the beetle_cyc_watch_* set,
- * psxrecomp_cdc_irq_type, psxrecomp_dma_int_status, retro_psxref_exc_ring_dump)
- * that no committed patch supplies and whose semantics are not recoverable from
- * this repo (see docs/beetle_oracle_buildfix.patch). Diagnosing the HLE boot
- * hang does not need any of that instrumentation: it needs one thing, the
+ * WHY THIS EXISTS: written when the full psx-beetle oracle target could not
+ * link (it needed eight symbols no committed patch supplied). That gap is
+ * closed as of 2026-08-08 — docs/beetle_oracle_instrumentation.patch supplies
+ * them and psx-beetle links. This tool survives because it is still the
+ * shortest path to the one thing the HLE boot-hang diagnosis needs: the
  * post-boot contents of kernel RAM from a known-good implementation, to diff
- * against what our HLE boot-skip synthesises. That is all this does.
+ * against what our HLE boot-skip synthesises. No debug server, no window, no
+ * game loop. Use psx-beetle for anything interactive.
  *
  * The core is linked statically (STATIC_LINKING=1 build), so retro_* is called
  * directly rather than dlopen'd.

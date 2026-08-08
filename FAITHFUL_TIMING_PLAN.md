@@ -213,6 +213,28 @@ on a fixed region -> next.
 
 ## 5. Status / Log (update every session)
 
+- **2026-08-08 (ORACLE RESTORED — psx-beetle links and serves again):** The
+  Beetle oracle had been unavailable since the Linux move: `psx-beetle` failed to
+  link on eight missing symbols, and docs/beetle-linux.md recorded them as
+  unrecoverable ("reconstructing means inventing semantics", rule 14). That was
+  wrong — every one is specified by the consumer already in-tree, so nothing had
+  to be guessed: debug_server.c:2089 dictates the cyc_watch capture semantics
+  verbatim ("the Beetle side must match EXACTLY"), beetle_libretro.cpp:663 spells
+  out both IRQ-detail accessors, PRECISE_IRQ_SLICE.md:195 lists the exception-record
+  fields. Written up as docs/beetle_oracle_instrumentation.patch (5th patch, apply
+  last), symbol-by-symbol mapped to its spec. Cost when idle: one int32 store per
+  instruction + a not-taken branch.
+  MEASURED against BFM: ping frame 1772 / guest_cycles 1002596560 = 565800
+  cycles/frame vs 565045 expected (33868800/59.94); exc_ring 18154 exceptions,
+  all code 0 (INT) with cause IP2 and i_stat alternating 0x1 VBLANK / 0x8 DMA;
+  cyc_watch single-anchor 0x80000080 x6 with deltas matching the exc_ring IRQ
+  cadence (two independent instruments agreeing); cyc_watch region
+  0x80000080 -> 0x800027D0 (the vector's `jr $k0` target) = 11 cycles, all 5 passes.
+  KNOWN GAP: the exception ring omits the pending-load slot PRECISE_IRQ_SLICE.md
+  lists — LDWhich/LDValue are RunReal locals and the class copies are stale in
+  Exception(); threading them through the signature is the fix if a divergence
+  ever turns on it. Stage-2 cycle calibration is now unblocked.
+
 - **2026-07-02 (HLE PIVOT implemented — HLE as a first-class swappable tier, gbarecomp model):**
   USER-DIRECTED pivot (supersedes "no HLE" §0; CLAUDE.md amended 2026-07-02, memory
   hle_tier_architecture.md). Built the full stack this session: (1) EMITTER —
