@@ -89,15 +89,59 @@ Recorded, not chosen: the user chose the proven path.
 
 ## Phases
 
-### Phase 0 — `tools/window_shot.py`
+### Phase 0 — ABANDONED 2026-08-08: no external capture works on this host
 
-Captures the real `psx-runtime` window to PNG via `import -window`, locating it
-by an explicitly-set window title (`--window-title`, `main.cpp:2015`) rather
-than guessing.
+Planned as `tools/window_shot.py` grabbing the real window. **It cannot work
+here, and the reason is structural — do not try this again on this machine.**
 
-**It must not trust its own success.** A capture that is all-black or a single
-flat colour is rejected loudly — a silent black PNG is the same class of failure
-this whole plan exists to eliminate.
+ImageMagick 7's `import` rejects its own documented invocation
+("missing an image filename"), so the backend became ffmpeg `x11grab`. That
+runs, and returns black. The decisive measurement is a full-screen grab:
+
+```
+ffmpeg -f x11grab -video_size 1366x768 -i :0.0+0,0 -frames:v 1 full.png
+  -> 1366x768, 43 distinct colours, mean 0.000056
+```
+
+An entirely black desktop while the user sees windows normally. This session is
+Wayland; XWayland hands its surfaces to the Wayland compositor and the X screen
+stays empty, so **no X11-based tool can capture anything**, whatever the window.
+
+A false retraction is worth recording, because it cost a cycle: the hypothesis
+was raised, then withdrawn when a user screenshot showed the same black window
+the tool had captured — which looked like confirmation the capture was faithful.
+It was not; both were failures, and only the full-screen grab separated them.
+**When a capture and a screenshot agree on "black", that is not corroboration.**
+
+What survives, and is worth reusing: the degeneracy gate must count DISTINCT
+COLOURS, not standard deviation. A black window containing only the mouse cursor
+measures stddev 0.0124 — past any sane threshold, because ~200 white pixels in
+307200 are enough — but only 43 colours, against thousands for any real PSX
+frame (dithered 15-bit output never yields a small palette).
+
+Replacement not yet chosen. The candidates are a `present_shot` debug command
+(glReadPixels of the window framebuffer before SwapWindow, reusing
+`png_write_rgb`; Wayland-proof and Rule-3-correct), or user-by-eye verification.
+Currently the user verifies by eye.
+
+#### 4:3 baseline, captured 2026-08-08 (the reference for "did it get fatter?")
+
+User-confirmed: Musashi at normal proportions, intro/title/menu all correct.
+
+- Game image **884x663** — exactly 4:3 — inside a 933x663 client area.
+- The configured 1280 width was cut by `clamp_window_aspect` (main.cpp:224)
+  because 4:3 at 1280 is 1280x960 and the screen is 1366x768. **16:9 at 1280 is
+  1280x720 and does fit**, so the widescreen window should end up larger, not
+  smaller.
+- `gpu_state` → `ws:{configured:0, active:0, game_mode:0, mode:0, squash:[1,1]}`.
+- `gp0_copy` = 5132, non-zero: BFM does VRAM→VRAM copies. `NATIVE_WIDE_PLAN.md`
+  flags framebuffer feedback as the key complexity driver for the wide
+  compositor surface, so this matters to plan B.
+
+#### Tooling defect found in passing
+
+`gpu_state` sends its response with no trailing newline, against the documented
+line protocol every other handler follows — a readline-based client hangs on it.
 
 ### Phase 1 — Discovery
 
