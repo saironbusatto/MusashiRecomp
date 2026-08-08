@@ -1,0 +1,395 @@
+Oracle instrumentation: the eight symbols psx-beetle needed to link.
+
+Apply LAST, after beetle_wtrace_hook / beetle_sio_trace_hook /
+beetle_cdcmd_trace_hook / beetle_oracle_buildfix, against beetle-psx
+at 5759277b.
+
+docs/beetle-linux.md previously recorded these as unrecoverable ("inventing
+semantics", CLAUDE.md rule 14). They are not: every one of them is fully
+specified by the consumer already in this repo, so nothing here is a guess.
+
+  beetle_core_get_guest_cycles   runtime/src/beetle_debug_server.c:50 —
+      "absolute guest CPU cycles since boot". The core's `timestamp` restarts
+      at 0 each retro_run, so absolute = cycles retired by completed frames
+      (folded in when Run() returns) + the in-frame timestamp (published by
+      the CPU loop once per instruction). Reset on PSX_Power so it counts from
+      power-on like the runtime's psx_cycle_count.
+
+  beetle_cyc_watch_{arm,clear,get,get_state}   runtime/src/debug_server.c:2089
+      documents the capture semantics the Beetle half "must match EXACTLY",
+      including the single-anchor and two-anchor region modes and the
+      pc & 0x1FFFFFFF anchor normalisation. Implemented to that spec. Native
+      observes at basic-block leaders, Beetle before every instruction — a
+      superset, so a block-leader anchor fires at the same architectural point
+      on both. The native dedupe of its dispatch+prologue double-fire has no
+      Beetle counterpart and is deliberately absent: Beetle cannot double-fire.
+
+  psxrecomp_cdc_irq_type / psxrecomp_dma_int_status
+      runtime/src/beetle_libretro.cpp:663-677 spells both out: "CD -> low
+      nibble of cdc IRQBuffer (INT type)", "DMA -> DMAIntStatus per-channel
+      bitmask".
+
+  retro_psxref_exc_ring_dump   PRECISE_IRQ_SLICE.md:195 lists the fields;
+      beetle_debug_server.c:287 says the core emits the complete JSON object,
+      forwarded verbatim, and that the comparison is by ORDER + EPC VALUE
+      (cross-emulator cycle counts are not comparable). Recorded before
+      CP0.SR/CAUSE are rewritten, so `sr` is the state taken FROM.
+      NOT recorded: the pending-load slot, which PRECISE_IRQ_SLICE.md lists.
+      LDWhich/LDValue are locals of RunReal and the copies in the class are
+      stale by the time Exception() runs; reaching them means threading them
+      through the signature. Add that if a divergence ever turns on it.
+
+Cost when idle: one int32 store per instruction (the cycle publish) plus a
+predicted-not-taken branch on the armed flag. The exception ring records
+unconditionally — an exception is rare, and the take-point that matters is
+usually the one that happened before anyone thought to arm a trace.
+
+Verified 2026-08-08 against Brave Fencer Musashi (USA):
+  ping           frame 1772, guest_cycles 1002596560
+                 -> 565800 cycles/frame vs 33868800/59.94 = 565045 expected
+  exc_ring       18154 exceptions, all code 0 (INT), cause IP2, i_stat
+                 alternating 0x1 (VBLANK) / 0x8 (DMA)
+  cyc_watch      anchor 0x80000080, 6 hits, deltas matching the exc_ring IRQ
+                 cadence (two independent instruments agreeing)
+  cyc_watch      region 0x80000080 -> 0x800027D0 (the vector's jr $k0 target),
+                 5 passes, 11 cycles every time
+
+--- a/libretro.cpp
++++ b/libretro.cpp
+@@ -515,6 +515,199 @@
+ psxrecomp_rtrace_cb_t  g_psxrecomp_rtrace_cb  = NULL;
+ psxrecomp_irq_cb_t     g_psxrecomp_irq_cb     = NULL;
+ 
++/* ---- PSXRecomp oracle: guest cycle clock (psx.h) ---- */
++uint64_t g_psxrecomp_cyc_base     = 0;
++int32_t  g_psxrecomp_cyc_in_frame = 0;
++
++uint64_t psxrecomp_guest_cycles(void)
++{
++   return g_psxrecomp_cyc_base + (uint64_t)(uint32_t)g_psxrecomp_cyc_in_frame;
++}
++
++extern "C" unsigned long long beetle_core_get_guest_cycles(void)
++{
++   return (unsigned long long)psxrecomp_guest_cycles();
++}
++
++/* ---- PSXRecomp oracle: cyc_watch (psx.h documents the capture semantics) ---- */
++#define PSXREC_CYC_WATCH_CAP 1024
++typedef struct {
++   uint32_t hit_index;
++   uint32_t pc;         /* matched physical PC */
++   uint64_t cycles;     /* absolute cycles, or the A->B delta in region mode */
++} PsxrecCycWatchEntry;
++
++static PsxrecCycWatchEntry s_cw_ring[PSXREC_CYC_WATCH_CAP];
++int      g_psxrecomp_cyc_watch_armed = 0;
++static uint32_t s_cw_anchor_raw   = 0;
++static uint32_t s_cw_anchor_phys  = 0;
++static uint32_t s_cw_end_raw      = 0;
++static uint32_t s_cw_end_phys     = 0;   /* non-zero selects region (A->B delta) mode */
++static uint32_t s_cw_max_hits     = 16;
++static uint32_t s_cw_hits         = 0;
++static int      s_cw_in_region    = 0;
++static uint64_t s_cw_region_start = 0;
++
++void psxrecomp_cyc_watch_observe(uint32_t pc)
++{
++   const uint32_t phys = pc & 0x1FFFFFFFu;
++   const uint64_t now  = psxrecomp_guest_cycles();
++
++   if (s_cw_end_phys != 0u)               /* region mode: record delta per A->B pass */
++   {
++      if (!s_cw_in_region)
++      {
++         if (phys == s_cw_anchor_phys)
++         {
++            s_cw_region_start = now;
++            s_cw_in_region    = 1;
++         }
++         return;
++      }
++      if (phys != s_cw_end_phys)
++         return;
++      s_cw_ring[s_cw_hits].hit_index = s_cw_hits;
++      s_cw_ring[s_cw_hits].pc        = phys;
++      s_cw_ring[s_cw_hits].cycles    = now - s_cw_region_start;
++      s_cw_hits++;
++      s_cw_in_region = 0;
++   }
++   else                                   /* single-anchor mode: absolute cycles at A */
++   {
++      if (phys != s_cw_anchor_phys)
++         return;
++      s_cw_ring[s_cw_hits].hit_index = s_cw_hits;
++      s_cw_ring[s_cw_hits].pc        = phys;
++      s_cw_ring[s_cw_hits].cycles    = now;
++      s_cw_hits++;
++   }
++
++   if (s_cw_hits >= s_cw_max_hits)
++      g_psxrecomp_cyc_watch_armed = 0;    /* ring full: stop sampling, keep the data */
++}
++
++extern "C" void beetle_cyc_watch_arm(uint32_t anchor_raw, uint32_t end_raw, int n)
++{
++   g_psxrecomp_cyc_watch_armed = 0;       /* disarm first: the observer runs on the CPU thread */
++   if (n < 1)                       n = 1;
++   if (n > PSXREC_CYC_WATCH_CAP)    n = PSXREC_CYC_WATCH_CAP;
++   s_cw_anchor_raw   = anchor_raw;
++   s_cw_anchor_phys  = anchor_raw & 0x1FFFFFFFu;
++   s_cw_end_raw      = end_raw;
++   s_cw_end_phys     = end_raw & 0x1FFFFFFFu;
++   s_cw_max_hits     = (uint32_t)n;
++   s_cw_hits         = 0;
++   s_cw_in_region    = 0;
++   s_cw_region_start = 0;
++   g_psxrecomp_cyc_watch_armed = 1;
++}
++
++extern "C" void beetle_cyc_watch_clear(void)
++{
++   g_psxrecomp_cyc_watch_armed = 0;
++   s_cw_hits      = 0;
++   s_cw_in_region = 0;
++}
++
++extern "C" void beetle_cyc_watch_get_state(uint32_t *anchor_raw, uint32_t *anchor_phys,
++                                           uint32_t *end_raw, uint32_t *end_phys,
++                                           uint32_t *max_hits, uint32_t *hits, int *armed)
++{
++   if (anchor_raw)  *anchor_raw  = s_cw_anchor_raw;
++   if (anchor_phys) *anchor_phys = s_cw_anchor_phys;
++   if (end_raw)     *end_raw     = s_cw_end_raw;
++   if (end_phys)    *end_phys    = s_cw_end_phys;
++   if (max_hits)    *max_hits    = s_cw_max_hits;
++   if (hits)        *hits        = s_cw_hits;
++   if (armed)       *armed       = g_psxrecomp_cyc_watch_armed;
++}
++
++extern "C" int beetle_cyc_watch_get(uint32_t i, uint32_t *hit_index, uint32_t *pc,
++                                    unsigned long long *cycles)
++{
++   if (i >= s_cw_hits)
++      return 0;
++   if (hit_index) *hit_index = s_cw_ring[i].hit_index;
++   if (pc)        *pc        = s_cw_ring[i].pc;
++   if (cycles)    *cycles    = (unsigned long long)s_cw_ring[i].cycles;
++   return 1;
++}
++
++/* ---- PSXRecomp oracle: exception-entry ring (psx.h) ----
++ * Always recording — an exception is rare enough that an unconditional 40-byte
++ * store costs nothing, and the take-point that matters is usually the one that
++ * happened before anyone thought to arm a trace. Oldest entries are dropped. */
++#define PSXREC_EXC_RING_CAP 4096
++typedef struct {
++   uint64_t seq;
++   uint64_t cycles;
++   uint32_t code;      /* EXCEPTION_* */
++   uint32_t pc;        /* PC handed to Exception() */
++   uint32_t next_pc;
++   uint32_t epc;       /* CP0.EPC after the branch-delay adjustment */
++   uint32_t bd;        /* 1 = exception taken in a branch delay slot */
++   uint32_t sr;        /* CP0.SR before the IEc/KUc push */
++   uint32_t cause;
++   uint32_t i_stat;
++   uint32_t i_mask;
++} PsxrecExcEntry;
++
++static PsxrecExcEntry s_exc_ring[PSXREC_EXC_RING_CAP];
++static uint64_t s_exc_seq = 0;   /* total exceptions since boot; ring holds the last CAP */
++
++void psxrecomp_exc_note(uint32_t code, uint32_t pc, uint32_t next_pc,
++                        uint32_t epc, uint32_t bd, uint32_t sr, uint32_t cause)
++{
++   PsxrecExcEntry *e = &s_exc_ring[s_exc_seq % PSXREC_EXC_RING_CAP];
++   e->seq     = s_exc_seq++;
++   e->cycles  = psxrecomp_guest_cycles();
++   e->code    = code;
++   e->pc      = pc;
++   e->next_pc = next_pc;
++   e->epc     = epc;
++   e->bd      = bd;
++   e->sr      = sr;
++   e->cause   = cause;
++   e->i_stat  = IRQ_GetRegister(IRQ_GSREG_STATUS, NULL, 0);
++   e->i_mask  = IRQ_GetRegister(IRQ_GSREG_MASK,   NULL, 0);
++}
++
++/* Emits the complete JSON object the debug server forwards verbatim. Returns
++ * bytes written, or 0 if `cap` cannot hold the whole dump — a truncated dump
++ * would be invalid JSON, which is worse than no dump. */
++extern "C" int retro_psxref_exc_ring_dump(char *out, int cap)
++{
++   if (!out || cap < 256)
++      return 0;
++
++   const uint64_t have  = (s_exc_seq < PSXREC_EXC_RING_CAP) ? s_exc_seq : PSXREC_EXC_RING_CAP;
++   const uint64_t first = s_exc_seq - have;
++
++   int pos = snprintf(out, (size_t)cap,
++      "{\"ok\":true,\"total\":%llu,\"count\":%llu,\"entries\":[",
++      (unsigned long long)s_exc_seq, (unsigned long long)have);
++
++   for (uint64_t i = 0; i < have; i++)
++   {
++      const PsxrecExcEntry *e = &s_exc_ring[(first + i) % PSXREC_EXC_RING_CAP];
++      const int n = snprintf(out + pos, (size_t)(cap - pos),
++         "%s{\"seq\":%llu,\"cycles\":%llu,\"code\":%u,\"pc\":\"0x%08X\","
++         "\"next_pc\":\"0x%08X\",\"epc\":\"0x%08X\",\"bd\":%u,\"sr\":\"0x%08X\","
++         "\"cause\":\"0x%08X\",\"i_stat\":\"0x%08X\",\"i_mask\":\"0x%08X\"}",
++         i ? "," : "", (unsigned long long)e->seq, (unsigned long long)e->cycles,
++         e->code, e->pc, e->next_pc, e->epc, e->bd, e->sr, e->cause,
++         e->i_stat, e->i_mask);
++      if (n < 0 || n >= cap - pos)
++         return 0;
++      pos += n;
++   }
++
++   const int n = snprintf(out + pos, (size_t)(cap - pos), "]}");
++   if (n < 0 || n >= cap - pos)
++      return 0;
++   return pos + n;
++}
++
+ MultiAccessSizeMem<512 * 1024, uint32, false> *BIOSROM = NULL;
+ MultiAccessSizeMem<65536, uint32, false> *PIOMem = NULL;
+ MultiAccessSizeMem<2048 * 1024, uint32, false> *MainRAM = NULL;
+@@ -1279,6 +1472,11 @@
+ 
+    cd_warned_slow = false;
+ 
++   /* PSXRecomp oracle clock counts from power-on, matching the runtime's
++    * psx_cycle_count; a reset must restart it or the two stop lining up. */
++   g_psxrecomp_cyc_base     = 0;
++   g_psxrecomp_cyc_in_frame = 0;
++
+    memset(MainRAM->data32, 0, 2048 * 1024);
+ 
+    for(i = 0; i < 9; i++)
+@@ -4823,6 +5021,12 @@
+    Running = -1;
+    timestamp = PSX_CPU->Run(timestamp, false, false);
+ 
++   /* PSXRecomp oracle clock: fold the frame we just ran into the absolute
++    * cycle base. `timestamp` restarts at 0 next frame (see RebaseTS below),
++    * so this is the only place the base can advance. */
++   g_psxrecomp_cyc_base    += (uint64_t)(uint32_t)timestamp;
++   g_psxrecomp_cyc_in_frame = 0;
++
+    assert(timestamp);
+ 
+    ForceEventUpdates(timestamp);
+--- a/mednafen/psx/psx.h
++++ b/mednafen/psx/psx.h
+@@ -231,4 +231,39 @@
+ typedef void (*psxrecomp_irq_cb_t)(int which);
+ extern psxrecomp_irq_cb_t g_psxrecomp_irq_cb;
+ 
++/* ---- PSXRecomp oracle: guest cycle clock ----
++ *
++ * The core's `timestamp` restarts at 0 every retro_run, so it cannot be
++ * compared against the runtime's psx_cycle_count, which counts from boot.
++ * Absolute cycles = cycles retired by completed frames + the current in-frame
++ * timestamp. The CPU loop publishes the second half once per instruction; the
++ * frame loop folds it into the base when Run() returns.
++ *
++ * Read across threads by the debug server: a 64+32 read can tear. This is an
++ * observation-only clock (no emulation decision reads it), and the native side
++ * samples its counter just as loosely, so a torn sample costs one bad row in a
++ * diff, never a behaviour change. */
++extern uint64_t g_psxrecomp_cyc_base;      /* cycles retired in completed frames */
++extern int32_t  g_psxrecomp_cyc_in_frame;  /* current timestamp inside Run()     */
++uint64_t psxrecomp_guest_cycles(void);
++
++/* ---- PSXRecomp oracle: cyc_watch, the Beetle half of the per-anchor cycle
++ * comparator. Capture semantics are dictated by the native implementation
++ * (runtime/src/debug_server.c) and must match it exactly: the anchor is
++ * sampled BEFORE the anchor instruction executes, so the recorded cycle count
++ * excludes every cycle of the anchored instruction. Native only observes at
++ * basic-block leaders; Beetle observes at every instruction, which is a
++ * superset — an anchor that is a block leader on the native side fires at the
++ * same architectural point on both. Anchors are compared as physical
++ * addresses (pc & 0x1FFFFFFF). */
++extern int g_psxrecomp_cyc_watch_armed;    /* hot-path gate; 0 = observer is dead code */
++void psxrecomp_cyc_watch_observe(uint32_t pc);
++
++/* ---- PSXRecomp oracle: exception-entry ring. Records the architectural
++ * take-point of every CPU exception so the runtime's IRQ take-PC can be
++ * arbitrated against real-hardware behaviour by ORDER + EPC VALUE (raw cycle
++ * counts are not comparable across emulators). */
++void psxrecomp_exc_note(uint32_t code, uint32_t pc, uint32_t next_pc,
++                        uint32_t epc, uint32_t bd, uint32_t sr, uint32_t cause);
++
+ #endif
+--- a/mednafen/psx/cpu.cpp
++++ b/mednafen/psx/cpu.cpp
+@@ -619,6 +619,10 @@
+  if(ADDBT)
+   ADDBT(PC, handler, true);
+ 
++ /* PSXRecomp oracle (psx.h): record the take-point before CP0.SR/CAUSE are
++  * rewritten below, so SR is the state the exception was taken FROM. */
++ psxrecomp_exc_note(code, PC, NP, CP0.EPC, (BDBT & 2) ? 1u : 0u, CP0.SR, CP0.CAUSE);
++
+  // "Push" IEc and KUc(so that the new IEc and KUc are 0)
+  CP0.SR = (CP0.SR & ~0x3F) | ((CP0.SR << 2) & 0x3F);
+ 
+@@ -690,6 +694,14 @@
+    // Zero must be zero...until the Master Plan is enacted.
+    GPR[0] = 0;
+ 
++   /* PSXRecomp oracle (psx.h): publish the in-frame cycle count, then sample
++    * the cyc_watch anchor. Both happen BEFORE the fetch, so the cycle a hit
++    * records excludes every cycle of the anchored instruction — which is what
++    * the native block-leader observer records. */
++   g_psxrecomp_cyc_in_frame = timestamp;
++   if(MDFN_UNLIKELY(g_psxrecomp_cyc_watch_armed))
++    psxrecomp_cyc_watch_observe(PC);
++
+ #ifdef DEBUG
+    if(DebugMode && CPUHook)
+    {
+--- a/mednafen/psx/cdc.h
++++ b/mednafen/psx/cdc.h
+@@ -39,6 +39,12 @@
+ 
+       void GetCDAudio(int32 samples[2], const unsigned freq);
+ 
++      /* PSXRecomp oracle: pending CD INT type (1=sector-data, 2=complete,
++       * 3=ack, ...). The low nibble of IRQBuffer, exposed so the device-event
++       * trace can label an IRQ_CD edge with the same detail the runtime
++       * records for its own CD interrupts. */
++      uint8 GetIRQType(void) const { return IRQBuffer & 0xF; }
++
+       CD_Audio_Buffer AudioBuffer;
+ #ifdef __LIBRETRO__
+       int DriveStatus;
+--- a/mednafen/psx/cdc.cpp
++++ b/mednafen/psx/cdc.cpp
+@@ -2438,3 +2438,11 @@
+    { /* 0x1E, */ 0, 0, "ReadTOC", &PS_CDC::Command_ReadTOC, &PS_CDC::Command_ReadTOC_Part2 },
+    { /* 0x1F, */ 0, 0, NULL, NULL, NULL },
+ };
++
++/* PSXRecomp oracle: detail for an IRQ_CD edge (runtime/src/beetle_libretro.cpp
++ * irq_event_callback). Zero when no CDC exists yet, which the consumer treats
++ * the same as "no pending INT". */
++extern "C" unsigned psxrecomp_cdc_irq_type(void)
++{
++   return PSX_CDC ? (unsigned)PSX_CDC->GetIRQType() : 0u;
++}
+--- a/mednafen/psx/dma.cpp
++++ b/mednafen/psx/dma.cpp
+@@ -727,3 +727,10 @@
+ 
+    return(ret);
+ }
++
++/* PSXRecomp oracle: detail for an IRQ_DMA edge (runtime/src/beetle_libretro.cpp
++ * irq_event_callback). Bit n = channel n signalled completion. */
++extern "C" unsigned psxrecomp_dma_int_status(void)
++{
++   return (unsigned)DMAIntStatus;
++}
