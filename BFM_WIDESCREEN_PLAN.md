@@ -332,6 +332,37 @@ Real gotcha, not phantom: the PSX pad word is **active-low** (`main.cpp:1295`)
 and `PAD_LEFT` is `1<<7` (`main.cpp:752`), so LEFT is `0xFF7F`. Injecting
 `0x8000` means *everything except one button pressed*, which cost a cycle.
 
+
+#### Reveal-margin black patches — two causes eliminated, one open (2026-08-09)
+
+After enabling the cull widening the user still saw black wedges on the RIGHT,
+with the red carpet and floor stopping abruptly. Measured from a user-saved
+state in that room (savestate slot 4, `Shift+F5`):
+
+- **Not the cull we widened.** Prims ARE submitted into both revealed strips —
+  20 on the left, **36 on the right**. The side that looks empty receives more
+  geometry than the side that looks full.
+- **Not the wide-surface mirror clip.** `gpu_gl_renderer.c:1086` documents that
+  the mirror pass scissors X to the FULL wide surface, deliberately not to the
+  draw area, "would crop exactly the margin content native-wide exists to
+  reveal".
+- **Open candidate: the geometry ends.** The black boundary follows the floor's
+  tile grid rather than a straight screen-space line, which is what a tiled
+  floor running out of tiles looks like. The level was authored for 4:3. If this
+  is the cause there is no emulator-side fix — nothing was modelled there.
+
+The discriminator is whether the black edge slides with the world (geometry
+ends) or stays fixed on screen (a clip). It needs the camera to actually move,
+and debug-server input injection does not move the character in that room, so
+it needs a human at the controls.
+
+**Workflow note that made this measurable at all:** `Shift+F1..F12` saves a
+state, `F1..F12` loads it (`main.cpp:1487`, slot = key - F1, so Shift+F5 writes
+slot **4**). With a state saved at the scene of interest, the same frame can be
+reloaded and measured any number of times without replaying to it — and a stray
+F-key during play loads a slot, which is what silently teleported one session
+back to the tutorial and read as a freeze.
+
 ### Phase 2 — Apply and verify
 
 `game.toml`: `aspect_ratio = "16:9"`, the `[widescreen]` block, and
