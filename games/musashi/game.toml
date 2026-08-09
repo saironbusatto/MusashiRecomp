@@ -72,3 +72,20 @@ overlay_cache = true
 # Issue #8 — including two hypotheses eliminated by measurement, so a future
 # pass does not repeat them. Flip back to true once that issue closes.
 bios_hle = false
+
+[widescreen.cull]
+# Automatic horizontal-FOV cull widening. Without it, native-wide reveals side
+# strips the game never draws into: its GTE render funnels reject a primitive
+# whose vertices ALL fall outside the 4:3 frame, so geometry that only becomes
+# visible in the wider view is culled before it can be rasterised, and the
+# margins stay black. User-observed on the first play session.
+#
+# This is the general form of the fix — the recompiler detects the per-vertex
+# reject signature itself (`sltiu SX, 0x140` paired with `sltiu SY, 0xE0` in the
+# same function) and emits every width compare with + 2*psx_ws_x_margin(). No
+# per-site address list, so nothing here is specific to this game.
+#
+# The margin is 0 at 4:3, so a 4:3 build stays byte-identical. Unlike everything
+# else in this file's widescreen setup, this one is REGEN-CLASS: it changes the
+# generated C, so the game and its overlays must be recompiled.
+auto_screen_x = true
