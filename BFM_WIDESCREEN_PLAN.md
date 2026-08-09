@@ -244,7 +244,61 @@ So a working squash on BFM needs the tag to fire **per loop iteration**, which
 means teaching the recompiler to emit the hook at an arbitrary PC rather than at
 a function entry. That is a mechanism change, not configuration.
 
-#### Recommendation: take plan B
+#### Plan B taken and SHIPPED 2026-08-09 — widescreen engages, no per-game RE
+
+The detector is `gte_projection_recent()` (gte.cpp), stamped in `gte_execute`
+on RTPS (0x01) and RTPT (0x30). That is the single site BOTH backends route
+through, so there is no second path to keep in sync, and the cost is one store
+on two opcodes. `ws_game_mode()` (gpu.c) ORs it after the existing full_2d and
+sprite-tag tests, so a title already tuned against tags (Tomba) is unchanged.
+
+A perspective transform is direct evidence of the question being asked: a frame
+that ran one drew 3D, a flat 2D screen never does. No per-game reverse
+engineering, nothing configured — measured.
+
+`games/musashi/game.toml` now sets `aspect_ratio = "16:9"`. No regen: without
+`sprite_tag_funcs` nothing changes in the generated C.
+
+MEASURED:
+
+- `nw_extra` = 106 (320 -> 426, the exact 16:9 figure) stable across 12/12
+  samples during gameplay.
+- Title screen stays 4:3 — user-confirmed by eye, which is the behaviour the
+  per-game tag path used to provide and the reason a naive "always wide" would
+  have been wrong.
+- `wide_shot` = 852x480, aspect **1.775**. Note this command only works at all
+  once native-wide is engaged, so its success is itself a check.
+- Proportions correct, user-confirmed: characters are not horizontally
+  stretched, and more scenery is visible at the sides.
+
+- **The HUD is correct.** User-confirmed in gameplay: HP/BP bars, sword icon,
+  money, Fusion, Day counter and the portrait all sit properly in the wide
+  frame's corners, and a boss health bar renders correctly at the top. No
+  re-anchoring was needed — milestone 3 of `NATIVE_WIDE_PLAN.md` ("Re-anchor
+  the 2D HUD/dialogue") turns out not to apply to this title.
+
+  Recorded because it was nearly written up as a defect: an earlier screenshot
+  during a **cutscene** showed only a sliver of the gold bar, which read as a
+  misplaced HUD. The game hides the HUD during cutscenes, and the sliver was
+  its slide animation. The census was consistent with the wrong reading too —
+  all 174 HUD prims still emitted over the same `x=-156..148` range — because
+  "prims emitted but misplaced" and "prims emitted but hidden" look identical
+  from there. Only the user's second screenshot, in normal gameplay,
+  distinguished them.
+
+OPEN, user-reported and expected: **black patches in the revealed side strips.**
+This is milestone 2 of `NATIVE_WIDE_PLAN.md` — the game rejects a primitive when
+all its vertices fall outside the 4:3 frame, so geometry that only becomes
+visible in the wider field of view is culled before it can be drawn, and the
+margin stays empty.
+
+The fix is already general and needs no per-game RE: `[widescreen.cull]
+auto_screen_x` (`config_loader.h:451`) makes the recompiler auto-detect the
+`sltiu SX, 0x140` / `sltiu SY, 0xE0` per-vertex reject signature and emit every
+width compare with `+ 2*psx_ws_x_margin()`. It is 0 at 4:3, so a 4:3 build stays
+byte-identical. **It is regen-class**, unlike everything above.
+
+#### Recommendation that led here
 
 Plan B got stronger with what phase 1 measured. The emitters use RTPT, so a
 general "did this frame run RTPS/RTPT?" test is straightforward, is **game-

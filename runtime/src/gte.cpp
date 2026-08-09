@@ -876,6 +876,39 @@ uint32_t gte_cfc2(GTEState* gte, uint8_t reg) {
 static uint64_t s_gte_exec_count = 0;
 extern "C" uint64_t gte_get_exec_count(void) { return s_gte_exec_count; }
 
+/* ---- Widescreen: general 3D-frame detector -------------------------------
+ *
+ * The wide-aspect paths need to tell a 3D gameplay frame from a flat 2D screen
+ * (title, menu, save), because a 2D screen must present native 4:3 rather than
+ * be widened. Until now that question was answered per game, by configuring
+ * [widescreen] sprite_tag_funcs — the addresses of a title's character-render
+ * functions, found by hand in Ghidra. A title with no such config had every
+ * frame classified as 2D and silently stayed pillarboxed (ISSUES.md Issue #9).
+ *
+ * A perspective transform is the direct evidence of the thing being asked
+ * about: RTPS/RTPT projects world geometry to the screen, so a frame that ran
+ * one drew 3D, and a flat 2D screen never does. That holds for any game,
+ * needs no per-title reverse engineering, and is measured rather than
+ * configured.
+ *
+ * Stamped here because gte_execute is the single site BOTH backends route
+ * through (compiled code and the dirty-RAM interpreter alike), so there is no
+ * second path to keep in sync. Cost is one store on the two projection
+ * opcodes, against the full register load/store the surrounding call already
+ * does.
+ *
+ * Deliberately NOT a replacement for the sprite tags: those also carry each
+ * prim's anchor, which the squash strategy needs for per-primitive correction.
+ * This only answers "is this frame 3D", which is all native-wide needs. */
+extern uint64_t s_frame_count;               /* debug_server.c */
+static uint64_t s_gte_proj_frame = (uint64_t)-1000;
+
+extern "C" int gte_projection_recent(uint32_t within_frames) {
+    /* Unsigned wrap is intentional: before the first projection the stamp is
+     * far in the "past" and this reads false. */
+    return (uint64_t)(s_frame_count - s_gte_proj_frame) <= (uint64_t)within_frames;
+}
+
 extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
     using namespace PSXRecomp::GTE;
     s_gte_exec_count++;
@@ -891,7 +924,9 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
 
     uint8_t func = cmd & 0x3F;
     switch (func) {
-        case 0x01: gte_rtps(&gte, cmd); break;
+        /* RTPS/RTPT: the frame projected 3D geometry — see the widescreen
+         * 3D-frame detector above. */
+        case 0x01: s_gte_proj_frame = s_frame_count; gte_rtps(&gte, cmd); break;
         case 0x06: gte_nclip(&gte, cmd); break;
         case 0x0C: gte_op(&gte, cmd); break;
         case 0x10: gte_dpcs(&gte, cmd); break;
@@ -909,7 +944,7 @@ extern "C" void gte_execute(CPUState* cpu, uint32_t cmd) {
         case 0x2A: gte_dpct(&gte, cmd); break;
         case 0x2D: gte_avsz3(&gte, cmd); break;
         case 0x2E: gte_avsz4(&gte, cmd); break;
-        case 0x30: gte_rtpt(&gte, cmd); break;
+        case 0x30: s_gte_proj_frame = s_frame_count; gte_rtpt(&gte, cmd); break;
         case 0x3D: gte_gpf(&gte, cmd); break;
         case 0x3E: gte_gpl(&gte, cmd); break;
         case 0x3F: gte_ncct(&gte, cmd); break;
