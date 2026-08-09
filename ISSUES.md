@@ -779,3 +779,15 @@ per-primitive work at all — it needs the tags only as a 3D-frame-vs-2D-screen
 detector, which a general GTE-activity test could supply with zero per-game RE.
 The squash path was chosen deliberately as the one proven in production on
 Tomba; the general route is recorded there as plan B.
+
+**Update 2026-08-08 — discovery done; the squash mechanism does not fit BFM.**
+The render funnel was found and the character buffer identified on two
+independent tests (see the plan). The blocker is not missing information: the
+emitters `FUN_8004ab68` / `FUN_8004b078` / `FUN_8004b614` take the model
+command pointer in `$a0`, while `psx_ws_sprite_tag` (gpu.c:804) keys the tag on
+`$a0` **being the prim address**. The prim pointer only exists inside their
+per-primitive loop. Tagging at function entry would therefore be silently inert
+— the Issue #9 failure mode itself. Making squash work needs a recompiler
+change (emit the hook at an arbitrary PC, not a function entry); plan B needs a
+general GTE-activity frame detector instead. Recommendation is plan B, pending
+the user's call.
