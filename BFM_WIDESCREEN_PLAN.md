@@ -373,6 +373,43 @@ reloaded and measured any number of times without replaying to it — and a stra
 F-key during play loads a slot, which is what silently teleported one session
 back to the tutorial and read as a freeze.
 
+
+#### Leading hypothesis: depth cue, not culling (2026-08-09, user observations)
+
+The "geometry ends" candidate above is DISPROVEN by four user observations, and
+they point somewhere better:
+
+1. The black edge slides with the world, not the screen.
+2. Walk toward the missing floor and it appears — **and can be walked on**. So
+   the tiles exist in the level and in the collision data.
+3. When the boss slams the ground, some missing tiles flash into view — only
+   ones near the impact, not all of them.
+4. Walls do not show the effect.
+
+Something that is culled does not reappear under a flash; it is not in the draw
+list to reappear. So these prims are being submitted and drawn **black**, which
+is consistent with the census already showing 36 prims in the right margin.
+
+PSX depth cue (the GTE's per-vertex fade toward a fog colour, here black)
+explains all four. Widening the FOV makes the view corners *further* from the
+camera, so a tile that was never visible in 4:3 now appears at greater depth,
+past the distance where the game already fades to black. Walking closer reduces
+the depth and it returns. The explosion adds light that beats the fade, only
+within its radius. The stair-stepped boundary is per-vertex cue on large tiles,
+so the transition lands on tile seams. Walls are nearer and lit differently.
+
+DISCRIMINATING TEST (not yet run — the process was closed before it completed):
+read each margin prim's colour word from RAM at its census `src_addr` and
+compare against centre prims in the same frame. Colour ~0 in the margin and
+normal at the centre ⇒ depth cue, and the fix is the fade distance, not a cull
+site. Normal colour in both ⇒ the hypothesis is wrong and this is something
+else. Note the packet may start at the PsyQ P_TAG, so check both `src_addr` and
+`src_addr+4` for a word whose top byte is a polygon opcode (0x20-0x3F).
+
+Recorded as a hypothesis with its test, deliberately: several confident
+readings this session survived until a measurement or a user screenshot killed
+them, and this one has not been measured yet.
+
 ### Phase 2 — Apply and verify
 
 `game.toml`: `aspect_ratio = "16:9"`, the `[widescreen]` block, and
