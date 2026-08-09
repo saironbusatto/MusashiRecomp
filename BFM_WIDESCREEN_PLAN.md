@@ -1,9 +1,19 @@
 # BFM Widescreen — Design (Issue #9)
 
-**Status:** designed, not implemented
-**Date:** 2026-08-08
+**Status:** SHIPPED 2026-08-09 — BFM renders 16:9, user-confirmed on screen
+**Date:** designed 2026-08-08, shipped 2026-08-09
 **Closes:** ISSUES.md Issue #9 for Brave Fencer Musashi (SLUS-00726)
-**Strategy chosen:** squash (the Tomba-proven path), NOT native-wide
+**Strategy shipped:** native-wide + a general GTE-activity 3D-frame detector
+
+> The sections below are kept in the order they were written, so the reasoning
+> is auditable rather than tidied after the fact. Read them knowing the
+> conclusion changed: the design chose **squash**, phase 1 proved that mechanism
+> cannot tag this engine, and plan B — recorded up front for exactly that
+> contingency — is what shipped. Where an early section says "squash", it is
+> recording what was believed then, not what was built.
+>
+> Still open: black patches in the reveal margins, two causes eliminated and one
+> outstanding (see the 2026-08-09 section).
 
 ---
 
