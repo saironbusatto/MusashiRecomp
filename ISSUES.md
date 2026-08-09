@@ -791,3 +791,56 @@ per-primitive loop. Tagging at function entry would therefore be silently inert
 change (emit the hook at an arbitrary PC, not a function entry); plan B needs a
 general GTE-activity frame detector instead. Recommendation is plan B, pending
 the user's call.
+
+
+## Issue #10 — Save states taken in overlay code do not restore
+
+**Status:** open, strong evidence, control run pending
+**Date opened:** 2026-08-09
+**Affects:** Brave Fencer Musashi (SLUS-00726); likely any title using overlays
+
+### Symptom
+
+A state saved while the guest is executing overlay code (resume PC above the
+text end, `0x80074800`) terminates the runtime on load:
+
+```
+savestate: LOADED slot 4 -> resuming pc=0x8017F8E8
+psxrecomp runtime: execution completed, PC=0x00000000
+[slice diag] slice_fired=0 dirty_insns=260731063 exit_pc=0x00000000
+             dispatchable=0 dirty=0 in_text=0
+```
+
+The runtime states outright that the restored PC was not dispatchable, then
+falls through to pc=0 and exits.
+
+### The contrast is internal to one build
+
+Two states written minutes apart by the same session, same binary:
+
+| saved | resume PC | region | result |
+|---|---|---|---|
+| 09:16 | `0x8004B1D8` | static text | loads and runs |
+| 09:21 | `0x8017F8E8` | overlay | pc=0 exit |
+
+### Why it matters beyond widescreen
+
+MusaGround needs save states AND overlays together — overlays are where BFM
+keeps its gameplay logic (the damage store lives at `0x8014BCB4`). A state that
+only survives if the player happens to freeze inside static text is a serious
+limitation for the mod, not a corner case.
+
+### Likely mechanism (unverified)
+
+Overlay code is dispatched through loaded native fragments or the dirty-RAM
+interpreter. A restore rebuilds RAM but the resume PC's overlay may not be
+re-registered as dispatchable, so the dispatcher finds nothing at that address.
+`dirty=0` in the diag suggests the dirty-page state that would route it to the
+interpreter is not restored either.
+
+### Next step
+
+Re-run the control (load a static-PC state on the same binary) — the attempt
+made when this was found exited before the load and proved nothing. Then check
+whether overlay registration and dirty-page state are part of the snapshot at
+all (`boot_state.c` section list).
