@@ -165,6 +165,119 @@ position while walking. Correlation alone is rejected.
 reuse address ranges. If the renderer sits above `0x80074800`, confirm only one
 overlay maps that address, or the tag fires inside unrelated code.
 
+### Phase 1 — RESULT 2026-08-08: the discovery succeeded, the mechanism does not fit
+
+Discovery ran and produced its answer. Assumption 4 then failed — not by being
+wrong about BFM's engine, but by being wrong about the mechanism's fit.
+
+#### Prim buffers, found straight from `ws_census`
+
+`ws_census` carries a `src_addr` column, so the prim buffers came out of the
+census directly; `wtrace` was not needed to find them. From a live gameplay
+frame (savestate slot 1):
+
+| region | what | evidence |
+|---|---|---|
+| `0x8007B000+` | world / scenery | ~566 prims/frame, coords spread -240..173 |
+| `0x800A4000+` | HUD | 58 prims, sprite opcodes (0x74/0x64/0x60), fixed position |
+| `0x80115000+` | **the character** | ~180 prims in a 35x28px cluster, gouraud + textured-gouraud polys |
+
+#### The character identification passed on two independent tests
+
+**Geometry.** From a user screenshot: Musashi at screen (655,575) in a 884x610
+game image → PSX (149.9, 188.8). Region C centroid cx=-8.53, cy=62.69 with
+`draw_offset [160,360]` and `draw_area` starting at y=250 → PSX (151.5, 172.7).
+**X matches to 1.6px.** The 16px Y difference is the expected offset between a
+model's centroid and the visual centre of the sprite. The other two characters
+on screen sit at PSX y≈85, far from region C.
+
+**Movement.** The user walked the character (input injection could not, see
+below) between two census snapshots:
+
+| region | Δx | Δy | reading |
+|---|---|---|---|
+| A world | **+57.97** | -32.42 | camera moved, scenery scrolled |
+| B HUD | **-0.00** | +0.00 | screen-fixed — the experiment's control |
+| C character | **-38.46** | -23.86 | moved, on a different vector than the world |
+
+The HUD reading exactly zero is what gives the result its force: it proves the
+measurement is sensitive, so "did not move" would have shown as zero.
+
+#### The engine's render funnel
+
+`wtrace_range` over the character buffer, then Ghidra lookup of the store PCs:
+
+- **Prim emitters** (leaf, they do the stores): `FUN_8004ab68` (0x8004AB68),
+  `FUN_8004b078` (0x8004B078), `FUN_8004b614` (0x8004B614). All three take the
+  same 7 parameters and run `copFunction(2,0x280030)` = **RTPT** then
+  `copFunction(2,0x1400006)` = NCLIP. They differ by primitive type. This is
+  the RTPS cluster the design predicted.
+- **Dominant caller**: `FUN_80055d40` (0x80055D40, 4568 bytes) — 220 of 256
+  traced writes, from 5 call sites.
+- Remaining 36 writes come from overlay code (`ra` above 0x80074800). The
+  emitters themselves are in **static text**, so the overlay address-reuse
+  hazard flagged in this plan does not apply to them.
+
+#### Why the squash mechanism cannot tag this engine
+
+`psx_ws_sprite_tag` (gpu.c:804):
+
+```c
+uint32_t key = cpu->gpr[4] & 0x1FFFFCu;   /* $a0 must BE the prim address */
+uint32_t sxy = cpu->read_word(ws_anchor_addr);
+```
+
+The key is `$a0` at function entry, and `ws_tagged_anchor` looks it up against
+`gp0_cmd_source_addr` — the prim's address — when the GP0 command executes.
+
+In BFM, `$a0` at the entry of these emitters is the **model command data**
+(0x800DCxxx). Prims are written to 0x115xxx. The stored key could never match
+the looked-up one, so **the tag would be inert** — and inert in exactly the
+silent way Issue #9 is about.
+
+The prim pointer does exist, but only inside the loop: the trace shows `a3` and
+`v1` holding 0x0011CC00 / 0x0011CBB8 / 0x0011CD30 mid-iteration, derived from
+`param_7`. The emitters iterate over primitives internally (`do/while`) and
+there is no deeper per-prim helper to hook — they are the leaf.
+
+So a working squash on BFM needs the tag to fire **per loop iteration**, which
+means teaching the recompiler to emit the hook at an arbitrary PC rather than at
+a function entry. That is a mechanism change, not configuration.
+
+#### Recommendation: take plan B
+
+Plan B got stronger with what phase 1 measured. The emitters use RTPT, so a
+general "did this frame run RTPS/RTPT?" test is straightforward, is **game-
+agnostic**, and is the only piece native-wide lacks — native-wide does no
+per-primitive work at all, is already the repo default (`config_loader.h:406`),
+and already has `wide_shot` to capture its result.
+
+| | squash (current choice) | native-wide (plan B) |
+|---|---|---|
+| work left | recompiler per-PC hook + find the anchor | 3D-frame detector |
+| scope | BFM only | every 3D title |
+| capture to verify | none on this host | `wide_shot` exists |
+| artifact tail | known, documented | gone by construction |
+| open risk | — | `gp0_copy`=5132, BFM does VRAM→VRAM copies |
+
+#### Two phantom defects, both retracted
+
+Recorded because the pattern cost real time: inferring defects from a blind
+channel, where the user's view of the screen kept correcting the inference.
+
+1. **"savestate load crashes the runtime."** It exited with EXIT=0 — a clean
+   shutdown, because the user had closed the window. `"emu busy or frozen"` was
+   `s_io_running` already false, not a wedge.
+2. **"input injection is broken / the hybrid-pad bug."** `pad_status` reflected
+   `0xFF7F` correctly and nothing moved, which looked like the SIO weakness
+   CLAUDE.md flags on Axis 5. The actual cause: a boss had cast a hold on the
+   character, which the game releases only after a skill. No evidence of a pad
+   bug here.
+
+Real gotcha, not phantom: the PSX pad word is **active-low** (`main.cpp:1295`)
+and `PAD_LEFT` is `1<<7` (`main.cpp:752`), so LEFT is `0xFF7F`. Injecting
+`0x8000` means *everything except one button pressed*, which cost a cycle.
+
 ### Phase 2 — Apply and verify
 
 `game.toml`: `aspect_ratio = "16:9"`, the `[widescreen]` block, and
