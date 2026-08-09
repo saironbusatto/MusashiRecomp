@@ -830,17 +830,34 @@ keeps its gameplay logic (the damage store lives at `0x8014BCB4`). A state that
 only survives if the player happens to freeze inside static text is a serious
 limitation for the mod, not a corner case.
 
-### Likely mechanism (unverified)
+### CORRECTION 2026-08-09 — the diag zeros are NOT evidence
 
-Overlay code is dispatched through loaded native fragments or the dirty-RAM
-interpreter. A restore rebuilds RAM but the resume PC's overlay may not be
-re-registered as dispatchable, so the dispatcher finds nothing at that address.
-`dirty=0` in the diag suggests the dirty-page state that would route it to the
-interpreter is not restored either.
+An earlier version of this issue reasoned from `dispatchable=0 dirty=0
+in_text=0` and concluded the restored PC was not dispatchable. **That was a
+misreading.** Those are `g_slice_exit_*`, owned by the precise-slicing
+mechanism, which is parked and off by default — and the same line reports
+`slice_fired=0`, so nothing ever populated them. They are initial values, not a
+measurement.
+
+What remains as actual evidence is only this: restoring a state whose resume PC
+lies in overlay code is followed by a `PC=0x00000000` exit. That is real and
+reproducible. Any mechanism beyond it is currently unsupported.
+
+What IS established about the snapshot, by reading `boot_state.c`: it carries 14
+sections (CPU, RAM, SPAD, IRQ, TIMER, CLOCK, GPU, VRAM, SPU, SPURAM, CDROM, DMA,
+SIO, DIRTY) and **no overlay section**. Overlays appear only as header integrity
+fields (codegen hash, ABI tag, version), which check that the build matches —
+not which overlays are mapped. Whether that absence is the cause is exactly what
+has not been shown.
 
 ### Next step
 
-Re-run the control (load a static-PC state on the same binary) — the attempt
-made when this was found exited before the load and proved nothing. Then check
-whether overlay registration and dirty-page state are part of the snapshot at
-all (`boot_state.c` section list).
+Run with **`PSX_EXIT_HALT=1`** (main.cpp:3109). It halts and serves at the pc=0
+exit instead of shutting down, with the overlays still loaded and the whole
+guest state live over TCP — which is the difference between reading a corpse
+and questioning a witness. Then ask what the dispatcher actually holds for
+0x8017F8E8 at that moment.
+
+Also still outstanding: the control run (load a static-PC state on the same
+binary). The attempt made when this was found exited before the load and proved
+nothing.
