@@ -24,13 +24,21 @@ strict  = true
 # window as unresponsive during boot). Baked in so no CLI flag is needed.
 renderer          = "opengl"
 
-# aspect_ratio is deliberately NOT set. Widescreen is not a config-only win
-# here: it applies only to frames the sprite-tag path has stamped, and that
-# path needs [widescreen] sprite_tag_funcs + sprite_anchor_addr — i.e. the
-# game's own character-drawing functions have to be identified first. With no
-# tags, ws_game_mode() is always false, gpu_ws_present_native_43() forces a 4:3
-# pillarbox, and the picture stays 4:3 while the boot banner cheerfully claims
-# "widescreen 16:9". Verified on screen. See ISSUES.md Issue #9.
+# 16:9 via native-wide (the default wide strategy): the wider field of view is
+# rendered into an actually wider frame and presented 1:1, with no GTE squash
+# and no per-primitive correction — so it needs no [widescreen] block.
+#
+# This was previously unset, because the only 3D-frame detector was the
+# per-game sprite-tag path: with no tags ws_game_mode() was always false, every
+# frame pillarboxed, and the banner claimed "widescreen 16:9" while the picture
+# stayed 4:3 (ISSUES.md Issue #9). The detector is now general — gte.cpp stamps
+# the frame on RTPS/RTPT, which is direct evidence the frame drew 3D — so the
+# setting does what it says here without identifying any of the game's own
+# drawing functions.
+#
+# Note this window is LARGER than 4:3 on a short screen: 4:3 at 1280 is
+# 1280x960 and gets clamped down to fit, 16:9 at 1280 is 1280x720 and does not.
+aspect_ratio      = "16:9"
 
 # 2x ordered-grid supersampling. Fill-rate cost is ~N^2, which is nothing for
 # PS1-era geometry on any modern GPU; 3 or 4 also work if the edges still read

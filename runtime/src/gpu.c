@@ -89,6 +89,7 @@ static WsTag    ws_tags[WS_TAG_BUCKETS];
 static uint32_t ws_last_tag_stamp = (uint32_t)-1000; /* frame of newest tag */
 extern uint64_t s_frame_count;               /* defined in debug_server.c */
 extern int      mdec_recently_active(uint32_t within_frames);  /* mdec.c */
+extern int      gte_projection_recent(uint32_t within_frames); /* gte.cpp */
 
 static int ws_configured(void) { return ws_xnum != ws_xden; }
 
@@ -121,9 +122,21 @@ static int ws_full_2d_mode(void) {
     if (env < 0) { const char *e = getenv("PSX_WS_FORCE_2D"); env = (e && e[0] == '1') ? 1 : 0; }
     return ws_full_2d || env;
 }
+/* A frame is gameplay when it drew 3D. Three independent ways to know, in
+ * increasing generality:
+ *   - [widescreen] full_2d, for a pure-2D sprite game that never projects.
+ *   - A sprite tag within 2 frames: the per-game character-render funnel ran.
+ *     Only titles with [widescreen] sprite_tag_funcs configured can say this.
+ *   - The GTE ran RTPS/RTPT within 2 frames (gte.cpp). This needs no per-game
+ *     configuration at all, so a title with no [widescreen] block still gets a
+ *     correct answer instead of being silently pillarboxed forever
+ *     (ISSUES.md Issue #9).
+ * ORed, not replaced: the tag path stays authoritative where it is configured,
+ * so a title already tuned against it (Tomba) keeps its exact behaviour. */
 static int ws_game_mode(void) {
     if (ws_full_2d_mode()) return 1;
-    return (uint32_t)s_frame_count - ws_last_tag_stamp <= 2;
+    if ((uint32_t)s_frame_count - ws_last_tag_stamp <= 2) return 1;
+    return gte_projection_recent(2);
 }
 
 /* True when the current frame is presented at native 4:3 (NOT stretched), so
