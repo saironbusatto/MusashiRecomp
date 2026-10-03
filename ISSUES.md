@@ -953,7 +953,8 @@ config-load guard was added. Carried forward as a known gap, not a BFM defect.
 
 ## Issue #10 — Save states taken in overlay code do not restore
 
-**Status:** root-caused 2026-10-03 — control run done; resume PC is mid-function
+**Status:** OPEN, narrowed 2026-10-03 — control run done; failure is in the interpreter's
+return path at the resumed function's epilogue, NOT an unroutable resume PC.
 inside a natively-mapped overlay, which the dispatcher cannot route. Not fixed.
 **Date opened:** 2026-08-09
 **Affects:** Brave Fencer Musashi (SLUS-00726); likely any title using overlays
@@ -1054,9 +1055,9 @@ range. `HI`/`LO` after the failed load (`0xFFFFFFFF` / `0xFFFC10BD`) match
 slot04's saved values exactly. **The snapshot restored correctly; the bytes are
 there.** The failure is not a missing-overlay-section problem.
 
-**What the dispatcher holds for `0x8017F8E8`: nothing.** `sljit_try` (a
-one-shot leaf compile of the function at a live phys address) discriminates
-exactly the two cases:
+**What the dispatcher holds for `0x8017F8E8`: nothing usable, but the address
+IS routed.** `sljit_try` (a one-shot leaf compile of the function at a live phys
+address) discriminates the two cases:
 
 | address | role | `sljit_try` |
 |---|---|---|
@@ -1064,12 +1065,56 @@ exactly the two cases:
 | `0x8017F8E8` | the failing resume PC | `compiled:0` |
 | `0x80042558` | working static-text PC | `compiled:0` (not a leaf — expected) |
 
-`0x8017F8E8` behaves like a non-entry address, not like a function start. The
-consistent reading: **the resume PC is mid-function inside a natively-mapped
-overlay.** Dispatch routes on registered overlay function entries, or falls to
-`dirty_ram_dispatch` for pages the interpreter owns. A mid-function address in
-a natively-compiled overlay matches neither, so the trampoline has no route and
-publishes `PC=0`.
+`overlay_cps_probe` armed at `0x8017F8E8` and then loading slot04 gives the
+precise rejection (`count:1`, `ci:-1`, `cands_in_range:0`):
+`overlay_find_by_range` finds **no candidate whose declared code ranges contain
+`0x17F8E8`**. So the native/CPS continuation re-entry path
+(`overlay_loader.c:1714`, which *would* resume mid-function via
+`cpu->pc = addr; c->fn(cpu)`) cannot fire — the owning function was never
+discovered, so there is no registered entry.
+
+**CORRECTION 2026-10-03 (later the same day) — "the dispatcher holds nothing"
+was wrong, and so was the implied cause.** The address *is* routed: the
+`dirty_ram_is_dirty` gate at `dirty_ram_interp.c:2128` passes (the snapshot's
+DIRTY bitmap has page `0x17F` set — verified by decoding slot04's 64-byte DIRTY
+section), so the interpreter executes it. It runs the ~24 bytes from
+`0x8017F8E8` and then **fails closed to `PC=0` at `0x8017F900`** — named by the
+existing PC=0 tripwire (`freeze_check` → `pczero_count:1`,
+`pczero_addr:0x8017F900`).
+
+Decoded from the snapshot's RAM, that address is the **epilogue of the function
+the resume landed in**:
+
+```
+0x8017F900: lbu   $3, 532($s0)
+0x8017F904: sw    $2, 408($s0)
+0x8017F908: addiu $3, $v1, 1
+0x8017F90C: sb    $3, 532($s0)
+0x8017F910: lw    $31, 28($sp)      <- restore ra
+0x8017F914: lw    $16, 24($sp)      <- restore s0
+0x8017F918: addiu $29, $sp, 32      <- pop frame
+0x8017F91C: jr    $31               <- return
+```
+
+`$s0 = 0x800DB888`, so every load/store above is valid RAM — no address fault.
+`dirty_ram_unsupported` reads all zeros, so the unsupported-opcode path (line
+2288) did **not** fire. The remaining candidates are the interpreter's
+`jal`/`jalr`/`jr` transfer paths (lines 1215/1232/1386/1403), which set
+`cpu->pc = 0` and then try `interp_enter_compiled` / `overlay_loader_call_native`
+before falling into the call-contract logic — and where a **sp mismatch at
+return starts a bail unwind that publishes `cpu->pc = cpu->gpr[31]`**, i.e. `0`
+when `$ra` is 0.
+
+**So this is very likely NOT a "missing mid-function resume capability."** It is
+the interpreter's return/call-contract path failing on a mid-function resume,
+where the frame bookkeeping only makes sense if the function was entered at its
+own prologue. That distinction matters: option (a) below is not merely cheaper,
+it is **not implementable as scoped** — with `ci == -1` there is no registered
+entry to record an offset against.
+
+**Not yet confirmed:** which of the transfer paths publishes the 0. The next
+measurement is to catch the `jr $31` at `0x8017F91C` and read `$ra`/`$sp` at that
+instant. Until then the call-contract hypothesis stays a hypothesis.
 
 **A caveat that killed a wrong turn:** `dispatch_check` is useless here. It
 answers "was this address recently dispatched" against a bounded ring
@@ -1077,13 +1122,19 @@ answers "was this address recently dispatched" against a bounded ring
 `0x80042558` too — a PC that demonstrably works. Do not read its zeros as
 "undispatchable".
 
-### Fix direction (not implemented)
+### Fix direction (SUPERSEDED — see the correction above)
 
-Not a codegen bug — a missing capability. Restoring mid-function requires the
-dispatcher to accept a resume PC that is not an entry: either snapshot the
-overlay entry + intra-function offset and resume at the entry, or teach the
-trampoline to hand a mid-function overlay address to the interpreter. Option 1
-is cheaper and matches the observation that entries *are* registered.
+Do **not** implement "snapshot the entry + intra-function offset" as written:
+`overlay_find_by_range` returns -1 and `sljit_try` returns `compiled:0` for
+`0x8017F8E8`, so there is no registered entry to record an offset against. The
+failure is further downstream, in the interpreter's return path at the function
+epilogue (`0x8017F910`–`0x8017F91C`), not in the absence of a mid-function
+resume capability.
+
+The real fix is in the interpreter's call-contract/bail-unwind handling for a
+mid-function resume: a frame entered at its prologue has return bookkeeping
+that a mid-function entry does not. Confirm which transfer path publishes the
+0 before changing it.
 
 ### Tooling fixed along the way
 
