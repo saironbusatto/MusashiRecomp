@@ -540,6 +540,29 @@ base for a 26-bit region-relative jump. Five sites in the tree agree
 call is ever executed is not established here. Resolve by tracing the
 `func_8001FC08` call site at runtime before treating it as a live defect.
 
+### Audit caveat — "CLEAN" means "no KNOWN defects", not "no defects"
+
+`codegen_audit_game.py` now exits 0 / prints CLEAN on BFM. Do not read that as
+proof the build is clean. Two limits, both structural:
+
+1. **Passes [2] and [3] are VACUOUS.** BFM's generated code contains **zero**
+   `call_by_address` sites — the emitter produces CPS tail-transfers instead
+   (2940 of them). So the pass that was originally written to watch Issue #5's
+   exact regression class can no longer fire, for BFM or for any game emitted
+   through the CPS path. The tool now prints an explicit VACUOUS note rather
+   than letting a structural zero read as "0 bugs".
+2. **Pass [4] buckets by declared region.** All 8 remaining tail-call misses
+   fall outside `[audit] regions`, so they are reported as expected-absent
+   overlay/RAM targets. Seven are confirmed inside captured overlay[1]. The
+   eighth, `0x800CAE80`, is bucketed the same way only because it lies outside
+   the declared text region — it is in the 358 KB gap between text end
+   (0x80074800) and overlay[1] base (0x800CE000), which nothing maps. If the
+   declared region is ever widened, that target will move into the DEFECT
+   bucket.
+
+So the accurate statement is: **0 known defects, 1 unexplained target, 2 dead
+passes.** The exit code is a regression tripwire, not a correctness proof.
+
 ---
 
 ## Issue #4 — 7 unemitted GTE / COP2 instructions in BIOS Shell code

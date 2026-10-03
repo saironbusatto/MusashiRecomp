@@ -136,21 +136,50 @@ def main():
         cnt = sum(1 for t in cba_lits if cfg.normalize_addr(int(t, 16)) == m)
         print(f"      0x{m:08X}  ({cnt} site{'s' if cnt!=1 else ''})")
 
+    # A pass that finds nothing is indistinguishable from a pass that is
+    # watching a construct the emitter no longer produces. ISSUES.md Issue #5
+    # was "call_by_address mid-func targets missing from dispatch", yet this
+    # pass read 0 sites on BFM — so it could never have caught that
+    # regression, or its repair. Say so explicitly rather than letting a
+    # structural zero pass as "no bugs".
+    if not cba_lits:
+        print("    NOTE: no call_by_address sites exist in this build, so this pass")
+        print("          is VACUOUS. It cannot detect a regression in the")
+        print("          call_by_address emit path (ISSUES.md Issue #5). The")
+        print("          construct actually emitted is the CPS tail-transfer")
+        print("          checked by pass [4].")
+
     # ── 3. Indirect call_by_address distribution ───────────────────────
     cba_regs = RE_CALL_BY_ADDR_REG.findall(full_c)
     print(f"\n[3] indirect call_by_address sites: {len(cba_regs)} total")
     print(f"    by register: {dict(Counter(cba_regs).most_common(8))}")
+    if not cba_regs:
+        print("    NOTE: VACUOUS — no indirect call_by_address sites in this build.")
 
     # ── 4. Tail-call targets ───────────────────────────────────────────
+    # This is the construct BFM's emit actually produces (thousands of CPS
+    # tail-transfers), so unlike pass [2] it is not vacuous. But a target
+    # absent from the static table is only a DEFECT when it is code that
+    # should have been compiled. A target outside every declared code region
+    # is a RAM-loaded overlay, which the dirty-RAM interpreter owns by
+    # design (CLAUDE.md Rule 18) and which is expected to be missing here.
     tail_calls = RE_TAIL_CALL.findall(full_c)
     tail_set = set(cfg.normalize_addr(int(t, 16)) for t in tail_calls)
     tail_missing = sorted(tail_set - table_set)
+    tail_missing_code = [m for m in tail_missing if is_in_code(m)]
+    tail_missing_ram = [m for m in tail_missing if not is_in_code(m)]
     print(f"\n[4] tail-call (cpu->pc=...; return;) targets: {len(tail_set)} unique, "
           f"{len(tail_calls)} sites")
     print(f"    tail-call targets MISSING from dispatch: {len(tail_missing)}")
-    for m in tail_missing[:25]:
+    print(f"      in declared code regions (DEFECTS): {len(tail_missing_code)}")
+    for m in tail_missing_code[:25]:
         cnt = sum(1 for t in tail_calls if cfg.normalize_addr(int(t, 16)) == m)
-        print(f"      0x{m:08X}  ({cnt} site{'s' if cnt!=1 else ''})")
+        print(f"        0x{m:08X}  ({cnt} site{'s' if cnt!=1 else ''})")
+    print(f"      outside code regions (overlay/RAM — expected absent): "
+          f"{len(tail_missing_ram)}")
+    for m in tail_missing_ram[:25]:
+        cnt = sum(1 for t in tail_calls if cfg.normalize_addr(int(t, 16)) == m)
+        print(f"        0x{m:08X}  ({cnt} site{'s' if cnt!=1 else ''})")
 
     # ── 5. Branch-condition population ─────────────────────────────────
     bc_decls = RE_BC_DECL.findall(full_c)
@@ -167,10 +196,14 @@ def main():
         print(f"      {g}")
 
     # ── Summary ────────────────────────────────────────────────────────
+    # Only count things that are actually defects. An out-of-region
+    # tail-call target is a RAM-loaded overlay the dirty-RAM interpreter owns
+    # (CLAUDE.md Rule 18); counting it as a "real-bug finding" is what made
+    # this tool report 929 phantom misses before the dispatch regex was fixed.
     real_bugs = (
         len(unresolved_calls)        # direct call to undefined function
         + len(cba_missing_in_code)    # in-code literal call_by_address not in dispatch
-        + len(tail_missing)           # tail call not in dispatch
+        + len(tail_missing_code)      # tail call to in-code address not in dispatch
         + len(unresolved_gotos)       # goto to undefined label
     )
 
@@ -178,8 +211,12 @@ def main():
     print(f"  unresolved direct calls           : {len(unresolved_calls)}")
     print(f"  in-code call_by_address misses    : {len(cba_missing_in_code)}")
     print(f"  RAM call_by_address (expected)    : {len(cba_in_ram)}")
-    print(f"  tail-call misses                  : {len(tail_missing)}")
+    print(f"  tail-call misses (in code)        : {len(tail_missing_code)}")
+    print(f"  tail-call misses (overlay, ok)   : {len(tail_missing_ram)}")
     print(f"  unresolved goto labels            : {len(unresolved_gotos)}")
+    if not cba_lits:
+        print("  vacuous passes                    : [2] [3] "
+              "(no call_by_address emitted — see NOTE above)")
     print(f"  total real-bug findings           : {real_bugs}")
     print(f"  STATUS                            : {'CLEAN' if real_bugs == 0 else 'ISSUES FOUND'}")
 
