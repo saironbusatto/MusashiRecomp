@@ -25,6 +25,7 @@ Commands (shared — identical on both servers):
     watch <addr>                Set byte watchpoint
     unwatch <addr>              Remove watchpoint
     pause                       Pause execution
+    savestate load|save <slot>  Save-state load/save (F1-F12 / Shift+F1-F12)
     continue / c                Resume execution
     step [n]                    Step N frames (default 1)
     run_to <frame>              Run to specific frame, then pause
@@ -230,6 +231,18 @@ def build_cmd(args):
         return {"cmd": "unwatch", "addr": args[1]}, pretty_json
     elif cmd == "pause":
         return {"cmd": "pause"}, pretty_json
+    elif cmd == "savestate":
+        # Server supports this (debug_server.c handle_savestate) but the client
+        # had no binding for it, so the whole save/load flow was undrivable
+        # headlessly -- which is why ISSUES.md Issue #10's control run was
+        # recorded as "exited before the load and proved nothing".
+        # Usage: savestate load|save <slot>
+        if len(args) < 3:
+            return None, lambda _: "Usage: savestate load|save <slot>"
+        op = args[1]
+        if op not in ("load", "save"):
+            return None, lambda _: "Usage: savestate load|save <slot>"
+        return {"cmd": "savestate", "op": op, "slot": int(args[2])}, pretty_json
     elif cmd in ("continue", "c"):
         return {"cmd": "continue"}, pretty_json
     elif cmd == "step":

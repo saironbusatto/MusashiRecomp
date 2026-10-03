@@ -10056,8 +10056,18 @@ static void handle_sljit_try(int id, const char *json)
 {
     extern void overlay_loader_sljit_probe(uint32_t addr, OverlaySljitResult *out);
     uint32_t addr = 0;
-    const char *p = strstr(json, "\"addr\"");
-    if (p) { p = strchr(p, ':'); if (p) addr = (uint32_t)strtoul(p + 1, NULL, 0); }
+    /* Accept BOTH JSON shapes. The hand-rolled strstr/strchr/strtoul below
+     * only parsed an UNQUOTED number: on a quoted value ("addr":"0x8017F8E8")
+     * strtoul met the opening quote, returned 0, and the probe answered
+     * "need addr" for every well-formed request. tools/debug_client.py sends
+     * hex addresses as quoted strings, so the probe was unreachable from the
+     * sanctioned Rule-3 client. Parse via the shared helpers instead. */
+    char sbuf[32] = {0};
+    if (json_get_str(json, "addr", sbuf, sizeof(sbuf)) && sbuf[0]) {
+        addr = (uint32_t)strtoul(sbuf, NULL, 0);
+    } else {
+        addr = (uint32_t)json_get_int(json, "addr", 0);
+    }
     if (!addr) { send_fmt("{\"id\":%d,\"ok\":false,\"err\":\"need addr\"}\n", id); return; }
     OverlaySljitResult r = {0};
     overlay_loader_sljit_probe(addr, &r);

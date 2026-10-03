@@ -953,7 +953,8 @@ config-load guard was added. Carried forward as a known gap, not a BFM defect.
 
 ## Issue #10 — Save states taken in overlay code do not restore
 
-**Status:** open, strong evidence, control run pending
+**Status:** root-caused 2026-10-03 — control run done; resume PC is mid-function
+inside a natively-mapped overlay, which the dispatcher cannot route. Not fixed.
 **Date opened:** 2026-08-09
 **Affects:** Brave Fencer Musashi (SLUS-00726); likely any title using overlays
 
@@ -1019,3 +1020,79 @@ and questioning a witness. Then ask what the dispatcher actually holds for
 Also still outstanding: the control run (load a static-PC state on the same
 binary). The attempt made when this was found exited before the load and proved
 nothing.
+
+### MEASURED 2026-10-03 — control run done, cause narrowed to mid-function resume
+
+Both gaps above are now closed. The states were on disk the whole time; they
+were decoded rather than re-captured (`probes/decode_pst.py`), and all three
+carry **identical** integrity fields (`bios_checksum=0xF67ECB99`,
+`codegen_hash=0x0F5548CF`, `abi_tag=0x0A`, `codegen_ver=4`) — so they came from
+one build and can be compared against each other:
+
+| state | resume PC | region |
+|---|---|---|
+| slot01 | `0x80042558` | static text (control) |
+| slot02 | `0x8004250C` | static text (control) |
+| slot04 | `0x8017F8E8` | **overlay** |
+
+Reproduced twice, same process, same binary, control first:
+
+```
+savestate: LOADED slot 1 -> resuming pc=0x80042558   -> keeps running
+savestate: LOADED slot 4 -> resuming pc=0x8017F8E8
+FATAL: top-level dispatch returned PC=0 (abnormal boot exit -- inspect live)
+```
+
+So the contrast the issue needed is now real, and the earlier evidence is
+vindicated: a state survives iff its resume PC is a static-text address.
+
+**The overlay code IS present after restore.** RAM at `0x8017F8E8` reads
+`1b1c050c 21200002 1980043c 44728424 9fdd040c 00000000 14020392 980102ae`,
+which decodes to plausible MIPS (`jal 0x8014706C`, `lui`/`addiu`,
+`jal 0x8013767C`, `nop`, `lbu`, `sb`) with both `jal` targets inside the overlay
+range. `HI`/`LO` after the failed load (`0xFFFFFFFF` / `0xFFFC10BD`) match
+slot04's saved values exactly. **The snapshot restored correctly; the bytes are
+there.** The failure is not a missing-overlay-section problem.
+
+**What the dispatcher holds for `0x8017F8E8`: nothing.** `sljit_try` (a
+one-shot leaf compile of the function at a live phys address) discriminates
+exactly the two cases:
+
+| address | role | `sljit_try` |
+|---|---|---|
+| `0x800CF854` | registered overlay entry | `compiled:1, insns:4` |
+| `0x8017F8E8` | the failing resume PC | `compiled:0` |
+| `0x80042558` | working static-text PC | `compiled:0` (not a leaf — expected) |
+
+`0x8017F8E8` behaves like a non-entry address, not like a function start. The
+consistent reading: **the resume PC is mid-function inside a natively-mapped
+overlay.** Dispatch routes on registered overlay function entries, or falls to
+`dirty_ram_dispatch` for pages the interpreter owns. A mid-function address in
+a natively-compiled overlay matches neither, so the trampoline has no route and
+publishes `PC=0`.
+
+**A caveat that killed a wrong turn:** `dispatch_check` is useless here. It
+answers "was this address recently dispatched" against a bounded ring
+(22.7M entries at capture time), and it returns `found:false` for
+`0x80042558` too — a PC that demonstrably works. Do not read its zeros as
+"undispatchable".
+
+### Fix direction (not implemented)
+
+Not a codegen bug — a missing capability. Restoring mid-function requires the
+dispatcher to accept a resume PC that is not an entry: either snapshot the
+overlay entry + intra-function offset and resume at the entry, or teach the
+trampoline to hand a mid-function overlay address to the interpreter. Option 1
+is cheaper and matches the observation that entries *are* registered.
+
+### Tooling fixed along the way
+
+- `tools/debug_client.py` had **no binding for `savestate`**, though the server
+  implements it (`handle_savestate`). The entire save/load flow was undrivable
+  from the sanctioned Rule-3 client — which is why the control run was recorded
+  as impossible. Added, plus a usage line.
+- `handle_sljit_try` parsed `addr` with hand-rolled `strstr`/`strchr`/`strtoul`,
+  which only worked on an **unquoted** JSON number. `debug_client.py` sends hex
+  addresses as quoted strings, so the probe answered `"need addr"` for every
+  well-formed request — the tool was unreachable exactly as this issue needed
+  it. Now parses both shapes; verified quoted-hex works, decimal still works.
