@@ -544,7 +544,8 @@ call is ever executed is not established here. Resolve by tracing the
 
 ## Issue #4 — 7 unemitted GTE / COP2 instructions in BIOS Shell code
 
-**Status:** open, audit-surfaced
+**Status:** CLOSED 2026-10-03 — false positive. All are emitted; the detection
+method was invalid (see below).
 **Date opened:** 2026-05-12
 **Phase:** 4 (BIOS shell render)
 **Likely related to:** Issue #3 (missing PS logo on disc-detected screen)
@@ -591,6 +592,49 @@ Check whether ANY PC near `0xBFC34FF8` appears in
 sites aren't, it's an emit gap (fix in code_generator.cpp). If
 neighbors are absent too, it's a discovery gap (fix in function
 discovery seeds). Either way, then close Issue #3 alongside.
+
+### CLOSED 2026-10-03 — false positive; every one of these is emitted
+
+The next step above is what produced the false positive, so it is worth
+recording why it cannot work. Generated C is a *translation*: it carries a
+per-instruction `/* 0xADDR: WORD text */` comment for instructions worth
+annotating, but an ordinary instruction's PC does **not** appear as a
+token. Grepping the generated file for a PC therefore proves nothing —
+neither presence nor absence. The right instrument is `tools/gte_coverage.py`,
+which pairs each ROM GTE site with the emit attributed to it:
+
+```
+$ python3 tools/gte_coverage.py
+=== GTE instructions in BFC34F00-BFC36D00 ===
+Total in region: 479
+Present in generated: 479
+Missing: 0
+```
+
+All four MVMVA sites are emitted inside `func_1FC34FA0`, each as
+`gte_execute(cpu, 0x0480012)` directly under its own address comment:
+
+```
+/* 0xBFC34FF8: 4A480012  gte cmd 0x12 */   gte_execute(cpu, 0x0480012);
+/* 0xBFC3502C: 4A480012  gte cmd 0x12 */   gte_execute(cpu, 0x0480012);
+/* 0xBFC35064: 4A480012  gte cmd 0x12 */   gte_execute(cpu, 0x0480012);
+/* 0xBFC350C4: 4A480012  gte cmd 0x12 */   gte_execute(cpu, 0x0480012);
+```
+
+The LWC2/SWC2 class is emitted too, via the `gte_read_data` /
+`gte_write_data` helpers that keep register side effects centralized (16
+`gte_read_data` in this function) plus a direct `swc2` at 0xBFC35094 — so
+"3 missing LWC2/SWC2 emits" was an artifact of counting emits instead of
+tracing them.
+
+Corroborating the emit-gap half of the old hypothesis is wrong too: the
+containing function was discovered long ago. `func_1FC34FA0` is emitted and
+its next emitted sibling is `func_1FC35128`, so these PCs are interior to a
+known function rather than sitting in an undiscovered gap.
+
+**Issue #3 is unaffected by this.** The missing PS-logo glyph is still open and
+still unexplained; this closure removes only the proposed *cause*. Do not read
+it as evidence that the logo bug is fixed.
 
 ## Issue #6 — Launcher art has rough cutout edges (memory cards + controllers)
 
