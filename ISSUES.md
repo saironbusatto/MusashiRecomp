@@ -403,7 +403,9 @@ RAM/VRAM coordinates.
 
 ## Issue #5 — Mid-function split targets not registered in dispatch table
 
-**Status:** open, audit-surfaced
+**Status:** CLOSED 2026-10-03 — does not reproduce; fixed upstream by the
+mid-function convergence pre-pass. Audit tooling that would have caught a
+regression was broken and has been repaired (see below).
 **Date opened:** 2026-05-12
 **Phase:** platform (recompiler emit, full_function_emitter path)
 **Bug class:** same shape as 2026-05-12 jump-table cross-function fix
@@ -460,6 +462,83 @@ overlays correctly handled by `dirty_ram_dispatch`.
 3. Re-run `codegen_audit_game.py` — expect "in-code call_by_address
    misses: 0".
 4. Re-run on BIOS to confirm no regression.
+
+### CLOSED 2026-10-03 — measured on BFM; the original symptom is absent
+
+Re-measured on Brave Fencer Musashi (SLUS-00726) rather than Tomba:
+
+```
+[2] literal call_by_address targets: 0 unique, 0 sites
+    in-code targets MISSING from dispatch: 0
+```
+
+**Zero** literal `call_by_address(mid-func)` sites exist in BFM's generated
+code, so the three emit sites never fire. The fix that actually landed was
+upstream of them: the mid-function **convergence pre-pass**
+(`code_generator.cpp`, `MAX_PASSES` raised 3 → 256) now splits every
+mid-function target until no new ones appear, so nothing falls through to the
+unregistered `call_by_address` path. The `register_cross_function_target`
+calls this issue asked for were never needed.
+
+Note the line numbers above (970/981/998) are stale — the sites are now
+1549/1567/1594, and they live in the `code_generator.cpp` CPS path, which is a
+different emitter from the `full_function_emitter.cpp:849/864` sites that
+already did the registration correctly.
+
+### Tooling repaired the same day (Rule 15) — the audit could not detect a regression
+
+Two independent breakages meant this issue's evidence went stale rather than
+being disproved:
+
+1. **No config in the tree had an `[audit]` block**, so
+   `codegen_audit_game.py` refused to run on *any* game
+   (`KeyError: missing [audit] block`). Added one to
+   `games/musashi/game.toml` with the code region read from the EXE header
+   itself (`t_addr=0x80010000`, `t_size=0x64800` → text 0x80010000-0x80074800,
+   file bytes 0x800-0x65000), not assumed.
+2. **`RE_DISPATCH_TABLE_ENTRY` matched 0 of 15606 real cases.** It required
+   `func_` to follow `case 0xADDR:` immediately, but the emitter emits
+   `psx_check_interrupts_dispatch_entry(cpu, A); cpu->pc = 0;` first. Every
+   run therefore reported `dispatch table size: 0` and **929 phantom
+   tail-call misses**. Regex now matches to end-of-line.
+
+With the tool trustworthy, the real remaining finding is 8 `jal` targets
+absent from the static dispatch table — see below.
+
+### Open item — one `jal` target in an unmapped gap (2026-10-03)
+
+Not part of this issue's original claim; recorded because it is a real
+dispatch-table gap and would otherwise look like a regression.
+
+8 tail-transfer/jal targets are absent from the static table:
+
+| target | classification |
+|---|---|
+| `0x800CEDFC`, `0x800CEE74`, `0x800CEEC8`, `0x800D1724`, `0x800D25FC`, `0x801281D8`, `0x8016E918` | inside overlay[1] (0x800CE000-0x80170000) — correctly absent; dirty-RAM interpreter domain |
+| `0x800CAE80` | **in a gap** — see below |
+
+Three of the seven overlay ones (`0x800CEDFC`, `0x800CEE74`, `0x800CEEC8`) are
+independently confirmed as overlay `dispatch_entry_pcs` in
+`runtime/build/overlay_captures.json`.
+
+**`0x800CAE80` is unexplained.** It is the target of a `jal` at 0x8002019C
+inside `func_8001FC08` (static text). It lies in the **358 KB gap** between
+static text end (0x80074800) and overlay[1] base (0x800CE000), covered by
+neither the static text nor any captured overlay. At runtime it would miss
+the table, then miss `dirty_ram_dispatch`, then hit `psx_unknown_dispatch`.
+
+A transcription-bug hypothesis was raised and **killed by measurement**: the
+emitted address was suspected of being a digit transposition of
+`0x800DAE80`. It is not. `get_jump_target` (`control_flow.cpp:48`) implements
+the architectural MIPS rule `(PC+4) & 0xF0000000 | idx<<2`, which legitimately
+yields 0x800CAE80 for this word (0x0C032BA0) — the load address is *not* the
+base for a 26-bit region-relative jump. Five sites in the tree agree
+(`mips_decoder.cpp:29`, `function_analysis.cpp:506`,
+`full_function_emitter.cpp:277/283`, `strict_translator.cpp:665/679`).
+
+**Unknown, deliberately not guessed:** what lives at 0x800CAE80. Whether that
+call is ever executed is not established here. Resolve by tracing the
+`func_8001FC08` call site at runtime before treating it as a live defect.
 
 ---
 
@@ -715,7 +794,8 @@ so the 40s is a per-session cost, not a per-iteration one.
 
 ## Issue #9 — Widescreen needs per-game sprite-tag RE, and fails silently without it
 
-**Status:** open, root-caused, not implemented
+**Status:** CLOSED for BFM 2026-08-09 (plan B shipped, user-confirmed on screen).
+The general silent-failure guard named below is still NOT implemented.
 **Date opened:** 2026-07-27
 **Phase:** enhancement tier
 **Affects:** any 3D game with no `[widescreen]` block. Found on BFM (SLUS-00726).
@@ -791,6 +871,17 @@ per-primitive loop. Tagging at function entry would therefore be silently inert
 change (emit the hook at an arbitrary PC, not a function entry); plan B needs a
 general GTE-activity frame detector instead. Recommendation is plan B, pending
 the user's call.
+
+**CLOSED for BFM 2026-08-09 — plan B was taken and shipped.** The general
+GTE-activity 3D-frame detector replaced the sprite-tag path, so BFM renders 16:9
+with no per-game RE at all. See `BFM_WIDESCREEN_PLAN.md`.
+
+What is *not* closed is the silent-failure hazard this issue also described: on a
+game with no `[widescreen]` block that is not 2D, nothing stamps a frame-mode
+signal, so the banner / `configured` / `mode` / `squash` readouts can still
+report success while the picture stays 4:3. The shipped detector is general so
+this is less likely than it was, but it has not been proven inert and no
+config-load guard was added. Carried forward as a known gap, not a BFM defect.
 
 
 ## Issue #10 — Save states taken in overlay code do not restore

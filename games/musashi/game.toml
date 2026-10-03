@@ -18,6 +18,26 @@ seeds   = "games/musashi/seeds.txt"
 out_dir = "games/musashi/generated"
 strict  = true
 
+# Declares where generated code lives, so the audit tools
+# (tools/codegen_audit_game.py) can tell a call_by_address target that MUST
+# resolve to the static dispatch table from one that is legitimately absent
+# from it. The latter is the dirty-RAM interpreter's domain — BFM's overlays
+# are RAM-loaded, so they are expected to be missing from the table.
+#
+# Without this block the audit tools refuse to run at all, which is how
+# ISSUES.md Issue #5's evidence went stale: it was last measured on Tomba,
+# whose config is not in this tree.
+#
+# Numbers read from the PS-X EXE header of SLUS_007.26 (t_addr/t_size), not
+# assumed: code occupies file bytes 0x800..0x65000 (the file is exactly
+# 0x800 + t_size) and maps to vaddr 0x80010000..0x80074800. The 0x80074800
+# text end is the same boundary ISSUES.md Issue #10 uses to tell a static-text
+# resume PC from an overlay one.
+[audit]
+regions = [
+    { name = "text", rom_start = "0x800", rom_end = "0x65000", vaddr_base = "0x80010000" },
+]
+
 [video]
 # OpenGL is the backend this game is actually developed and tested against
 # (the software rasterizer is slow enough here that the compositor treats the

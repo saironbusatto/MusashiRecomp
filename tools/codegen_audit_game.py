@@ -38,11 +38,20 @@ import audit_config
 # ── Patterns shared with codegen_audit.py (BIOS emit) ──────────────────
 RE_TAIL_CALL = re.compile(r'cpu->pc = 0x([0-9A-Fa-f]+)u?;\s*return;')
 
-# Game emit uses a switch/case dispatch table:
-#   case 0xADDRu: func_ADDR(cpu); return 1;
-# This is NOT the BIOS strict-translator's `{ 0xADDR, func_ADDR }` array.
+# Game emit uses a switch/case dispatch table. This is NOT the BIOS
+# strict-translator's `{ 0xADDR, func_ADDR }` array.
+#
+# The case body is NOT just `func_ADDR(cpu)`. The emitter prefixes an IRQ
+# check and clears cpu->pc before the call:
+#   case 0xADDRu: psx_check_interrupts_dispatch_entry(cpu, 0xADDRu); \
+#                 cpu->pc = 0; func_ADDR(cpu); return 1;
+# An earlier version of this regex required `func_` to follow the colon
+# immediately, so it matched 0 of the 31212 real cases and every audit
+# reported "dispatch table size: 0" — which made all 929 tail-call
+# "misses" an artifact of the broken matcher, not real findings.
+# Anchored on `case ... :` and matched to end-of-line instead.
 RE_DISPATCH_TABLE_ENTRY = re.compile(
-    r'case\s+0x([0-9A-Fa-f]+)u?\s*:\s*func_[0-9A-Fa-f]+\s*\(cpu\)'
+    r'case\s+0x([0-9A-Fa-f]+)u?\s*:.*?\bfunc_[0-9A-Fa-f]+\s*\(cpu\)'
 )
 
 # ── Patterns specific to game full-function-emitter ────────────────────
