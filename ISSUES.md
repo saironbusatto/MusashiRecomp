@@ -953,9 +953,9 @@ config-load guard was added. Carried forward as a known gap, not a BFM defect.
 
 ## Issue #10 — Save states taken in overlay code do not restore
 
-**Status:** OPEN, narrowed 2026-10-03 — control run done; failure is in the interpreter's
-return path at the resumed function's epilogue, NOT an unroutable resume PC.
-inside a natively-mapped overlay, which the dispatcher cannot route. Not fixed.
+**Status:** OPEN, narrowed 2026-10-03 — control run done. The resume PC IS
+routed; the failure is in the interpreter's return path at the resumed
+function's epilogue, NOT an unroutable resume PC. Not fixed.
 **Date opened:** 2026-08-09
 **Affects:** Brave Fencer Musashi (SLUS-00726); likely any title using overlays
 
