@@ -1105,16 +1105,56 @@ before falling into the call-contract logic — and where a **sp mismatch at
 return starts a bail unwind that publishes `cpu->pc = cpu->gpr[31]`**, i.e. `0`
 when `$ra` is 0.
 
-**So this is very likely NOT a "missing mid-function resume capability."** It is
-the interpreter's return/call-contract path failing on a mid-function resume,
-where the frame bookkeeping only makes sense if the function was entered at its
-own prologue. That distinction matters: option (a) below is not merely cheaper,
-it is **not implementable as scoped** — with `ci == -1` there is no registered
-entry to record an offset against.
+**ROOT CAUSE 2026-10-03 (proven, offline from the snapshot) — the guest executes
+`jr $0`.** The epilogue reloads the return address from the stack, and that
+stack slot is **zero**:
 
-**Not yet confirmed:** which of the transfer paths publishes the 0. The next
-measurement is to catch the `jr $31` at `0x8017F91C` and read `$ra`/`$sp` at that
-instant. Until then the call-contract hypothesis stays a hypothesis.
+```
+sp = 0x1F800240                       (from the snapshot's CPU section)
+0x8017F910: lw    $31, 28($sp)   ->  scratchpad[0x25C] = 0x00000000
+0x8017F914: lw    $16, 24($sp)   ->  scratchpad[0x258] = 0x800A6518   (fine)
+0x8017F918: addiu $29, $sp, 32
+0x8017F91C: jr    $31            ->  jump to 0x00000000
+```
+
+`jr $0` **is** the `PC=0` abort, and `pczero_addr=0x8017F900` is exactly the
+block containing that sequence. Confirmed end to end:
+
+- `dirty_break_range 0x8017F8E8..0x8017F920` + `savestate load 4` →
+  `hits:1, target:0x8017F8E8`, with `ra=0x80056600`, `a0..a3` and
+  `sp=0x1F800240` all matching the snapshot. **The interpreter does enter the
+  resume block, with correctly restored state.** (An earlier attempt read
+  `hits:0` and appeared to disprove this — that run was invalid: the first load
+  had already tripped `psx_fatal_halt`, so the guest was frozen and the second
+  load was a no-op. Each experiment needs a fresh runtime, armed *before* the
+  load.)
+- `overlay_find_by_range` returns -1 for `0x17F8E8`, so the native CPS
+  continuation path never fires and the interpreter takes over — but it takes
+  over *successfully*, and only dies at the `jr`.
+
+**Therefore this is not a dispatch, overlay-loader, interpreter or
+call-contract defect.** Every component executed the guest's instruction
+faithfully. The guest state itself contains a zero where the return address
+should be.
+
+**So the real question is which of these is true, and it is NOT answerable
+from this repo alone:**
+
+1. The capture recorded a genuinely degenerate guest state (the real PS1 would
+   also `jr $0` there) — in which case the runtime is faithful and the bug is
+   that **savestate is offered at unsafe freeze points**; or
+2. the SPAD section is captured/restored incorrectly, so the value was non-zero
+   live and the snapshot lost it; or
+3. the state was captured mid-frame at a point the game never reaches in normal
+   play, so resuming there is meaningless.
+
+(2) is cheaply testable and should be ruled out FIRST: write a known pattern to
+scratchpad, save, load, read back. (1) requires the Beetle oracle (port 4380) —
+per CLAUDE.md §16 that is the only way to settle what real hardware held at
+that instant. Do not guess between these.
+
+Also note the control state's resume PC works, so this is specific to states
+captured inside overlay code, not to savestates generally.
 
 **A caveat that killed a wrong turn:** `dispatch_check` is useless here. It
 answers "was this address recently dispatched" against a bounded ring
@@ -1122,19 +1162,19 @@ answers "was this address recently dispatched" against a bounded ring
 `0x80042558` too — a PC that demonstrably works. Do not read its zeros as
 "undispatchable".
 
-### Fix direction (SUPERSEDED — see the correction above)
+### Fix direction (SUPERSEDED twice — read the ROOT CAUSE section first)
 
-Do **not** implement "snapshot the entry + intra-function offset" as written:
-`overlay_find_by_range` returns -1 and `sljit_try` returns `compiled:0` for
-`0x8017F8E8`, so there is no registered entry to record an offset against. The
-failure is further downstream, in the interpreter's return path at the function
-epilogue (`0x8017F910`–`0x8017F91C`), not in the absence of a mid-function
-resume capability.
+Do **not** implement "snapshot the entry + intra-function offset": with
+`ci == -1` there is no registered entry to take an offset against, and the
+failure is not in routing at all — the guest's own `jr $0` produces the PC=0.
 
-The real fix is in the interpreter's call-contract/bail-unwind handling for a
-mid-function resume: a frame entered at its prologue has return bookkeeping
-that a mid-function entry does not. Confirm which transfer path publishes the
-0 before changing it.
+Do **not** "fix" the interpreter, overlay loader, or call-contract path either:
+each was measured executing the guest faithfully. Changing them would break
+faithfulness to paper over a state-capture question.
+
+The next step is diagnostic, not a code change: rule out a SPAD
+save/restore defect, then settle what real hardware held at that instant via
+the Beetle oracle.
 
 ### Tooling fixed along the way
 
