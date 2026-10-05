@@ -1025,7 +1025,7 @@ nothing.
 ### MEASURED 2026-10-03 — control run done, cause narrowed to mid-function resume
 
 Both gaps above are now closed. The states were on disk the whole time; they
-were decoded rather than re-captured (`probes/decode_pst.py`), and all three
+were decoded rather than re-captured (`tools/decode_pst.py`), and all three
 carry **identical** integrity fields (`bios_checksum=0xF67ECB99`,
 `codegen_hash=0x0F5548CF`, `abi_tag=0x0A`, `codegen_ver=4`) — so they came from
 one build and can be compared against each other:
