@@ -1203,3 +1203,30 @@ So possibility 2 (defective SPAD round-trip) is dead. Remaining: 1 (unsafe
 freeze point) or 3 (degenerate capture) — needs the Beetle oracle. Note `pause`
 is removed from the debug server, so in-process round-trips are racy; compare
 saved files instead.
+
+### ROOT CAUSE + FIX 2026-10-28 — the resume PC came from a different frame
+
+slot04 is impossible machine state: at `0x8017F8E8` the function has just
+returned from `jal 0x80154274`, whose epilogue restores `$ra` and `jr $ra`, so
+`$ra` MUST be `0x8017F8E8`. The file has `ra=0x80056600` (return of a `jalr`
+in static text). PC and GPRs were captured from different frames — none of the
+three hypotheses above; no oracle needed.
+
+Mechanism (measured with a temporary counter in `psx_check_interrupts_at`):
+`psx_check_interrupts` picks `g_dirty_safe_resume_pc` over the compiled caller's
+`resume_pc`. In BFM gameplay the whole game loop runs nested under one dirty
+pump, so that global sat at `0x8018038C` for >30 s while ~3.3 M compiled
+checks/s ran at `0x80056Fxx` / `0x8017C9BC`. Three back-to-back saves all
+recorded `pc=0x8018038C` with unrelated GPRs. The same PC also fed EPC on every
+IRQ taken from compiled code in that state (gameplay survived only because
+compiled code resumes through the C stack, not EPC).
+
+Fix (`interrupts.c`, `psx_check_interrupts_at`): scope `g_dirty_safe_resume_pc`
+to 0 for the compiled check and restore it after. Verified: 5 save→load cycles
+in gameplay (static, overlay `0x8017DDCC`, `sp=0x1F800240`) — distinct coherent
+PCs, no FATAL, frames advancing, gameplay on screen.
+
+Not yet done: cosim/Beetle diff of IRQ take-PC/EPC (the fix changes EPC for
+IRQs taken in compiled code nested under the interp — architecturally more
+correct, but unverified against the oracle). Old slot04 stays unloadable (its
+bytes are inconsistent); new saves are fine.

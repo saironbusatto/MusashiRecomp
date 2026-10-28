@@ -1129,10 +1129,18 @@ void psx_check_interrupts(CPUState* cpu) {
  * interrupts via psx_check_interrupts (cpu->pc / scratch sentinel). Forwarding
  * here gives the mmx6 baseline interrupt behavior — sufficient to build+run the
  * current generated code on the good baseline for instrumented comparison. */
+/* The compiled caller's resume_pc IS the interrupted PC. An outer dirty-interp
+ * frame's g_dirty_safe_resume_pc (still set while interp->compiled nesting
+ * persists — in BFM gameplay the whole game loop runs under one pump) must not
+ * override it: it fed EPC and the save-state resume PC a PC from a different
+ * frame than the live GPRs (Issue #10). */
 void psx_check_interrupts_at(CPUState* cpu, uint32_t resume_pc) {
     uint32_t prev = s_compiled_interrupt_resume_pc;
+    uint32_t prev_dirty = g_dirty_safe_resume_pc;
     s_compiled_interrupt_resume_pc = resume_pc;
+    g_dirty_safe_resume_pc = 0;
     psx_check_interrupts(cpu);
+    g_dirty_safe_resume_pc = prev_dirty;
     s_compiled_interrupt_resume_pc = prev;
 }
 
