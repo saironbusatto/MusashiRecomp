@@ -1,3 +1,5 @@
+**English** · [Português (BR)](README.pt-BR.md)
+
 <p align="center">
   <img src="docs/assets/psxrecomp-logo.png" alt="PSXRecomp" width="640">
 </p>
