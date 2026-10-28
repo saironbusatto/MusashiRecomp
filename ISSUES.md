@@ -379,7 +379,10 @@ window.
 
 ## Issue #3 — BIOS "PlayStation" disc-detected screen is missing the PS logo glyph
 
-**Status:** open
+**Status:** CLOSED 2026-10-28 — does not reproduce. LLE boot of BFM renders the
+full license screen (3D PS logo, "PlayStation", "Licensed by Sony Computer
+Entertainment America", SCEA) — screenshot-verified via the debug server and
+confirmed by the user on a real window. Fixed by some later renderer/CD work.
 **Date opened:** 2026-05-11
 **Phase:** 4 (BIOS shell render)
 
