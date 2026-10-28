@@ -345,6 +345,17 @@ shell skips it." Suggested approach:
 
 ---
 
+### Update 2026-10-28 — in-game card path works (BFM)
+
+BFM title → CONTINUE shows "No data is available." `card_read_summary` shows
+the game reading `card1.mcd` sector 0 (`MC`) and directory sectors (entries of
+the synthetic test saves `BISLPS-01234…`), so the card is detected and its
+directory parsed; there is simply no BFM save on it. Writes flush on
+completion (`sio.c:1158`). The BIOS-shell icon symptom itself was not
+re-checked (the game binary always boots the disc from `game.toml`).
+
+---
+
 ## Issue #2 — `fn_entry_dump` / `fn_exit_dump` freeze the debug server on populated rings
 
 **Status:** open
