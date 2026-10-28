@@ -1187,3 +1187,19 @@ the Beetle oracle.
   addresses as quoted strings, so the probe answered `"need addr"` for every
   well-formed request — the tool was unreachable exactly as this issue needed
   it. Now parses both shapes; verified quoted-hex works, decimal still works.
+
+### Update 2026-10-28 — SPAD save/restore ruled out
+
+- Code: one scratchpad buffer (`memory.c:32`); `boot_state.c` writes and
+  restores all 1024 bytes of it (`BS_SEC_SPAD`). No second mirror exists.
+- Live, same binary (`codegen_hash=0x0F5548CF`, same as slot04): a fresh save
+  taken in overlay code with `sp` in scratchpad (`pc=0x8018003C`,
+  `sp=0x1F800158`) loads and keeps running (frames advance, no FATAL). Loading
+  slot04 next in the same process still dies `FATAL PC=0`.
+- slot04's frame is not empty (509/1024 SPAD bytes non-zero; neighbours of
+  `sp+0x1C` hold `0x800A65xx` pointers) — only the `$ra` slot is zero.
+
+So possibility 2 (defective SPAD round-trip) is dead. Remaining: 1 (unsafe
+freeze point) or 3 (degenerate capture) — needs the Beetle oracle. Note `pause`
+is removed from the debug server, so in-process round-trips are racy; compare
+saved files instead.
