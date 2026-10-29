@@ -1,6 +1,9 @@
 # PSXRecomp v4 — Open Issues
 
-## Issue #1 — Per-card directory load never runs in recomp (Phase 4 blocker)
+Local IDs use an `L-` prefix (L-1 … L-10) so they never clash with GitHub
+issue numbers (`#N`, https://github.com/saironbusatto/MusashiRecomp/issues).
+
+## Issue L-1 — Per-card directory load never runs in recomp (Phase 4 blocker)
 
 **Status:** open, root cause narrowed
 **Date opened:** 2026-05-03
@@ -374,7 +377,7 @@ videos. It is the original art at 320x240. Do not chase.
 
 ---
 
-## Issue #2 — `fn_entry_dump` / `fn_exit_dump` freeze the debug server on populated rings
+## Issue L-2 — `fn_entry_dump` / `fn_exit_dump` freeze the debug server on populated rings
 
 **Status:** open
 **Date opened:** 2026-05-03
@@ -395,7 +398,7 @@ window.
 
 ---
 
-## Issue #3 — BIOS "PlayStation" disc-detected screen is missing the PS logo glyph
+## Issue L-3 — BIOS "PlayStation" disc-detected screen is missing the PS logo glyph
 
 **Status:** CLOSED 2026-10-28 — does not reproduce. LLE boot of BFM renders the
 full license screen (3D PS logo, "PlayStation", "Licensed by Sony Computer
@@ -433,7 +436,7 @@ RAM/VRAM coordinates.
 
 ---
 
-## Issue #5 — Mid-function split targets not registered in dispatch table
+## Issue L-5 — Mid-function split targets not registered in dispatch table
 
 **Status:** CLOSED 2026-10-03 — does not reproduce; fixed upstream by the
 mid-function convergence pre-pass. Audit tooling that would have caught a
@@ -579,7 +582,7 @@ proof the build is clean. Two limits, both structural:
 
 1. **Passes [2] and [3] are VACUOUS.** BFM's generated code contains **zero**
    `call_by_address` sites — the emitter produces CPS tail-transfers instead
-   (2940 of them). So the pass that was originally written to watch Issue #5's
+   (2940 of them). So the pass that was originally written to watch Issue L-5's
    exact regression class can no longer fire, for BFM or for any game emitted
    through the CPS path. The tool now prints an explicit VACUOUS note rather
    than letting a structural zero read as "0 bugs".
@@ -597,13 +600,13 @@ passes.** The exit code is a regression tripwire, not a correctness proof.
 
 ---
 
-## Issue #4 — 7 unemitted GTE / COP2 instructions in BIOS Shell code
+## Issue L-4 — 7 unemitted GTE / COP2 instructions in BIOS Shell code
 
 **Status:** CLOSED 2026-10-03 — false positive. All are emitted; the detection
 method was invalid (see below).
 **Date opened:** 2026-05-12
 **Phase:** 4 (BIOS shell render)
-**Likely related to:** Issue #3 (missing PS logo on disc-detected screen)
+**Likely related to:** Issue L-3 (missing PS logo on disc-detected screen)
 
 ### Symptom
 
@@ -628,10 +631,10 @@ old unfiltered tool. The B1 code-region filter surfaced them.
 MVMVA is matrix-vector-multiply-and-add — the BIOS only uses GTE/3D
 math in two narrow places: the boot logo intro and the
 disc-detected/PlayStation-logo screen. We boot past both, but
-**Issue #3's missing PS-logo glyph is consistent with these
+**Issue L-3's missing PS-logo glyph is consistent with these
 unemitted MVMVA + LWC2/SWC2 sites**: if the recompiler skipped the
 3D math that draws the logo, the logo would render as nothing or
-garbage but the surrounding text would be fine — exactly Issue #3's
+garbage but the surrounding text would be fine — exactly Issue L-3's
 symptom.
 
 Two possible root causes (not yet distinguished):
@@ -646,7 +649,7 @@ Check whether ANY PC near `0xBFC34FF8` appears in
 `generated/SCPH1001_full.c`. If neighbors are emitted but the GTE
 sites aren't, it's an emit gap (fix in code_generator.cpp). If
 neighbors are absent too, it's a discovery gap (fix in function
-discovery seeds). Either way, then close Issue #3 alongside.
+discovery seeds). Either way, then close Issue L-3 alongside.
 
 ### CLOSED 2026-10-03 — false positive; every one of these is emitted
 
@@ -687,11 +690,11 @@ containing function was discovered long ago. `func_1FC34FA0` is emitted and
 its next emitted sibling is `func_1FC35128`, so these PCs are interior to a
 known function rather than sitting in an undiscovered gap.
 
-**Issue #3 is unaffected by this.** The missing PS-logo glyph is still open and
+**Issue L-3 is unaffected by this.** The missing PS-logo glyph is still open and
 still unexplained; this closure removes only the proposed *cause*. Do not read
 it as evidence that the logo bug is fixed.
 
-## Issue #6 — Launcher art has rough cutout edges (memory cards + controllers)
+## Issue L-6 — Launcher art has rough cutout edges (memory cards + controllers)
 
 **Status:** open, cosmetic — deferred
 **Date opened:** 2026-06-12
@@ -740,7 +743,7 @@ Phase 4/5 wiring.
 
 ---
 
-## Issue #7 — sljit live execution is unvalidated (pure-live save-load wedge)
+## Issue L-7 — sljit live execution is unvalidated (pure-live save-load wedge)
 
 **Status:** open, root-caused — fix in progress (branch `feat/sljit-backend`)
 **Date opened:** 2026-06-15
@@ -807,7 +810,7 @@ closes live.
 
 ---
 
-## Issue #8 — HLE boot: game wedges in an event poll loop (BFM)
+## Issue L-8 — HLE boot: game wedges in an event poll loop (BFM)
 
 **Status:** open, two hypotheses eliminated, not root-caused
 **Date opened:** 2026-07-27
@@ -891,7 +894,7 @@ so the 40s is a per-session cost, not a per-iteration one.
 
 ---
 
-## Issue #9 — Widescreen needs per-game sprite-tag RE, and fails silently without it
+## Issue L-9 — Widescreen needs per-game sprite-tag RE, and fails silently without it
 
 **Status:** CLOSED for BFM 2026-08-09 (plan B shipped, user-confirmed on screen).
 The general silent-failure guard named below is still NOT implemented.
@@ -966,7 +969,7 @@ emitters `FUN_8004ab68` / `FUN_8004b078` / `FUN_8004b614` take the model
 command pointer in `$a0`, while `psx_ws_sprite_tag` (gpu.c:804) keys the tag on
 `$a0` **being the prim address**. The prim pointer only exists inside their
 per-primitive loop. Tagging at function entry would therefore be silently inert
-— the Issue #9 failure mode itself. Making squash work needs a recompiler
+— the Issue L-9 failure mode itself. Making squash work needs a recompiler
 change (emit the hook at an arbitrary PC, not a function entry); plan B needs a
 general GTE-activity frame detector instead. Recommendation is plan B, pending
 the user's call.
@@ -983,7 +986,7 @@ this is less likely than it was, but it has not been proven inert and no
 config-load guard was added. Carried forward as a known gap, not a BFM defect.
 
 
-## Issue #10 — Save states taken in overlay code do not restore
+## Issue L-10 — Save states taken in overlay code do not restore
 
 **Status:** OPEN, narrowed 2026-10-03 — control run done. The resume PC IS
 routed; the failure is in the interpreter's return path at the resumed

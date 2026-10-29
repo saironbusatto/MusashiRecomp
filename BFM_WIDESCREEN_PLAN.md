@@ -1,8 +1,8 @@
-# BFM Widescreen — Design (Issue #9)
+# BFM Widescreen — Design (Issue L-9)
 
 **Status:** SHIPPED 2026-08-09 — BFM renders 16:9, user-confirmed on screen
 **Date:** designed 2026-08-08, shipped 2026-08-09
-**Closes:** ISSUES.md Issue #9 for Brave Fencer Musashi (SLUS-00726)
+**Closes:** ISSUES.md Issue L-9 for Brave Fencer Musashi (SLUS-00726)
 **Strategy shipped:** native-wide + a general GTE-activity 3D-frame detector
 
 > The sections below are kept in the order they were written, so the reasoning
@@ -30,19 +30,19 @@
   unless native-wide is engaged — so on the squash path nothing in-tree can see
   the composited picture.
 - Success is judged by eye on a captured window, not by any internal readout.
-  Issue #9 exists precisely because `configured`, `mode` and `squash` all
+  Issue L-9 exists precisely because `configured`, `mode` and `squash` all
   reported success while the picture stayed 4:3.
 - For: the user playing BFM, and MusaGround downstream, which inherits the
   presentation.
 
 ### Non-goals
 
-Native-wide, Issue #8, Stage 2 cycle calibration, and the squash artifact tail
+Native-wide, Issue L-8, Stage 2 cycle calibration, and the squash artifact tail
 (backdrop void, prop drift). Document if they surface; do not chase.
 
 ---
 
-## Why the gate blocks BOTH strategies (the finding that reframed Issue #9)
+## Why the gate blocks BOTH strategies (the finding that reframed Issue L-9)
 
 `gpu.c:124`:
 
@@ -62,7 +62,7 @@ strategies stay off.
 The consequence worth writing down: **native-wide does not need per-prim tags to
 render** — it shifts `draw_offset` and widens the frame, with no per-primitive
 work at all. It needs them only as a *3D-frame-vs-2D-screen detector*. So the
-per-game RE that Issue #9 describes is a requirement of the squash strategy
+per-game RE that Issue L-9 describes is a requirement of the squash strategy
 specifically, not of widescreen as such.
 
 This is why **plan B is a general 3D-frame detector (GTE RTPS/RTPT activity this
@@ -88,9 +88,9 @@ Recorded, not chosen: the user chose the proven path.
 
 | # | Decision | Alternatives | Why |
 |---|---|---|---|
-| 1 | Work on visible/playable output, not foundation | Stage 2 cycle calibration; Issue #8 HLE boot; tooling-debt audit | User's call. Note that the Beetle oracle restored on 2026-08-08 unblocks Stage 2 specifically — §3c named the two-anchor region mode on both backends as its gate, and that now exists. |
+| 1 | Work on visible/playable output, not foundation | Stage 2 cycle calibration; Issue L-8 HLE boot; tooling-debt audit | User's call. Note that the Beetle oracle restored on 2026-08-08 unblocks Stage 2 specifically — §3c named the two-anchor region mode on both backends as its gate, and that now exists. |
 | 2 | Squash strategy | Native-wide (repo default, `config_loader.h:406`); general 3D-frame detector | User chose the path proven in production on Tomba. Cost accepted: the artifact tail, and a capture tool that native-wide would not have needed. |
-| 3 | Discovery = dynamic narrows, static confirms | Static-only from the Ghidra corpus; dynamic-only correlation | BFM streams gameplay from overlays and overlay corpus coverage is unverified, so static-only bets blind on it. Dynamic-only would pick the anchor address by correlation, and a wrong scratchpad fails silently — the exact Issue #9 failure mode. |
+| 3 | Discovery = dynamic narrows, static confirms | Static-only from the Ghidra corpus; dynamic-only correlation | BFM streams gameplay from overlays and overlay corpus coverage is unverified, so static-only bets blind on it. Dynamic-only would pick the anchor address by correlation, and a wrong scratchpad fails silently — the exact Issue L-9 failure mode. |
 | 4 | Link prims to functions via `wtrace`, not GPU tracing | Correlate `ws_census` against `fntrace` by time | `wtrace` records `func_addr` (dispatch target) and the exact store `pc` per write (debug_server.c:322-327). Direct evidence of who wrote the prim, not temporal coincidence. |
 | 5 | Build the capture tool before the RE | User confirms by eye each iteration; do both | User's call: iterate without a human in the loop. |
 | 6 | Anchor candidates must pass a runtime test | Accept the address the disassembly implies | Rule 14. A scratchpad that merely correlates fails silently. |
@@ -243,7 +243,7 @@ The key is `$a0` at function entry, and `ws_tagged_anchor` looks it up against
 In BFM, `$a0` at the entry of these emitters is the **model command data**
 (0x800DCxxx). Prims are written to 0x115xxx. The stored key could never match
 the looked-up one, so **the tag would be inert** — and inert in exactly the
-silent way Issue #9 is about.
+silent way Issue L-9 is about.
 
 The prim pointer does exist, but only inside the loop: the trace shows `a3` and
 `v1` holding 0x0011CC00 / 0x0011CBB8 / 0x0011CD30 mid-iteration, derived from
@@ -421,7 +421,7 @@ passes `--ws-config`, lines 1349/1758), then build the runtime.
 
 Verification, weakest to strongest:
 
-1. `gpu_state` → `ws.game_mode`. This is the readout that was false in Issue #9
+1. `gpu_state` → `ws.game_mode`. This is the readout that was false in Issue L-9
    (stuck at 0). If it is 1 during gameplay, tags are firing.
 2. `window_shot` before/after, compared side by side. This is the proof.
 

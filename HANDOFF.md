@@ -1,7 +1,7 @@
 # SESSION HANDOFF — 2026-10-03
 
-Session that closed #5 and #4 (both false positives), repaired two audit tools,
-and root-caused #10. **Read this first, then `ISSUES.md` for detail.**
+Session that closed L-5 and L-4 (both false positives), repaired two audit tools,
+and root-caused L-10. **Read this first, then `ISSUES.md` for detail.**
 
 This is a *session* handoff. The durable records are `ISSUES.md` (per-issue
 truth), `BFM_WIDESCREEN_PLAN.md`, and `FAITHFUL_TIMING_PLAN.md`. If this file
@@ -14,11 +14,11 @@ corrected in place each time a conclusion was overturned.
 
 | | |
 |---|---|
-| Closed | **#5** (mid-func dispatch) and **#4** (unemitted GTE) — both were **false positives** |
-| Root-caused | **#10** — the guest executes `jr $0`. Nothing is malfunctioning |
+| Closed | **L-5** (mid-func dispatch) and **L-4** (unemitted GTE) — both were **false positives** |
+| Root-caused | **L-10** — the guest executes `jr $0`. Nothing is malfunctioning |
 | Fixed | 3 broken tools that had been silently lying (see below) |
 | Retracted | 3 of my own wrong claims, all corrected in `ISSUES.md` |
-| Still open | #1, #3, `0x800CAE80`, and one `scratchpad` question that decides #10's real fix |
+| Still open | L-1, L-3, `0x800CAE80`, and one `scratchpad` question that decides L-10's real fix |
 
 **Nothing user-visible got faster or better this session.** The gain is that the
 board is finally trustworthy: three issues that looked like defects were not,
@@ -28,7 +28,7 @@ and the one real bug is now down to a single instruction with a known cause.
 
 ## The single most important thing to carry forward
 
-**`ISSUES.md` was wrong about #5 and #4, and both were "found" by tools that
+**`ISSUES.md` was wrong about L-5 and L-4, and both were "found" by tools that
 were broken.** Before trusting any audit finding in this repo, confirm the tool
 actually produces non-zero output on the construct it claims to watch. A pass
 that reads zero because the emitter stopped emitting that construct is
@@ -42,7 +42,7 @@ out loud. Its `CLEAN`/exit-0 means **"0 known defects"**, never "no defects".
 
 ---
 
-## #10 — the one real bug, and why the obvious fix is wrong
+## L-10 — the one real bug, and why the obvious fix is wrong
 
 Reproduced twice, control-first, same process and binary:
 
@@ -131,7 +131,7 @@ shutting down, which is the difference between a corpse and a witness.
 | `tools/codegen_audit_game.py` | matched 0/15606 dispatch cases; 929 phantom misses | correct; vacuous passes self-report |
 | `tools/debug_client.py` | no `savestate` binding — the whole save/load flow was undrivable | bound |
 | `handle_sljit_try` | `strtoul` rejected quoted hex → `"need addr"` for every valid request | parses both shapes |
-| `tools/gte_coverage.py` | fine, but its detection *method* was invalid (see #4) | unchanged |
+| `tools/gte_coverage.py` | fine, but its detection *method* was invalid (see L-4) | unchanged |
 | `tools/decode_pst.py` | **did not exist** | new; decodes a `.pst` from its bytes, self-checking layout |
 
 No config in the tree had an `[audit]` block, so `codegen_audit*.py` refused to
@@ -140,31 +140,31 @@ read from the EXE header (`t_addr`/`t_size`), not assumed.
 
 ---
 
-## Why #4 and #5 closed (both false positives)
+## Why L-4 and L-5 closed (both false positives)
 
-- **#5** — the mid-function convergence pre-pass (`MAX_PASSES` 3→256) already
+- **L-5** — the mid-function convergence pre-pass (`MAX_PASSES` 3→256) already
   prevents the unregistered `call_by_address` path from ever being reached. BFM
   has **0** in-code misses. The `register_cross_function_target` calls the issue
   asked for were never needed.
-- **#4** — `tools/gte_coverage.py` reports **479/479** GTE instructions present,
+- **L-4** — `tools/gte_coverage.py` reports **479/479** GTE instructions present,
   **0 missing**. All four MVMVA sites emit `gte_execute(cpu, 0x0480012)`.
   The issue's proposed test — *grep the generated C for the PC* — **cannot
   work**: generated C is a translation that annotates PCs only where it chooses.
-  **#3 (missing PS logo) is NOT closed by this**; only its proposed cause died.
+  **L-3 (missing PS logo) is NOT closed by this**; only its proposed cause died.
 
 ---
 
 ## Open, ranked
 
-1. **#10** — the scratchpad round-trip test, then the oracle. See above.
-2. **#1** — per-card directory load never runs; Phase 4 blocker, root cause
+1. **L-10** — the scratchpad round-trip test, then the oracle. See above.
+2. **L-1** — per-card directory load never runs; Phase 4 blocker, root cause
    narrowed, has a "Concrete next step" at `ISSUES.md:216`.
 3. **`0x800CAE80`** — a `jal` target sitting in the **358 KB gap** between text
    end (`0x80074800`) and overlay[1] base (`0x800CE000`), covered by nothing.
    I chased a digit-transposition theory here and **it was wrong**: the emitter
    correctly implements `(PC+4)&0xF0000000 | idx<<2`. Still unexplained — trace
    the `func_8001FC08` call site at runtime before treating it as live.
-4. **#3** — missing PS logo glyph. Cause removed, bug untouched.
+4. **L-3** — missing PS logo glyph. Cause removed, bug untouched.
 5. **Reveal-margin black patches** (`BFM_WIDESCREEN_PLAN.md`) — the only
    player-visible defect. Its discriminating test is written down and **never
    run**: read each margin prim's colour word at its census `src_addr` vs centre
@@ -187,9 +187,9 @@ read from the EXE header (`t_addr`/`t_size`), not assumed.
 
 ## If you only remember five things
 
-1. #5 and #4 were **false positives**; the tools that "found" them were broken.
+1. L-5 and L-4 were **false positives**; the tools that "found" them were broken.
 2. `codegen_audit_game.py` `CLEAN` means **0 known defects**, not "no defects".
-3. #10's cause is `jr $0` from a **zero saved-`$ra` stack slot** — do **not**
+3. L-10's cause is `jr $0` from a **zero saved-`$ra` stack slot** — do **not**
    build the entry+offset fix; there is no entry to anchor to.
 4. **One experiment per process**, armed before the load, or you will "measure" a
    frozen guest and believe it.
