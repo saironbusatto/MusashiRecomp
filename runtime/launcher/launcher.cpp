@@ -630,6 +630,10 @@ bool load_fonts(const fs::path& assets_dir) {
 
 namespace psx_launcher {
 
+std::string pick_file(const char* title, const char* filter) {
+    return win_pick_file(nullptr, title, filter);
+}
+
 Result run(SDL_Window* window, void* gl_context,
            PSXRecompV4::UserSettings& io,
            const GameInfo& game, const char* assets_dir)

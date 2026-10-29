@@ -422,6 +422,15 @@ static bool pick_runtime_file(const char* title, const char* filter,
     if (!GetOpenFileNameA(&ofn)) return false;
     out = path_buf;
     return true;
+#elif defined(PSX_LAUNCHER)
+    const std::string picked = psx_launcher::pick_file(title, filter);
+    if (picked.empty()) {
+        std::fprintf(stderr, "psxrecomp: %s — cancelled, or no file chooser "
+                             "(install zenity or kdialog).\n", title);
+        return false;
+    }
+    out = picked;
+    return true;
 #else
     (void)filter;
     (void)out;
@@ -2427,7 +2436,7 @@ int main(int argc, char** argv) {
             int lwin_h = 0;
             clamp_window_aspect(&lwin_w, &lwin_h, 4, 3);
             std::string lwin_title = (game_name.empty() ? std::string("PSX") : game_name)
-                                     + " \xE2\x80\x94 Launcher";
+                                     + " - Launcher";
             SDL_Window* lwin = SDL_CreateWindow(
                 lwin_title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                 lwin_w, lwin_h, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);

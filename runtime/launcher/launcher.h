@@ -57,4 +57,9 @@ Result run(SDL_Window* window, void* gl_context,
            PSXRecompV4::UserSettings& io,
            const GameInfo& game, const char* assets_dir);
 
+// Native open-file dialog (Win32, or zenity/kdialog/qarma on POSIX), usable
+// outside the launcher loop. Returns "" on cancel or when no chooser exists.
+// `filter` is a Win32 double-null filter; ignored on POSIX.
+std::string pick_file(const char* title, const char* filter);
+
 } // namespace psx_launcher
