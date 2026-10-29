@@ -345,6 +345,15 @@ shell skips it." Suggested approach:
 
 ---
 
+### Update 2026-10-28 (later) — full in-game save/load cycle VERIFIED
+
+From `probes/state_80010000_slot02.pst` (sits on "Would you like to save?"):
+X → File 1 → Yes → "Would you like to resume play?". `card1.mcd` on disk then
+holds directory entry 4 = `BASLUS-00726MUSASHI`. Fresh process → title →
+CONTINUE lists File 1 (Playtime 00:26, Day 1 Mon 08:30, HP 65/150, $1860) →
+load → gameplay resumes in the inn room with dialogue, no FATAL. Pad note: the
+game ignores 4-frame presses in these menus; `press ... frames=12` works.
+
 ### Update 2026-10-28 — in-game card path works (BFM)
 
 BFM title → CONTINUE shows "No data is available." `card_read_summary` shows
