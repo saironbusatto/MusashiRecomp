@@ -33,7 +33,11 @@ stage_common() {  # build_dir stage_dir
     mkdir -p "$stage/games/musashi"
     cp -r "$build/launcher.rml" "$build/fonts" "$build/img" "$stage/"
     # Drop the dev-tree disc path: the player picks their own dump in the launcher.
-    sed 's|^disc *=.*|disc         = ""|' "$ROOT/games/musashi/game.toml" > "$stage/games/musashi/game.toml"
+    # Ship 4:3 by default: 16:9 still has black patches in the revealed margins
+    # (BFM_WIDESCREEN_PLAN.md); players can opt in via Settings > Widescreen.
+    sed -e 's|^disc *=.*|disc         = ""|' \
+        -e 's|^aspect_ratio *=.*|aspect_ratio      = "4:3"|' \
+        "$ROOT/games/musashi/game.toml" > "$stage/games/musashi/game.toml"
     cp "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_ATTRIBUTION.md" "$stage/"
     sed "s/@VERSION@/$VERSION/" "$ROOT/tools/release/START_HERE.txt" > "$stage/START_HERE.txt"
 }

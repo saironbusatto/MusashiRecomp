@@ -20,6 +20,11 @@ WHERE YOUR DATA LIVES
   Memory cards are card1.mcd / card2.mcd (created blank on first run).
   Settings: settings.toml. Controller mapping: input.ini.
 
+WIDESCREEN
+  The game starts in the original 4:3. A 16:9 mode is available in the
+  launcher under Settings > Widescreen (EXPERIMENTAL): some floor tiles at the
+  far left/right edges can show up black.
+
 WARNING - ALPHA
   Nobody has finished the game on this build yet. It boots, plays, and saves
   states, but a crash or softlock later in the game is possible. Keep a

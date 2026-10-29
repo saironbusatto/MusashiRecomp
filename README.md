@@ -129,18 +129,27 @@ BIOS-only memory card management.
 
 ## Release Package
 
-The framework release package is BIOS-only:
+> **Alpha — nobody has finished the game on this build yet.** It boots, plays
+> and saves, but a crash or softlock later in the game is possible. Keep a
+> memory-card save and a backup of `card1.mcd` as you go.
 
-1. Download `PSXRecomp-v*-windows-x64.zip` from Releases.
-2. Extract it and run `PSXRecomp.exe`.
-3. Select your legally obtained `SCPH1001.BIN` BIOS when prompted.
+Brave Fencer Musashi Recompiled ships for **Windows x64** and **Linux x86_64**:
 
-The package does not include a PS1 BIOS, game disc image, generated game code,
-or save data. The selected BIOS path is saved next to the executable as
-`bios.cfg`; delete that file to pick a different BIOS later.
+1. Download from Releases: `MusashiRecomp-v*-windows-x64.zip` or
+   `MusashiRecomp-v*-linux-x86_64.AppImage`.
+2. Windows: extract and run `MusashiRecomp.exe`. Linux: `chmod +x` the
+   AppImage and run it (needs `zenity` or `kdialog` for the file picker).
+3. In the launcher, select your BIOS (`SCPH1001.BIN`) and your own dump of the
+   disc (`.cue`, SLUS-00726). The launcher verifies the disc.
 
-Game-specific recomp projects, including TombaRecomp, use the same runtime
-picker contract but also prompt for a legally obtained game disc image.
+The packages contain **no** PS1 BIOS, disc image, or save data — you supply
+your own legally obtained copies, as with every recomp. Settings, memory cards
+and the overlay cache live next to the exe on Windows and in
+`~/.local/share/MusashiRecomp/` on Linux. The game starts in 4:3; 16:9 is an
+experimental toggle in Settings.
+
+Maintainers build both packages with `tools/release/package.sh all <version>`
+(Docker; needs the locally generated code, which is never committed).
 
 ## Setup
 
