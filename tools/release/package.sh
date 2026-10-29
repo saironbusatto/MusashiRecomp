@@ -60,6 +60,7 @@ build_linux() {
     # Bundle SDL2 (dynamic on purpose: it dlopens X11/Wayland/audio backends
     # from the host). libGL/libOpenGL always come from the host driver.
     in_docker musashi-release-linux Dockerfile.linux "
+        strip release-build/AppDir/usr/share/$NAME/$NAME &&
         cp -L \$(ldconfig -p | awk '/libSDL2-2.0.so.0 /{print \$NF; exit}') release-build/AppDir/usr/share/$NAME/lib/"
 
     # Assert the binary needs nothing beyond glibc/GL/X11 and the bundled SDL2.
@@ -94,7 +95,8 @@ build_windows() {
     # Same self-containment rule as tools/package_release.ps1: system DLLs only.
     local nonsys
     nonsys=$(in_docker musashi-release-windows Dockerfile.windows \
-                 "x86_64-w64-mingw32-objdump -p release-build/$NAME-windows-x64/$NAME.exe" |
+                 "x86_64-w64-mingw32-strip release-build/$NAME-windows-x64/$NAME.exe &&
+                  x86_64-w64-mingw32-objdump -p release-build/$NAME-windows-x64/$NAME.exe" |
              awk '/DLL Name:/{print tolower($3)}' | sed 's/\.dll$//' |
              grep -vxE "$SYSTEM_DLLS" || true)
     [ -z "$nonsys" ] || { echo "exe imports non-system DLLs: $nonsys" >&2; exit 1; }

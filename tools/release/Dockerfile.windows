@@ -1,0 +1,16 @@
+# Windows release build environment: MinGW-w64 cross toolchain on Fedora.
+# SDL2 is linked statically (PSX_STATIC_RUNTIME defaults ON for MinGW Release)
+# so the exe imports only Windows system DLLs. Fedora 42 ships SDL2 only as
+# sdl2-compat (no static lib), so the official SDL2 MinGW dev release is used.
+FROM fedora:42
+ARG SDL2_VERSION=2.30.12
+RUN dnf -y install --setopt=install_weak_deps=False \
+        cmake ninja-build python3 git curl \
+        mingw64-gcc-c++ mingw64-winpthreads-static mingw64-filesystem pkgconf \
+    && dnf clean all
+RUN curl -fsSL https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-devel-${SDL2_VERSION}-mingw.tar.gz \
+        | tar xz -C /tmp \
+    && cp -r /tmp/SDL2-${SDL2_VERSION}/x86_64-w64-mingw32/. /usr/x86_64-w64-mingw32/sys-root/mingw/ \
+    && sed -i 's|^prefix=.*|prefix=/usr/x86_64-w64-mingw32/sys-root/mingw|' \
+        /usr/x86_64-w64-mingw32/sys-root/mingw/lib/pkgconfig/sdl2.pc \
+    && rm -rf /tmp/SDL2-${SDL2_VERSION}
