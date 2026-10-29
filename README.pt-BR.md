@@ -1,33 +1,25 @@
 [English](README.md) · **Português (BR)**
 
+# Brave Fencer Musashi Recompiled
+
+Recompilação estática de *Brave Fencer Musashi* (PS1, Square 1998, NTSC-U
+SLUS-00726) para x64 nativo no Windows e no Linux. O código MIPS do jogo é
+traduzido para C antes da execução e ligado a um runtime de hardware de PS1;
+não é emulado. A BIOS real SCPH1001 também é recompilada e roda como kernel.
+
 <p align="center">
-  <img src="docs/assets/psxrecomp-logo.png" alt="PSXRecomp" width="640">
+  <img src="docs/assets/bfm-gameplay.png" alt="Brave Fencer Musashi Recompiled — tutorial da Lumina em gameplay" width="640">
 </p>
 
-# PSXRecomp
+Feito sobre o [PSXRecomp](https://github.com/RetroPortingToolKit/psxrecomp), o framework de recompilação estática de PS1
+de Matthew Stanley ([artigo de contexto](https://1379.tech/i-built-a-ps1-static-recompiler-with-no-prior-experience-and-claude-code/)). Este repositório começou de
+uma cópia desse framework, mantém o histórico dele e acrescenta o alvo Brave
+Fencer Musashi (`games/musashi/`), o decodificador de overlays do disco do BFM
+e o empacotamento do release.
 
-Framework genérico de recompilação estática para PlayStation 1: MIPS R3000A para C para
-x64 nativo.
-
-Contexto do protótipo original:
-[I Built a PS1 Static Recompiler With No Prior Experience (and Claude Code)](https://1379.tech/i-built-a-ps1-static-recompiler-with-no-prior-experience-and-claude-code/)
-
-[![PSXRecomp demo](https://img.youtube.com/vi/CID9oVhgCyY/maxresdefault.jpg)](https://www.youtube.com/watch?v=CID9oVhgCyY)
-
-## O que é
-
-O PSXRecomp traduz binários MIPS de PS1 para C e compila esse C como um
-executável nativo ligado a um runtime de hardware de PS1. A arquitetura v4
-recompila a BIOS real SCPH1001 e a executa como kernel. Não há camada de BIOS
-HLE, nem stubs, nem fallback para um interpretador de uso geral no código estático.
-
-O PSXRecomp é um framework. Projetos específicos de jogos vivem em seus próprios
-repositórios e usam este aqui para compilar o binário do jogo. Os alvos ativos
-ponta a ponta são:
-
-- [TombaRecomp](https://github.com/mstan/TombaRecomp) — *Tomba!*
-- [MegaManX6Recomp](https://github.com/mstan/MegaManX6Recomp) — *Mega Man X6*
-- [Brave Fencer Musashi Recompiled](https://github.com/saironbusatto/MusashiRecomp) — *Brave Fencer Musashi*
+Outros jogos no mesmo framework:
+[TombaRecomp](https://github.com/mstan/TombaRecomp) (*Tomba!*) e
+[MegaManX6Recomp](https://github.com/mstan/MegaManX6Recomp) (*Mega Man X6*).
 
 ## Filosofia — rumo à recompilação 100% estática
 
@@ -88,46 +80,19 @@ o jogo é jogado; este branch é onde essa maquinaria está sendo construída.
 
 ## Status
 
-Marco atual em 2026-07-08:
+Na v0.2.0-alpha (2026-10-29):
 
-| Subsistema | Estado |
+| Área | Estado |
 |---|---|
-| Recompilação da BIOS (`SCPH1001.BIN`) | Inicializa e passa o controle ao jogo |
-| Recompilação do EXE do jogo | Tela-título, OPTIONS, NEW GAME, salvar/carregar e gameplay do Tomba alcançados. BFM passa do título para o gameplay |
-| CD-ROM / MDEC / XA | FMVs do Tomba fazem streaming e tocam a 15 fps; BFM carrega do disco |
-| Memory cards | Salvar e carregar do Tomba verificados |
-| Controles SIO0 | Polling do controle digital e respostas de configuração do DualShock |
-| GPU | Funcional para boot da BIOS, FMVs, menus e gameplay |
-| Interrupções, COP0, timers | Funcionando nos caminhos de jogo atuais |
-| Suporte a RAM suja | Caminhos de despacho instalados em RAM da BIOS/jogo tratados; guarda de janela do kernel evita despachar overlay obsoleto no boot |
-| Entrada de controle | Teclado e mapeamento de controle estilo SDL/XInput via `input.ini` |
-| Cache de overlay (Linux) | dlopen POSIX + varredura de diretório com dirent.h para cachear overlays compilados do jogo. Captura overlays carregados por CD DMA e os despacha como DLLs nativas |
+| Boot | A BIOS SCPH1001 recompilada dá boot no disco (boot LLE, `bios_hle = false`) |
+| Gameplay | Título, novo jogo, tutorial e gameplay alcançados |
+| Memory cards | Salvar → recarregar dentro do jogo verificado |
+| Overlays | Overlays do disco decodificados e compilados no binário: 97% das chamadas de overlay nativas no gameplay, 86% no menu de save |
+| Vídeo | Renderer OpenGL; 4:3 por padrão, 16:9 experimental |
+| Plataformas | Pacotes de release para Windows x64 e Linux x86_64 |
 
-Trabalho de acompanhamento conhecido:
-
-- O recente burn-down visual do Tomba corrigiu o logo PS da BIOS, as emendas de glifos do
-  título/menu, as emendas dos painéis de diálogo/pausa, o sombreamento do terreno e a renderização
-  de ramificações com textura sombreada observada na primeira área.
-- A cobertura de SPU é parcial; reverb, ruído, sweep e o comportamento preciso de IRQ da SPU
-  não estão completos.
-- O histórico travamento "Not Responding" no Windows está mitigado, mas deve continuar na
-  lista de observação até que testes de imersão mais longos fiquem limpos.
-- Nenhum dos jogos está totalmente validado ponta a ponta ainda. Tomba tem consideravelmente mais
-  cobertura; Mega Man X6 está jogável (fases, controle e salvar/carregar
-  em memory card funcionam). Brave Fencer Musashi passa da tela de título
-  e chega ao gameplay, mas ainda precisa de trabalho na estabilidade do cache de overlays.
-  Playthroughs completos de todos os alvos continuam não verificados.
-
-Para o marco atual do jogo, compile e rode o projeto irmão TombaRecomp:
-
-```sh
-cd ../TombaRecomp
-cmake --build build -j16
-./build/psx-runtime.exe --game game.toml
-```
-
-Rodar o runtime deste repositório sem `--game` continua útil para
-gerenciar memory cards apenas com a BIOS.
+Ninguém terminou o jogo nesta build ainda. Os problemas em aberto ficam nas
+[issues do GitHub](https://github.com/saironbusatto/MusashiRecomp/issues); o `ISSUES.md` (IDs `L-`) guarda notas antigas do framework.
 
 ## Pacote de release
 
@@ -273,6 +238,15 @@ protegido por direitos autorais — mantenha-o na sua máquina, junto com a sua 
 de disco. Um formato de contribuição apenas com metadados (endereços e checksums, sem
 código de jogo) está planejado para que as descobertas possam ser compartilhadas com segurança no futuro.
 
+## Notas sobre o repositório
+
+Os documentos de design na raiz (`PLAN.md`, `FAITHFUL_TIMING_PLAN.md`,
+`ACCURACY_BURNDOWN.md`, `HANDOFF.md`, …) e boa parte de `docs/` são histórico
+do framework PSXRecomp. Eles citam muito *Tomba!* e *Mega Man X6* porque o
+framework foi desenvolvido primeiro nesses jogos. O material específico do BFM
+está em `games/musashi/`, `BFM_WIDESCREEN_PLAN.md` e na seção do BFM em
+`docs/overlay-discovery.md`.
+
 ## Licença
 
 PolyForm Noncommercial 1.0.0. Veja `LICENSE`.
@@ -288,7 +262,7 @@ como N64: Recompiled.
 ---
 
 <p align="center">
-  <sub><b>R.A.I.D. — Retro AI Development</b> · um Discord para engenharia reversa, decomp &amp; recomp retrô assistidos por IA</sub>
+  <sub><b>R.A.I.D. — Retro AI Development</b> · a comunidade por trás do PSXRecomp · um Discord para engenharia reversa, decomp &amp; recomp retrô assistidos por IA</sub>
 </p>
 
 <p align="center">
