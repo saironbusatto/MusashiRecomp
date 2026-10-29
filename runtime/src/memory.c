@@ -353,6 +353,13 @@ uint32_t overlay_watch_pagegen_sum(uint32_t phys, uint32_t len) {
     return sum;
 }
 
+/* Bulk RAM replacement (savestate restore) bypasses the store chokepoint, so
+ * every page's generation must move or the loader's generation fast paths
+ * would trust validity decided against the pre-restore bytes. */
+void overlay_watch_bump_all(void) {
+    for (uint32_t pg = 0; pg < DIRTY_RAM_PAGE_COUNT; pg++) overlay_page_gen[pg]++;
+}
+
 static inline void overlay_watch_note_write(uint32_t phys, uint32_t size) {
     uint32_t pg = phys >> DIRTY_RAM_PAGE_SHIFT;
     if (pg >= DIRTY_RAM_PAGE_COUNT) return;

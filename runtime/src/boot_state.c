@@ -13,6 +13,7 @@
 
 /* ---- core accessors (existing runtime modules) ---- */
 extern uint8_t*  memory_get_ram_ptr(void);
+extern void      overlay_watch_bump_all(void);
 extern uint8_t*  memory_get_scratchpad_ptr(void);
 extern uint32_t  dirty_ram_get_bitmap_word(uint32_t word_index);
 extern uint32_t  dirty_ram_get_bitmap_word_count(void);
@@ -211,6 +212,7 @@ static int apply_section(uint32_t tag, const uint8_t* p, uint32_t len,
     case BS_SEC_RAM:
         if (len != RAM_SIZE) return 0;
         memcpy(memory_get_ram_ptr(), p, RAM_SIZE);
+        overlay_watch_bump_all();
         return 1;
     case BS_SEC_SPAD:
         if (len != SPAD_SIZE) return 0;
