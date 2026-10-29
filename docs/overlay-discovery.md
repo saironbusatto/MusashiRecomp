@@ -73,7 +73,7 @@ straight from the disc, which covers areas nobody has played yet.
   more sources are added: stack-frame prologues right after a `jr ra`, and the
   word after a resident module's header word.
 
-Result on the US disc: 159 code images at 5 slots (136 scene builds at
+Result on the US disc: 159 code images at 6 slots (136 scene builds at
 0x80128158, plus 0x800CAE08, 0x800CCB1C, 0x800CEDF8, 0x801A00D8 and
 0x801E4C60). These hold ~95k unique functions. `compile_overlays.py --static`
 links them into the binary (see `runtime/include/overlay_static.h`). The 138
