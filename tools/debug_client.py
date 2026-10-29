@@ -321,11 +321,11 @@ def build_cmd(args):
     elif cmd == "wtrace_add":
         if len(args) < 3:
             return None, lambda _: "Usage: wtrace_add <lo> <hi>"
-        return {"cmd": "wtrace_add", "lo": args[1], "hi": args[2]}, pretty_json
+        return {"cmd": "wtrace_arm", "lo": args[1], "hi": args[2]}, pretty_json
     elif cmd == "wtrace_del":
         if len(args) < 2:
             return None, lambda _: "Usage: wtrace_del <slot>"
-        return {"cmd": "wtrace_del", "slot": int(args[1])}, pretty_json
+        return {"cmd": "wtrace_disarm", "slot": int(args[1])}, pretty_json
     elif cmd == "wtrace_ranges":
         return {"cmd": "wtrace_ranges"}, pretty_json
     elif cmd == "wtrace":
@@ -336,7 +336,7 @@ def build_cmd(args):
             d["addr_hi"] = args[2]
         return d, pretty_json
     elif cmd == "wtrace_clear":
-        return {"cmd": "wtrace_clear"}, pretty_json
+        return {"cmd": "wtrace_reset"}, pretty_json
     elif cmd == "wtrace_stats":
         return {"cmd": "wtrace_stats"}, pretty_json
     elif cmd == "mmio":

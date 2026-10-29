@@ -65,9 +65,7 @@ class DiscReader:
     def read_file_bytes(self, lba, size):
         """Read exactly `size` bytes starting at `lba`."""
         sectors_needed = (size + SECTOR_DATA - 1) // SECTOR_DATA
-        data = b''
-        for i in range(sectors_needed):
-            data += self.read_sector_data(lba + i)
+        data = b''.join(self.read_sector_data(lba + i) for i in range(sectors_needed))
         return data[:size]
 
 # ---------------------------------------------------------------------------
@@ -75,17 +73,21 @@ class DiscReader:
 # ---------------------------------------------------------------------------
 
 def parse_cue(cue_path):
-    """Return (bin_path, is_raw) from a .cue file."""
+    """Return (bin_path, is_raw) for the first data track of a .cue file.
+    Multi-track rips list one FILE per track; the ISO 9660 filesystem lives in
+    the first MODEn track, never in the trailing audio tracks."""
     cue_dir = os.path.dirname(os.path.abspath(cue_path))
     bin_path = None
     is_raw   = True   # default: MODE2/2352
+    cur_file = None
     with open(cue_path, encoding='utf-8', errors='replace') as f:
         for line in f:
             m = re.match(r'\s*FILE\s+"([^"]+)"\s+BINARY', line, re.IGNORECASE)
             if m:
-                bin_path = os.path.join(cue_dir, m.group(1))
+                cur_file = os.path.join(cue_dir, m.group(1))
             m = re.match(r'\s*TRACK\s+\d+\s+(MODE\d/(\d+))', line, re.IGNORECASE)
-            if m:
+            if m and bin_path is None:
+                bin_path = cur_file
                 is_raw = (int(m.group(2)) == SECTOR_RAW)
     if bin_path is None:
         raise ValueError(f'No BINARY FILE found in {cue_path}')
