@@ -53,6 +53,10 @@ Como fechamos a lacuna, sem nunca comprometer a correção:
    identificada pelo seu conteúdo, cacheado, e nas execuções seguintes carregado e despachado como
    código nativo *antes* de qualquer fallback. A cobertura cresce conforme o jogo é jogado:
    todo overlay que alguém alcança passa a ser nativo para todos depois.
+   No Brave Fencer Musashi, os arquivos de overlay do disco são decodificados
+   diretamente (`tools/musashi_disc_overlays.py`), e ~95 mil funções de overlay
+   são compiladas no executável antecipadamente, inclusive de áreas que ninguém
+   jogou ainda (`docs/overlay-discovery.md`).
 3. **Failover para o interpretador — só para código que ainda não é estático.** Um pequeno
    interpretador MIPS executa código *instalado em tempo de execução* (overlays/RAM suja) que
    ainda não foi capturado e compilado. É uma rede de segurança e um alimentador de cobertura,

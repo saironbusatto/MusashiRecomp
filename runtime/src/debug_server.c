@@ -10109,6 +10109,31 @@ static void handle_overlay_capture_dump(int id, const char *json)
              id, overlay_capture_count());
 }
 
+/* overlay_interp_hot: overlay-window PCs that still fall back to the
+ * interpreter, hottest first. {"cmd":"overlay_interp_hot","count":N,"reset":0|1}
+ * reason: 0 uncovered, 1 in a candidate range but unmatched, 2 refused entry. */
+static void handle_overlay_interp_hot(int id, const char *json)
+{
+    enum { MAXN = 256 };
+    int count = json_get_int(json, "count", 32);
+    if (count < 1) count = 1;
+    if (count > MAXN) count = MAXN;
+    uint32_t phys[MAXN], reason[MAXN], used = 0;
+    uint64_t cnt[MAXN], dropped = 0;
+    int n = overlay_loader_interp_hot(phys, reason, cnt, count, &used, &dropped);
+    char *out = (char *)malloc(256 + (size_t)n * 64);
+    if (!out) { send_err(id, "alloc failed"); return; }
+    int off = sprintf(out, "{\"id\":%d,\"ok\":true,\"unique\":%u,\"dropped\":%llu,\"hot\":[",
+                      id, used, (unsigned long long)dropped);
+    for (int i = 0; i < n; i++)
+        off += sprintf(out + off, "%s[\"0x%08X\",%u,%llu]", i ? "," : "",
+                       phys[i] | 0x80000000u, reason[i], (unsigned long long)cnt[i]);
+    sprintf(out + off, "]}\n");
+    debug_server_send_line(out);
+    free(out);
+    if (json_get_int(json, "reset", 0)) overlay_loader_interp_hot_reset();
+}
+
 /* overlay_loader_status: report the dynamic overlay DLL loader state —
  * whether active, how many functions are registered, which regions have
  * been checked, and the most recent load event. Rule-3 inspection path for
@@ -10138,7 +10163,7 @@ static void handle_overlay_loader_status(int id, const char *json)
         if (msg[si] == '\\' || msg[si] == '"') esc_msg[di++] = '\\';
         esc_msg[di++] = msg[si];
     }
-    char buf[1536];
+    char buf[2048];
     int n = snprintf(buf, sizeof(buf),
         "{\"id\":%d,\"ok\":true,\"active\":%d,\"registered\":%d,"
         "\"regions_checked\":%d,\"last_crc\":\"0x%08X\",\"file_found\":%d,"
@@ -10168,6 +10193,11 @@ static void handle_overlay_loader_status(int id, const char *json)
             regions, loads, invs, reval, unreg,
             (unsigned long long)dnat, (unsigned long long)dint,
             (unsigned long long)stale, lw_pc, lw_addr, lw_size);
+        int scand = 0; uint64_t sdisp = 0;
+        overlay_loader_get_static(&scand, &sdisp);
+        n += snprintf(buf + n, sizeof(buf) - n,
+            ",\"static_candidates\":%d,\"dispatch_static\":%llu",
+            scand, (unsigned long long)sdisp);
         int r0v=0; uint32_t r0w=0, r0lo=0, r0hi=0, r0crc=0, ratt=0, rmiss=0, rlast=0;
         overlay_loader_get_reload_debug(&r0v, &r0w, &r0lo, &r0hi, &r0crc,
                                         &ratt, &rmiss, &rlast);
@@ -11283,6 +11313,7 @@ static const CmdEntry s_commands[] = {
     { "overlay_dump",      handle_overlay_dump },
     { "cd_read_log",       handle_cd_read_log },
     { "overlay_loader_status", handle_overlay_loader_status },
+    { "overlay_interp_hot",    handle_overlay_interp_hot },
     { "overlay_candidates",   handle_overlay_candidates },
     { "overlay_native_ring",  handle_overlay_native_ring },
     { "overlay_irq_suppress_on",  handle_overlay_irq_suppress_on },

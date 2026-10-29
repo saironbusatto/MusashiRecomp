@@ -2085,14 +2085,8 @@ static int dirty_ram_dispatch_inner(CPUState* cpu, uint32_t addr, uint32_t stop_
     }
 #endif
 
-    /* B-2: statically-compiled overlay functions (generated/overlays_static.c).
-     * Inert unless a game provides an overlays_static.c at build time. */
-#ifdef PSX_HAS_OVERLAY_DISPATCH
-    {
-        extern int psx_overlay_dispatch(CPUState *cpu, uint32_t addr);
-        if (psx_overlay_dispatch(cpu, addr)) return 1;
-    }
-#endif
+    /* B-2 statically-linked overlays register as loader candidates
+     * (overlay_static.h), so the A-1 dispatch below covers them too. */
 
     /* A-1: dynamically-loaded overlay DLL functions, checked before the
      * interpreter.  No-op (returns 0) until overlay_loader_init() runs, which

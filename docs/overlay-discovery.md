@@ -49,6 +49,49 @@ land in RAM, after all scatter-reassembly and decompression. This works for:
 - Game-specific LZ or RLE compression (bytes arrive decompressed via DMA)
 - Direct file loads (trivially captured)
 
+### Exception: a per-game disc decoder (Brave Fencer Musashi)
+
+When a game's container format is understood, every overlay can be decoded
+straight from the disc, which covers areas nobody has played yet.
+`tools/musashi_disc_overlays.py` does this for BFM:
+
+- Code lives in the `MAIN.CD` / `SC01–07.CD` archives (`u32 count, u32 0`, then
+  `(first_sector, byte_size)` pairs). Each entry is a run of `PAC` chunks, one
+  per sector-aligned header: `"PAC\0", u8 type, u8 more, u16, u32 param,
+  u32 size`. Type 1 is a raw copy and type 4 is the EXE's LZSS (`FUN_80018730`:
+  1 KiB ring, cursor starting at 1, LSB-first flags).
+- The load address is a runtime argument, not part of the file. The tool
+  recovers it from the image's own absolute references: `jal` targets,
+  word-sized pointers, and their sum each vote for the bases that land them
+  on in-image prologues. A base is accepted only when a clear winner exists
+  (≥16 votes, 1.5× the runner-up) and every clear winner agrees. If the base
+  is wrong, the code is never executed: the loader runs a compiled function
+  only while live RAM matches the bytes it was compiled from.
+- Seeds come from `jal` targets and callable pointers in the EXE, in the image
+  itself and in modules loaded at *other* slots. Modules that share a slot
+  replace each other, so their references never count for one another. Two
+  more sources are added: stack-frame prologues right after a `jr ra`, and the
+  word after a resident module's header word.
+
+Result on the US disc: 159 code images at 5 slots (136 scene builds at
+0x80128158, plus 0x800CAE08, 0x800CCB1C, 0x800CEDF8, 0x801A00D8 and
+0x801E4C60). These hold ~95k unique functions. `compile_overlays.py --static`
+links them into the binary (see `runtime/include/overlay_static.h`). The 138
+images that have no provable base are mostly data or tiny actor modules, and
+they stay on the dirty-RAM interpreter.
+
+```bash
+python3 tools/musashi_disc_overlays.py --disc "<BFM>.cue" --exe SLUS_007.26 \
+    --out build/musashi_disc_overlays.json
+# parallel shards share --out-dir: pass --no-finalize, then finalize once
+python3 tools/compile_overlays.py --static --no-finalize --cps --force \
+    --captures build/musashi_disc_overlays.json --game-toml games/musashi/game.toml \
+    --recompiler recompiler/build/psxrecomp-game --runtime-include runtime/include \
+    --out-dir games/musashi/generated/overlays_static
+python3 tools/compile_overlays.py --static-finalize \
+    --out-dir games/musashi/generated/overlays_static
+```
+
 ---
 
 ## Architecture

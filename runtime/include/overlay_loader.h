@@ -44,6 +44,12 @@ void overlay_loader_check_cache(uint32_t load_addr, uint32_t size,
  * 0 if not found (fall through to interpreter). */
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr);
 
+/* Top `max` interp-fallback PCs in the overlay window, by count (descending).
+ * reason: 0 uncovered, 1 in a candidate's range but unmatched, 2 refused entry. */
+int overlay_loader_interp_hot(uint32_t *phys, uint32_t *reason, uint64_t *count,
+                              int max, uint32_t *used, uint64_t *dropped);
+void overlay_loader_interp_hot_reset(void);
+
 /* Step 2.8: re-scan the cache dir for DLLs compiled after init and clear the
  * checked-regions memo so the next dispatch reconsiders the cache. Idempotent
  * (loaded DLLs stay loaded); emu thread only. */
@@ -76,6 +82,8 @@ void overlay_loader_active_write_check(uint32_t phys, uint32_t size);
 
 /* Inc3 counters, surfaced via overlay_loader_status (field meanings remapped
  * to the per-entry model — see overlay_loader.c getters). */
+/* Static (linked-in) overlay tier: candidates registered, native dispatches. */
+void overlay_loader_get_static(int *cands, uint64_t *disp);
 void overlay_loader_get_counters(uint32_t *loads, uint32_t *invalidations,
                                  uint32_t *unregistered,
                                  uint64_t *disp_native, uint64_t *disp_interp,

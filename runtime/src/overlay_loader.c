@@ -69,6 +69,8 @@ typedef struct {
     int       device_touch;              /* 1 = touches MMIO; never run its shard,
                                           * always interp (shadow diff can't safely
                                           * double-execute device I/O). */
+    uint32_t  probe;                     /* code word at entry (valid if has_probe)*/
+    int       has_probe;                 /* 1: reject on probe mismatch, no crc   */
 } Candidate;
 
 /* Same-state differential verify budget: diff a candidate this many times with
@@ -79,9 +81,18 @@ typedef struct {
  * kept) and never executes native live. */
 #define OVERLAY_DIFF_BUDGET 32u
 
-#define CAND_CAP   16384
-static Candidate s_cand[CAND_CAP];
-static int       s_cand_n = 0;
+/* Candidate storage is sized at overlay_loader_init(): CAND_DYNAMIC_CAP for
+ * DLL/sljit candidates found at run time plus every statically-linked overlay
+ * function. Allocated once, never reallocated, so Candidate pointers stay
+ * valid across registration. */
+#define CAND_DYNAMIC_CAP 16384
+static Candidate *s_cand = NULL;
+static int        s_cand_cap = 0;
+static int        s_cand_n = 0;
+
+/* Static-overlay candidates are tagged with this pseudo DLL index: >= 0 keeps
+ * them in the trusted tier (only sljit shards, dll == -1, are diff-gated). */
+#define CAND_STATIC_DLL 0x7FFFFFFF
 
 /* RECURSION_BUG.md §25 — 1 when the build is continuation-passing (set by a
  * constructor in the generated CPS dispatch). The overlay dispatch + sljit JIT
@@ -91,7 +102,7 @@ int g_psx_cps_mode = 0;
 
 /* Open-addressed index: phys entry addr -> head candidate index (-1 sentinel
  * stored as chain terminator on each Candidate). addr 0 = empty slot. */
-#define IDX_CAP  32768u
+#define IDX_CAP  (1u << 19)   /* > 2x the distinct entries of every static overlay */
 #define IDX_MASK (IDX_CAP - 1u)
 typedef struct { uint32_t addr; int head; } IdxSlot;
 static IdxSlot s_idx[IDX_CAP];
@@ -115,6 +126,44 @@ static void idx_set_head(uint32_t phys, int head) {
             return;
         }
     }
+}
+
+/* Range index: 256-byte RAM buckets -> candidates whose code ranges cover the
+ * bucket. Serves continuation re-entry (CPS: a return lands mid-function) and
+ * picks the RESIDENT variant among every overlay sharing the address. `hint`
+ * is the last candidate that matched there (index + 1, 0 = none) — the common
+ * case is one cheap generation check. */
+#define BKT_SHIFT 8
+#define BKT_COUNT ((2u * 1024u * 1024u) >> BKT_SHIFT)
+typedef struct { int *v; int n, cap, hint; } Bucket;
+static Bucket s_bkt[BKT_COUNT];
+
+static void bkt_add(int ci) {
+    const Candidate *c = &s_cand[ci];
+    for (int r = 0; r < c->nranges; r++) {
+        uint32_t lo = c->range_lo[r], len = c->range_len[r];
+        if (len == 0 || lo >= 2u * 1024u * 1024u) continue;
+        uint32_t last = (lo + len - 1u) >> BKT_SHIFT;
+        if (last >= BKT_COUNT) last = BKT_COUNT - 1u;
+        for (uint32_t b = lo >> BKT_SHIFT; b <= last; b++) {
+            Bucket *k = &s_bkt[b];
+            if (k->n && k->v[k->n - 1] == ci) continue;   /* two ranges, one bucket */
+            if (k->n == k->cap) {
+                int nc = k->cap ? k->cap * 2 : 8;
+                int *nv = (int *)realloc(k->v, sizeof(int) * (size_t)nc);
+                if (!nv) return;
+                k->v = nv;
+                k->cap = nc;
+            }
+            k->v[k->n++] = ci;
+        }
+    }
+}
+
+static int cand_contains(const Candidate *c, uint32_t phys) {
+    for (int r = 0; r < c->nranges; r++)
+        if (phys >= c->range_lo[r] && phys < c->range_lo[r] + c->range_len[r]) return 1;
+    return 0;
 }
 
 /* Active native-entry stack (self-modification detection, §8.5). */
@@ -265,6 +314,8 @@ static int      s_ndlls          = 0;   /* DLLs LoadLibrary'd                 */
 static int      s_valid_count    = 0;   /* candidates currently VALID         */
 static uint64_t s_disp_native    = 0;
 static uint64_t s_disp_interp    = 0;
+static uint64_t s_disp_static    = 0;   /* subset of s_disp_native: static tier */
+static int      s_static_cands   = 0;   /* static-overlay candidates registered */
 static uint64_t s_stale_blocked  = 0;   /* dispatches skipped (candidate !valid)*/
 static uint32_t s_invalidations  = 0;   /* VALID -> INVALID transitions       */
 static uint32_t s_revalidations  = 0;   /* INVALID -> VALID (reload-on-return) */
@@ -300,6 +351,48 @@ static uint32_t cand_gensum(const Candidate *c) {
     for (int i = 0; i < c->nranges; i++)
         s += overlay_watch_pagegen_sum(c->range_lo[i], c->range_len[i]);
     return s;
+}
+
+static uint64_t s_probe_rejects = 0;   /* foreign variants rejected by probe   */
+
+/* Does live RAM hold the bytes `c` was compiled from? Generation-gated both
+ * ways: every store to a watched page bumps its generation (memory.c, and
+ * overlay_watch_bump_all on savestate restore), so an unchanged generation
+ * proves unchanged bytes — a known-valid entry is still valid and a
+ * known-invalid one still invalid, with no hash. Otherwise the entry-word probe
+ * rejects most foreign overlays sharing the address before the crc runs.
+ * Updates val_gen; the caller owns the state transition. */
+static int cand_match(Candidate *c) {
+    uint32_t gen = cand_gensum(c);
+    if (gen == c->val_gen && c->state != ENTRY_BLACKLIST) {
+        s_gen_fastpath++;
+        return c->state == ENTRY_VALID;
+    }
+    c->val_gen = gen;
+    if (c->has_probe) {
+        uint32_t w;
+        memcpy(&w, memory_get_ram_ptr() + c->addr, sizeof w);
+        if (w != c->probe) { s_probe_rejects++; return 0; }
+    }
+    uint32_t live = cand_crc(c);
+    s_rehashes++;
+    s_last_crc = live;
+    return live == c->crc_code;
+}
+
+/* cand_match plus the VALID/INVALID transition. A caller of cand_match must
+ * always record the outcome: val_gen has moved, so leaving a failed entry
+ * VALID would let the next generation check accept stale bytes. */
+static int cand_resident(Candidate *c) {
+    int m = cand_match(c);
+    if (m && c->state != ENTRY_VALID) {
+        c->state = ENTRY_VALID;
+        s_valid_count++;
+    } else if (!m && c->state == ENTRY_VALID) {
+        c->state = ENTRY_INVALID;
+        if (s_valid_count > 0) s_valid_count--;
+    }
+    return m;
 }
 
 /* ---- Per-DLL code-range manifest --------------------------------------- */
@@ -369,8 +462,8 @@ static ManFn *man_find(ManFn *arr, int n, uint32_t entry) {
 
 static void loader_log(const char *fmt, ...);   /* defined below */
 
-static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) {
-    if (s_cand_n >= CAND_CAP) return;
+static int cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) {
+    if (s_cand_n >= s_cand_cap) return -1;
     int idx = s_cand_n++;
     Candidate *c = &s_cand[idx];
     c->addr    = phys;
@@ -378,6 +471,9 @@ static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) 
     c->dll     = dll;
     c->state   = ENTRY_VALID;
     c->nranges = 0;
+    c->has_probe = 0;
+    c->diff_passes = 0;
+    c->device_touch = 0;
     for (int i = 0; i < m->n && c->nranges < MAX_CODE_RANGES; i++) {
         c->range_lo[c->nranges]  = m->lo[i] & 0x1FFFFFFFu;
         c->range_len[c->nranges] = m->len[i];
@@ -403,6 +499,7 @@ static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) 
     c->state   = (cand_crc(c) == c->crc_code) ? ENTRY_VALID : ENTRY_INVALID;
     c->next    = idx_head(phys);
     idx_set_head(phys, idx);
+    bkt_add(idx);
     if (c->state == ENTRY_VALID) s_valid_count++;
 
     /* Obsolescence (load priority: static > gcc shard > sljit shard > interp). A
@@ -435,6 +532,7 @@ static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) 
             }
         }
     }
+    return idx;
 }
 
 /* ---- sljit Tier-2 shard registration (SLJIT.md §7 step 5) -------------- */
@@ -451,7 +549,7 @@ static void cand_register(uint32_t phys, OverlayFn fn, const ManFn *m, int dll) 
  * RAM against it so the shard only runs once the identical bytes are present. */
 static void register_sljit_candidate(uint32_t phys, OverlayFn fn,
                                      uint32_t lo, uint32_t len, uint32_t crc_override) {
-    if (s_cand_n >= CAND_CAP || len == 0) return;
+    if (s_cand_n >= s_cand_cap || len == 0) return;
     int idx = s_cand_n++;
     Candidate *c = &s_cand[idx];
     c->addr        = phys & 0x1FFFFFFFu;
@@ -467,8 +565,10 @@ static void register_sljit_candidate(uint32_t phys, OverlayFn fn,
     c->state    = ENTRY_VALID;
     c->diff_passes = 0;
     c->device_touch = 0;
+    c->has_probe = 0;
     c->next     = idx_head(c->addr);
     idx_set_head(c->addr, idx);
+    bkt_add(idx);
     s_valid_count++;
     s_sljit_registered++;
     loader_log("sljit shard registered 0x%08X [%u bytes]", c->addr, len);
@@ -1366,11 +1466,66 @@ static int load_overlay_dll(const char *dll_path, ManFn *man, int man_n, int dll
 }
 #endif
 
+/* ---- Statically-linked overlays (B-2) ---------------------------------- */
+
+#ifdef PSX_HAS_STATIC_OVERLAYS
+#include "overlay_static.h"
+
+static uint32_t static_overlay_fn_count(void) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < psx_static_overlay_count; i++) n += psx_static_overlays[i]->nfns;
+    return n;
+}
+
+/* Register every static overlay function as a trusted-tier candidate. The same
+ * (entry, code crc) can appear in several overlay images (shared engine code
+ * at the same address); one candidate per identity is enough. */
+static void register_static_overlays(void) {
+    int registered = 0, duplicate = 0;
+    for (uint32_t i = 0; i < psx_static_overlay_count; i++) {
+        const PsxStaticOverlay *ov = psx_static_overlays[i];
+        for (uint32_t f = 0; f < ov->nfns; f++) {
+            const PsxStaticOvFn *sf = &ov->fns[f];
+            int dup = 0;
+            for (int j = idx_head(sf->entry); j >= 0 && !dup; j = s_cand[j].next)
+                dup = s_cand[j].dll == CAND_STATIC_DLL && s_cand[j].crc_code == sf->crc;
+            if (dup) { duplicate++; continue; }
+            ManFn m;
+            m.entry = sf->entry;
+            m.crc = sf->crc;
+            m.has_crc = 1;
+            m.n = 0;
+            for (uint32_t r = 0; r < sf->nranges && m.n < MAX_CODE_RANGES; r++, m.n++) {
+                m.lo[m.n]  = ov->ranges[2 * (sf->range_first + r)];
+                m.len[m.n] = ov->ranges[2 * (sf->range_first + r) + 1];
+            }
+            int ci = cand_register(sf->entry, sf->fn, &m, CAND_STATIC_DLL);
+            if (ci < 0) break;
+            s_cand[ci].probe = sf->probe;
+            s_cand[ci].has_probe = 1;
+            registered++;
+        }
+    }
+    s_static_cands = registered;
+    loader_log("static overlays: %u image(s) -> %d candidates (%d duplicate identities)",
+               psx_static_overlay_count, registered, duplicate);
+}
+#else
+static uint32_t static_overlay_fn_count(void) { return 0; }
+static void register_static_overlays(void) {}
+#endif
+
 /* ---- Public API -------------------------------------------------------- */
 
 void overlay_loader_init(const char *cache_dir, const char *game_id) {
     strncpy(s_cache_dir, cache_dir, sizeof(s_cache_dir) - 1);
     strncpy(s_game_id,   game_id,   sizeof(s_game_id)   - 1);
+    if (!s_cand) {
+        s_cand_cap = CAND_DYNAMIC_CAP + (int)static_overlay_fn_count();
+        s_cand = (Candidate *)calloc((size_t)s_cand_cap, sizeof(Candidate));
+        if (!s_cand) s_cand_cap = 0;
+        register_static_overlays();
+    }
     init_callbacks();
     scan_cache_dir();
     /* Persisted sljit shard cache (Stage 2): the cache is enabled (this init only
@@ -1630,26 +1785,103 @@ static void try_load_region(uint32_t phys) {
 
 /* ---- Dispatch ---------------------------------------------------------- */
 
-/* CPS (§25): find a non-blacklisted candidate whose code range CONTAINS phys —
- * i.e. phys is a continuation / return point INSIDE an overlay function, not its
- * registered entry. Under continuation-passing, an overlay function tail-
- * transfers after each block, so a callee returns to a mid-function address that
- * idx_head() (entry-keyed) misses; we re-enter the owning function with
- * cpu->pc = that address so its entry-switch routes to the right block. Returns
- * the candidate index, or -1. */
+/* CPS (§25): find the candidate whose code range CONTAINS phys and whose bytes
+ * are the ones live in RAM — i.e. phys is a continuation / return point INSIDE
+ * the resident overlay function, not its registered entry. Under continuation-
+ * passing, an overlay function tail-transfers after each block, so a callee
+ * returns to a mid-function address that idx_head() (entry-keyed) misses; we
+ * re-enter the owning function with cpu->pc = that address so its entry-switch
+ * routes to the right block. Many overlays can cover the same address (BFM:
+ * every scene module at 0x80128158), so containment alone is not enough — the
+ * live-RAM match picks the resident one. Returns the candidate index, or -1
+ * (no resident candidate covers phys: interpret). */
 static int overlay_find_by_range(uint32_t phys) {
-    for (int i = 0; i < s_cand_n; i++) {
-        const Candidate *c = &s_cand[i];
-        if (c->state == ENTRY_BLACKLIST) continue;
-        for (int r = 0; r < c->nranges; r++) {
-            uint32_t lo = c->range_lo[r];
-            if (phys >= lo && phys < lo + c->range_len[r]) return i;
+    if (phys >= 2u * 1024u * 1024u) return -1;
+    Bucket *k = &s_bkt[phys >> BKT_SHIFT];
+    if (k->hint) {
+        Candidate *c = &s_cand[k->hint - 1];
+        if (c->state != ENTRY_BLACKLIST && cand_contains(c, phys) && cand_resident(c))
+            return k->hint - 1;
+    }
+    for (int j = 0; j < k->n; j++) {
+        int ci = k->v[j];
+        Candidate *c = &s_cand[ci];
+        if (c->state == ENTRY_BLACKLIST || !cand_contains(c, phys)) continue;
+        if (cand_resident(c)) {
+            k->hint = ci + 1;
+            return ci;
         }
     }
     return -1;
 }
 
+/* Interp-fallback histogram: which overlay-window PCs still run interpreted,
+ * and why. Reason: 0 = no candidate covers the PC, 1 = a candidate's range
+ * covers it but none matches live RAM (or it is a non-entry), 2 = an entry
+ * candidate exists but was refused (stale / device-touch / blocked).
+ * Read via the overlay_interp_hot debug command. */
+#define IHOT_CAP 8192u
+typedef struct { uint32_t phys; uint32_t reason; uint64_t count; } IHot;
+static IHot     s_ihot[IHOT_CAP];
+static uint32_t s_ihot_used = 0;
+static uint64_t s_ihot_dropped = 0;
+
+static void ihot_record(uint32_t phys) {
+    uint32_t h = (phys >> 2) * 2654435761u;
+    for (uint32_t k = 0; k < IHOT_CAP; k++) {
+        IHot *e = &s_ihot[(h + k) & (IHOT_CAP - 1u)];
+        if (e->count && e->phys == phys) { e->count++; return; }
+        if (!e->count) {
+            if (s_ihot_used >= IHOT_CAP * 3u / 4u) { s_ihot_dropped++; return; }
+            s_ihot_used++;
+            e->phys = phys;
+            e->reason = idx_head(phys) >= 0 ? 2u
+                      : (overlay_count_by_range(phys) > 0 ? 1u : 0u);
+            e->count = 1;
+            return;
+        }
+    }
+}
+
+static int dispatch_impl(CPUState *cpu, uint32_t addr);
+
 int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
+    int r = dispatch_impl(cpu, addr);
+    if (!r) {
+        extern uint32_t g_overlay_region_floor;
+        uint32_t phys = addr & 0x1FFFFFFFu;
+        if (phys >= g_overlay_region_floor) ihot_record(phys);
+    }
+    return r;
+}
+
+int overlay_loader_interp_hot(uint32_t *phys, uint32_t *reason, uint64_t *count,
+                              int max, uint32_t *used, uint64_t *dropped) {
+    int n = 0;
+    for (uint32_t i = 0; i < IHOT_CAP; i++) {
+        if (!s_ihot[i].count) continue;
+        /* keep the top `max` by count (insertion into a small sorted array) */
+        int j;
+        if (n < max) j = n++;
+        else if (count[max - 1] >= s_ihot[i].count) continue;
+        else j = max - 1;
+        while (j > 0 && count[j - 1] < s_ihot[i].count) {
+            phys[j] = phys[j - 1]; reason[j] = reason[j - 1]; count[j] = count[j - 1]; j--;
+        }
+        phys[j] = s_ihot[i].phys; reason[j] = s_ihot[i].reason; count[j] = s_ihot[i].count;
+    }
+    if (used) *used = s_ihot_used;
+    if (dropped) *dropped = s_ihot_dropped;
+    return n;
+}
+
+void overlay_loader_interp_hot_reset(void) {
+    memset(s_ihot, 0, sizeof(s_ihot));
+    s_ihot_used = 0;
+    s_ihot_dropped = 0;
+}
+
+static int dispatch_impl(CPUState *cpu, uint32_t addr) {
     uint32_t phys = addr & 0x1FFFFFFFu;
 
     /* Rule 18: kernel window code (phys < g_overlay_region_floor) is
@@ -1734,23 +1966,10 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
         if (ci >= 0) {
             Candidate *c = &s_cand[ci];
             /* Generation-gated validation (overlay-cache v2 P2) — same contract
-             * as the main chain: skip the crc32 when no watched code page changed
-             * since this entry was last confirmed VALID. */
-            uint32_t gen = cand_gensum(c);
-            int matched;
-            if (c->state == ENTRY_VALID && gen == c->val_gen) {
-                matched = 1;
-                s_gen_fastpath++;
-            } else {
-                uint32_t live = cand_crc(c);
-                s_rehashes++;
-                s_last_crc = live;
-                c->val_gen = gen;
-                matched = (live == c->crc_code);
-            }
+             * as the main chain. */
+            int matched = cand_resident(c);
             if (_probe) s_cps_probe_matched = matched;
             if (matched) {
-                if (c->state != ENTRY_VALID) { c->state = ENTRY_VALID; s_valid_count++; }
                 if (c->device_touch)   { if (_probe) s_cps_probe_outcome = 3; s_disp_interp++; return 0; }
                 if (!s_native_exec || overlay_native_blocked(c->addr) || overlay_native_blocked(addr))
                                        { if (_probe) s_cps_probe_outcome = 4; s_would_run_native++; s_disp_interp++; return 0; }
@@ -1767,6 +1986,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
                 if (s_active_depth < (int)(sizeof(s_active_stack) / sizeof(s_active_stack[0])))
                     s_active_stack[s_active_depth++] = ci;
                 s_disp_native++;
+                if (c->dll == CAND_STATIC_DLL) s_disp_static++;
                 cpu->pc = addr;          /* route the func's entry-switch to the block */
                 c->fn(cpu);
                 overlay_post_dispatch_irq_pump(cpu);
@@ -1802,18 +2022,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
          * This removes the per-dispatch crc32 of the whole function body from the
          * hot path for stable code (the warm-cache common case). Correctness is
          * identical to the old unconditional hash; only redundant hashing is cut. */
-        uint32_t gen = cand_gensum(c);
-        int matched;
-        if (c->state == ENTRY_VALID && gen == c->val_gen) {
-            matched = 1;                 /* no watched write since validation */
-            s_gen_fastpath++;
-        } else {
-            uint32_t live = cand_crc(c);
-            s_rehashes++;
-            s_last_crc = live;
-            c->val_gen = gen;
-            matched = (live == c->crc_code);
-        }
+        int matched = cand_match(c);
         if (matched) {
             if (c->state != ENTRY_VALID) {
                 c->state = ENTRY_VALID;
@@ -1867,6 +2076,7 @@ int overlay_loader_dispatch(CPUState *cpu, uint32_t addr) {
             if (s_active_depth < (int)(sizeof(s_active_stack) / sizeof(s_active_stack[0])))
                 s_active_stack[s_active_depth++] = i;
             s_disp_native++;
+            if (c->dll == CAND_STATIC_DLL) s_disp_static++;
             /* Delimit this native execution in the interp insn ring (native code
              * emits no per-insn entries; markers keep the timeline alignable). */
             extern void dirty_ram_log_marker(uint32_t addr, uint32_t tag, int kind);
@@ -1934,6 +2144,11 @@ void overlay_loader_active_write_check(uint32_t phys, uint32_t size) {
 }
 
 /* ---- Status getters (signatures preserved for debug_server.c) ---------- */
+
+void overlay_loader_get_static(int *cands, uint64_t *disp) {
+    if (cands) *cands = s_static_cands;
+    if (disp)  *disp  = s_disp_static;
+}
 
 void overlay_loader_get_counters(uint32_t *loads, uint32_t *invalidations,
                                  uint32_t *unregistered,

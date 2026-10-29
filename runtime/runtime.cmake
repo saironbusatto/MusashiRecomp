@@ -262,7 +262,7 @@ function(psxrecomp_add_runtime_target target)
     set(oneValueArgs
         GAME_GENERATED_FULL_C
         GAME_GENERATED_DISPATCH_C
-        GAME_OVERLAY_STATIC_C
+        GAME_OVERLAY_STATIC_DIR
         DEBUG_PORT
         WINDOW_TITLE
         DEFAULT_BIOS_PATH
@@ -299,12 +299,14 @@ function(psxrecomp_add_runtime_target target)
         list(APPEND generated_sources "${PSXRT_GAME_GENERATED_DISPATCH_C}")
         set(has_game_dispatch TRUE)
     endif()
-    # Layer B: statically-compiled overlay dispatch. Inert unless a game
-    # provides a generated overlays_static.c — no target sets this yet.
-    if(PSXRT_GAME_OVERLAY_STATIC_C AND EXISTS "${PSXRT_GAME_OVERLAY_STATIC_C}")
-        set_source_files_properties("${PSXRT_GAME_OVERLAY_STATIC_C}" PROPERTIES GENERATED TRUE)
-        list(APPEND generated_sources "${PSXRT_GAME_OVERLAY_STATIC_C}")
-        set(has_overlay_dispatch TRUE)
+    # Layer B: statically-linked overlays (tools/compile_overlays.py --static):
+    # one C file per overlay image plus overlays_static_index.c, registered as
+    # crc-gated loader candidates at overlay_loader_init().
+    if(PSXRT_GAME_OVERLAY_STATIC_DIR AND EXISTS "${PSXRT_GAME_OVERLAY_STATIC_DIR}/overlays_static_index.c")
+        file(GLOB overlay_static_sources CONFIGURE_DEPENDS "${PSXRT_GAME_OVERLAY_STATIC_DIR}/*.c")
+        set_source_files_properties(${overlay_static_sources} PROPERTIES GENERATED TRUE)
+        list(APPEND generated_sources ${overlay_static_sources})
+        set(has_static_overlays TRUE)
     endif()
 
     if(PSXRT_ORACLE)
@@ -433,8 +435,8 @@ function(psxrecomp_add_runtime_target target)
     if(has_game_dispatch)
         target_compile_definitions(${target} PRIVATE PSX_HAS_GAME_DISPATCH=1)
     endif()
-    if(has_overlay_dispatch)
-        target_compile_definitions(${target} PRIVATE PSX_HAS_OVERLAY_DISPATCH=1)
+    if(has_static_overlays)
+        target_compile_definitions(${target} PRIVATE PSX_HAS_STATIC_OVERLAYS=1)
     endif()
 
     # PSX_DEBUG_TOOLS option declared at the top of runtime.cmake so it's

@@ -51,6 +51,9 @@ if(EXISTS "${MUSASHI_GENERATED}/SLUS_007.26_full.c")
     psxrecomp_add_runtime_target(musashi-runtime
         GAME_GENERATED_FULL_C     "${MUSASHI_GENERATED}/SLUS_007.26_full.c"
         GAME_GENERATED_DISPATCH_C "${MUSASHI_GENERATED}/SLUS_007.26_dispatch.c"
+        # Disc overlays compiled ahead of time (tools/musashi_disc_overlays.py
+        # + compile_overlays.py --static); skipped when not generated.
+        GAME_OVERLAY_STATIC_DIR   "${MUSASHI_GENERATED}/overlays_static"
         DEBUG_PORT 4370
         WINDOW_TITLE "Brave Fencer Musashi (PSXRecomp)"
         # Relative on purpose: resolve_existing_runtime_path() anchors these on

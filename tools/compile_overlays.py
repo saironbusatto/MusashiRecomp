@@ -1074,22 +1074,20 @@ def patch_generated_c(src: str, load_addr: int, size: int) -> str:
 # Static (B-2) post-processing
 # ---------------------------------------------------------------------------
 
-STATIC_PREAMBLE = """\
-/* ---- Static overlay (B-2): psx_runtime.h already provides call_by_address. */
-
-"""
-
-def patch_generated_c_static(src: str, load_addr: int, size: int) -> tuple:
+def patch_generated_c_static(src: str, load_addr: int, size: int,
+                             crc32: int) -> tuple:
     """
-    Post-process psxrecomp-game's _full.c output for static binary compilation.
+    Post-process psxrecomp-game's _full.c output for static (B-2) linking.
 
     Returns (patched_src, sorted_list_of_in_overlay_virt_addrs).
 
-    Differences from DLL path:
-    - No overlay_api.h / OverlayCallbacks / overlay_init
-    - Callbacks are direct extern calls, not function pointers
-    - No __declspec(dllexport) — all functions have normal external linkage
-    - Returns function address list so caller can build the switch dispatch
+    Many overlays share one load address (BFM: every scene module sits at
+    0x80128158), so each overlay's functions get a file-local, crc-namespaced
+    name — ovl_<crc32>_<addr> — and are reached only through the registration
+    table emitted by static_overlay_table(). The loader validates every entry
+    against live RAM (per-function code crc) before running it, exactly as it
+    does for cached DLLs, so a different overlay at the same address can never
+    run this code.
     """
     ov_lo = load_addr & 0x1FFFFFFF
     ov_hi = ov_lo + size
@@ -1097,59 +1095,141 @@ def patch_generated_c_static(src: str, load_addr: int, size: int) -> tuple:
     def in_overlay(addr: int) -> bool:
         return ov_lo <= (addr & 0x1FFFFFFF) < ov_hi
 
-    # 1. Insert preamble after last #include
-    last_inc = -1
-    for m in re.finditer(r'^#include\s+[<"].*[>"]\s*$', src, re.MULTILINE):
-        last_inc = m.end()
-    if last_inc == -1:
-        src = STATIC_PREAMBLE + src
-    else:
-        src = src[:last_inc] + '\n' + STATIC_PREAMBLE + src[last_inc:]
-
-    # 2. Remove out-of-range forward declarations
+    # Out-of-range forward declarations would be unresolved: drop them.
     def drop_extern(m):
-        addr = int(m.group(1), 16)
-        return '' if not in_overlay(addr) else m.group(0)
+        return m.group(0) if in_overlay(int(m.group(1), 16)) else ''
     src = re.sub(r'^void func_([0-9A-Fa-f]{8})\(CPUState\* cpu\);\n',
                  drop_extern, src, flags=re.MULTILINE)
 
-    # 3. Replace out-of-range direct calls with call_by_address
+    # Out-of-range direct calls go through the runtime dispatcher.
     def fix_call(m):
         addr = int(m.group(1), 16)
-        if in_overlay(addr):
-            return m.group(0)
-        return f'call_by_address(cpu, 0x{addr:08X}u)'
+        return m.group(0) if in_overlay(addr) else f'call_by_address(cpu, 0x{addr:08X}u)'
     src = re.sub(r'\bfunc_([0-9A-Fa-f]{8})\(cpu\)', fix_call, src)
 
-    # 4. Collect in-overlay function definition addresses (no export annotation needed)
-    func_virt_addrs = []
-    def collect_fn(m):
-        addr = int(m.group(1), 16)
-        if in_overlay(addr):
-            func_virt_addrs.append(0x80000000 | (addr & 0x1FFFFFFF))
-        return m.group(0)
-    src = re.sub(r'^void func_([0-9A-Fa-f]{8})\(CPUState\* cpu\)$',
-                 collect_fn, src, flags=re.MULTILINE)
+    func_virt_addrs = sorted({0x80000000 | (int(a, 16) & 0x1FFFFFFF) for a in
+                              re.findall(r'^void func_([0-9A-Fa-f]{8})\(CPUState\* cpu\)$',
+                                         src, flags=re.MULTILINE)
+                              if in_overlay(int(a, 16))})
 
-    return src, sorted(func_virt_addrs)
+    prefix = f'ovl_{crc32:08X}_'
+    src = re.sub(r'^void func_([0-9A-Fa-f]{8})\(CPUState\* cpu\)',
+                 lambda m: f'static void {prefix}{m.group(1)}(CPUState* cpu)',
+                 src, flags=re.MULTILINE)
+    src = re.sub(r'\bfunc_([0-9A-Fa-f]{8})\(cpu\)',
+                 lambda m: f'{prefix}{m.group(1)}(cpu)', src)
+    return src, func_virt_addrs
 
 
-def generate_overlay_dispatch(all_virt_addrs: list) -> str:
-    """Generate psx_overlay_dispatch() covering all statically-compiled overlays."""
-    lines = [
-        '',
-        '/* Auto-generated overlay dispatch — do not edit. */',
-        'int psx_overlay_dispatch(CPUState *cpu, uint32_t addr) {',
-        '    switch (addr) {',
-    ]
-    for va in sorted(all_virt_addrs):
-        lines.append(f'        case 0x{va:08X}u: func_{va:08X}(cpu); return 1;')
-    lines += [
-        '        default: return 0;',
-        '    }',
-        '}',
-        '',
-    ]
+def static_overlay_symbol(phys_addr: int, crc32: int) -> str:
+    return f'psx_static_ovl_{phys_addr:08X}_{crc32:08X}'
+
+
+def static_overlay_table(func_ids: list, defined: set, data: bytes, load_addr: int,
+                         crc32: int) -> tuple:
+    """Emit the overlay's registration table (see runtime/include/overlay_static.h).
+    Only functions the C defines AND the manifest hashes are registered —
+    precision-first, same rule the DLL loader applies. Returns (c_text, count)."""
+    prefix = f'ovl_{crc32:08X}_'
+    ranges, fns = [], []
+    for ev, crc, rs in func_ids:
+        if ev not in defined or not rs:
+            continue
+        probe = _word_at(data, load_addr, ev)
+        fns.append(f'    {{ 0x{ev & 0x1FFFFFFF:08X}u, 0x{crc:08X}u, 0x{probe:08X}u, '
+                   f'{len(ranges) // 2}u, {len(rs)}u, {prefix}{ev:08X} }},')
+        for lo, length in rs:
+            ranges += [f'0x{lo & 0x1FFFFFFF:08X}u', f'0x{length:X}u']
+    if not fns:
+        return '', 0
+    sym = static_overlay_symbol(load_addr & 0x1FFFFFFF, crc32)
+    text = ['', '#include "overlay_static.h"', '',
+            f'static const uint32_t {sym}_ranges[] = {{']
+    text += ['    ' + ', '.join(ranges[i:i + 8]) + ',' for i in range(0, len(ranges), 8)]
+    text += ['};', f'static const PsxStaticOvFn {sym}_fns[] = {{'] + fns + ['};',
+             f'const PsxStaticOverlay {sym} = {{ {len(fns)}u, {sym}_fns, {sym}_ranges }};', '']
+    return '\n'.join(text), len(fns)
+
+
+_STATIC_ROW = re.compile(r'^    \{ 0x([0-9A-F]{8})u, 0x([0-9A-F]{8})u, 0x[0-9A-F]{8}u, '
+                         r'\d+u, \d+u, (ovl_[0-9A-F]{8}_[0-9A-F]{8}) \},\n', re.MULTILINE)
+
+
+def _prune_static_source(src: str, drop: set) -> str:
+    """Remove the generated functions named in `drop` — forward declaration,
+    body (definition line through the first column-0 '}') and table row — in
+    one linear pass over the lines."""
+    out, skipping = [], False
+    for line in src.splitlines(keepends=True):
+        if skipping:
+            skipping = line != '}\n'
+            continue
+        if line.startswith('static void ovl_'):
+            name = line[len('static void '):line.index('(')]
+            if name in drop:
+                skipping = line.endswith(')\n')      # definition, not declaration
+                continue
+        elif line.startswith('    { 0x'):
+            m = _STATIC_ROW.match(line)
+            if m and m.group(3) in drop:
+                continue
+        out.append(line)
+    return ''.join(out)
+
+
+def finalize_static_dir(out_dir: str) -> tuple:
+    """Deduplicate function identities across every ovl_*.c in out_dir, then
+    write overlays_static_index.c.
+
+    Many overlay images carry byte-identical functions at the same address
+    (BFM's scene modules share the engine). An (entry, code crc) identity is
+    the loader's unit of validity, so one compiled copy serves every image:
+    later files drop their copy (body, declaration, table row). Files are
+    visited in sorted order, so the result is deterministic. Run once after all
+    --static runs that share out_dir have finished. Returns (files, kept, dropped)."""
+    files = sorted(fn for fn in os.listdir(out_dir)
+                   if re.fullmatch(r'ovl_[0-9A-F]{8}_[0-9A-F]{8}\.c', fn))
+    seen, kept, dropped, symbols = set(), 0, 0, []
+    for fn in files:
+        path = os.path.join(out_dir, fn)
+        with open(path) as f:
+            src = f.read()
+        drop = set()
+        for m in _STATIC_ROW.finditer(src):
+            ident = (m.group(1), m.group(2))
+            if ident in seen:
+                drop.add(m.group(3))
+            else:
+                seen.add(ident)
+        live = len(_STATIC_ROW.findall(src)) - len(drop)
+        kept += live
+        dropped += len(drop)
+        if live == 0:
+            os.remove(path)
+            continue
+        if drop:
+            # Table rows carry their first-range index, so a pruned table stays
+            # self-consistent (ranges[] is left whole).
+            src = _prune_static_source(src, drop)
+        sym = re.search(r'^const PsxStaticOverlay (\w+) = \{ (\d+)u,', src, re.MULTILINE)
+        if sym is None:
+            raise RuntimeError(f'{path}: no PsxStaticOverlay table')
+        src = src.replace(sym.group(0), f'const PsxStaticOverlay {sym.group(1)} = {{ {live}u,', 1)
+        with open(path, 'w') as f:
+            f.write(src)
+        symbols.append(sym.group(1))
+    with open(os.path.join(out_dir, 'overlays_static_index.c'), 'w') as f:
+        f.write(static_overlay_index(symbols))
+    return len(symbols), kept, dropped
+
+
+def static_overlay_index(symbols: list) -> str:
+    lines = ['/* Auto-generated by tools/compile_overlays.py --static — do not edit. */',
+             '#include "overlay_static.h"', '']
+    lines += [f'extern const PsxStaticOverlay {s};' for s in symbols]
+    lines += ['', 'const PsxStaticOverlay *const psx_static_overlays[] = {']
+    lines += [f'    &{s},' for s in symbols]
+    lines += ['    0', '};', f'const uint32_t psx_static_overlay_count = {len(symbols)}u;', '']
     return '\n'.join(lines)
 
 
@@ -1536,11 +1616,11 @@ def main():
                          'runtime injects PSX_OVERLAY_CAPTURES (the canonical '
                          '<exe>/overlay_captures.json), which wins. Required only '
                          'for manual/offline invocation.')
-    ap.add_argument('--game-toml',       required=True,
+    ap.add_argument('--game-toml',
                     help='game.toml (for game_id)')
-    ap.add_argument('--recompiler',      required=True,
+    ap.add_argument('--recompiler',
                     help='path to psxrecomp-game.exe')
-    ap.add_argument('--runtime-include', required=True,
+    ap.add_argument('--runtime-include',
                     help='path to psxrecomp runtime/include dir')
     ap.add_argument('--out-dir',         default='build-dev/cache',
                     help='cache root dir (default: build-dev/cache)')
@@ -1555,7 +1635,15 @@ def main():
     ap.add_argument('--force',           action='store_true',
                     help='recompile even if output already exists')
     ap.add_argument('--static',          action='store_true',
-                    help='B-2 mode: compile into binary (overlays_static.c) instead of DLL')
+                    help='B-2 mode: emit one C file per overlay + overlays_static_index.c '
+                         'into --out-dir, for linking into the binary instead of DLLs')
+    ap.add_argument('--static-finalize', action='store_true',
+                    help='only deduplicate the ovl_*.c already in --out-dir and '
+                         'rewrite overlays_static_index.c (run after parallel '
+                         '--static runs sharing one --out-dir)')
+    ap.add_argument('--no-finalize',     action='store_true',
+                    help='with --static: skip the end-of-run finalize (parallel '
+                         'runs sharing --out-dir; run --static-finalize after)')
     ap.add_argument('--flavor',          type=int, default=0,
                     help='codegen flavor id baked into overlay_abi() (0=base/master; '
                          'widescreen build passes 1). The loader rejects DLLs whose '
@@ -1565,6 +1653,15 @@ def main():
                          'when invoking the recompiler so overlay funcs tail-transfer '
                          '+ carry an entry-switch. Must match the runtime build.')
     args = ap.parse_args()
+
+    if args.static_finalize:
+        n, kept, dropped = finalize_static_dir(args.out_dir)
+        print(f'Static overlays: {n} file(s), {kept} functions kept, '
+              f'{dropped} duplicate identities dropped -> {args.out_dir}')
+        return
+    for name in ('game_toml', 'recompiler', 'runtime_include'):
+        if not getattr(args, name):
+            ap.error(f"--{name.replace('_', '-')} is required")
 
     # ---- Framework-injected cache location wins over CLI flags ----------------
     # The runtime (autocompile.c) exports PSX_OVERLAY_CACHE_DIR / PSX_OVERLAY_CAPTURES
@@ -1614,7 +1711,7 @@ def main():
     verify_recompiler_matches_tag(args.recompiler, codegen_hash(args.runtime_include))
 
     if args.static:
-        static_out = os.path.join(args.out_dir, 'overlays_static.c')
+        static_out = os.path.join(args.out_dir, 'overlays_static_index.c')
         if os.path.exists(static_out) and not args.force:
             print(f'SKIP: {static_out} already exists (use --force to recompile)')
             return
@@ -1636,8 +1733,9 @@ def main():
 
     print(f'Captures: {len(captures)} overlay(s) to process\n')
 
-    # B-2 static mode: accumulate all overlay C into one file
-    static_parts = []   # list of (patched_src, func_virt_addrs)
+    # B-2 static mode: one C file per overlay, indexed at the end
+    static_symbols = []
+    static_fn_total = 0
 
     # overlay-cache v2: per-region_start function-identity coverage, so a capture
     # that adds no NEW (entry, code_crc) skips the gcc compile (volatile-data
@@ -1785,14 +1883,28 @@ def main():
 
             # Post-process
             if args.static:
-                src, func_addrs = patch_generated_c_static(src, load_addr, size)
                 c_audit = audit_generated_c(src, load_addr, size, crc32, toml)
                 print_generated_c_audit(load_addr, size, crc32, c_audit)
                 if c_audit['unknown_bad'] or c_audit['unsupported_todo_addrs']:
                     print('  GENERATED-C AUDIT FAILED\n')
                     continue
-                static_parts.append((src, func_addrs))
-                print(f'  recompiled: {len(func_addrs)} functions\n')
+                src, func_addrs = patch_generated_c_static(src, load_addr, size, crc32)
+                ranges_src = next((os.path.join(out_dir_tmp, fn) for fn in os.listdir(out_dir_tmp)
+                                   if fn.endswith('_full.ranges')), None)
+                if not ranges_src:
+                    print('  no _full.ranges from the recompiler — overlay left to the interpreter\n')
+                    continue
+                func_ids = parse_overlay_func_ids(ranges_src, data, load_addr, size)
+                table, nreg = static_overlay_table(func_ids, set(func_addrs), data, load_addr, crc32)
+                if not nreg:
+                    print('  no registrable functions\n')
+                    continue
+                with open(os.path.join(args.out_dir,
+                                       f'ovl_{phys_addr:08X}_{crc32:08X}.c'), 'w') as f:
+                    f.write(src + table)
+                static_symbols.append(static_overlay_symbol(phys_addr, crc32))
+                static_fn_total += nreg
+                print(f'  recompiled: {len(func_addrs)} functions, {nreg} registered\n')
             else:
                 src = patch_generated_c(src, load_addr, size)
                 c_audit = audit_generated_c(src, load_addr, size, crc32, toml)
@@ -1905,19 +2017,15 @@ def main():
             print(f'  interior fragments @0x{phys_addr:08X}: {built}/{len(orphans)} '
                   f'executed orphan interior(s) -> isolated island shards')
 
-    # B-2: write combined static C file
-    if args.static and static_parts:
-        all_addrs = []
-        combined = '/* Auto-generated overlay dispatch — do not edit.\n'
-        combined += ' * Rebuild: python3 psxrecomp/tools/compile_overlays.py --static ...\n'
-        combined += ' */\n'
-        for src, addrs in static_parts:
-            combined += src
-            all_addrs.extend(addrs)
-        combined += generate_overlay_dispatch(all_addrs)
-        with open(static_out, 'w') as f:
-            f.write(combined)
-        print(f'Static output: {static_out}  ({len(all_addrs)} functions total)')
+    # B-2: dedupe + write the index the runtime registers at
+    # overlay_loader_init(). Parallel runs sharing --out-dir should instead run
+    # --static-finalize once after all of them finish.
+    if args.static:
+        print(f'Static output: {len(static_symbols)} overlay(s), {static_fn_total} '
+              f'functions -> {args.out_dir}')
+        if not args.no_finalize:
+            n, kept, dropped = finalize_static_dir(args.out_dir)
+            print(f'  finalized: {n} file(s), {kept} kept, {dropped} duplicates dropped')
 
     print('Done.')
 

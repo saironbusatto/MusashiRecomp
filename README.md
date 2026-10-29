@@ -54,6 +54,10 @@ How we close the gap, without ever compromising correctness:
    keyed by its content, cached, and on later runs loaded and dispatched as
    native code *before* any fallback. Coverage grows as the game is played:
    every overlay someone reaches becomes native for everyone after.
+   For Brave Fencer Musashi the disc's overlay archives are decoded directly
+   (`tools/musashi_disc_overlays.py`), and ~95k overlay functions are compiled
+   into the executable ahead of time, including areas nobody has played yet
+   (`docs/overlay-discovery.md`).
 3. **Interpreter failover — only for code that isn't static yet.** A small
    MIPS interpreter runs *runtime-installed* code (overlays/dirty RAM) that
    hasn't been captured-and-compiled. It is a safety net and a coverage feeder,

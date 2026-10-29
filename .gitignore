@@ -113,3 +113,6 @@ runtime/tests/*.exe
 *.pst
 /release-build/
 /dist/
+
+# Disc-derived overlay extraction output (copyrighted game code) - never commit
+/build/
