@@ -1,0 +1,8 @@
+# Linux release build environment. Ubuntu 22.04 = glibc 2.35, so the AppImage
+# runs on any distro from that era onward (Ubuntu 22.04+, Debian 12+, Fedora 36+).
+FROM ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake ninja-build pkg-config git ca-certificates curl file \
+        libsdl2-dev libgl-dev libx11-dev libxext-dev python3 \
+    && rm -rf /var/lib/apt/lists/*

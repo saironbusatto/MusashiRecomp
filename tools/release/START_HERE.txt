@@ -1,0 +1,27 @@
+Brave Fencer Musashi Recompiled @VERSION@  (alpha)
+
+A native PC build of Brave Fencer Musashi, statically recompiled from the
+original PlayStation code. This package contains NO PlayStation BIOS, NO game
+disc image and NO save data. You need your own, legally obtained copies.
+
+WHAT YOU NEED
+  - A PS1 BIOS: SCPH1001.BIN
+  - A dump of your Brave Fencer Musashi (USA) disc (SLUS-00726), as .cue + .bin
+
+FIRST LAUNCH
+  1. Linux: run the .AppImage (chmod +x it first).  Windows: run MusashiRecomp.exe.
+  2. In the launcher, select your BIOS and your disc's .cue file.
+     The launcher checks that the disc is SLUS-00726.
+  3. Press Start.
+
+WHERE YOUR DATA LIVES
+  Windows: next to MusashiRecomp.exe.
+  Linux:   ~/.local/share/MusashiRecomp/
+  Memory cards are card1.mcd / card2.mcd (created blank on first run).
+  Settings: settings.toml. Controller mapping: input.ini.
+
+WARNING - ALPHA
+  Nobody has finished the game on this build yet. It boots, plays, and saves
+  states, but a crash or softlock later in the game is possible. Keep a
+  memory-card save (and a backup of card1.mcd) as you progress.
+  Please report problems with the area/scene where they happened.

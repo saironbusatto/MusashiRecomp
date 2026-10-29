@@ -111,3 +111,5 @@ runtime/tests/*.exe
 # game data. Useful locally (they restore overlay code for analysis without
 # replaying), never distributable.
 *.pst
+/release-build/
+/dist/

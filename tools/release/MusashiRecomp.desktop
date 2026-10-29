@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Brave Fencer Musashi Recompiled
+Comment=Native PC port of Brave Fencer Musashi (requires your own disc dump and BIOS)
+Exec=MusashiRecomp
+Icon=MusashiRecomp
+Categories=Game;
+Terminal=false

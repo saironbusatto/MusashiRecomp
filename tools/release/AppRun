@@ -1,0 +1,17 @@
+#!/bin/sh
+# The runtime keeps settings, memory cards and its overlay cache next to the
+# executable, and an AppImage mounts read-only. So run from a writable copy:
+# shipped files are refreshed when the version changes; player files
+# (settings.toml, card*.mcd, input.ini, cache/) are never touched.
+set -e
+HERE="$(dirname "$(readlink -f "$0")")"
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}/MusashiRecomp"
+if [ "$(cat "$DATA/.version" 2>/dev/null)" != "@VERSION@" ]; then
+    mkdir -p "$DATA"
+    cp -rf "$HERE/usr/share/MusashiRecomp/." "$DATA/"
+    echo "@VERSION@" > "$DATA/.version"
+fi
+# Unset APPIMAGE so the runtime anchors on this copy (exe_dir_from_argv prefers
+# $APPIMAGE's directory, where the launcher assets do not exist).
+unset APPIMAGE
+exec "$DATA/MusashiRecomp" "$@"
