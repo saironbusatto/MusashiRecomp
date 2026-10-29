@@ -356,6 +356,15 @@ re-checked (the game binary always boots the disc from `game.toml`).
 
 ---
 
+## Not a bug — Musashi looks dark/near-silhouette (2026-10-28)
+
+User-reported. Same attract-demo temple scene, psx-runtime vs psx-beetle
+(port 4382): identical look (dark purple hair/cape, red outfit). Software and
+OpenGL renderers also identical. User confirmed against real-hardware gameplay
+videos. It is the original art at 320x240. Do not chase.
+
+---
+
 ## Issue #2 — `fn_entry_dump` / `fn_exit_dump` freeze the debug server on populated rings
 
 **Status:** open
